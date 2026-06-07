@@ -1,0 +1,16 @@
+# Never commit a filled-in MCP config (it contains your personal DevSpec token)
+mcp_config.json
+*.local.json
+.env
+.env.*
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Logs
+*.log
+node_modules/
