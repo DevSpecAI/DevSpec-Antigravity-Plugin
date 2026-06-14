@@ -39,6 +39,33 @@ Before staging and running `git commit`, read your staged diff end-to-end with `
 
 Fix real issues before committing. If a fix would expand scope beyond the action item, add an implementation note explaining the trade-off — do not ship broken code. This pass is **not skippable** for "small" changes.
 
+## Knowledge & Provenance
+
+DevSpec's memory + artifact knowledge base is the team's institutional brain. During an autonomous run you both CONSUME it (so you don't repeat past mistakes) and CONTRIBUTE to it (so the next run is smarter), under one rule: **an unattended agent proposes, a human ratifies.**
+
+### Stamp every write as autonomous — non-negotiable
+
+On EVERY DevSpec MCP **write** call in this run, pass `runner_session_id: <session_id>` — the SAME UUID you send to `send_heartbeat` (Step 0.6). That stamp is how the server knows the write is unattended, so it lands for human confirmation instead of masquerading as a human decision. There is no person watching this run, so the stamp is mandatory on: `record_implementation`, `add_implementation_note`, `create_resource`, `update_resource`, `supersede_resource`, `archive_resource`, `record_memory`, `supersede_memory`, `retract_memory`, `create_action_item`, `update_action_item`, `add_commit_reference`. (A human driving these tools interactively omits it — its absence IS the interactive signal. The autopilot run ALWAYS sends it.)
+
+### Consume the knowledge you're handed
+
+`get_next_work_item`, `get_testing_brief`, and `get_action_item_siblings` return `relevant_memories` + `relevant_artifacts` with the item. Read them BEFORE writing code:
+- `convention` memories and decided ADRs/plans are **binding constraints, not suggestions** — implement to match them.
+- If a recorded decision contradicts what the code now needs, **surface it** (`add_implementation_note`, and propose `supersede_memory`) rather than silently deviating.
+- Heed the item's `unresolved_conflicts` and the `related_candidates` returned by create/update: if your work would duplicate or undo another item, raise it (`fail_work_item` with "Requires human judgment" if it truly blocks) — never proceed silently.
+
+### Record what you learn
+
+When you discover something worth persisting — a deviation from the item's stated approach ("the item said X, we did Y because Z"), a non-obvious constraint, an architectural finding — record it with `record_memory` (`decision`/`convention`/`architecture`/`risk`/`insight`). ALWAYS `search_memories` first and `supersede_memory` the closest match instead of duplicating. Do NOT record transient details or anything obvious from the code. Your writes land **unconfirmed** and capped at `in_discussion` — you propose; the human ratifies.
+
+### Keep artifacts current
+
+When your work executes or invalidates a plan / ADR / runbook artifact, maintain it: `update_resource` (revise), `supersede_resource` (rewrite), or `archive_resource` (retire). Stale artifacts mislead every future grounding search. Uploaded documents are read-only to agents. Your changes take effect immediately but land unconfirmed for human ratification.
+
+### Treat unconfirmed knowledge as a lead
+
+Memories/artifacts labelled `[unconfirmed — recorded by ...]` (or `provenance_status: unconfirmed_agent_write`) were written by a prior unattended run and NOT ratified by a human. Treat them as leads to verify against the code — never as settled team decisions.
+
 ## Workflow
 
 ### Step 0: Load Settings & Initialize Local Storage
