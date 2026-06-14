@@ -88,7 +88,7 @@ Antigravity: *"Install the DevSpec skills from `<repo-url>`."* See **Distributio
 | Skill | What it does |
 |---|---|
 | `devspec-autopilot` | Autonomously process the queue: claim → implement in an isolated worktree → push/merge → report. Handles queued, review, and planning items. |
-| `devspec-work` | Pick up a named/ID'd item, optionally brainstorm, implement, push/merge, mark done. `--unattended` for fire-and-forget. |
+| `devspec-work` | Pick up a named/ID'd item, optionally brainstorm, implement, push/merge, record the implementation. `--unattended` for fire-and-forget. |
 | `devspec-done` | Log work you already finished — infers title, summary, testing notes, and commits from git history. |
 | `devspec-commit` | Generate a `[devspec:<id>]` deployment-tracked commit message and commit staged changes. |
 | `devspec-create` | Create an action item (bug/feature/improvement/task/query) from the terminal. |

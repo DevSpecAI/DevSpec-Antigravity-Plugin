@@ -1,6 +1,6 @@
 ---
 name: devspec-work
-description: "Pick up a specific DevSpec action item by name or ID, optionally brainstorm, implement it in an isolated worktree, push/merge per project settings, and mark it done. Supports --unattended for fire-and-forget. Use when asked to work on or implement a named action item."
+description: "Pick up a specific DevSpec action item by name or ID, optionally brainstorm, implement it in an isolated worktree, push/merge per project settings, and record the implementation. Supports --unattended for fire-and-forget. Use when asked to work on or implement a named action item."
 ---
 
 Pick up a specific action item, optionally brainstorm on it, implement the changes, push/merge based on project settings, and record completion — all in one flow.
@@ -374,5 +374,6 @@ On any validation failure, fail the item via Failure Handling — do not strip c
 - Write title and description as requirements (imperative tense), not past-tense summaries
 - `completion_summary` is for end users, not developers
 - `testing_notes` MUST be numbered step-by-step instructions a non-developer can follow
+- `record_implementation` lands the item at `implemented`, NOT `done`. NEVER offer to verify or "mark it done", and never call `verify_action_item` — reaching `done` is a separate decision a present human makes. Report the item as implemented (plus its check status) and stop. In `--unattended` mode you never verify under any circumstances.
 - ALL completion fields are required — never skip any
 - If the action item is too vague or requires human judgment, fail it with error "Requires human judgment"

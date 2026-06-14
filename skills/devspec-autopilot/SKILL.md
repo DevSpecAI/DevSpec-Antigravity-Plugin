@@ -598,6 +598,7 @@ On any validation failure, call `fail_work_item` with a clear error — do not s
 - Priority order when the queued queue is empty: under_human_review > planning. Only enter planning mode when both the queued and review queues are empty.
 - The commit message MUST include `[devspec:{action_item_id}]` in the body.
 - Always push your branch before calling record_implementation.
+- NEVER verify. `record_implementation` lands the item at `implemented`, not `done`. The autopilot is unattended — there is no human to confirm the work — so it records the implementation and stops. Reaching `done` is always a present human's decision; never call `verify_action_item`.
 - Always read a file before editing it.
 - Stage specific files only — never `git add -A`.
 - Follow the Shell Safety rules above for every shell command built from API values.
