@@ -289,7 +289,7 @@ Fix real issues before committing. If a fix would expand scope beyond the action
 
     **b)** `add_commit_reference` — commit SHA and message.
 
-    **c)** `complete_work_item` with ALL fields (never skip any):
+    **c)** `record_implementation` with ALL fields (never skip any):
       - `action_item_id`
       - `commit_sha`: the final commit SHA
       - `agent_merged`: true if auto_merge was performed, false otherwise

@@ -324,7 +324,7 @@ Call in this order:
 
 1. `add_implementation_note` with a final summary of all changes made.
 2. `add_commit_reference` with `action_item_id`, `commit_sha`, and `commit_message`.
-3. `complete_work_item` with:
+3. `record_implementation` with:
    - `action_item_id`, `commit_sha`, `agent_merged`, `affected_files` (from `git diff --name-only`)
    - `completion_note`: multi-paragraph markdown — what changed, why, decisions made
    - `completion_summary`: 2-4 sentences for non-technical stakeholders
@@ -404,7 +404,7 @@ The final heartbeat's gating state is informational only — the cycle's work ha
 This step runs only when Step 1b found a planning item and no queued work exists. The item's `agent_activity` is `planning` and it stays in that state throughout — planning mode is read-only analysis that writes an implementation plan for human approval.
 
 **Absolute forbiddens — these rules are non-negotiable:**
-- Do NOT call `claim_work_item`, `complete_work_item`, `fail_work_item`, or `update_action_item`.
+- Do NOT call `claim_work_item`, `record_implementation`, `fail_work_item`, or `update_action_item`.
 - Do NOT create a git branch, modify any files, commit, push, or merge.
 - Do NOT change the item's `agent_activity` — it must stay `planning` so a human can approve or reject the plan.
 
@@ -485,7 +485,7 @@ This step runs only when Step 1b found a planning item and no queued work exists
 This step runs only when Step 1b found a review item (`agent_activity: 'under_human_review'`) and no queued work exists. The item description **is** the plan to review. The item stays in `under_human_review` state throughout this step — review mode is read-only analysis that submits structured feedback via `submit_plan_review`, which transitions the item's `agent_activity` to NULL so the team can discuss the feedback in the originating session.
 
 **Absolute forbiddens — these rules are non-negotiable:**
-- Do NOT call `claim_work_item`, `complete_work_item`, `fail_work_item`, `update_action_item`, or `add_implementation_note`.
+- Do NOT call `claim_work_item`, `record_implementation`, `fail_work_item`, `update_action_item`, or `add_implementation_note`.
 - Do NOT create a git branch, modify any files, commit, push, or merge.
 - Do NOT rewrite the plan — your job is to validate it, flag risks, and identify gaps. That is the review contract.
 - Do NOT change the item's `agent_activity` manually; `submit_plan_review` performs that transition server-side.
@@ -592,12 +592,12 @@ On any validation failure, call `fail_work_item` with a clear error — do not s
 - Execute ALL steps autonomously. Never ask for user confirmation.
 - Quality matters: completion notes and testing steps become the permanent audit trail.
 - If you encounter an unexpected error during implementation (Steps 2–7), call fail_work_item with full details rather than silently failing.
-- In planning mode (Step 8), NEVER call fail_work_item, complete_work_item, update_action_item, or claim_work_item — the item stays in `planning` state regardless of outcome.
-- In review mode (Step 9), NEVER call fail_work_item, complete_work_item, update_action_item, claim_work_item, or add_implementation_note — the item stays in `under_human_review` state regardless of outcome (submit_plan_review handles the lifecycle transition on success).
+- In planning mode (Step 8), NEVER call fail_work_item, record_implementation, update_action_item, or claim_work_item — the item stays in `planning` state regardless of outcome.
+- In review mode (Step 9), NEVER call fail_work_item, record_implementation, update_action_item, claim_work_item, or add_implementation_note — the item stays in `under_human_review` state regardless of outcome (submit_plan_review handles the lifecycle transition on success).
 - In review mode, NEVER rewrite the plan. Your contract is to validate, flag risks, and identify gaps — not to produce a better plan.
 - Priority order when the queued queue is empty: under_human_review > planning. Only enter planning mode when both the queued and review queues are empty.
 - The commit message MUST include `[devspec:{action_item_id}]` in the body.
-- Always push your branch before calling complete_work_item.
+- Always push your branch before calling record_implementation.
 - Always read a file before editing it.
 - Stage specific files only — never `git add -A`.
 - Follow the Shell Safety rules above for every shell command built from API values.

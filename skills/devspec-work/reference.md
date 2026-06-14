@@ -107,7 +107,7 @@ List action items by filter. In this plugin it is used exclusively to detect **p
 
 ### update_action_item
 
-Update an action item's lifecycle state. In this plugin it is used **only** for stale-claim recovery (resetting in-progress items claimed by crashed runners). All other lifecycle transitions happen through the dedicated tools (`claim_work_item`, `complete_work_item`, `fail_work_item`, `submit_plan_review`) — do NOT use `update_action_item` for those.
+Update an action item's lifecycle state. In this plugin it is used **only** for stale-claim recovery (resetting in-progress items claimed by crashed runners). All other lifecycle transitions happen through the dedicated tools (`claim_work_item`, `record_implementation`, `fail_work_item`, `submit_plan_review`) — do NOT use `update_action_item` for those.
 
 **Parameters** (only the stale-recovery fields shown — see DevSpec docs for the full schema):
 ```json
@@ -128,7 +128,7 @@ Update an action item's lifecycle state. In this plugin it is used **only** for 
 - **Stale-claim reset**: called once per stale in-progress item found during Step 1. Never called for any other purpose.
 
 **Absolute forbiddens**:
-- Do NOT use `update_action_item` to manually set `agent_activity: 'finished'` — use `complete_work_item`.
+- Do NOT use `update_action_item` to manually set `agent_activity: 'finished'` — use `record_implementation`.
 - Do NOT use it to fail an item you claimed and worked on — use `fail_work_item`.
 - Do NOT use it to submit a review — use `submit_plan_review`.
 - Do NOT use it to reset a non-stale item (age ≤ `stale_claim_timeout_minutes`) — that would clobber active work.
@@ -294,7 +294,7 @@ Record implementation decisions and progress for the audit trail. The project ow
 
 **When to call**:
 1. **During implementation** (best-effort): After making significant changes, before testing. If this call fails, log the error and continue — do not fail the item.
-2. **Before `complete_work_item`** (mandatory): A final summary of all changes made. This call is required — if it fails, note the error but still proceed to `complete_work_item`.
+2. **Before `record_implementation`** (mandatory): A final summary of all changes made. This call is required — if it fails, note the error but still proceed to `record_implementation`.
 
 **Errors**:
 - `401 Unauthorized` — Token invalid.
@@ -306,8 +306,8 @@ Record implementation decisions and progress for the audit trail. The project ow
 
 Link a git commit SHA to an action item. This populates the commit history visible on the action item detail page in DevSpec.
 
-This is **separate from** the automatic commit reference that `complete_work_item` records — use `add_commit_reference` for:
-- The final commit during autopilot / `/devspec:work` runs (called before `complete_work_item` so the reference is written even if completion fails).
+This is **separate from** the automatic commit reference that `record_implementation` records — use `add_commit_reference` for:
+- The final commit during autopilot / `/devspec:work` runs (called before `record_implementation` so the reference is written even if completion fails).
 - Retroactively attaching commits that were made outside any DevSpec command (via the `/devspec:link` command).
 
 **Parameters**:
@@ -326,7 +326,7 @@ This is **separate from** the automatic commit reference that `complete_work_ite
 | `commit_message` | The full commit message (subject line is sufficient; the body is optional). Required. |
 
 **When to call**:
-- **Autopilot / work flow**: After committing, before `complete_work_item`. If this call fails, note the error and still proceed to `complete_work_item`.
+- **Autopilot / work flow**: After committing, before `record_implementation`. If this call fails, note the error and still proceed to `record_implementation`.
 - **Retroactive linking (`/devspec:link`)**: Any time a commit exists in the repo that should be associated with an action item but isn't yet. This is purely additive — it does not change item status.
 
 **Errors**:
@@ -335,7 +335,7 @@ This is **separate from** the automatic commit reference that `complete_work_ite
 
 ---
 
-### complete_work_item
+### record_implementation
 
 Mark an action item as completed with a full report. **All fields become part of the action item's permanent record visible to the entire team.** Write substantive content, not placeholders.
 
@@ -795,7 +795,7 @@ Every `/autopilot:process` cycle begins with a **stale-claim recovery** pass tha
 
 ### Why it exists
 
-Runners can die unexpectedly: the Antigravity process is killed, the machine reboots, network drops cause the final `complete_work_item` or `fail_work_item` to never land. Without stale recovery, those items sit in `in_progress` until a human manually resets them, blocking re-work. Stale recovery automates the cleanup using a simple age heuristic.
+Runners can die unexpectedly: the Antigravity process is killed, the machine reboots, network drops cause the final `record_implementation` or `fail_work_item` to never land. Without stale recovery, those items sit in `in_progress` until a human manually resets them, blocking re-work. Stale recovery automates the cleanup using a simple age heuristic.
 
 ### The `stale_claim_timeout_minutes` setting
 
@@ -906,7 +906,7 @@ And for runner-presence reporting:
 **Explicitly NOT used in review mode:**
 
 - `claim_work_item` — review items are never claimed. They stay in `under_human_review` until `submit_plan_review` succeeds, which transitions `agent_activity` to NULL server-side.
-- `complete_work_item`, `fail_work_item`, `update_action_item` — no manual lifecycle transitions. `submit_plan_review` owns the state transition.
+- `record_implementation`, `fail_work_item`, `update_action_item` — no manual lifecycle transitions. `submit_plan_review` owns the state transition.
 - `add_implementation_note` — reviews are recorded via `submit_plan_review`, NOT as implementation notes. Writing an implementation note in review mode bypasses the review contract and is a bug.
 - `add_commit_reference` — no commit is produced.
 - `git` commands of any kind — no branch, no staging, no commit, no push, no merge.
@@ -918,7 +918,7 @@ Review mode is strictly read-only with respect to the codebase and strictly non-
 - Create a git branch or mutate local git state.
 - Modify, create, or delete any file in the repo.
 - Run `git commit`, `git push`, or `git merge`.
-- Call `claim_work_item`, `complete_work_item`, `fail_work_item`, `update_action_item`, or `add_implementation_note`.
+- Call `claim_work_item`, `record_implementation`, `fail_work_item`, `update_action_item`, or `add_implementation_note`.
 - Change the item's `agent_activity` manually — `submit_plan_review` performs that transition server-side.
 - **Rewrite the plan.** The reviewer's contract is to validate, flag risks, and identify gaps. DevSpec rewrites plans; reviewers review them. Producing a better plan in the review is a contract violation.
 
@@ -984,7 +984,7 @@ And for runner-presence reporting:
 **Explicitly NOT used in planning mode:**
 
 - `claim_work_item` — planning items are never claimed. They stay in `planning` state, visible to the whole team, so any runner or human can take the next step.
-- `complete_work_item`, `fail_work_item`, `update_action_item` — no lifecycle transitions.
+- `record_implementation`, `fail_work_item`, `update_action_item` — no lifecycle transitions.
 - `add_commit_reference` — no commit is produced.
 - `git` commands of any kind — no branch, no staging, no commit, no push, no merge.
 
@@ -996,7 +996,7 @@ Planning mode is strictly read-only with respect to the codebase and the action 
 - Modify, create, or delete any file in the repo.
 - Run `git commit`, `git push`, or `git merge`.
 - Change the item's `agent_activity` — it must remain `planning` so a human can approve or reject the plan.
-- Call `claim_work_item`, `complete_work_item`, `fail_work_item`, or `update_action_item`.
+- Call `claim_work_item`, `record_implementation`, `fail_work_item`, or `update_action_item`.
 
 A planning runner that violates any of these rules is broken — the whole point is that the plan is a proposal awaiting human approval, not a fait accompli.
 
