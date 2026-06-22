@@ -88,7 +88,7 @@ List action items by filter. In this plugin it is used exclusively to detect **p
 | Field | Requirements |
 |-------|-------------|
 | `agent_activity` | One of `idle`, `queued`, `claimed`, `implementing`, `reporting`, `finished`, `failed`. Use `idle` to find planning items, `reporting` to find items pending plan review. |
-| `lifecycle` | One of `open`, `in_progress`, `done`, `dismissed`, `blocked`, `all`. Defaults to `open`. |
+| `lifecycle` | One of `open`, `in_progress`, `done`, `dismissed`, `deferred`, `blocked`, `all`. Defaults to `open`. (`deferred` = consciously parked; counts as resolved, reversible via `update_action_item(lifecycle: 'open')`.) |
 | `limit` | Max results. Defaults to 20. Use `1` when you only need the next item to process. |
 | `assigned_to` | Optional user UUID or `"me"` to restrict to a specific assignee. Omit to include unassigned items. |
 
@@ -137,6 +137,31 @@ Update an action item's lifecycle state. In this plugin it is used **only** for 
 - `401 Unauthorized` — Token invalid.
 - `404 Not Found` — Item not found (already deleted or out of scope). Log and continue.
 - `409 Conflict` — Item state changed between fetch and update (e.g. the original runner finished naturally). Log as informational, not an error — this is a benign race and stale recovery should simply skip it.
+
+---
+
+### spin_off_action_item
+
+Extract a brief CHILD into a standalone follow-up item, detaching it from its parent brief and recording a `derived_from` provenance link back to the original. Defaults to parking the new item as `deferred`. Use this instead of simply deferring when the parked work is genuinely SEPARATE future work rather than something to resume on the same brief.
+
+**Parameters**:
+```json
+{
+  "action_item_id": "4d753b6a-28d9-4d2d-8f23-af3103af76db",
+  "defer": true
+}
+```
+
+| Field | Requirements |
+|-------|-------------|
+| `action_item_id` | The UUID of the brief child to spin off. Required. |
+| `defer` | Optional boolean. When `true` (the default) the spun-off item is parked as `deferred`; pass `false` to leave it `open`. |
+
+**Server-side effect**: The child is detached from its parent brief and re-created (or re-parented) as a standalone item with a `derived_from` link to the original. Detaching a child lets the parent brief auto-complete once its remaining children are all verified, dismissed, or deferred.
+
+**Errors**:
+- `401 Unauthorized` — Token invalid.
+- `404 Not Found` — Item not found.
 
 ---
 

@@ -88,7 +88,7 @@ List action items by filter. In this plugin it is used exclusively to detect **p
 | Field | Requirements |
 |-------|-------------|
 | `agent_activity` | One of `idle`, `queued`, `claimed`, `implementing`, `reporting`, `finished`, `failed`. Use `idle` to find planning items, `reporting` to find items pending plan review. |
-| `lifecycle` | One of `open`, `in_progress`, `done`, `dismissed`, `blocked`, `all`. Defaults to `open`. |
+| `lifecycle` | One of `open`, `in_progress`, `done`, `dismissed`, `deferred`, `blocked`, `all`. Defaults to `open`. (`deferred` = consciously parked; counts as resolved, reversible via `update_action_item(lifecycle: 'open')`.) |
 | `limit` | Max results. Defaults to 20. Use `1` when you only need the next item to process. |
 | `assigned_to` | Optional user UUID or `"me"` to restrict to a specific assignee. Omit to include unassigned items. |
 
