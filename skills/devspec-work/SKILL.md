@@ -115,6 +115,8 @@ Fix real issues before committing. If a fix would expand scope beyond the action
    - `get_action_item_history(action_item_id)` — prior notes, commits, lifecycle changes
    - `search_memories(query: "<action item title>")` — related decisions, conventions, risks
 
+   Then read the item's spec fields: `intent` (the WHY — the problem and desired outcome), `acceptance_criteria` (your definition of done — the diff must satisfy it), and `ai_instructions` (constraints). If `intent` is missing or too thin to grasp the real goal — common when the item came from a terse conversation — and the item has a `source_session_id`, call `get_session_transcript({ session_id: <source_session_id> })` to recover the originating intent. This is optional and on-demand: skip it when the spec fields already make the goal clear. When the transcript reveals intent or criteria the item lacks, persist it back via `update_action_item({ action_item_id, intent, acceptance_criteria })`.
+
 6. **Present the item:**
    ```
    ━━━ Work ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

@@ -250,11 +250,12 @@ Call `claim_work_item` with `action_item_id` and `agent_branch: branch_name`.
 
 Read the action item's full context carefully:
 
-1. **Description**: Read the complete description. It contains the requirements, context, and implementation guidance.
+1. **Description + spec fields**: Read the `description` (the WHAT and HOW), the `intent` (the WHY — the problem and desired outcome), the `acceptance_criteria` (your definition of done — the diff must satisfy it), and `ai_instructions` (constraints). The criteria are your target, not a suggestion.
 2. **Affected files**: If `affected_files` is populated, these are the files most likely to need changes. Read them first.
 3. **Tags and type**: Use these to understand the nature of the work (bug fix, feature, improvement, etc.).
 4. **Priority**: Higher priority items may need more careful testing.
 5. **Brief context (if this is a child item)**: If the action item has `parent_action_item_id` set, call `get_action_item_siblings({ action_item_id: <claimed_id> })` before writing any code. The response contains `parent` (the brief's title and description — the feature-level context the user wrote) and `siblings` (other children of the same brief, with their titles, lifecycles, and completion summaries). Read both. Use them to avoid changes that conflict with sibling work already in progress. If `parent` is null, the item is flat — skip this step.
+6. **Recover thin intent (optional, on-demand)**: If `intent` is missing or too thin to understand the real goal — common when the item came from a terse conversation — and the item has a `source_session_id`, call `get_session_transcript({ session_id: <source_session_id> })` to recover the originating intent from the conversation that produced it. Skip this when the spec fields already make the goal clear (don't pull a transcript every time). When the transcript reveals intent or criteria the item is missing, persist it back with `update_action_item({ action_item_id, intent, acceptance_criteria })` so the next agent inherits it.
 
 Plan your implementation approach before writing any code.
 

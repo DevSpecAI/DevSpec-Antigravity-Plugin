@@ -451,7 +451,10 @@ Create a new action item in the project. Used by `/devspec:create` to let develo
 | Field | Requirements |
 |-------|-------------|
 | `title` | Required. Non-empty after trimming. The server rejects titles that are too long — do not pre-enforce a length limit client-side, let the server's 422 response drive the failure. |
-| `description` | Optional. Markdown supported. Multi-paragraph is fine and encouraged. Omit or pass null to skip. |
+| `description` | Optional. The WHAT and HOW (the concrete change). Markdown supported. Keep intent and acceptance_criteria in their own fields rather than dumping everything here. |
+| `intent` | Optional. The WHY — the problem being solved and desired outcome. What an agent picking the item up later needs to understand the real goal. Distinct from description. |
+| `acceptance_criteria` | Optional. The definition of done — the conditions the work must satisfy to be done and correct. Concrete, checkable points. Markdown OK. |
+| `ai_instructions` | Optional. Approach guidance or constraints that aren't obvious from the code. |
 | `type` | Optional enum: `"bug"`, `"feature"`, `"improvement"`, `"task"`, `"query"`. Defaults to `"task"` server-side. |
 | `agent_ready` | Optional boolean. Defaults to `false`. Pass `true` only when the item is a concrete code change a runner can implement autonomously (see below). |
 | `assigned_to` | Optional user UUID. Omit for unassigned items. |
