@@ -226,6 +226,11 @@ Fix real issues before committing. If a fix would expand scope beyond the action
 
     Call `add_implementation_note` at significant milestones to keep a running log on DevSpec. Also append a short line to `~/.devspec/logs/<exec_id>.log` at each milestone (e.g. `Branch created`, `Files modified: N`, `Tests passed`, `Committed <short_sha>`, `Pushed to origin`, `Merged into <target>`) using the per-task log helper from reference.md. Run the *rotate* helper before each log append. All local log calls are best-effort.
 
+    **Database migrations (if this item adds or edits a DB migration).** Do NOT assume which database to apply it to — applying to the wrong one is a real, destructive failure. The `get_project_summary` response you loaded in Phase 0 includes a `database_targets` array: each connected database with its non-secret `identity` (for Supabase, `identity.externalId` is the project ref), declared `environment`, and the `branch_name` whose migrations target it.
+    - **(a)** Pick the target whose `branch_name` matches your merge target (`target_branch`/`starting_branch`), or one with `branch_name: null` (applies to all branches).
+    - **(b)** Apply the migration with your OWN database tooling pointed at that target's `identity` — for Supabase, ensure your Supabase tooling targets that exact project ref, not whatever it defaults to. DevSpec does not apply migrations for you and never hands you the credential.
+    - **(c)** Never select the target by `name` (it can be misleading — that is the bug this prevents). If the matching target has `needs_reconnect: true` / a null `identity`, or your tooling cannot reach it, STOP and fail the item (`"Requires human judgment: cannot reach migration target <identity.externalId>"`) rather than applying to a different or default database. Be especially careful when `environment` is `production`.
+
 14. **Test.** After implementation:
     - Run `npm run lint` if available (continue on failure but note it)
     - Run `npm test` if available (continue on failure but note it)
