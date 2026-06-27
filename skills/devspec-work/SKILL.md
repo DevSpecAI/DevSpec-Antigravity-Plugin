@@ -51,9 +51,10 @@ Fix real issues before committing. If a fix would expand scope beyond the action
 2. **Load project settings.** Call `get_project_summary` and read `local_plugin_settings`. Use safe defaults if absent:
    - `auto_push`: false
    - `auto_merge`: false
-   - `target_branch`: "" (falls back to starting branch)
    - `branch_prefix`: "work/action-item-"
    - `custom_instructions`: ""
+
+   Also store the `repos` array from the same response — `[{ id, full_name, target_branch, default_branch }]`, the branch DevSpec tracks for EACH repo; the source of truth for the merge target (step 18). Do NOT assume one branch for the whole project.
 
    If `auto_merge` is true, treat `auto_push` as true regardless of its stored value.
 
@@ -227,7 +228,7 @@ Fix real issues before committing. If a fix would expand scope beyond the action
     Call `add_implementation_note` at significant milestones to keep a running log on DevSpec. Also append a short line to `~/.devspec/logs/<exec_id>.log` at each milestone (e.g. `Branch created`, `Files modified: N`, `Tests passed`, `Committed <short_sha>`, `Pushed to origin`, `Merged into <target>`) using the per-task log helper from reference.md. Run the *rotate* helper before each log append. All local log calls are best-effort.
 
     **Database migrations (if this item adds or edits a DB migration).** Do NOT assume which database to apply it to — applying to the wrong one is a real, destructive failure. The `get_project_summary` response you loaded in Phase 0 includes a `database_targets` array: each connected database with its non-secret `identity` (for Supabase, `identity.externalId` is the project ref), declared `environment`, and the `branch_name` whose migrations target it.
-    - **(a)** Pick the target whose `branch_name` matches your merge target (`target_branch`/`starting_branch`), or one with `branch_name: null` (applies to all branches).
+    - **(a)** Pick the target whose `branch_name` matches the merge target you resolved for the repo (its `target_branch`), or one with `branch_name: null` (applies to all branches).
     - **(b)** Apply the migration with your OWN database tooling pointed at that target's `identity` — for Supabase, ensure your Supabase tooling targets that exact project ref, not whatever it defaults to. DevSpec does not apply migrations for you and never hands you the credential.
     - **(c)** Never select the target by `name` (it can be misleading — that is the bug this prevents). If the matching target has `needs_reconnect: true` / a null `identity`, or your tooling cannot reach it, STOP and fail the item (`"Requires human judgment: cannot reach migration target <identity.externalId>"`) rather than applying to a different or default database. Be especially careful when `environment` is `production`.
 
@@ -268,7 +269,7 @@ Fix real issues before committing. If a fix would expand scope beyond the action
     The worktree has `<branch_name>` checked out, so merging into the target branch from there would conflict with the worktree's own checkout. **Always merge from the main repo.**
 
 18. **Merge** (if auto_merge enabled):
-    Merge target: `target_branch` from settings if set and non-empty, otherwise `starting_branch`.
+    Resolve the merge target **for the repo you are pushing** from the `repos` array: the `target_branch` of the entry whose `full_name` matches this repo's `origin` remote; fall back to that entry's `default_branch`, then `starting_branch`. A multi-repo item pushes each repo to its OWN resolved branch — never one project-wide branch.
     **Shell safety (Rule 2):** Verify `merge_target` matches `^[a-zA-Z0-9/_.-]+$` before using it. If it fails, fail the item (Failure Handling will clean up the worktree).
     ```
     git checkout '<merge_target>'
