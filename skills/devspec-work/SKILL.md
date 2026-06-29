@@ -155,7 +155,7 @@ Fix real issues before committing. If a fix would expand scope beyond the action
    - This continues indefinitely until the user declines or all areas are exhausted.
    **Early exit:** If the user signals done at any point ("done", "good", "stop"), end immediately.
 
-   Compile a brainstorm summary and save via `add_implementation_note`. Output: `✓ Brainstorm saved`
+   Compile the brainstorm outcomes and persist them **onto the action item itself** with `update_action_item` (not `add_implementation_note`): push the refined `title`, `description`, `intent`, and `acceptance_criteria`. Only send a field you actually changed during the brainstorm. **Preserve existing context** — append to or intelligently rewrite the current `description` (and `title`) rather than overwriting it wholesale; the `description` write replaces the stored value, so never discard detail the item already carried. Output: `✓ Brainstorm saved to action item`
 
 10. **If no**, proceed to Phase 3.
 
