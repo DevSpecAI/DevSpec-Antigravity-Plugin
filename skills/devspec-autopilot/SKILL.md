@@ -74,7 +74,7 @@ Memories/artifacts labelled `[unconfirmed — recorded by ...]` (or `provenance_
 2. **Load project settings**: Call `get_project_summary` and read `local_plugin_settings` from the response. Extract:
    - `auto_push` (default: false)
    - `auto_merge` (default: false)
-   - `target_branch` (default: "" — fall back to starting_branch)
+   - the `repos` array — `[{ id, full_name, target_branch, default_branch }]`, the branch DevSpec tracks for EACH repo; the source of truth for the merge target (Step 16). Do NOT assume one branch for the whole project.
    - `branch_prefix` (default: "work/action-item-")
    - `custom_instructions` (default: "")
    - `protected_paths` (default: [] — glob patterns of files that must not be modified)
@@ -250,11 +250,12 @@ Call `claim_work_item` with `action_item_id` and `agent_branch: branch_name`.
 
 Read the action item's full context carefully:
 
-1. **Description**: Read the complete description. It contains the requirements, context, and implementation guidance.
+1. **Description + spec fields**: Read the `description` (the WHAT and HOW), the `intent` (the WHY — the problem and desired outcome), the `acceptance_criteria` (your definition of done — the diff must satisfy it), and `ai_instructions` (constraints). The criteria are your target, not a suggestion.
 2. **Affected files**: If `affected_files` is populated, these are the files most likely to need changes. Read them first.
 3. **Tags and type**: Use these to understand the nature of the work (bug fix, feature, improvement, etc.).
 4. **Priority**: Higher priority items may need more careful testing.
 5. **Brief context (if this is a child item)**: If the action item has `parent_action_item_id` set, call `get_action_item_siblings({ action_item_id: <claimed_id> })` before writing any code. The response contains `parent` (the brief's title and description — the feature-level context the user wrote) and `siblings` (other children of the same brief, with their titles, lifecycles, and completion summaries). Read both. Use them to avoid changes that conflict with sibling work already in progress. If `parent` is null, the item is flat — skip this step.
+6. **Recover thin intent (optional, on-demand)**: If `intent` is missing or too thin to understand the real goal — common when the item came from a terse conversation — and the item has a `source_session_id`, call `get_session_transcript({ session_id: <source_session_id> })` to recover the originating intent from the conversation that produced it. Skip this when the spec fields already make the goal clear (don't pull a transcript every time). When the transcript reveals intent or criteria the item is missing, persist it back with `update_action_item({ action_item_id, intent, acceptance_criteria })` so the next agent inherits it.
 
 Plan your implementation approach before writing any code.
 
@@ -304,6 +305,8 @@ All implementation work happens inside a git worktree — a sibling directory wi
 
 10. **Run type checking**: If a typecheck command exists, run it from the worktree and fix errors.
 
+10a. **Database migrations (if this item adds or edits a DB migration).** Do NOT assume which database to apply it to — the wrong one is a real, destructive failure. The `get_project_summary` settings and the `get_next_work_item` result both include a `database_targets` array: each connected database with its non-secret `identity` (for Supabase, `identity.externalId` is the project ref), `environment`, and the `branch_name` whose migrations target it. (a) Pick the target whose `branch_name` matches the merge target you resolved for the repo (its `target_branch`), or one with `branch_name: null`. (b) Apply the migration with your OWN database tooling pointed at that target's `identity` — for Supabase, ensure your Supabase tooling targets that exact project ref, not whatever it defaults to. DevSpec does not apply migrations for you and never hands you the credential. (c) Never select the target by `name` (it can mislead — the bug this prevents). If the matching target has `needs_reconnect: true` / a null `identity`, or you cannot reach it, STOP and fail the item via Step 6 (`"Requires human judgment: cannot reach migration target <identity.externalId>"`). Be especially careful when `environment` is `production`.
+
 11. **Validate protected paths**: Run `git diff --name-only` from the worktree and check each changed file against `protected_paths` from Step 0. If any match, fail the item via Step 6 — do not commit. (Step 6 will attempt worktree cleanup before calling `fail_work_item`.)
 
 12. **Shell safety before staging (Rule 3)**: For every file path returned by `git diff --name-only`, verify it matches `^[a-zA-Z0-9/_. ~-]+$` and contains none of `;` `|` `&` `$` `` ` `` `\` `(` `)` `{` `}` `<` `>` `!` `#`. If any file path fails validation, fail the item via Step 6 with the unsafe path quoted in the error and stop.
@@ -322,7 +325,7 @@ All implementation work happens inside a git worktree — a sibling directory wi
     ```
     Every git command from here on (merge, push of the target branch) runs in the main repo, **not** the worktree. This is critical: the worktree has `<branch_name>` checked out, so merging into the target branch from the worktree would conflict with the worktree's own checkout. Always merge from `main_repo`.
 
-16. **Merge (from the main repo)** (if auto_merge): Merge target is `target_branch` from settings if set, otherwise `starting_branch`. Before use, verify `merge_target` matches `^[a-zA-Z0-9/_.-]+$` (Rule 2). If it fails, fail the item via Step 6 (which will cleanup the worktree).
+16. **Merge (from the main repo)** (if auto_merge): Resolve the merge target **for the repo you are pushing** from the `repos` array — the `target_branch` of the entry whose `full_name` matches this repo's `origin` remote; fall back to that entry's `default_branch`, then `starting_branch`. A multi-repo run merges each repo to its OWN resolved branch, never one project-wide branch. Before use, verify `merge_target` matches `^[a-zA-Z0-9/_.-]+$` (Rule 2). If it fails, fail the item via Step 6 (which will cleanup the worktree).
     ```
     git checkout '<merge_target>'
     git merge '<branch_name>' --no-ff --no-edit
