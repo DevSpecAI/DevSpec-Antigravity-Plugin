@@ -67,15 +67,20 @@ Interactively brainstorm on an action item to sharpen its scope, surface edge ca
    ```
    Present this summary to the user.
 
-6. **Save to DevSpec.** Ask: `Save this brainstorm to the action item in DevSpec?`
-   - If yes: call `add_implementation_note(action_item_id: <resolved_action_item_id>, content: <compiled summary>)`.
-     Use the **full UUID** from `resolved_action_item_id` — never reconstruct or truncate the ID.
+6. **Save to DevSpec.** Ask: `Update the action item in DevSpec with this brainstorm? (y/n)`
+   - If yes: call `update_action_item(action_item_id: <resolved_action_item_id>, ...)`, mapping the agreed-upon outcomes onto the item's **own fields** rather than burying them in a note:
+     - `intent` ← the sharpened scope / problem statement
+     - `acceptance_criteria` ← the verifiable conditions
+     - `description` ← the chosen approach, edge cases, and other concrete detail
+     - `title` ← only if the brainstorm meaningfully reframed what the item is
+
+     Only pass the fields the brainstorm actually changed. **Preserve existing context:** a `description` (or `title`) write OVERWRITES the stored value, so append to or carefully rewrite the current text — never blindly replace it and wipe out detail the item already carried. Use the **full UUID** from `resolved_action_item_id` — never reconstruct or truncate the ID.
      Output:
      ```
-     ✓ Brainstorm saved
+     ✓ Action item updated
        Item:  {first 8 chars of id} — {title}
      ```
-   - If no: output `↻ Brainstorm not saved — summary is above if you need it later.`
+   - If no: output `↻ Action item not updated — summary is above if you need it later.`
 
 ## Rules
 
