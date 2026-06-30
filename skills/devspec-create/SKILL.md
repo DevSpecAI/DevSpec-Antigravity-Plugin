@@ -75,9 +75,19 @@ Before calling the MCP tool:
 
 On validation failure, output `✗ Invalid {field}: {reason}` and stop. Do NOT attempt to create a partial or malformed item.
 
+## Resolve the project (account-wide token)
+
+Your DevSpec MCP token is **account-wide** — it is not pinned to one project, so the new item needs an explicit `project_id`. Resolve it from the git remote of the current repo before creating:
+
+- `git remote get-url origin` → `remote_url`.
+- Call `list_projects({ git_remote: "<remote_url>" })` and read `remote_match.resolved_project_id` → `project_id`.
+  - **Resolved** → use it as `project_id` on the create call below.
+  - **null with `candidate_project_ids`** (repo tracked by >1 project): in interactive mode, ask the user which project; in unattended mode, fail with `✗ This repo is tracked by multiple DevSpec projects — pass the project explicitly or detach the duplicates.` and stop.
+  - **no match** (or no `origin` remote): if the user's account has exactly one project the server resolves it without a hint — call `list_projects()` (no `git_remote`); if it returns exactly one project, use that `project_id`. Otherwise, in interactive mode ask which project; in unattended mode fail with `✗ Cannot resolve which DevSpec project to create the item in.` and stop.
+
 ## Create the item
 
-Call `create_action_item` with the gathered fields. Pass `agent_ready: true` only when explicitly set — omitting the field (or passing false) defaults to `false` server-side.
+Call `create_action_item` with `project_id` (from the previous step) plus the gathered fields. Pass `agent_ready: true` only when explicitly set — omitting the field (or passing false) defaults to `false` server-side.
 
 If the call fails:
 - `401 Unauthorized` → output `✗ Authentication failed. Regenerate your token in DevSpec: Settings > Autopilot.` and stop.

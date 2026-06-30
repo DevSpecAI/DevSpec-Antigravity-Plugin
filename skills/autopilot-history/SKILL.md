@@ -7,10 +7,13 @@ Fetch completed and failed DevSpec action items and display a clean formatted hi
 
 ## Steps
 
-1. Call `get_action_items` with `agent_activity: 'completed'` and `get_action_items` with `agent_activity: 'failed'` in parallel.
-2. Combine all items, sort by most recent first (use `agent_claimed_at`).
-3. Calculate relative timestamps using the `agent_claimed_at` field (ISO 8601 string). Parse with the Date constructor — do NOT use string manipulation or regex. Do NOT produce "NaN" timestamps.
-4. Output the formatted history:
+1. **Resolve the project (account-wide token).** Your DevSpec MCP token is account-wide, so resolve which project this repo belongs to first:
+   - `git remote get-url origin` → `remote_url`. If there is no `origin`, output `✗ No git remote 'origin' — cannot resolve which DevSpec project this is.` and stop.
+   - Call `list_projects({ git_remote: "<remote_url>" })` and read `remote_match.resolved_project_id` → `project_id`. If it is null with `candidate_project_ids`, output `✗ This repo is tracked by multiple DevSpec projects — open the dashboard to see history.` and stop. If there is no match, output `✗ No DevSpec project tracks this repo.` and stop.
+2. Call `get_action_items` with `project_id, agent_activity: 'completed'` and `get_action_items` with `project_id, agent_activity: 'failed'` in parallel (thread the resolved `project_id` on both).
+3. Combine all items, sort by most recent first (use `agent_claimed_at`).
+4. Calculate relative timestamps using the `agent_claimed_at` field (ISO 8601 string). Parse with the Date constructor — do NOT use string manipulation or regex. Do NOT produce "NaN" timestamps.
+5. Output the formatted history:
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

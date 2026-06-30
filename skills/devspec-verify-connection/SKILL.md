@@ -7,7 +7,7 @@ Prove the end-to-end loop the DevSpec setup wizard cares about: that **this agen
 
 This is distinct from item verification — it does NOT touch action items and never calls `verify_action_item`.
 
-The `get_project_summary` and `report_connection_check` MCP tools' parameter schemas are provided by the `devspec` MCP server. Follow the **Shell Safety** rules at the end whenever you interpolate a value (verification id, repo path, branch) into a shell command.
+The `list_projects`, `get_project_summary` and `report_connection_check` MCP tools' parameter schemas are provided by the `devspec` MCP server. Follow the **Shell Safety** rules at the end whenever you interpolate a value (verification id, repo path, branch) into a shell command.
 
 ## Arguments
 
@@ -15,9 +15,15 @@ The `get_project_summary` and `report_connection_check` MCP tools' parameter sch
 
 ## Steps
 
+### 0. Resolve the project (account-wide token)
+
+The DevSpec MCP token is **account-wide** — it does not pin a project, so resolve which project this repo belongs to before fetching settings:
+- `git remote get-url origin` → `remote_url`. If there is no `origin`, output `✗ No git remote 'origin' — cannot resolve which DevSpec project to verify.` and stop.
+- Call `list_projects({ git_remote: "<remote_url>" })` and read `remote_match.resolved_project_id` → `project_id`. If it is null with `candidate_project_ids` (repo tracked by >1 project), ask the user which project to verify. If there is no match, output `✗ No DevSpec project tracks this repo.` and stop.
+
 ### 1. Fetch the target repos
 
-Call `get_project_summary` and read its `repos` array — `[{ id, full_name, target_branch, default_branch }]`. This is the authoritative per-repo branch map. The branch to push for a repo is `target_branch` if set, else `default_branch`, else `main`. Do not guess branches or ask the user for them.
+Call `get_project_summary({ project_id })` (the `project_id` resolved in step 0) and read its `repos` array — `[{ id, full_name, target_branch, default_branch }]`. This is the authoritative per-repo branch map. The branch to push for a repo is `target_branch` if set, else `default_branch`, else `main`. Do not guess branches or ask the user for them.
 
 ### 2. Build the verification commit message
 

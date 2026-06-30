@@ -12,13 +12,58 @@ This plugin connects Antigravity to DevSpec's autopilot system. When you run `/a
 
 All tools are called via the `devspec` MCP server configured in `mcp_config.json`. Antigravity handles the MCP transport — you invoke tools by name.
 
+**Account-wide token — resolve the project first.** The MCP token is account-wide; it does not pin a project. The server resolves the project per call from the most-specific id available: an `action_item_id` self-locates its project (so item-addressed tools need no `project_id`); otherwise an explicit `project_id` argument; otherwise the account's single project; otherwise it errors. So at startup you resolve WHICH project the run is for (via `list_projects` with the repo's git remote — see below) and thread `project_id` on the project-scoped tools: `get_project_summary`, `get_next_work_item`, `send_heartbeat`, `get_action_items`, `search_memories`, `create_action_item`. Do NOT add `project_id` to item-addressed tools (`claim_work_item`, `record_implementation`, `fail_work_item`, `update_action_item`, `add_implementation_note`, `add_commit_reference`, `get_action_item_siblings`, `submit_plan_review`, `spin_off_action_item`, `send_agent_message`) — they self-resolve from the item id.
+
+---
+
+### list_projects
+
+Resolve which project a run is for from the repo's git remote. Call this at startup, before the first heartbeat.
+
+**Parameters**:
+```json
+{ "git_remote": "https://github.com/Org/Repo.git" }
+```
+
+| Field | Requirements |
+|-------|-------------|
+| `git_remote` | Optional. The repo's `origin` remote URL (`git remote get-url origin`). When passed, the server matches it against every project's tracked repos and returns the match in `remote_match`. Omit to list all projects the token can see (no remote match). |
+
+**Response** (relevant fields):
+```json
+{
+  "projects": [ { "id": "…", "name": "…", "repos": [ { "full_name": "Org/Repo" } ] } ],
+  "remote_match": {
+    "resolved_project_id": "4d753b6a-28d9-4d2d-8f23-af3103af76db",
+    "candidate_project_ids": []
+  }
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `remote_match.resolved_project_id` | The single project that tracks this remote — use it as `project_id` for the whole run. |
+| `remote_match.candidate_project_ids` | When `resolved_project_id` is null and this is non-empty, the remote is tracked by **more than one** project — ambiguous. An unattended runner must fail naming the candidates; never guess. |
+| (both empty / `resolved_project_id` null with no candidates) | No project tracks this repo — fail with "no DevSpec project for this repo". |
+
+**Errors**:
+- `401 Unauthorized` — Token invalid or expired.
+- `500 Internal Server Error` — Retry once.
+
 ---
 
 ### get_project_summary
 
 Get project settings including autopilot configuration. Call this at startup to determine push/merge behavior.
 
-**Parameters**: None (uses token-scoped project)
+**Parameters**:
+```json
+{ "project_id": "4d753b6a-28d9-4d2d-8f23-af3103af76db" }
+```
+
+| Field | Requirements |
+|-------|-------------|
+| `project_id` | The project resolved from `list_projects` at startup. Required when the account has more than one project (the account-wide token does not pin a project); optional only when the account has exactly one project. |
 
 **Response** (relevant fields):
 ```json
@@ -46,7 +91,14 @@ Get project settings including autopilot configuration. Call this at startup to 
 
 Fetch the next highest-priority queued action item with full context.
 
-**Parameters**: None
+**Parameters**:
+```json
+{ "project_id": "4d753b6a-28d9-4d2d-8f23-af3103af76db" }
+```
+
+| Field | Requirements |
+|-------|-------------|
+| `project_id` | The project resolved from `list_projects` at startup. Required when the account has more than one project; optional for single-project accounts. |
 
 **Success Response**:
 ```json
@@ -76,9 +128,10 @@ Fetch the next highest-priority queued action item with full context.
 
 List action items by filter. In this plugin it is used exclusively to detect **planning-mode work** after `get_next_work_item` reports an empty queued queue.
 
-**Parameters** (all optional):
+**Parameters** (`project_id` required for multi-project accounts; the rest optional):
 ```json
 {
+  "project_id": "4d753b6a-28d9-4d2d-8f23-af3103af76db",
   "agent_activity": "idle",
   "lifecycle": "open",
   "limit": 1
@@ -87,6 +140,7 @@ List action items by filter. In this plugin it is used exclusively to detect **p
 
 | Field | Requirements |
 |-------|-------------|
+| `project_id` | The project resolved from `list_projects` at startup. Required when the account has more than one project; optional for single-project accounts. |
 | `agent_activity` | One of `idle`, `queued`, `claimed`, `implementing`, `reporting`, `finished`, `failed`. Use `idle` to find planning items, `reporting` to find items pending plan review. |
 | `lifecycle` | One of `open`, `in_progress`, `done`, `dismissed`, `deferred`, `blocked`, `all`. Defaults to `open`. (`deferred` = consciously parked; counts as resolved, reversible via `update_action_item(lifecycle: 'open')`.) |
 | `limit` | Max results. Defaults to 20. Use `1` when you only need the next item to process. |
@@ -441,6 +495,7 @@ Create a new action item in the project. Used by `/devspec:create` to let develo
 **Parameters**:
 ```json
 {
+  "project_id": "4d753b6a-28d9-4d2d-8f23-af3103af76db",
   "title": "Fix login timeout on mobile",
   "description": "## Context\nThe login flow times out after 5 seconds on cellular connections...",
   "type": "bug",
@@ -450,6 +505,7 @@ Create a new action item in the project. Used by `/devspec:create` to let develo
 
 | Field | Requirements |
 |-------|-------------|
+| `project_id` | The project the item belongs to (resolved from `list_projects` via the git remote). Required when the account has more than one project; optional for single-project accounts. |
 | `title` | Required. Non-empty after trimming. The server rejects titles that are too long — do not pre-enforce a length limit client-side, let the server's 422 response drive the failure. |
 | `description` | Optional. The WHAT and HOW (the concrete change). Markdown supported. Keep intent and acceptance_criteria in their own fields rather than dumping everything here. |
 | `intent` | Optional. The WHY — the problem being solved and desired outcome. What an agent picking the item up later needs to understand the real goal. Distinct from description. |
@@ -496,6 +552,7 @@ node -e "console.log(require('crypto').randomUUID())"
 **Parameters**:
 ```json
 {
+  "project_id": "4d753b6a-28d9-4d2d-8f23-af3103af76db",
   "session_id": "fdd1a2b3-c4d5-e6f7-8901-234567890abc",
   "machine_hostname": "brandons-macbook.local",
   "status": "idle",
@@ -517,6 +574,7 @@ node -e "console.log(require('crypto').randomUUID())"
 
 | Field | Requirements |
 |-------|-------------|
+| `project_id` | The project resolved from `list_projects` at startup — the gating check is per-project. Required when the account has more than one project; optional for single-project accounts. |
 | `session_id` | UUID generated at startup. Use the same value for all heartbeats in the session. Required. |
 | `machine_hostname` | Auto-detect from system hostname. Required. |
 | `lifecycle` | `"idle"` when no item is being processed (empty queue, startup, or after completion). `"working"` while actively implementing a claimed item — send immediately after a successful claim so the dashboard shows real-time progress instead of "idle" between claim and final heartbeat. |

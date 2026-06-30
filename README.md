@@ -17,7 +17,10 @@ It is the Antigravity sibling of the DevSpec plugins for Claude Code, Codex CLI,
 ## Requirements
 
 - Antigravity CLI (`agy`) **or** the Antigravity desktop app.
-- A DevSpec account and project, with an MCP/autopilot token (DevSpec → **Settings → Autopilot**).
+- A DevSpec account, with an **account-wide MCP token** (DevSpec → **Settings → Autopilot**) — one
+  token works across all projects in your account. The skills resolve which project a run is for
+  from the repo's git remote (`git remote get-url origin`), so the token is no longer pinned to a
+  single project.
 - `git` and `node` on your PATH (the autopilot/work skills use `git` worktrees and small
   cross-platform `node` one-liners for logging).
 
@@ -47,7 +50,9 @@ Start from [`mcp/devspec.mcp.json`](mcp/devspec.mcp.json):
 }
 ```
 
-- Replace `dvs_YOUR_DEVSPEC_MCP_TOKEN` with your token from DevSpec → **Settings → Autopilot**.
+- Replace `dvs_YOUR_DEVSPEC_MCP_TOKEN` with your **account-wide** token from DevSpec →
+  **Settings → Autopilot**. One token covers every project in your account — the skills resolve
+  which project each run targets from the repo's git remote, so you do not configure a project here.
 - Replace the host if your DevSpec instance lives elsewhere.
 
 **Antigravity CLI** — merge that `devspec` block into `~/.gemini/antigravity-cli/mcp_config.json`,
@@ -134,6 +139,17 @@ The repo contains **no secrets**: the MCP config ships with a token *placeholder
 blocks any filled-in `mcp_config.json` from being committed.
 
 ---
+
+## Project resolution (account-wide token)
+
+The MCP token is account-wide and does not pin a project. At startup each skill captures the repo's
+git remote (`git remote get-url origin`) and calls `list_projects({ git_remote: <url> })`; the
+server returns `remote_match.resolved_project_id`, which the skill threads as `project_id` on every
+project-scoped call (`get_project_summary`, `get_next_work_item`, `send_heartbeat`,
+`get_action_items`, `search_memories`, `create_action_item`). Item-addressed calls (claim, record,
+fail, update, commit-reference, …) self-resolve their project from the item id and take no
+`project_id`. If a repo is tracked by more than one project, an unattended run fails with the
+candidate list rather than guessing; an interactive run asks which project to use.
 
 ## Known follow-ups
 

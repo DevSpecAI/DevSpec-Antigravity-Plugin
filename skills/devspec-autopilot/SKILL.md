@@ -45,7 +45,7 @@ DevSpec's memory + artifact knowledge base is the team's institutional brain. Du
 
 ### Stamp every write as autonomous — non-negotiable
 
-On EVERY DevSpec MCP **write** call in this run — no exceptions — pass `runner_session_id: <session_id>`, the SAME UUID you send to `send_heartbeat` (Step 0.6). That stamp is how the server knows the write is unattended, so it lands for human confirmation instead of masquerading as a human decision. There is no person watching this run.
+On EVERY DevSpec MCP **write** call in this run — no exceptions — pass `runner_session_id: <session_id>`, the SAME UUID you send to `send_heartbeat` (Step 0a.6). That stamp is how the server knows the write is unattended, so it lands for human confirmation instead of masquerading as a human decision. There is no person watching this run.
 
 **"Every write" is literal — not the subset you remember most easily.** The stamp is required on the work-lifecycle tools you call first and most often — `claim_work_item`, `release_work_item`, `fail_work_item`, `report_progress`, `record_completed_work`, `spin_off_action_item`, `reopen_action_item`, `submit_plan_review`, `send_agent_message` — exactly as much as on the content writes — `record_implementation`, `add_implementation_note`, `add_commit_reference`, `create_action_item`, `update_action_item`, `create_resource`, `update_resource`, `supersede_resource`, `archive_resource`, `record_memory`, `supersede_memory`, `retract_memory`. **`claim_work_item` is the very first write of every run and the one most often forgotten — stamp it.** The rule with no list to memorise: *if a tool changes DevSpec state, it carries the stamp.* (A human driving these tools interactively omits it — its absence IS the interactive signal. The autopilot run ALWAYS sends it.)
 
@@ -70,10 +70,21 @@ Memories/artifacts labelled `[unconfirmed — recorded by ...]` (or `provenance_
 
 ## Workflow
 
-### Step 0: Load Settings & Initialize Local Storage
+### Step 0: Resolve Your Project (account-wide token)
+
+Your DevSpec MCP token is **account-wide** — it is not pinned to a single project, so you must resolve WHICH project this run is for before doing anything else. Resolution is by git remote: the project that tracks this repo is the project you work in.
+
+1. **Capture the git remote** of the current working directory: `git remote get-url origin 2>/dev/null` → `remote_url`. If there is no `origin` remote, fail: `✗ No git remote 'origin' — DevSpec cannot resolve which project this run is for.` and stop (do NOT claim or fetch any work).
+2. **Resolve the project**: call `list_projects({ git_remote: "<remote_url>" })`. The response contains `remote_match: { resolved_project_id, candidate_project_ids }` (and each project lists its `repos`). Branch on `remote_match`:
+   - **`resolved_project_id` is set** → store it as `project_id`. This is the project for the entire run. Thread it on every project-scoped call below.
+   - **`resolved_project_id` is null but `candidate_project_ids` has entries** → the repo is tracked by more than one project; an unattended runner must NEVER guess. Fail with a clear error naming the candidates: `✗ This repo is tracked by multiple DevSpec projects (<candidate ids>). Cannot resolve which one to run unattended — detach the duplicates in the DevSpec dashboard.` and stop. Do NOT fetch or claim work.
+   - **no match at all** (`resolved_project_id` null and `candidate_project_ids` empty/absent) → fail: `✗ No DevSpec project tracks this repo (<remote_url>). Connect the repo to a project in the DevSpec dashboard, then re-run.` and stop.
+3. **`project_id` is resolved before the startup heartbeat** (Step 0b) — the heartbeat runs the runner-gating check against this project, so it must be threaded there too.
+
+### Step 0a: Load Settings & Initialize Local Storage
 
 1. **Record starting branch**: Run `git branch --show-current` and store as `starting_branch`.
-2. **Load project settings**: Call `get_project_summary` and read `local_plugin_settings` from the response. Extract:
+2. **Load project settings**: Call `get_project_summary({ project_id })` and read `local_plugin_settings` from the response. Extract:
    - `auto_push` (default: false)
    - `auto_merge` (default: false)
    - the `repos` array — `[{ id, full_name, target_branch, default_branch }]`, the branch DevSpec tracks for EACH repo; the source of truth for the merge target (Step 16). Do NOT assume one branch for the whole project.
@@ -106,13 +117,14 @@ Memories/artifacts labelled `[unconfirmed — recorded by ...]` (or `provenance_
 Send an initial heartbeat **before fetching any work** so runner-gating conditions (branch mismatch, repo not found) are caught before the runner claims anything this cycle.
 
 1. Call `send_heartbeat` with:
-   - `session_id` (from Step 0.6)
-   - `machine_hostname` (from Step 0.6)
+   - `project_id` (from Step 0 — the heartbeat's gating check is per-project)
+   - `session_id` (from Step 0a.6)
+   - `machine_hostname` (from Step 0a.6)
    - `status: "idle"`
    - `cycle_count: 0`
    - `tasks_completed: 0`
    - `runner_type: "ephemeral"` (Gemini processes one item per invocation — not a persistent poller)
-   - `repositories` (from Step 0.6)
+   - `repositories` (from Step 0a.6)
 
 2. **Process the response** (see reference.md → *Heartbeat Response Processing & Runner Gating*). Read the `validation_state` field from the response object:
 
@@ -133,7 +145,7 @@ Send an initial heartbeat **before fetching any work** so runner-gating conditio
 
 ### Step 1: Fetch Next Item (with stale-claim recovery)
 
-Call `get_next_work_item` (no parameters) **and in parallel** `get_action_items({ agent_activity: 'in_progress', lifecycle: 'open', limit: 20 })`. Both calls are read-only and their results are processed independently — issue them together and wait for both before continuing.
+Call `get_next_work_item({ project_id })` **and in parallel** `get_action_items({ project_id, agent_activity: 'in_progress', lifecycle: 'open', limit: 20 })`. Both calls are read-only and their results are processed independently — issue them together and wait for both before continuing. (Thread the `project_id` resolved in Step 0 on both — the account-wide token does not pin a project.)
 
 **Stale-claim recovery** — before acting on the `get_next_work_item` result, walk the `get_action_items` in-progress list and reset any stale claims:
 
@@ -142,7 +154,7 @@ Call `get_next_work_item` (no parameters) **and in parallel** `get_action_items(
    - Read `agent_claimed_at`. If it is missing or null, skip the item (it is not a valid stale candidate).
    - Parse the claim time: `node -e "console.log(new Date(process.argv[1]).getTime())"` `'<agent_claimed_at>'` → `claimed_ms`. **NEVER parse the timestamp with a regex** — use the `Date` constructor so timezone and format quirks are handled correctly. If parsing returns `NaN`, skip the item and log a warning.
    - Compute `age_ms = now_ms − claimed_ms` and `age_min = age_ms / 60000`.
-   - If `age_min > stale_claim_timeout_minutes` (from Step 0, default 30), the claim is stale:
+   - If `age_min > stale_claim_timeout_minutes` (from Step 0a, default 30), the claim is stale:
      - **Shell safety (Rule 6):** Verify the item's `id` matches `^[0-9a-f-]{36}$` before using it in the reset call. Skip if it fails validation.
      - Call `update_action_item({ action_item_id: <id>, agent_activity: 'failed', agent_error: 'Stale claim: process may have crashed or timed out' })`. This is the ONLY place in the autopilot workflow where `update_action_item` is used to set `agent_activity: 'failed'` without a prior claim by this runner — it is explicitly sanctioned for stale recovery.
      - Output: `⚠ Reset stale item: <title> (claimed <age_min rounded> minutes ago)`. Use Rule 4 sanitization on `<title>` before printing.
@@ -168,7 +180,7 @@ If `get_action_items` itself fails (401, 500, network error), log a one-line war
 
 Priority order within this step is **under_human_review > planning**. Check review first; only fall through to the planning check if no review items exist.
 
-1. **Check for review items** — call `get_action_items({ agent_activity: 'under_human_review', lifecycle: 'open', limit: 1 })`.
+1. **Check for review items** — call `get_action_items({ project_id, agent_activity: 'under_human_review', lifecycle: 'open', limit: 1 })`.
 
    **If the response contains one or more items:**
    - Take the first returned item as `review_item`.
@@ -178,7 +190,7 @@ Priority order within this step is **under_human_review > planning**. Check revi
 
    **If the response is empty:** continue to step 2 below.
 
-2. **Check for planning items** — call `get_action_items({ agent_activity: 'planning', lifecycle: 'open', limit: 1 })`.
+2. **Check for planning items** — call `get_action_items({ project_id, agent_activity: 'planning', lifecycle: 'open', limit: 1 })`.
 
    **If the response contains one or more items:**
    - Take the first returned item as `planning_item` (the server returns items in default order — treat the first result as the one to plan).
@@ -188,7 +200,7 @@ Priority order within this step is **under_human_review > planning**. Check revi
 
    **If the response is empty:**
    - Output: "No items queued, under review, or planning — nothing to process."
-   - Call `send_heartbeat` with status: "idle", cycle_count: 1, tasks_completed: 0. Heartbeat is best-effort — if it fails, do not retry.
+   - Call `send_heartbeat` with `project_id` (from Step 0), status: "idle", cycle_count: 1, tasks_completed: 0. Heartbeat is best-effort — if it fails, do not retry.
    - Stop. Do not proceed further.
 
 ### Step 2: Claim the Item
@@ -224,15 +236,16 @@ Call `claim_work_item` with `action_item_id` and `agent_branch: branch_name`.
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   ```
 - **Send a "working" heartbeat** so the dashboard shows the runner actively processing this item (between the claim and the final heartbeat, the dashboard would otherwise show the runner as "idle"). Call `send_heartbeat` with:
-  - `session_id` (same UUID from Step 0.6)
-  - `machine_hostname` (same value as Step 0.6)
+  - `project_id` (from Step 0)
+  - `session_id` (same UUID from Step 0a.6)
+  - `machine_hostname` (same value as Step 0a.6)
   - `status: "working"`
   - `cycle_count: 1`
   - `tasks_completed: 0`
   - `current_task_id: <action_item_id>`
   - `current_task_title: <action item title>` (sanitize per Rule 4 before sending)
   - `runner_type: "ephemeral"`
-  - `repositories` (same array as Step 0.6)
+  - `repositories` (same array as Step 0a.6)
 
   Best-effort: wrap in try/catch. If the call fails, log a one-line warning and continue. A failed working-heartbeat MUST NOT block implementation — it is a visibility feature, not a correctness gate. Do NOT process the response for gating here (the Step 0b startup heartbeat is the authoritative gating check; a mid-cycle gate flip is handled at the final heartbeat in Step 7).
 - Continue to Step 3.
@@ -309,7 +322,7 @@ All implementation work happens inside a git worktree — a sibling directory wi
 
 10a. **Database migrations (if this item adds or edits a DB migration).** Do NOT assume which database to apply it to — the wrong one is a real, destructive failure. The `get_project_summary` settings and the `get_next_work_item` result both include a `database_targets` array: each connected database with its non-secret `identity` (for Supabase, `identity.externalId` is the project ref), `environment`, and the `branch_name` whose migrations target it. (a) Pick the target whose `branch_name` matches the merge target you resolved for the repo (its `target_branch`), or one with `branch_name: null`. (b) Apply the migration with your OWN database tooling pointed at that target's `identity` — for Supabase, ensure your Supabase tooling targets that exact project ref, not whatever it defaults to. DevSpec does not apply migrations for you and never hands you the credential. (c) Never select the target by `name` (it can mislead — the bug this prevents). If the matching target has `needs_reconnect: true` / a null `identity`, or you cannot reach it, STOP and fail the item via Step 6 (`"Requires human judgment: cannot reach migration target <identity.externalId>"`). Be especially careful when `environment` is `production`.
 
-11. **Validate protected paths**: Run `git diff --name-only` from the worktree and check each changed file against `protected_paths` from Step 0. If any match, fail the item via Step 6 — do not commit. (Step 6 will attempt worktree cleanup before calling `fail_work_item`.)
+11. **Validate protected paths**: Run `git diff --name-only` from the worktree and check each changed file against `protected_paths` from Step 0a. If any match, fail the item via Step 6 — do not commit. (Step 6 will attempt worktree cleanup before calling `fail_work_item`.)
 
 12. **Shell safety before staging (Rule 3)**: For every file path returned by `git diff --name-only`, verify it matches `^[a-zA-Z0-9/_. ~-]+$` and contains none of `;` `|` `&` `$` `` ` `` `\` `(` `)` `{` `}` `<` `>` `!` `#`. If any file path fails validation, fail the item via Step 6 with the unsafe path quoted in the error and stop.
 
@@ -413,13 +426,14 @@ Output: `✗ Item failed: {brief description}`
 ### Step 7: Final Heartbeat
 
 Call `send_heartbeat` with:
+- `project_id` (from Step 0)
 - `session_id` (same UUID used in Step 0b)
 - `machine_hostname` (same value as Step 0b)
 - `status: "idle"`
 - `cycle_count: 1`
 - `tasks_completed: 1` (success), `0` (failure), or `1` (planning/review success).
 - `runner_type: "ephemeral"`
-- `repositories` (the same array computed in Step 0.6 — refresh `branch` and `short_sha` via `git branch --show-current` / `git rev-parse --short HEAD` if the cycle may have changed them)
+- `repositories` (the same array computed in Step 0a.6 — refresh `branch` and `short_sha` via `git branch --show-current` / `git rev-parse --short HEAD` if the cycle may have changed them)
 - `last_error: "<sanitized reason>"` on failure, omit on success
 
 Best-effort — if the call fails, log a one-line warning and do not retry.
@@ -501,7 +515,7 @@ This step runs only when Step 1b found a planning item and no queued work exists
       Log: ~/.devspec/logs/{exec_id}.log
     ```
 
-11. **Heartbeat**: Call `send_heartbeat` with status: "idle", cycle_count: 1, tasks_completed: 1. Best-effort — if it fails, do not retry.
+11. **Heartbeat**: Call `send_heartbeat` with `project_id` (from Step 0), status: "idle", cycle_count: 1, tasks_completed: 1. Best-effort — if it fails, do not retry.
 
 12. **Stop**. Do NOT run Steps 2–7 for this invocation. The next `/autopilot:process` run will pick up the next queued or planning item.
 
@@ -509,7 +523,7 @@ This step runs only when Step 1b found a planning item and no queued work exists
 - Append a completion record with `status: "failure"`, `duration: <ms>`, and `error: "<sanitized reason>"` (Rule 4: escape `'` → `'\\''`, strip `$ ` `` ` `` ` # \\ | & < >`, truncate to 500 chars).
 - Append a final per-task log line: `Completed: planning failure — <reason>`.
 - Output: `✗ Planning failed: {brief description} — item left in planning state for retry`.
-- Call `send_heartbeat` with status: "idle", cycle_count: 1, tasks_completed: 0, and `last_error: "<sanitized reason>"`.
+- Call `send_heartbeat` with `project_id` (from Step 0), status: "idle", cycle_count: 1, tasks_completed: 0, and `last_error: "<sanitized reason>"`.
 - Stop.
 
 ### Step 9: Review Mode (alternate workflow — no claim, no code changes)
@@ -591,7 +605,7 @@ This step runs only when Step 1b found a review item (`agent_activity: 'under_hu
       Log: ~/.devspec/logs/{exec_id}.log
     ```
 
-12. **Heartbeat**: Call `send_heartbeat` with status: "idle", cycle_count: 1, tasks_completed: 1. Best-effort — if it fails, do not retry.
+12. **Heartbeat**: Call `send_heartbeat` with `project_id` (from Step 0), status: "idle", cycle_count: 1, tasks_completed: 1. Best-effort — if it fails, do not retry.
 
 13. **Stop**. Do NOT run Steps 2–7 or Step 8 for this invocation. The next `/autopilot:process` run will pick up the next queued, review, or planning item.
 
@@ -599,7 +613,7 @@ This step runs only when Step 1b found a review item (`agent_activity: 'under_hu
 - Append a completion record with `status: "failure"`, `duration: <ms>`, and `error: "<sanitized reason>"` (Rule 4 applies).
 - Append a final per-task log line: `Completed: review failure — <reason>`.
 - Output: `✗ Review failed: {brief description} — item left in under_human_review state for retry`.
-- Call `send_heartbeat` with status: "idle", cycle_count: 1, tasks_completed: 0, and `last_error: "<sanitized reason>"`.
+- Call `send_heartbeat` with `project_id` (from Step 0), status: "idle", cycle_count: 1, tasks_completed: 0, and `last_error: "<sanitized reason>"`.
 - Stop.
 
 ## Shell Compatibility

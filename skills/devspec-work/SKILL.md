@@ -48,7 +48,15 @@ Fix real issues before committing. If a fix would expand scope beyond the action
    - If a decision requires human judgment, fail the item with a documented error rather than guessing
    - If the action item name matches multiple items, auto-select the highest-priority match
 
-2. **Load project settings.** Call `get_project_summary` and read `local_plugin_settings`. Use safe defaults if absent:
+1a. **Resolve your project (account-wide token).** Your DevSpec MCP token is **account-wide** — it is not pinned to a single project, so resolve WHICH project this run is for before loading any project data. Resolution is by git remote:
+   - Capture the git remote: `git remote get-url origin` → `remote_url`. If there is no `origin`, tell the user `✗ No git remote 'origin' — DevSpec cannot resolve which project this is for.` and stop.
+   - Call `list_projects({ git_remote: "<remote_url>" })`. The response contains `remote_match: { resolved_project_id, candidate_project_ids }` (and each project lists its `repos`). Branch on it:
+     - **`resolved_project_id` set** → store as `project_id` for the whole run; thread it on every project-scoped call below.
+     - **null with `candidate_project_ids`** (repo tracked by >1 project) → this is interactive, so do NOT guess: list the candidate projects (use the `name`/`repos` in the `list_projects` result) and ask the user which one to work in. Use their pick as `project_id`.
+     - **no match** → tell the user `✗ No DevSpec project tracks this repo (<remote_url>). Connect it in the DevSpec dashboard, then re-run.` and stop.
+   - Reuse `remote_url` for the `repositories` array in step 3a (no need to re-capture).
+
+2. **Load project settings.** Call `get_project_summary({ project_id })` and read `local_plugin_settings`. Use safe defaults if absent:
    - `auto_push`: false
    - `auto_merge`: false
    - `branch_prefix`: "work/action-item-"
@@ -71,7 +79,7 @@ Fix real issues before committing. If a fix would expand scope beyond the action
    - Generate a session UUID: `node -e "console.log(require('crypto').randomUUID())"` → `session_id`. Reused in every heartbeat call this run.
    - Capture machine hostname: `node -e "console.log(require('os').hostname())"` → `machine_hostname`.
    - Collect repo info for the current working directory:
-     - `remote_url` = `git remote get-url origin`
+     - `remote_url` = the value already captured in step 1a (`git remote get-url origin`)
      - `normalized_url` = lowercase host, strip protocol / auth / port / `.git` suffix (e.g. `https://github.com/Org/Repo.git` → `github.com/org/repo`)
      - `branch` = `git branch --show-current` (already captured as `starting_branch`; reuse)
      - `short_sha` = `git rev-parse --short HEAD`
@@ -81,6 +89,7 @@ Fix real issues before committing. If a fix would expand scope beyond the action
 3b. **Startup heartbeat with gating check** — send an initial heartbeat and check for runner-gating conditions **before** doing any work. If the runner is gated, exit cleanly without picking up an item.
 
    1. Call `send_heartbeat` with:
+      - `project_id` (from step 1a — the heartbeat's gating check is per-project)
       - `session_id`, `machine_hostname`, `repositories` (from step 3a)
       - `lifecycle: "idle"`, `cycle_count: 0`, `tasks_completed: 0`
       - `runner_type: "ephemeral"`
@@ -105,7 +114,7 @@ Fix real issues before committing. If a fix would expand scope beyond the action
 ## Phase 1 — Resolve
 
 4. **Resolve the action item.** Extract an identifier from the user's input (strip any `--unattended` flag first).
-   - Match by ID prefix or title keywords via `get_action_items(lifecycle: "all")`.
+   - Match by ID prefix or title keywords via `get_action_items({ project_id, lifecycle: "all" })` (thread the `project_id` resolved in Phase 0 — the account-wide token does not pin a project).
    - **Interactive mode:** If ambiguous, present a numbered list and ask the user to pick.
    - **Unattended mode:** If ambiguous, auto-select highest-priority match.
    - If no match found: output `✗ No action item found matching: {input}` and stop.
@@ -113,8 +122,8 @@ Fix real issues before committing. If a fix would expand scope beyond the action
    - **Shell safety (Rule 6):** Verify `resolved_action_item_id` matches `^[0-9a-f-]{36}$` before using it in any shell command or file path. If it fails, output `✗ Resolved action_item_id failed UUID validation` and stop.
 
 5. **Load context.** Call in parallel:
-   - `get_action_item_history(action_item_id)` — prior notes, commits, lifecycle changes
-   - `search_memories(query: "<action item title>")` — related decisions, conventions, risks
+   - `get_action_item_history(action_item_id)` — prior notes, commits, lifecycle changes (self-resolves from the item id; no `project_id`)
+   - `search_memories({ project_id, query: "<action item title>" })` — related decisions, conventions, risks (project-scoped — thread `project_id`)
 
    Then read the item's spec fields: `intent` (the WHY — the problem and desired outcome), `acceptance_criteria` (your definition of done — the diff must satisfy it), and `ai_instructions` (constraints). If `intent` is missing or too thin to grasp the real goal — common when the item came from a terse conversation — and the item has a `source_session_id`, call `get_session_transcript({ session_id: <source_session_id> })` to recover the originating intent. This is optional and on-demand: skip it when the spec fields already make the goal clear. When the transcript reveals intent or criteria the item lacks, persist it back via `update_action_item({ action_item_id, intent, acceptance_criteria })`.
 
@@ -167,6 +176,7 @@ Fix real issues before committing. If a fix would expand scope beyond the action
 11. **Claim the item.** Call `claim_work_item(action_item_id)`. If already claimed (409), output `✗ Item already claimed` and stop.
 
     **Send a "working" heartbeat** (best-effort) so the dashboard shows the runner actively processing this item rather than sitting idle between the claim and the final heartbeat. Call `send_heartbeat` with:
+    - `project_id` (from Phase 0 step 1a)
     - `session_id`, `machine_hostname`, `repositories` (from Phase 0 step 3a)
     - `lifecycle: "working"`, `cycle_count: 1`, `tasks_completed: 0`
     - `current_task_id: <action_item_id>`
