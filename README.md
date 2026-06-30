@@ -94,6 +94,7 @@ Antigravity: *"Install the DevSpec skills from `<repo-url>`."* See **Distributio
 | `devspec-create` | Create an action item (bug/feature/improvement/task/query) from the terminal. |
 | `devspec-brainstorm` | Interactively refine an item's scope, edge cases, and approach, then save the summary. |
 | `devspec-link` | Link an existing commit (or `HEAD`) to an action item for traceability. |
+| `devspec-verify-connection` | Prove the setup connection loop: push a tagged `[devspec-verify:<id>]` commit to each tracked repo's primary branch and report per-repo via `report_connection_check`. |
 | `autopilot-status` | Compact panel: queued / in-progress counts and push/merge settings. |
 | `autopilot-history` | Recent completed/failed items from the DevSpec API. |
 | `autopilot-log` | Local run log from `~/.devspec/execution-history.jsonl` (offline; written by autopilot/work). |
