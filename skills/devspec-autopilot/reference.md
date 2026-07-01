@@ -515,7 +515,7 @@ Create a new action item in the project. Used by `/devspec:create` to let develo
 | `agent_ready` | Optional boolean. Defaults to `false`. Pass `true` only when the item is a concrete code change a runner can implement autonomously (see below). |
 | `assigned_to` | Optional user UUID. Omit for unassigned items. |
 | `parent_action_item_id` | Optional. Pass the UUID of a parent item to create this as a sub-task. Max depth 1 (no grandchildren). |
-| `session_id` | Optional. Pass the UUID of the originating session if the item is being filed from within a DevSpec session. |
+| `session_id` | Optional. The DevSpec CHAT session this item originates from (e.g. a session handoff gave you one). The item becomes owned by that session — it appears in the session's transcript and "This session" panel. Omit in autopilot/terminal flows with no live chat session; never pass the runner heartbeat `session_id` or a `source_session_id` you merely read intent from. |
 
 **Response**: The created action item object. Includes `id` (UUID assigned by the server), plus the fields you passed and defaults applied server-side (`lifecycle: "open"`, `agent_activity: "queued"` when `agent_ready: true`, else no `agent_activity`, etc.).
 
