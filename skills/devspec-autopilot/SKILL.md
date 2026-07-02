@@ -340,13 +340,34 @@ All implementation work happens inside a git worktree — a sibling directory wi
     ```
     Every git command from here on (merge, push of the target branch) runs in the main repo, **not** the worktree. This is critical: the worktree has `<branch_name>` checked out, so merging into the target branch from the worktree would conflict with the worktree's own checkout. Always merge from `main_repo`.
 
-16. **Merge (from the main repo)** (if auto_merge): Resolve the merge target **for the repo you are pushing** from the `repos` array — the `target_branch` of the entry whose `full_name` matches this repo's `origin` remote; fall back to that entry's `default_branch`, then `starting_branch`. A multi-repo run merges each repo to its OWN resolved branch, never one project-wide branch. Before use, verify `merge_target` matches `^[a-zA-Z0-9/_.-]+$` (Rule 2). If it fails, fail the item via Step 6 (which will cleanup the worktree).
+16. **Merge** (if auto_merge): Resolve the merge target **for the repo you are pushing** from the `repos` array — the `target_branch` of the entry whose `full_name` matches this repo's `origin` remote; fall back to that entry's `default_branch`, then `starting_branch`. A multi-repo run merges each repo to its OWN resolved branch, never one project-wide branch. Before use, verify `merge_target` matches `^[a-zA-Z0-9/_.-]+$` (Rule 2). If it fails, fail the item via Step 6 (which will cleanup the worktree).
+
+    Merges must serialize against other runners and concurrent sessions pushing the same target — parallel runners are supported. The protocol is git-native: **push atomicity is the lock**, and nothing lands without the checks passing against the COMBINED state (fresh target + your change).
+
+    **a) Integrate the fresh target into your work branch — back in the worktree:**
     ```
+    cd '<worktree_path>'
+    git fetch origin '<merge_target>'
+    git merge 'origin/<merge_target>' --no-edit
+    ```
+    - **Conflicts here are normal under parallel execution, not an error.** Resolve them yourself on the work branch — read both sides, produce the correct combined code (never resolve by discarding the other side's changes), then `git add` the resolved files and `git commit`. If you cannot produce a confident resolution: `git merge --abort` → Step 6.
+    - If this merge brought in any new commits (conflicted or not), **re-run the Step 9/10 test + typecheck commands** against the combined state. If they fail because of the interaction and you cannot fix it → Step 6.
+    - Push the updated work branch: `git push origin '<branch_name>'`.
+
+    **b) Land on the target — from the main repo** (`cd '<main_repo>'`):
+    ```
+    git fetch origin '<merge_target>'
     git checkout '<merge_target>'
+    git merge --ff-only 'origin/<merge_target>'
     git merge '<branch_name>' --no-ff --no-edit
     git push origin '<merge_target>'
     ```
-    Store `agent_merged = true`. On merge conflict, go to Step 6 with conflict details — Step 6 attempts `git merge --abort` followed by worktree cleanup before calling `fail_work_item`.
+    - If the `--ff-only` sync fails, the LOCAL target has commits the remote doesn't. If they are your own leftover from a rejected attempt of THIS item, discard with `git reset --hard 'origin/<merge_target>'`; anything else (e.g. the developer's local work) must NOT be discarded → Step 6 with a note.
+    - The `<branch_name>` merge must be CLEAN — resolution already happened on the work branch in (a). If it conflicts anyway, the target moved again: `git merge --abort` and return to (a).
+
+    **c) Push rejected (non-fast-forward)?** Another runner landed between your fetch and push — normal. Retry, **bounded at 3 attempts**: return to (a) (integrate, re-check, re-push branch), then (b). After the third rejection → Step 6.
+
+    Store `agent_merged = true` on success. On any failure path above, go to Step 6 with the conflicting files and the just-landed work they collide with named in the error — the work branch stays pushed for human triage, and the runner continues polling.
 
     If auto_merge is NOT enabled, store `agent_merged = false`.
 

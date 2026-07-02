@@ -267,7 +267,17 @@ Fix real issues before committing. If a fix would expand scope beyond the action
     ```
     Do NOT construct the message yourself — the `[devspec:<id>]` tag is what the deployment webhook uses.
 
-16. **Push** (if auto_push enabled or implied by auto_merge):
+16. **Integrate the fresh target, then push** (if auto_push enabled or implied by auto_merge).
+
+    When auto_merge is enabled, first integrate the target branch into your work branch **in the worktree** — another session or a parallel autopilot runner may have landed work since you branched (resolve `{merge_target}` per step 18):
+    ```
+    git fetch origin '{merge_target}'
+    git merge 'origin/{merge_target}' --no-edit
+    ```
+    - Conflicts here are normal, not an error: resolve them yourself on the work branch — read both sides, produce the correct combined code (never resolve by discarding the other side's changes), `git add` the resolved files and `git commit`. If you cannot produce a confident resolution, `git merge --abort` and go to Failure Handling.
+    - If the merge brought in any new commits, re-run the step-14 checks against the combined state before pushing.
+
+    Then push:
     ```
     git push -u origin '{branch_name}'
     ```
@@ -281,12 +291,17 @@ Fix real issues before committing. If a fix would expand scope beyond the action
 18. **Merge** (if auto_merge enabled):
     Resolve the merge target **for the repo you are pushing** from the `repos` array: the `target_branch` of the entry whose `full_name` matches this repo's `origin` remote; fall back to that entry's `default_branch`, then `starting_branch`. A multi-repo item pushes each repo to its OWN resolved branch — never one project-wide branch.
     **Shell safety (Rule 2):** Verify `merge_target` matches `^[a-zA-Z0-9/_.-]+$` before using it. If it fails, fail the item (Failure Handling will clean up the worktree).
+    Merges serialize git-natively against concurrent sessions and parallel runners: **push atomicity is the lock**. Sync the local target exactly to the remote, merge, push:
     ```
+    git fetch origin '<merge_target>'
     git checkout '<merge_target>'
+    git merge --ff-only 'origin/<merge_target>'
     git merge '<branch_name>' --no-ff --no-edit
     git push origin '<merge_target>'
     ```
-    If merge conflicts arise, go to Failure Handling (which aborts the merge and removes the worktree).
+    - If the `--ff-only` sync fails, the LOCAL target has commits the remote doesn't. If they are your own leftover from a rejected attempt of THIS item, discard with `git reset --hard 'origin/<merge_target>'`; anything else (e.g. the developer's local work) must NOT be discarded — go to Failure Handling and say so.
+    - The `'<branch_name>'` merge must be CLEAN — conflict resolution happened on the work branch in step 16. If it conflicts anyway, the target moved again: `git merge --abort`, repeat step 16's integrate (in the worktree — BEFORE removing it), then retry here.
+    - **Push rejected (non-fast-forward)?** Someone landed between your fetch and push — normal. Retry, bounded at 3 attempts: repeat step 16's integrate (new commits → resolve → re-run checks → re-push branch), then this step. After the third rejection, go to Failure Handling — the branch is already pushed, so the developer can resolve it manually.
 
 19. **Cleanup the worktree** — MANDATORY on every successful path (and also on failure, via Failure Handling):
     ```
