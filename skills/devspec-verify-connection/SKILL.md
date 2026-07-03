@@ -1,19 +1,32 @@
 ---
 name: devspec-verify-connection
-description: "Prove the DevSpec connection loop end-to-end — push a tagged verification commit to each tracked repo's primary branch and report the per-repo result via report_connection_check. Use when the setup wizard asks you to run the DevSpec verify tool with a verification ID."
+description: "Verify the DevSpec connection. Two modes — 'Run the DevSpec connection check' (no ID) pings DevSpec through your token via verify_agent_connection, no git involved; 'Run the DevSpec verify tool with ID <uuid>' pushes a tagged verification commit to each tracked repo's primary branch and reports the per-repo result via report_connection_check."
 ---
 
-Prove the end-to-end loop the DevSpec setup wizard cares about: that **this agent** can execute a tool, push to GitHub, and have DevSpec receive the webhook — for **every** repo the project tracks. Trigger when the user (or the wizard) says something like `Run the DevSpec verify tool with ID <uuid>`.
+Verify the DevSpec connection. The setup wizard hands the user one of two prompts — pick the mode by whether a verification UUID is present in the request, and never ask for one:
+
+- `Run the DevSpec connection check` (no UUID) → **Ping mode** below. This is the personal wizard's git-free check.
+- `Run the DevSpec verify tool with ID <uuid>` → **Commit mode** (the numbered steps). This is the project wizard's repo round-trip: prove that **this agent** can execute a tool, push to GitHub, and have DevSpec receive the webhook — for **every** repo the project tracks.
 
 This is distinct from item verification — it does NOT touch action items and never calls `verify_action_item`.
 
-The `list_projects`, `get_project_summary` and `report_connection_check` MCP tools' parameter schemas are provided by the `devspec` MCP server. Follow the **Shell Safety** rules at the end whenever you interpolate a value (verification id, repo path, branch) into a shell command.
+The `verify_agent_connection`, `list_projects`, `get_project_summary` and `report_connection_check` MCP tools' parameter schemas are provided by the `devspec` MCP server. Follow the **Shell Safety** rules at the end whenever you interpolate a value (verification id, repo path, branch) into a shell command.
 
-## Arguments
+## Ping mode (no verification ID)
 
-- **verification-id**: the UUID the setup wizard provides. If missing, ask the user once and stop if still absent.
+Call `verify_agent_connection` with no arguments. That single token-authenticated call is the whole proof: DevSpec stamps your token as agent-verified, and the user's wizard step turns green by itself within a few seconds. It needs no project, no repo, and no git — it works during first-time onboarding before any project exists.
 
-## Steps
+Print exactly:
+
+```
+✓ DevSpec connection verified
+  Connected as: {connected_as from the response, or the token owner}
+  Your setup wizard step will turn green automatically.
+```
+
+On an error, print `✗ DevSpec connection failed: {error}` and suggest checking that the token in the MCP config is the one just created. Do not fall through to commit mode.
+
+## Commit mode steps
 
 ### 0. Resolve the project (account-wide token)
 
