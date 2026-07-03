@@ -92,7 +92,7 @@ Antigravity: *"Install the DevSpec skills from `<repo-url>`."* See **Distributio
 
 | Skill | What it does |
 |---|---|
-| `devspec-autopilot` | Autonomously process the queue: claim → implement in an isolated worktree → push/merge → report. Handles queued, review, and planning items. |
+| `devspec-autopilot` | Autonomously process staged work: claim → implement in an isolated worktree → push/merge → report. Handles staged, review, and planning items. |
 | `devspec-work` | Pick up a named/ID'd item, optionally brainstorm, implement, push/merge, record the implementation. `--unattended` for fire-and-forget. |
 | `devspec-done` | Log work you already finished — infers title, summary, testing notes, and commits from git history. |
 | `devspec-commit` | Generate a `[devspec:<id>]` deployment-tracked commit message and commit staged changes. |
@@ -100,7 +100,7 @@ Antigravity: *"Install the DevSpec skills from `<repo-url>`."* See **Distributio
 | `devspec-brainstorm` | Interactively refine an item's scope, edge cases, and approach, then save the summary. |
 | `devspec-link` | Link an existing commit (or `HEAD`) to an action item for traceability. |
 | `devspec-verify-connection` | Prove the setup connection loop: push a tagged `[devspec-verify:<id>]` commit to each tracked repo's primary branch and report per-repo via `report_connection_check`. |
-| `autopilot-status` | Compact panel: queued / in-progress counts and push/merge settings. |
+| `autopilot-status` | Compact panel: staged / in-progress counts and push/merge settings. |
 | `autopilot-history` | Recent completed/failed items from the DevSpec API. |
 | `autopilot-log` | Local run log from `~/.devspec/execution-history.jsonl` (offline; written by autopilot/work). |
 

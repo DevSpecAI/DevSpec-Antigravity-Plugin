@@ -2,11 +2,11 @@
 
 ## What is DevSpec?
 
-DevSpec is an AI-native project planning and code intelligence platform. Teams use DevSpec to create, prioritize, and track action items (bugs, features, improvements, tasks). The autopilot system enables AI agents to autonomously pick up queued action items, implement them, and report results back to the team.
+DevSpec is an AI-native project planning and code intelligence platform. Teams use DevSpec to create, prioritize, and track action items (bugs, features, improvements, tasks). The autopilot system enables AI agents to autonomously pick up staged action items, implement them, and report results back to the team.
 
 ## What This Plugin Does
 
-This plugin connects Antigravity to DevSpec's autopilot system. When you run `/autopilot:process`, Antigravity fetches the next queued action item, claims it, implements the required changes, and reports completion with full audit details.
+This plugin connects Antigravity to DevSpec's autopilot system. When you run `/autopilot:process`, Antigravity fetches the next staged action item, claims it, implements the required changes, and reports completion with full audit details.
 
 ## MCP Tools
 
@@ -89,7 +89,7 @@ Get project settings including autopilot configuration. Call this at startup to 
 
 ### get_next_work_item
 
-Fetch the next highest-priority queued action item with full context.
+Fetch the next highest-priority staged action item with full context.
 
 **Parameters**:
 ```json
@@ -109,7 +109,7 @@ Fetch the next highest-priority queued action item with full context.
   "priority": "high",
   "type": "bug",
   "lifecycle": "open",
-  "agent_activity": "queued",
+  "agent_activity": "staged",
   "tags": ["auth", "mobile"],
   "affected_files": ["src/auth/login.ts", "src/auth/timeout.ts"],
   "parent_action_item_id": null
@@ -126,7 +126,7 @@ Fetch the next highest-priority queued action item with full context.
 
 ### get_action_items
 
-List action items by filter. In this plugin it is used exclusively to detect **planning-mode work** after `get_next_work_item` reports an empty queued queue.
+List action items by filter. In this plugin it is used exclusively to detect **planning-mode work** after `get_next_work_item` reports no staged work.
 
 **Parameters** (`project_id` required for multi-project accounts; the rest optional):
 ```json
@@ -141,7 +141,7 @@ List action items by filter. In this plugin it is used exclusively to detect **p
 | Field | Requirements |
 |-------|-------------|
 | `project_id` | The project resolved from `list_projects` at startup. Required when the account has more than one project; optional for single-project accounts. |
-| `agent_activity` | One of `idle`, `queued`, `claimed`, `implementing`, `reporting`, `finished`, `failed`. Use `idle` to find planning items, `reporting` to find items pending plan review. |
+| `agent_activity` | One of `idle`, `staged`, `implementing`, `reporting`, `finished`, `failed`. Use `idle` to find planning items, `reporting` to find items pending plan review. |
 | `lifecycle` | One of `open`, `in_progress`, `done`, `dismissed`, `deferred`, `blocked`, `all`. Defaults to `open`. (`deferred` = consciously parked; counts as resolved, reversible via `update_action_item(lifecycle: 'open')`.) |
 | `limit` | Max results. Defaults to 20. Use `1` when you only need the next item to process. |
 | `assigned_to` | Optional user UUID or `"me"` to restrict to a specific assignee. Omit to include unassigned items. |
@@ -151,7 +151,7 @@ List action items by filter. In this plugin it is used exclusively to detect **p
 **Usage in this plugin**:
 - **Stale-claim recovery**: `get_action_items({ agent_activity: 'implementing', lifecycle: 'open', limit: 20 })` — fetch currently claimed items so the runner can reset ones that have been stuck longer than `stale_claim_timeout_minutes`. Called in parallel with `get_next_work_item` at the start of every cycle. See `## Stale Claim Recovery` below.
 - **Review-mode detection**: `get_action_items({ agent_activity: 'reporting', lifecycle: 'open', limit: 1 })` — fetch the next pending review item after `get_next_work_item` returns empty. Review items take priority over planning items.
-- **Planning-mode detection**: `get_action_items({ agent_activity: 'idle', lifecycle: 'open', limit: 1 })` — fetch the next pending planning item after both the queued and review queues are empty.
+- **Planning-mode detection**: `get_action_items({ agent_activity: 'idle', lifecycle: 'open', limit: 1 })` — fetch the next pending planning item after both the staged and review pools are empty.
 
 **Errors**:
 - `401 Unauthorized` — Token invalid.
@@ -281,7 +281,7 @@ Atomically mark an action item as in_progress. Only one runner can claim a given
 | `action_item_id` | The UUID of the item returned by `get_next_work_item`. Required. |
 | `agent_branch` | The feature branch name that will be created for this item (format: `{branch_prefix}{id_first_8}`). Required. |
 
-**Success**: Item transitions from `queued` to `in_progress`.
+**Success**: Item transitions from `staged` to `in_progress`.
 
 **Errors**:
 - `409 Conflict` — Another runner already claimed this item. This is a normal race condition. Print a message and exit — run again to get the next item.
@@ -319,7 +319,7 @@ Return the parent brief and all sibling children for an action item that belongs
     "agent_activity": "idle"
   },
   "siblings": [
-    { "id": "…", "title": "Brief list UI", "lifecycle": "open", "agent_activity": "queued", "completion_summary": null },
+    { "id": "…", "title": "Brief list UI", "lifecycle": "open", "agent_activity": "staged", "completion_summary": null },
     { "id": "…", "title": "Brief detail page", "lifecycle": "done", "agent_activity": "finished", "completion_summary": "Shows parent header + children checklist" }
   ]
 }
@@ -492,7 +492,7 @@ Create a new action item in the project. Used by `/devspec:create` to let develo
 | `parent_action_item_id` | Optional. Pass the UUID of a parent item to create this as a sub-task. Max depth 1 (no grandchildren). |
 | `session_id` | Optional. The DevSpec CHAT session this item originates from (e.g. a session handoff gave you one). The item becomes owned by that session — it appears in the session's transcript and "This session" panel. Omit in autopilot/terminal flows with no live chat session; never pass the runner heartbeat `session_id` or a `source_session_id` you merely read intent from. |
 
-**Response**: The created action item object. Includes `id` (UUID assigned by the server), plus the fields you passed and defaults applied server-side (`lifecycle: "open"`, `agent_activity: "queued"` when `agent_ready: true`, else no `agent_activity`, etc.).
+**Response**: The created action item object. Includes `id` (UUID assigned by the server), plus the fields you passed and defaults applied server-side (`lifecycle: "open"`, `agent_activity: "staged"` when `agent_ready: true`, else no `agent_activity`, etc.).
 
 **When to set `agent_ready: true`** — the work is a concrete code change that an autopilot runner can implement autonomously:
 - Bug fix with a clear reproduction and a bounded scope
@@ -866,7 +866,7 @@ The setting MUST be a positive integer. Non-numeric, missing, or ≤ 0 values fa
 
 ### When it runs
 
-Stale recovery runs **on every cycle, alongside the normal fetch** — not as a separate step, not as a user-visible command. Specifically, at the top of Step 1, `get_next_work_item` and `get_action_items({ agent_activity: 'implementing', lifecycle: 'open', limit: 20 })` are called in parallel. The in-progress list is scanned for stale claims before the runner acts on the queued result.
+Stale recovery runs **on every cycle, alongside the normal fetch** — not as a separate step, not as a user-visible command. Specifically, at the top of Step 1, `get_next_work_item` and `get_action_items({ agent_activity: 'implementing', lifecycle: 'open', limit: 20 })` are called in parallel. The in-progress list is scanned for stale claims before the runner acts on the staged result.
 
 A failure of the in-progress fetch (401, 500, network error) skips recovery for this cycle only — it does NOT block the normal fetch. Stale recovery is best-effort.
 
@@ -933,24 +933,24 @@ Log failures must never block recovery.
 
 - Do NOT call `fail_work_item` for stale recovery — that tool is for items the current runner claimed and then could not complete. Stale recovery uses `update_action_item` because the stale item belongs to a different (crashed) runner.
 - Do NOT emit a heartbeat specifically for stale recovery — heartbeats are sent at the end of the normal cycle.
-- Do NOT block the queued-work path on stale recovery. If stale resets fail or time out, continue with normal processing.
+- Do NOT block the staged-work path on stale recovery. If stale resets fail or time out, continue with normal processing.
 
 ---
 
 ## Review Mode
 
-The autopilot supports a read-only **review mode** that submits structured feedback on plans awaiting human review. This runs automatically when the queued queue is empty but items exist with `agent_activity: 'under_human_review'`. Review mode sits between queued and planning in priority — it never blocks on planning items.
+The autopilot supports a read-only **review mode** that submits structured feedback on plans awaiting human review. This runs automatically when nothing is staged but items exist with `agent_activity: 'under_human_review'`. Review mode sits between staged and planning in priority — it never blocks on planning items.
 
 ### When Review Mode Activates
 
 `/autopilot:process` resolves item selection in this priority order:
 
-1. **Queued** — `get_next_work_item` returns an item → full implementation workflow.
+1. **Staged** — `get_next_work_item` returns an item → full implementation workflow.
 2. **Review** — `get_next_work_item` empty AND `get_action_items({ agent_activity: 'reporting', lifecycle: 'open', limit: 1 })` returns an item → review-mode workflow (Step 9 of `process.toml`).
-3. **Planning** — queued empty AND review empty AND a `planning` item exists → planning-mode workflow.
+3. **Planning** — staged empty AND review empty AND a `planning` item exists → planning-mode workflow.
 4. **Empty** — all queries empty → idle heartbeat and exit.
 
-Review mode is only reached when the queued queue is empty. It always takes priority over planning.
+Review mode is only reached when nothing is staged. It always takes priority over planning.
 
 ### MCP Tools Used
 
@@ -1018,18 +1018,18 @@ Review-mode runs follow the same JSONL logging schema as implementation runs (se
 
 ## Planning Mode
 
-The autopilot supports a read-only **planning mode** that generates implementation plans for action items without changing any code. This runs automatically when the queued work queue is empty but items exist with `agent_activity: 'planning'`.
+The autopilot supports a read-only **planning mode** that generates implementation plans for action items without changing any code. This runs automatically when no staged work exists but items exist with `agent_activity: 'planning'`.
 
 ### When Planning Mode Activates
 
 `/autopilot:process` resolves item selection in this priority order:
 
-1. **Queued** — `get_next_work_item` returns an item → full implementation workflow (Steps 2–7 of `process.toml`).
+1. **Staged** — `get_next_work_item` returns an item → full implementation workflow (Steps 2–7 of `process.toml`).
 2. **Review** — `get_next_work_item` empty AND `get_action_items({ agent_activity: 'reporting', lifecycle: 'open', limit: 1 })` returns an item → review-mode workflow (Step 9 of `process.toml`). See `## Review Mode` below.
 3. **Planning** — `get_next_work_item` empty AND review empty AND `get_action_items({ agent_activity: 'idle', lifecycle: 'open', limit: 1 })` returns one or more items → planning-mode workflow (Step 8 of `process.toml`).
 4. **Empty** — all three queries empty → idle heartbeat and exit.
 
-Queued items **always** take precedence, then review, then planning. Planning mode is only reached when the queued and review queues are both fully drained.
+Staged items **always** take precedence, then review, then planning. Planning mode is only reached when staged and review work are both fully drained.
 
 ### MCP Tools Used
 
@@ -1084,7 +1084,7 @@ The plan written via `add_implementation_note` must be substantive markdown cove
 - **Risks** — edge cases, error paths, concurrency, migration safety
 - **Testing strategy** — how to validate the change (unit, integration, manual)
 
-Use clear headings (`## Scope`, `## Approach`, `## Risks`, `## Testing`) and reference files, functions, and decisions by name. The plan becomes part of the action item's permanent record and is reviewed by a human before the item is either approved (promoted to `queued` for implementation) or rejected. Vague plans are not useful — write what you would want to read if you were the reviewer.
+Use clear headings (`## Scope`, `## Approach`, `## Risks`, `## Testing`) and reference files, functions, and decisions by name. The plan becomes part of the action item's permanent record and is reviewed by a human before the item is either approved (promoted to `staged` for implementation) or rejected. Vague plans are not useful — write what you would want to read if you were the reviewer.
 
 ### Local Storage in Planning Mode
 
@@ -1171,7 +1171,7 @@ Do not retry more than once per command. If the direct path also fails, treat it
 
 | Scenario | What To Do |
 |----------|-----------|
-| **Empty queue** (get_next_work_item returns null) | Print "No items queued — nothing to process." and exit cleanly. |
+| **Nothing staged** (get_next_work_item returns null) | Print "No items staged — nothing to process." and exit cleanly. |
 | **401 Unauthorized** (any tool) | Print error: "Authentication failed. Regenerate your token in DevSpec: Settings > Autopilot." Exit. |
 | **409 Conflict** (claim_work_item) | Print: "Item already claimed by another runner. Run again to pick up the next item." Exit cleanly. |
 | **Protected path violation** (before commit) | Call `fail_work_item` listing which files matched protected patterns. Do not commit. |

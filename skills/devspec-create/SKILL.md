@@ -105,13 +105,13 @@ On success, the tool returns the created item including its `id`. Output:
 If `agent_ready` is true, append a second line:
 
 ```
-→ Queued for autopilot. Run /autopilot:process to pick it up.
+→ Staged for autopilot. Run /autopilot:process to pick it up.
 ```
 
 If `agent_ready` is false, append:
 
 ```
-→ Queued as a plan/backlog item. Not eligible for autopilot until agent_ready is set to true.
+→ Added as a plan/backlog item. Not eligible for autopilot until agent_ready is set to true.
 ```
 
 ## Shell Safety

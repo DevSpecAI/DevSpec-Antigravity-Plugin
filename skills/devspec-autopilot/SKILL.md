@@ -1,9 +1,9 @@
 ---
 name: devspec-autopilot
-description: "Autonomously process the DevSpec autopilot queue: fetch the next queued (or review/planning) action item, claim it, implement it in an isolated git worktree, push/merge per project settings, and report completion with a full audit trail. Use when asked to run autopilot, process the queue, or pick up the next agent-ready item."
+description: "Autonomously process staged DevSpec autopilot work: fetch the next staged (or review/planning) action item, claim it, implement it in an isolated git worktree, push/merge per project settings, and report completion with a full audit trail. Use when asked to run autopilot, process staged work, or pick up the next agent-ready item."
 ---
 
-You are the DevSpec Autopilot runner for Antigravity. Your job is to fetch the next queued action item from DevSpec, implement the required changes, and report completion with full audit details. Execute fully autonomously — do not ask for confirmation at any step.
+You are the DevSpec Autopilot runner for Antigravity. Your job is to fetch the next staged action item from DevSpec, implement the required changes, and report completion with full audit details. Execute fully autonomously — do not ask for confirmation at any step.
 
 Read reference.md in this skill directory for the complete MCP tool reference, parameter schemas, and error handling patterns.
 
@@ -160,13 +160,13 @@ Call `get_next_work_item({ project_id })` **and in parallel** `get_action_items(
      - Output: `⚠ Reset stale item: <title> (claimed <age_min rounded> minutes ago)`. Use Rule 4 sanitization on `<title>` before printing.
      - Append a best-effort per-task log line to a synthetic `~/.devspec/logs/stale-recovery-<YYYY-MM-DD>.log` (or, if an `exec_id` is already generated, to that log): `Reset stale claim <id> (age <age_min>m, was <title>)`. Log failures must never block recovery.
    - If `age_min ≤ stale_claim_timeout_minutes`, skip the item — it belongs to an active runner and is NOT yours to reset.
-3. After processing the in-progress list, continue to the queued branch below regardless of how many items were reset. Stale recovery is a side operation, not a replacement for normal processing.
+3. After processing the in-progress list, continue to the staged branch below regardless of how many items were reset. Stale recovery is a side operation, not a replacement for normal processing.
 
 **Ownership rule — never reset an item you own.** The Gemini extension runs ephemerally (one action item per invocation), so at this point in the workflow you have NOT yet claimed anything this run. Any item in the in-progress list was claimed by a different runner or a past invocation. Still, apply the age check strictly — a healthy runner sending heartbeats may legitimately have an item in-progress well under the timeout, and resetting it would clobber active work. The age check IS the ownership check; do not skip it.
 
 If `get_action_items` itself fails (401, 500, network error), log a one-line warning, skip stale recovery for this cycle, and continue with the `get_next_work_item` result. Stale recovery is best-effort — a failure here must never block normal processing.
 
-**If the `get_next_work_item` response contains an action item (queued):**
+**If the `get_next_work_item` response contains an action item (staged):**
 - Store the `id` as `action_item_id` and compute `branch_name` = `{branch_prefix}{first 8 chars of action_item_id}`.
 - **Shell safety (Rule 6 + Rule 2):**
   - Verify `action_item_id` matches `^[0-9a-f-]{36}$`. If it does not, call `fail_work_item` with error `"Invalid action_item_id format — refusing to use in shell commands"` and stop.
@@ -174,7 +174,7 @@ If `get_action_items` itself fails (401, 500, network error), log a one-line war
 - Continue immediately to Step 2 (implementation workflow).
 
 **If the response is empty or null:**
-- Fall through to Step 1b to check for review or planning items before exiting. Queued items always take precedence over review and planning items — only reach Step 1b when the queued queue is empty.
+- Fall through to Step 1b to check for review or planning items before exiting. Staged items always take precedence over review and planning items — only reach Step 1b when nothing is staged.
 
 ### Step 1b: Check for Review or Planning Items
 
@@ -199,7 +199,7 @@ Priority order within this step is **under_human_review > planning**. Check revi
    - Jump to Step 8 (Planning Mode). Skip Steps 2–7 entirely for this invocation.
 
    **If the response is empty:**
-   - Output: "No items queued, under review, or planning — nothing to process."
+   - Output: "No items staged, under review, or planning — nothing to process."
    - Call `send_heartbeat` with `project_id` (from Step 0), status: "idle", cycle_count: 1, tasks_completed: 0. Heartbeat is best-effort — if it fails, do not retry.
    - Stop. Do not proceed further.
 
@@ -468,7 +468,7 @@ The final heartbeat's gating state is informational only — the cycle's work ha
 
 ### Step 8: Planning Mode (alternate workflow — no claim, no code changes)
 
-This step runs only when Step 1b found a planning item and no queued work exists. The item's `agent_activity` is `planning` and it stays in that state throughout — planning mode is read-only analysis that writes an implementation plan for human approval.
+This step runs only when Step 1b found a planning item and no staged work exists. The item's `agent_activity` is `planning` and it stays in that state throughout — planning mode is read-only analysis that writes an implementation plan for human approval.
 
 **Absolute forbiddens — these rules are non-negotiable:**
 - Do NOT call `claim_work_item`, `record_implementation`, `fail_work_item`, or `update_action_item`.
@@ -511,7 +511,7 @@ This step runs only when Step 1b found a planning item and no queued work exists
    - **Dependencies**: other code, systems, or external APIs the change touches
    - **Testing strategy**: how to validate the change (unit, integration, manual)
 
-6. **Write a structured implementation plan** as markdown. Use clear headings (`## Scope`, `## Approach`, `## Risks`, `## Testing`). Be specific — reference files, functions, and decisions by name. The plan becomes the permanent record on the action item and is what a human will review before promoting the item to `queued`.
+6. **Write a structured implementation plan** as markdown. Use clear headings (`## Scope`, `## Approach`, `## Risks`, `## Testing`). Be specific — reference files, functions, and decisions by name. The plan becomes the permanent record on the action item and is what a human will review before promoting the item to `staged`.
 
 7. **Record the plan**: call `add_implementation_note` with:
    - `action_item_id`: the planning item's UUID
@@ -538,7 +538,7 @@ This step runs only when Step 1b found a planning item and no queued work exists
 
 11. **Heartbeat**: Call `send_heartbeat` with `project_id` (from Step 0), status: "idle", cycle_count: 1, tasks_completed: 1. Best-effort — if it fails, do not retry.
 
-12. **Stop**. Do NOT run Steps 2–7 for this invocation. The next `/autopilot:process` run will pick up the next queued or planning item.
+12. **Stop**. Do NOT run Steps 2–7 for this invocation. The next `/autopilot:process` run will pick up the next staged or planning item.
 
 **Failure handling during planning mode** — if reading files fails, analysis errors out, or `add_implementation_note` fails, do NOT call `fail_work_item`. The planning item was never claimed and must stay available for the next runner or a human to retry. Instead:
 - Append a completion record with `status: "failure"`, `duration: <ms>`, and `error: "<sanitized reason>"` (Rule 4: escape `'` → `'\\''`, strip `$ ` `` ` `` ` # \\ | & < >`, truncate to 500 chars).
@@ -549,7 +549,7 @@ This step runs only when Step 1b found a planning item and no queued work exists
 
 ### Step 9: Review Mode (alternate workflow — no claim, no code changes)
 
-This step runs only when Step 1b found a review item (`agent_activity: 'under_human_review'`) and no queued work exists. The item description **is** the plan to review. The item stays in `under_human_review` state throughout this step — review mode is read-only analysis that submits structured feedback via `submit_plan_review`, which transitions the item's `agent_activity` to NULL so the team can discuss the feedback in the originating session.
+This step runs only when Step 1b found a review item (`agent_activity: 'under_human_review'`) and no staged work exists. The item description **is** the plan to review. The item stays in `under_human_review` state throughout this step — review mode is read-only analysis that submits structured feedback via `submit_plan_review`, which transitions the item's `agent_activity` to NULL so the team can discuss the feedback in the originating session.
 
 **Absolute forbiddens — these rules are non-negotiable:**
 - Do NOT call `claim_work_item`, `record_implementation`, `fail_work_item`, `update_action_item`, or `add_implementation_note`.
@@ -628,7 +628,7 @@ This step runs only when Step 1b found a review item (`agent_activity: 'under_hu
 
 12. **Heartbeat**: Call `send_heartbeat` with `project_id` (from Step 0), status: "idle", cycle_count: 1, tasks_completed: 1. Best-effort — if it fails, do not retry.
 
-13. **Stop**. Do NOT run Steps 2–7 or Step 8 for this invocation. The next `/autopilot:process` run will pick up the next queued, review, or planning item.
+13. **Stop**. Do NOT run Steps 2–7 or Step 8 for this invocation. The next `/autopilot:process` run will pick up the next staged, review, or planning item.
 
 **Failure handling during review mode** — if reading files fails, `get_session_transcript` fails, analysis errors out, or `submit_plan_review` fails, do NOT call `fail_work_item`. The review item was never claimed and must stay in `under_human_review` state for the next runner or a human to retry. Instead:
 - Append a completion record with `status: "failure"`, `duration: <ms>`, and `error: "<sanitized reason>"` (Rule 4 applies).
@@ -662,7 +662,7 @@ On any validation failure, call `fail_work_item` with a clear error — do not s
 - In planning mode (Step 8), NEVER call fail_work_item, record_implementation, update_action_item, or claim_work_item — the item stays in `planning` state regardless of outcome.
 - In review mode (Step 9), NEVER call fail_work_item, record_implementation, update_action_item, claim_work_item, or add_implementation_note — the item stays in `under_human_review` state regardless of outcome (submit_plan_review handles the lifecycle transition on success).
 - In review mode, NEVER rewrite the plan. Your contract is to validate, flag risks, and identify gaps — not to produce a better plan.
-- Priority order when the queued queue is empty: under_human_review > planning. Only enter planning mode when both the queued and review queues are empty.
+- Priority order when nothing is staged: under_human_review > planning. Only enter planning mode when both the staged and review pools are empty.
 - The commit message MUST include `[devspec:{action_item_id}]` in the body.
 - Always push your branch before calling record_implementation.
 - NEVER verify. `record_implementation` lands the item at `implemented`, not `done`. The autopilot is unattended — there is no human to confirm the work — so it records the implementation and stops. Reaching `done` is always a present human's decision; never call `verify_action_item`.
