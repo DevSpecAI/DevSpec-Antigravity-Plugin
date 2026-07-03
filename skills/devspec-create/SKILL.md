@@ -45,25 +45,20 @@ In interactive mode, after inferring, confirm once: `Type: {inferred} — press 
 
 In unattended mode, use the inference without confirmation.
 
-### 4. `agent_ready` (optional, defaults to false)
+### 4. `suggest_human_only` (optional, defaults to unset)
 
-**When to set `agent_ready: true`** — the work is a concrete code change that an autopilot runner can implement autonomously. Typical candidates:
-- Bug fix with a clear reproduction and a single file to edit
-- Small feature with well-defined acceptance criteria
-- Refactor with a bounded scope (file, function, module)
-- Documentation update with a specific target file
+Any open item can be staged for autopilot or handed to an agent — the act of staging is the readiness decision. The one exception is pure off-platform work no agent could ever do. For those items pass `suggest_human_only: true`; it is a suggestion a human confirms in DevSpec, and confirmed human-only items are never picked up by agents.
 
-**When to keep `agent_ready: false`** — the work requires human judgment, external access, or is non-code:
-- Research queries ("how should we architect X?")
-- Items requiring human stakeholder input
-- External service setup (Stripe dashboard, DNS records, vendor onboarding)
-- Ambiguous scope that needs a plan before implementation
-- Infrastructure or security-sensitive changes
-- Anything requiring credentials the runner does not have
+**When to pass `suggest_human_only: true`** — the work happens entirely off-platform:
+- Calling or emailing an external party (lawyer, vendor, stakeholder)
+- Purchasing something (a domain, a license)
+- External dashboard work an agent has no access to (Stripe dashboard, DNS records, vendor onboarding)
 
-In interactive mode, ask: `Agent-ready (y/N)?`. Default to `N` (false) on empty input.
+**Everything else needs no flag** — research queries, ambiguous scope, infrastructure or security-sensitive changes are all stageable; whether an agent runs them is decided when a human stages them.
 
-In unattended mode: set to true if `--agent-ready` is in the input, otherwise false.
+In interactive mode, ask `Suggest human-only (y/N)?` only when the work looks plainly off-platform. Default to `N` on empty input.
+
+In unattended mode: set to true if `--human-only` is in the input, otherwise leave unset.
 
 ## Validate
 
@@ -71,7 +66,7 @@ Before calling the MCP tool:
 
 - `title` must be non-empty after trimming.
 - `type` (if set) must be one of the enum values.
-- `agent_ready` must be a boolean.
+- `suggest_human_only` (if set) must be a boolean.
 
 On validation failure, output `✗ Invalid {field}: {reason}` and stop. Do NOT attempt to create a partial or malformed item.
 
@@ -87,7 +82,7 @@ Your DevSpec MCP token is **account-wide** — it is not pinned to one project, 
 
 ## Create the item
 
-Call `create_action_item` with `project_id` (from the previous step) plus the gathered fields. Pass `agent_ready: true` only when explicitly set — omitting the field (or passing false) defaults to `false` server-side.
+Call `create_action_item` with `project_id` (from the previous step) plus the gathered fields. Pass `suggest_human_only: true` only for plainly off-platform work — omitting the field is the norm.
 
 If the call fails:
 - `401 Unauthorized` → output `✗ Authentication failed. Regenerate your token in DevSpec: Settings > Autopilot.` and stop.
@@ -102,16 +97,16 @@ On success, the tool returns the created item including its `id`. Output:
 ✓ Created: {title} ({type}) [ID: {first 8 chars of id}]
 ```
 
-If `agent_ready` is true, append a second line:
+If `suggest_human_only` is true, append a second line:
 
 ```
-→ Staged for autopilot. Run /autopilot:process to pick it up.
+→ Suggested as human-only (a human confirms in DevSpec). Agents never pick up confirmed human-only items.
 ```
 
-If `agent_ready` is false, append:
+Otherwise, append:
 
 ```
-→ Added as a plan/backlog item. Not eligible for autopilot until agent_ready is set to true.
+→ Added as an open item. Stage it in DevSpec when it's ready for an agent to pick up.
 ```
 
 ## Shell Safety
@@ -128,6 +123,6 @@ The MCP tool call itself passes values as structured JSON (no shell interpolatio
 - One question at a time in interactive mode. Do NOT dump a 5-field form; ask one at a time.
 - In unattended mode, never prompt the user. Infer or fail cleanly.
 - Trim whitespace from every user-provided field.
-- Default to the least-privilege setting: `agent_ready: false` unless the user explicitly says otherwise.
+- Only suggest human-only for plainly off-platform work; everything else needs no flag.
 - Confirm in one line. No multi-line success banners.
 - If the user interrupts mid-question in interactive mode, exit cleanly without creating a partial item.

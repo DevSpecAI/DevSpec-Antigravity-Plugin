@@ -13,7 +13,7 @@ Fetch current state and output a compact status panel.
 
 2. Call all three in parallel (thread the resolved `project_id` on each):
    - `get_project_summary({ project_id })` — for settings
-   - `get_action_items` with `project_id, agent_ready: true, agent_activity: 'staged', limit: 1` — for the staged count
+   - `get_action_items` with `project_id, agent_activity: 'staged', limit: 1` — for the staged count
    - `get_action_items` with `project_id, agent_activity: 'in_progress', limit: 1` — for the active count
 
    For each count, read **`page.total_matching`** from the response — that is the true number of matching items. Do NOT count the returned `items` array: it is a single capped page, so a busy queue would be silently under-reported. `limit: 1` keeps the call cheap because only the count is needed, not the rows.

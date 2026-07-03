@@ -473,8 +473,7 @@ Create a new action item in the project. Used by `/devspec:create` to let develo
   "project_id": "4d753b6a-28d9-4d2d-8f23-af3103af76db",
   "title": "Fix login timeout on mobile",
   "description": "## Context\nThe login flow times out after 5 seconds on cellular connections...",
-  "type": "bug",
-  "agent_ready": false
+  "type": "bug"
 }
 ```
 
@@ -487,26 +486,19 @@ Create a new action item in the project. Used by `/devspec:create` to let develo
 | `acceptance_criteria` | Optional. The definition of done — the conditions the work must satisfy to be done and correct. Concrete, checkable points. Markdown OK. |
 | `ai_instructions` | Optional. Approach guidance or constraints that aren't obvious from the code. |
 | `type` | Optional enum: `"bug"`, `"feature"`, `"improvement"`, `"task"`, `"query"`. Defaults to `"task"` server-side. |
-| `agent_ready` | Optional boolean. Defaults to `false`. Pass `true` only when the item is a concrete code change a runner can implement autonomously (see below). |
+| `suggest_human_only` | Optional boolean. Pass `true` only for plainly off-platform work no agent could ever do (see below). It is a suggestion — a human confirms it in DevSpec. |
 | `assigned_to` | Optional user UUID. Omit for unassigned items. |
 | `parent_action_item_id` | Optional. Pass the UUID of a parent item to create this as a sub-task. Max depth 1 (no grandchildren). |
 | `session_id` | Optional. The DevSpec CHAT session this item originates from (e.g. a session handoff gave you one). The item becomes owned by that session — it appears in the session's transcript and "This session" panel. Omit in autopilot/terminal flows with no live chat session; never pass the runner heartbeat `session_id` or a `source_session_id` you merely read intent from. |
 
-**Response**: The created action item object. Includes `id` (UUID assigned by the server), plus the fields you passed and defaults applied server-side (`lifecycle: "open"`, `agent_activity: "staged"` when `agent_ready: true`, else no `agent_activity`, etc.).
+**Response**: The created action item object. Includes `id` (UUID assigned by the server), plus the fields you passed and defaults applied server-side (`lifecycle: "open"`, etc.). Item payloads carry `human_only`, which becomes true only once a human confirms the suggestion in DevSpec.
 
-**When to set `agent_ready: true`** — the work is a concrete code change that an autopilot runner can implement autonomously:
-- Bug fix with a clear reproduction and a bounded scope
-- Small feature with well-defined acceptance criteria
-- Refactor with a bounded scope (file, function, module)
-- Documentation update with a specific target file
+**When to pass `suggest_human_only: true`** — the work is pure off-platform work no agent could ever do:
+- Calling or emailing an external party (lawyer, vendor, stakeholder)
+- Purchasing something (a domain, a license)
+- External dashboard work an agent has no access to (Stripe dashboard, DNS records, vendor onboarding)
 
-**When to keep `agent_ready: false`** — the work requires human judgment, external access, or is non-code:
-- Research queries ("how should we architect X?")
-- Items requiring human stakeholder input
-- External service setup (Stripe dashboard, DNS records, vendor onboarding)
-- Ambiguous scope that needs a plan before implementation
-- Infrastructure or security-sensitive changes
-- Anything requiring credentials the runner does not have
+**Everything else needs no flag** — any open item can be staged for autopilot or handed to an agent; the act of staging is the readiness decision. Research queries, ambiguous scope, and security-sensitive changes simply stay unstaged until a human decides an agent should run them.
 
 **Errors**:
 - `401 Unauthorized` — Token invalid.
