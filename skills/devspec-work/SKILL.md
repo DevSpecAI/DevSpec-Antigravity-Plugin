@@ -340,7 +340,9 @@ Fix real issues before committing. If a fix would expand scope beyond the action
         - `confidence`: 0.0–1.0
       - `provider`: always pass `"antigravity"`
 
-    **d)** Write completion to local storage (see reference.md → *Local Storage*, best-effort):
+    **d)** `record_memory` — *only if this work surfaced something durable about the project* (a decision made, a convention followed or established, an architecture fact, a risk). `search_memories` FIRST for the closest existing match and `supersede_memory`/`retract_memory` it rather than recording a duplicate. Record only SHARED project knowledge the whole team should inherit — DevSpec memory is the team's source of truth and the in-app DevSpec assistant reads it every turn — never transient or obvious details, and never personal or machine-specific notes, which belong in your OWN local agent memory (e.g. `AGENTS.md`), not DevSpec. Skip this step entirely when nothing durable was learned.
+
+    **e)** Write completion to local storage (see reference.md → *Local Storage*, best-effort):
     - Capture `completed_at` and compute `duration` (ms from `started_at`).
     - Append a second JSONL record with the **same `id`** as the start record: `{"id":"<exec_id>","completedAt":"<iso>","lifecycle":"success","duration":<ms>,"commitSha":"<full_sha>","commitPushed":<bool>,"merged":<bool>}` via the JSONL helper from reference.md.
     - Append a final line to `~/.devspec/logs/<exec_id>.log`: `Completed: success, commit <short_sha>, merged=<bool>`.

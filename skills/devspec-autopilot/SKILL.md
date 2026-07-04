@@ -58,7 +58,7 @@ On EVERY DevSpec MCP **write** call in this run — no exceptions — pass `runn
 
 ### Record what you learn
 
-When you discover something worth persisting — a deviation from the item's stated approach ("the item said X, we did Y because Z"), a non-obvious constraint, an architectural finding — record it with `record_memory` (`decision`/`convention`/`architecture`/`risk`/`insight`). ALWAYS `search_memories` first and `supersede_memory` the closest match instead of duplicating. Do NOT record transient details or anything obvious from the code. Your writes land **unconfirmed** and capped at `in_discussion` — you propose; the human ratifies.
+When you discover something worth persisting — a deviation from the item's stated approach ("the item said X, we did Y because Z"), a non-obvious constraint, an architectural finding — record it with `record_memory` (`decision`/`convention`/`architecture`/`risk`/`insight`). ALWAYS `search_memories` first and `supersede_memory` the closest match instead of duplicating. Do NOT record transient details or anything obvious from the code. DevSpec memory is the team's SHARED source of truth — the in-app DevSpec assistant reads it every turn — distinct from your OWN local agent memory (e.g. `AGENTS.md`): shared durable project knowledge goes to DevSpec via `record_memory`; personal or machine-specific notes stay in your local memory. Your writes land **unconfirmed** and capped at `in_discussion` — you propose; the human ratifies.
 
 ### Keep artifacts current
 
