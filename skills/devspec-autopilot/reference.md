@@ -221,7 +221,7 @@ Extract a brief CHILD into a standalone follow-up item, detaching it from its pa
 
 ### get_session_transcript
 
-Retrieve the full message transcript of a past DevSpec session. In this plugin it is used only in **review mode** to read the conversation that produced the plan under review.
+Retrieve the full message transcript of a past DevSpec session. In this plugin it is used at **claim time** — to read the human intent and nuance behind an item you are about to implement — and in **review mode**, to read the conversation that produced the plan under review.
 
 **Parameters**:
 ```json
@@ -237,6 +237,7 @@ Retrieve the full message transcript of a past DevSpec session. In this plugin i
 **Response**: The session's message transcript, including user messages, AI responses, and tool call results. Exact shape is session-specific — consume the natural-language content rather than binding to a rigid schema.
 
 **Usage in this plugin**:
+- **Claim-time intent reading**: when `claim_work_item` returns a `session_context` with `transcript_is_authoritative: true`, call with `session_id = session_context.originating_session_id` before implementing. The item was born in that conversation, which carries the human intent and nuance its fields can lose — an autopilot run is always a cold pickup, so read it every time, and do NOT gate on whether the fields "look complete". When `transcript_is_authoritative` is `false`, the item's fields are canonical and the transcript is only optional background.
 - **Review-mode transcript reading**: After detecting a review item, call with `session_id = <review_item.source_session_id>` to read the discussion that led to the plan. Skipping this call produces shallow reviews — the transcript often contains the rationale behind key decisions and rejected alternatives.
 
 **Errors**:

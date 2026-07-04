@@ -125,7 +125,7 @@ Fix real issues before committing. If a fix would expand scope beyond the action
    - `get_action_item_history(action_item_id)` — prior notes, commits, lifecycle changes (self-resolves from the item id; no `project_id`)
    - `search_memories({ project_id, query: "<action item title>" })` — related decisions, conventions, risks (project-scoped — thread `project_id`)
 
-   Then read the item's spec fields: `intent` (the WHY — the problem and desired outcome), `acceptance_criteria` (your definition of done — the diff must satisfy it), and `ai_instructions` (constraints). If `intent` is missing or too thin to grasp the real goal — common when the item came from a terse conversation — and the item has a `source_session_id`, call `get_session_transcript({ session_id: <source_session_id> })` to recover the originating intent. This is optional and on-demand: skip it when the spec fields already make the goal clear. When the transcript reveals intent or criteria the item lacks, persist it back via `update_action_item({ action_item_id, intent, acceptance_criteria })`.
+   Then read the item's spec fields: `intent` (the WHY — the problem and desired outcome), `acceptance_criteria` (your definition of done — the diff must satisfy it), and `ai_instructions` (constraints). Reading the originating conversation behind the item happens at claim time (Phase 3 step 11), driven by the `session_context` the claim returns — not here.
 
 6. **Present the item:**
    ```
@@ -195,6 +195,8 @@ Fix real issues before committing. If a fix would expand scope beyond the action
        **Shell safety (Rule 1 + Rule 4):** sanitize `<title>` — escape `'` as `'\''` and `"` as `\"`, strip `$ ` `` ` `` ` \\`, truncate to 500 chars.
     4. Write the first line to `~/.devspec/logs/<exec_id>.log` using the helper from reference.md.
     5. Skip all logging steps if the item was already claimed by this agent in a prior session (i.e. we are returning to address verification feedback) — start a new `exec_id` and record as normal.
+
+    **Read the originating conversation before implementing.** The `claim_work_item` response returns a `session_context` object (`{ originating_session_id, originating_session_number, transcript_is_authoritative, instruction }`, or `null` for manual/background-origin items). If `session_context.transcript_is_authoritative` is `true` — the item was born in that session, which holds the human intent and nuance behind it — **and you have not already read that conversation** (a cold pickup, or you are not continuing that same session), call `get_session_transcript({ session_id: session_context.originating_session_id })` before implementing. Do NOT gate this on whether the item's fields look complete. If `transcript_is_authoritative` is `false` (filed externally, then attributed), the item's fields are canonical — pull the transcript only as optional background. When the transcript reveals intent or acceptance criteria the item lacks, persist it back via `update_action_item({ action_item_id, intent, acceptance_criteria })`.
 
 12. **Create an isolated worktree (not a branch-in-place).**
     All implementation work happens inside a git worktree — a sibling directory with its own working tree but sharing the main repo's object database. This keeps the main repo clean: if anything fails mid-way, the main repo working directory is still on the original branch and nothing is left uncommitted in the user's workspace.

@@ -248,6 +248,7 @@ Call `claim_work_item` with `action_item_id` and `agent_branch: branch_name`.
   - `repositories` (same array as Step 0a.6)
 
   Best-effort: wrap in try/catch. If the call fails, log a one-line warning and continue. A failed working-heartbeat MUST NOT block implementation — it is a visibility feature, not a correctness gate. Do NOT process the response for gating here (the Step 0b startup heartbeat is the authoritative gating check; a mid-cycle gate flip is handled at the final heartbeat in Step 7).
+- **Capture `session_context`** from the claim response — it is present when the item is tied to a session (`null` for manual/background-origin items). You act on it in Step 3.6: when it flags the originating conversation as authoritative, you read that transcript before implementing.
 - Continue to Step 3.
 
 **If claim fails with 409 (Conflict):**
@@ -270,7 +271,18 @@ Read the action item's full context carefully:
 3. **Tags and type**: Use these to understand the nature of the work (bug fix, feature, improvement, etc.).
 4. **Priority**: Higher priority items may need more careful testing.
 5. **Brief context (if this is a child item)**: If the action item has `parent_action_item_id` set, call `get_action_item_siblings({ action_item_id: <claimed_id> })` before writing any code. The response contains `parent` (the brief's title and description — the feature-level context the user wrote) and `siblings` (other children of the same brief, with their titles, lifecycles, and completion summaries). Read both. Use them to avoid changes that conflict with sibling work already in progress. If `parent` is null, the item is flat — skip this step.
-6. **Recover thin intent (optional, on-demand)**: If `intent` is missing or too thin to understand the real goal — common when the item came from a terse conversation — and the item has a `source_session_id`, call `get_session_transcript({ session_id: <source_session_id> })` to recover the originating intent from the conversation that produced it. Skip this when the spec fields already make the goal clear (don't pull a transcript every time). When the transcript reveals intent or criteria the item is missing, persist it back with `update_action_item({ action_item_id, intent, acceptance_criteria })` so the next agent inherits it.
+6. **Read the originating conversation before implementing**: The moment to read the conversation behind an item is when you pick it up to implement it — not while browsing. The `claim_work_item` response (Step 2) returns a `session_context` object when the item is tied to a session:
+   ```
+   session_context: {
+     originating_session_id, originating_session_number,
+     transcript_is_authoritative,  // true if the item was BORN in that session; false if filed externally then attributed
+     instruction
+   } | null   // null for manual/background-origin items with no useful session
+   ```
+   - **If `session_context.transcript_is_authoritative` is `true`** — the item was born in that conversation, which carries the human intent and nuance behind it. Call `get_session_transcript({ session_id: session_context.originating_session_id })` **before implementing**. An autopilot run is always a cold pickup — it never has that conversation in context — so read it every time. Do **NOT** gate this on whether the item's fields "look complete": fields can read as fully-specified yet still have lost the nuance from the conversation.
+   - **If `session_context.transcript_is_authoritative` is `false`** — the item was filed externally and later attributed to the session, so its own fields are canonical. Pull the transcript only as optional background.
+   - **If `session_context` is `null`** — there is no useful originating conversation; work from the item's fields.
+   - When the transcript reveals intent or acceptance criteria the item is missing, persist it back with `update_action_item({ action_item_id, intent, acceptance_criteria })` so the next agent inherits it.
 
 Plan your implementation approach before writing any code.
 
