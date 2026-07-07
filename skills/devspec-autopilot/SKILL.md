@@ -84,15 +84,17 @@ Your DevSpec MCP token is **account-wide** — it is not pinned to a single proj
 ### Step 0a: Load Settings & Initialize Local Storage
 
 1. **Record starting branch**: Run `git branch --show-current` and store as `starting_branch`.
-2. **Load project settings**: Call `get_project_summary({ project_id })` and read `local_plugin_settings` from the response. Extract:
-   - `auto_push` (default: false)
-   - `auto_merge` (default: false)
+2. **Load project settings**: Call `get_project_summary({ project_id })`. Read **execution settings** from the unified **`execution`** block (how work is done — applies to interactive and unattended runs alike); for back-compat with older web/MCP versions, fall back to the legacy `local_plugin_settings` object then the legacy `autopilot` execution fields. Extract:
+   - `auto_push` (default: true)
+   - `auto_merge` (default: true)
    - the `repos` array — `[{ id, full_name, target_branch, default_branch }]`, the branch DevSpec tracks for EACH repo; the source of truth for the merge target (Step 16). Do NOT assume one branch for the whole project.
    - `branch_prefix` (default: "work/action-item-")
+   - `commit_message_prefix` (default: "")
    - `custom_instructions` (default: "")
+   - `test_commands` ({ unit, e2e, typecheck }; default: none configured — tests are skipped, see Step 9)
    - `protected_paths` (default: [] — glob patterns of files that must not be modified)
-   - `stale_claim_timeout_minutes` (default: 30) — from the top-level `autopilot` settings object if present there, otherwise from `local_plugin_settings`, otherwise 30. Used in Step 1 to reset in-progress items whose `agent_claimed_at` is older than this threshold (assumed crashed/abandoned runners). Must be a positive integer; if the value is non-numeric, missing, or ≤ 0, fall back to 30.
-3. If `auto_merge` is true, treat `auto_push` as true regardless of its stored value.
+   - `stale_claim_timeout_minutes` (default: 30) — this is **orchestration**, read from the top-level `autopilot` settings object (not the execution block); otherwise 30. Used in Step 1 to reset in-progress items whose `agent_claimed_at` is older than this threshold (assumed crashed/abandoned runners). Must be a positive integer; if the value is non-numeric, missing, or ≤ 0, fall back to 30.
+3. If `auto_merge` is true, treat `auto_push` as true regardless of its stored value. (Unattended honours the stored `auto_push`/`auto_merge` — there is no live human override in this path.)
 4. If `custom_instructions` is non-empty, read and follow those instructions throughout this session.
 5. **Initialize local storage** (see reference.md → *Local Storage*):
    - Ensure directories exist:
@@ -328,7 +330,7 @@ All implementation work happens inside a git worktree — a sibling directory wi
 
 **Milestone logging:** After each of the sub-steps above (worktree created, files edited, tests run, etc.), append a one-line milestone to `~/.devspec/logs/<exec_id>.log` using the per-task log helper from reference.md. Run the *rotate* helper before each append (best-effort). All log calls must remain best-effort — a failed log write must never block the main workflow. Example messages: `Worktree created at <path>`, `node_modules linked`, `Files modified: <N>`, `Tests passed`, `Typecheck passed`, `Committed <short_sha>`, `Pushed to origin`, `Merged into <target>`, `Worktree removed`.
 
-9. **Run tests**: If test commands are available (check package.json scripts, Makefile, etc.), run them **inside the worktree**. Fix any failures. On Windows, if `npm run <command>` fails with PATH errors (common when `node_modules/.bin` shims don't resolve through junctions), retry once with `node ./node_modules/typescript/bin/tsc --noEmit` (for tsc) or `node ./node_modules/.bin/<command>` for other binaries.
+9. **Run tests**: Run the project's configured `test_commands` (unit/e2e/typecheck, from the execution settings loaded in Step 2) **inside the worktree** — each only if set. Fix any failures. If **no** test commands are configured, skip testing gracefully (note it) — do **not** assume `npm`/a JS toolchain or infer commands from package.json; this project may not be a Node project. On Windows, if a configured npm-based command fails with PATH errors (common when `node_modules/.bin` shims don't resolve through junctions), retry once with `node ./node_modules/typescript/bin/tsc --noEmit` (for tsc) or `node ./node_modules/.bin/<command>` for other binaries.
 
 10. **Run type checking**: If a typecheck command exists, run it from the worktree and fix errors.
 

@@ -56,15 +56,18 @@ Fix real issues before committing. If a fix would expand scope beyond the action
      - **no match** → tell the user `✗ No DevSpec project tracks this repo (<remote_url>). Connect it in the DevSpec dashboard, then re-run.` and stop.
    - Reuse `remote_url` for the `repositories` array in step 3a (no need to re-capture).
 
-2. **Load project settings.** Call `get_project_summary({ project_id })` and read `local_plugin_settings`. Use safe defaults if absent:
-   - `auto_push`: false
-   - `auto_merge`: false
+2. **Load project settings.** Call `get_project_summary({ project_id })` and read the unified **`execution`** block: `auto_push`, `auto_merge`, `branch_prefix`, `commit_message_prefix`, `custom_instructions`, `test_commands` ({ unit, e2e, typecheck }), `protected_paths`. For back-compat with older web/MCP versions that don't serve it, fall back to the legacy `local_plugin_settings` object, then the legacy `autopilot` execution fields. Use these defaults if a field is absent everywhere:
+   - `auto_push`: true
+   - `auto_merge`: true
    - `branch_prefix`: "work/action-item-"
+   - `commit_message_prefix`: "" (none)
    - `custom_instructions`: ""
+   - `test_commands`: none configured (tests are skipped — see step 14)
+   - `protected_paths`: none
 
    Also store the `repos` array from the same response — `[{ id, full_name, target_branch, default_branch }]`, the branch DevSpec tracks for EACH repo; the source of truth for the merge target (step 18). Do NOT assume one branch for the whole project.
 
-   If `auto_merge` is true, treat `auto_push` as true regardless of its stored value.
+   If `auto_merge` is true, treat `auto_push` as true regardless of its stored value. **Interactive override:** the user may tell you not to push or merge this particular run — honour that live instruction over the stored value (this interactive skill only; the unattended `devspec-autopilot` skill honours the stored value). These execution settings apply to both interactive and unattended runs.
 
 3. **Record starting branch.** Run `git branch --show-current` and store as `starting_branch`.
 
@@ -244,10 +247,13 @@ Fix real issues before committing. If a fix would expand scope beyond the action
     - **(b)** Apply the migration with your OWN database tooling pointed at that target's `identity` — for Supabase, ensure your Supabase tooling targets that exact project ref, not whatever it defaults to. DevSpec does not apply migrations for you and never hands you the credential.
     - **(c)** Never select the target by `name` (it can be misleading — that is the bug this prevents). If the matching target has `needs_reconnect: true` / a null `identity`, or your tooling cannot reach it, STOP and fail the item (`"Requires human judgment: cannot reach migration target <identity.externalId>"`) rather than applying to a different or default database. Be especially careful when `environment` is `production`.
 
-14. **Test.** After implementation:
-    - Run `npm run lint` if available (continue on failure but note it)
-    - Run `npm test` if available (continue on failure but note it)
-    - Run any test commands mentioned in `ai_instructions`
+14. **Test.** After implementation, run the project's configured `test_commands` from the execution settings loaded in step 2 — each only if it is set:
+    - Unit: `{test_commands.unit}` (if configured)
+    - E2E: `{test_commands.e2e}` (if configured)
+    - Typecheck: `{test_commands.typecheck}` (if configured)
+    - Plus any test commands mentioned in `ai_instructions`
+
+    Continue on failure but note it. If **no** test commands are configured, skip testing gracefully (note it) — do **not** assume `npm`/a JS toolchain or invent commands; this project may not be a Node project.
 
 15. **Commit.** Stage only the files you changed — never use `git add -A`:
     ```

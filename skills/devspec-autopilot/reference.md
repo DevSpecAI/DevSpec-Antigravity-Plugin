@@ -68,22 +68,30 @@ Get project settings including autopilot configuration. Call this at startup to 
 **Response** (relevant fields):
 ```json
 {
-  "local_plugin_settings": {
+  "execution": {
     "auto_push": true,
     "auto_merge": true,
-    "target_branch": "staging",
     "branch_prefix": "work/action-item-",
-    "custom_instructions": "..."
-  }
+    "commit_message_prefix": "",
+    "custom_instructions": "...",
+    "test_commands": { "unit": "", "e2e": "", "typecheck": "" },
+    "protected_paths": []
+  },
+  "autopilot": { "stale_claim_timeout_minutes": 30 }
 }
 ```
 
-**Key settings**:
-- `auto_push`: Whether to push feature branches to remote
-- `auto_merge`: Whether to merge feature branches into target_branch after push
-- `target_branch`: Branch to merge into (e.g., "staging", "main")
+Read execution settings from the unified **`execution`** block. For back-compat with older web/MCP versions that don't serve it, fall back to the legacy `local_plugin_settings` object, then the legacy `autopilot` execution fields — both still populated during rollout but deprecated. Orchestration (e.g. `stale_claim_timeout_minutes`) stays on the `autopilot` block. The merge target is NOT a setting: resolve it per-repo from the `repos` array (`target_branch` → `default_branch`).
+
+**Key settings** (execution unless noted):
+- `auto_push`: Whether to push feature branches to remote (default **true**)
+- `auto_merge`: Whether to merge feature branches into the repo's target branch after push (default **true**; implies auto_push)
 - `branch_prefix`: Prefix for feature branches (e.g., "work/action-item-")
+- `commit_message_prefix`: Optional prefix prepended to commit messages
 - `custom_instructions`: Additional instructions to follow during processing
+- `test_commands`: `{ unit, e2e, typecheck }` — commands to verify work; skip when unset (no toolchain assumed)
+- `protected_paths`: Glob patterns of files that must not be modified
+- `stale_claim_timeout_minutes` (orchestration, on `autopilot`): stale-claim reset threshold
 
 ---
 
