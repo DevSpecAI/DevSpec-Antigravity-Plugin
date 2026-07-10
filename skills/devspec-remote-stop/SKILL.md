@@ -1,3 +1,5 @@
+**Requirement:** preferred remote-control path needs **Node.js 18+** (`node` on PATH) for the packaged poller scripts. Idle polling is mechanical MCP HTTP — it does **not** consume LLM tokens. Without Node, use the fallback in-agent poll loop (less reliable).
+
 ---
 name: devspec-remote-stop
 description: Disconnect DevSpec remote control — mark Agents page offline and clear local state. Use when done remote controlling or before exiting the agent.

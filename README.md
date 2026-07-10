@@ -21,8 +21,10 @@ It is the Antigravity sibling of the DevSpec plugins for Claude Code, Codex CLI,
   token works across all projects in your account. The skills resolve which project a run is for
   from the repo's git remote (`git remote get-url origin`), so the token is no longer pinned to a
   single project.
-- `git` and `node` on your PATH (the autopilot/work skills use `git` worktrees and small
-  cross-platform `node` one-liners for logging).
+- `git` and **`node` (Node.js 18+)** on your PATH. Autopilot/work skills use git worktrees and
+  small Node helpers for logging. **DevSpec remote control** (`devspec-remote`) also needs Node:
+  it runs a local poller so the agent can stay connected to the Agents page without burning LLM
+  tokens while waiting for instructions.
 
 ---
 
