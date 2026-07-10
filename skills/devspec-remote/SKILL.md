@@ -44,7 +44,7 @@ This is **DevSpec** remote control — not Claude Code's built-in `/remote-contr
    ```
 
 4. **Connected signal.** If create_session did not already post one, call:
-   `post_session_message(session_id, "🖥️ **Local agent connected** — ready for remote control from DevSpec.", agent_name: "Antigravity")`.
+   `post_session_message(session_id, "🖥️ **Local agent connected** — ready for remote control from DevSpec. Will capture decisions as memories/artifacts interactively — not only action items.", agent_name: "Antigravity")`.
 
 5. **Poll-and-react loop** (until the user says stop / disconnect / exit remote):
    - Keep a cursor: `after_message_id` (and/or `since_created_at`) from the last poll.
@@ -90,6 +90,25 @@ Exit **1** = disabled/timeout/error → re-arm if still enabled, else stop.
 5. On stop: `report_remote_agent_heartbeat(session_id, status: "offline")` + disable local state
 
 Resolve `mcp_url` from MCP client config / session host — never hardcode production when on staging.
+
+
+## Interactive knowledge capture (while remote — non-negotiable)
+
+Remote control has **no in-session Dev** offering memories each turn. **You** are the capture agent. Action items alone are not enough — decisions evaporate if they only live in the control transcript.
+
+When the conversation produces a durable decision, convention, architecture choice, accepted risk, or short plan/ADR-worthy write-up:
+
+1. **Memories (primary)** — interactive, human-in-the-loop (do **not** pass `runner_session_id`; absence = interactive authority):
+   - Prefer: ask the owner *"Should I record this as a decided memory/convention?"* then call `record_memory` (or `supersede_memory` if updating).
+   - If the owner already clearly decided, propose the memory text in your mirrored reply and record after a clear yes (or record immediately when they said "please capture that").
+   - Always `search_memories` first; never duplicate — `supersede_memory` the closest match.
+   - Types: `decision`, `convention`, `architecture`, `risk`, `insight` as appropriate.
+2. **Artifacts (when durable docs are needed)** — short plans/ADRs/runbooks via `create_resource` / `update_resource` / `supersede_resource` (interactive, no runner stamp).
+3. **Do not** rely on autopilot post-session pending-memory extraction for this channel.
+4. Mirror the offer and the capture confirmation into `post_session_message` so the phone transcript shows knowledge landing.
+
+Be as proactive about memories/artifacts as you already are about **action items**. Losing decisions is a product failure mode of remote control.
+
 
 ## Rules
 
