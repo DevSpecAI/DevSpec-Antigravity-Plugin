@@ -66,6 +66,29 @@ This is **DevSpec** remote control — not Claude Code's built-in `/remote-contr
    - `post_session_message(session_id, "🔌 **Local agent disconnected**.", agent_name: "Antigravity")`
    - Print `✓ DevSpec remote control ended` and stop polling.
 
+
+## Poll loop (prescribed — do not invent)
+
+**Preferred (Claude Code plugin):** after connect, write state with the plugin helper that resolves the MCP token from `.mcp.json`, then run the packaged poller in the background:
+
+```bash
+# After create_session:
+node "<plugin>/hooks/scripts/remote-control-state.mjs" write --session <uuid> --agent "Antigravity" --cwd "$(pwd)"
+node "<plugin>/hooks/scripts/devspec-remote-poll.mjs" --session <uuid>
+```
+
+Poller exit **0** = owner message(s) arrived (JSON lines on stdout) → act, mirror reply, re-arm poller.  
+Exit **1** = disabled/timeout/error → re-arm if still enabled, else stop.
+
+**Fallback (any agent, if poller unavailable):** exact recipe only:
+1. `report_remote_agent_heartbeat(session_id, status: "live")`
+2. `get_session_transcript(session_id, after_message_id: cursor)` — owner human messages only are instructions
+3. Advance cursor from response
+4. Background wait ~40s, re-invoke (do not invent a different cadence)
+5. On stop: `report_remote_agent_heartbeat(session_id, status: "offline")` + disable local state
+
+Resolve `mcp_url` from MCP client config / session host — never hardcode production when on staging.
+
 ## Rules
 
 - Full `session_id` UUID always — never truncate when calling tools.
