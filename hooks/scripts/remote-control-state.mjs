@@ -13,9 +13,10 @@
  *   node remote-control-state.mjs disable --session <uuid>
  *   node remote-control-state.mjs read [--session <uuid>]
  *   node remote-control-state.mjs list
- *   node remote-control-state.mjs find-reconnect [--cwd <path>] [--agent "Grok Build"]
- *     Pick the best prior local session to rejoin after remote-stop (same cwd).
- *     Prefer most recently updated disabled session for this cwd over inventing create_session.
+ *   node remote-control-state.mjs find-reconnect [--cwd <path>] [--agent "Grok Build"] [--max-age-minutes 30]
+ *     Rejoin ONLY after a recent local stop of the same control channel.
+ *     Default: create_session. Does NOT pick arbitrary old sessions for this cwd —
+ *     a fresh agent conversation that never ran remote must open a new channel.
  *   node remote-control-state.mjs stop-poller --session <uuid>
  *     Kill only poller processes whose argv includes this session UUID.
  *     Never kills other sessions' pollers.
@@ -57,6 +58,7 @@ function parseArgs(argv) {
     else if (a === '--agent' || a === '--agent_name') out.agent = argv[++i]
     else if (a === '--cwd') out.cwd = argv[++i]
     else if (a === '--url') out.url = argv[++i]
+    else if (a === '--max-age-minutes' || a === '--max_age_minutes') out['max-age-minutes'] = argv[++i]
     else out._.push(a)
   }
   return out
@@ -152,12 +154,12 @@ function listSessionStates() {
  * Recoverable ends a live heartbeat can clear (mirrors server isRecoverableRemoteEndReason).
  * UI end is non-recoverable — skill must create_session.
  */
-function isRecoverableLocalEnd(s) {
-  if (s.ended_from_ui === true) return false
-  if (s.end_reason === 'ui') return false
-  // disabled without terminal UI end → candidate (local_stop / idle / auth / soft)
-  return true
+function isRecoverableEndReason(endReason) {
+  return endReason === 'local_stop' || endReason === 'idle_timeout' || endReason === 'auth'
 }
+
+/** Default window for stop → remote again in the same local conversation. */
+const DEFAULT_RECONNECT_MAX_AGE_MINUTES = 30
 
 if (cmd === 'list') {
   const out = listSessionStates()
@@ -183,21 +185,55 @@ if (cmd === 'list') {
 }
 
 if (cmd === 'find-reconnect') {
+  // Product rule: reconnect is ONLY for "remote → stop → remote soon" in the same
+  // local agent conversation. A brand-new agent chat that turns remote on for the
+  // first time must create_session — even if this cwd has old remote state files.
   const cwd = path.resolve(args.cwd || process.cwd())
   const preferAgent = (args.agent || '').trim().toLowerCase()
+  const maxAgeMinutesRaw = args['max-age-minutes'] ?? args.maxAgeMinutes
+  const maxAgeMinutes = Math.max(
+    1,
+    Number.parseInt(String(maxAgeMinutesRaw ?? DEFAULT_RECONNECT_MAX_AGE_MINUTES), 10) ||
+      DEFAULT_RECONNECT_MAX_AGE_MINUTES,
+  )
+  const maxAgeMs = maxAgeMinutes * 60 * 1000
+  const now = Date.now()
   const sessions = listSessionStates()
+
+  const rejected = { wrong_cwd: 0, still_enabled: 0, not_recoverable: 0, stale: 0, no_timestamp: 0 }
+
   const candidates = sessions
-    .filter((s) => s.session_id && s.cwd && path.resolve(s.cwd) === cwd)
-    .filter((s) => isRecoverableLocalEnd(s))
+    .filter((s) => {
+      if (!s.session_id || !s.cwd || path.resolve(s.cwd) !== cwd) {
+        rejected.wrong_cwd++
+        return false
+      }
+      // Never "steal" or re-arm another terminal's still-enabled session
+      if (s.enabled !== false) {
+        rejected.still_enabled++
+        return false
+      }
+      if (s.ended_from_ui === true || s.end_reason === 'ui' || !isRecoverableEndReason(s.end_reason)) {
+        rejected.not_recoverable++
+        return false
+      }
+      const t = Date.parse(s.updated_at || '')
+      if (!Number.isFinite(t)) {
+        rejected.no_timestamp++
+        return false
+      }
+      if (now - t > maxAgeMs) {
+        rejected.stale++
+        return false
+      }
+      return true
+    })
     .map((s) => {
-      // Primary: most recently touched session for this cwd (stop → remote again
-      // should rejoin that stop, not an older local_stop from earlier in the day).
       let score = Date.parse(s.updated_at || '') || 0
-      // Small tie-breakers only — never outweigh hours of recency
-      if (preferAgent && (s.agent_name || '').toLowerCase() === preferAgent) score += 60_000 // +1 min
+      if (preferAgent && (s.agent_name || '').toLowerCase() === preferAgent) score += 60_000
+      // Prefer an intentional local stop over idle/auth within the window
       if (s.end_reason === 'local_stop') score += 30_000
-      if (s.enabled === false) score += 10_000
-      return { ...s, score }
+      return { ...s, score, age_ms: now - (Date.parse(s.updated_at || '') || now) }
     })
     .sort((a, b) => b.score - a.score)
 
@@ -205,6 +241,7 @@ if (cmd === 'find-reconnect') {
   const result = {
     ok: true,
     cwd,
+    max_age_minutes: maxAgeMinutes,
     found: !!best,
     session_id: best?.session_id || null,
     agent_name: best?.agent_name || null,
@@ -212,19 +249,20 @@ if (cmd === 'find-reconnect') {
     enabled: best ? best.enabled : null,
     cursor_after_message_id: best?.cursor_after_message_id || null,
     updated_at: best?.updated_at || null,
+    age_ms: best?.age_ms ?? null,
     candidates: candidates.slice(0, 5).map((c) => ({
       session_id: c.session_id,
       agent_name: c.agent_name,
       enabled: c.enabled,
       end_reason: c.end_reason,
       updated_at: c.updated_at,
+      age_ms: c.age_ms,
     })),
-    action: best
-      ? 'reconnect'
-      : 'create_session',
+    rejected,
+    action: best ? 'reconnect' : 'create_session',
     note: best
-      ? 'Reconnect: report_remote_agent_heartbeat(live) → write state → post reconnect message → start poller. Only create_session if live heartbeat refuses (UI end).'
-      : 'No prior local remote-control session for this cwd — call create_session.',
+      ? 'Recent local stop found — reconnect: live heartbeat → write state → post reconnect → poller. If live refuses (UI end), create_session instead.'
+      : `No recent recoverable local stop for this cwd within ${maxAgeMinutes}m (or only stale/unrelated sessions). Call create_session — do NOT invent a reconnect to an old channel.`,
   }
   process.stdout.write(JSON.stringify(result, null, 2) + '\n')
   process.exit(0)

@@ -29,12 +29,12 @@ One machine may run **several** remote-control sessions at once (multiple Grok/C
      session_id,
      status: "offline",
      end_reason: "local_stop",
-     agent_name: "Antigravity"
+     agent_name: "Grok Build"
    })
    ```
 
 3. **Post disconnect** (best-effort, same session only):
-   `post_session_message(session_id, "🔌 **Local agent disconnected**.", agent_name: "Antigravity")`
+   `post_session_message(session_id, "🔌 **Local agent disconnected**.", agent_name: "Grok Build")`
 
 4. **Disable local state + stop THIS poller only:**
    ```bash
@@ -53,5 +53,5 @@ One machine may run **several** remote-control sessions at once (multiple Grok/C
 ## Rules
 
 - Always offline **this** session even if post fails.
-- Do not delete the DevSpec session — history remains.
+- Do not delete the DevSpec session — history remains. `end_reason: local_stop` is recoverable **only soon after** (find-reconnect TTL ~30m, same cwd): remote → stop → remote again in the same conversation reuses the channel. A **new** agent chat later must not rejoin this session just because files remain under `~/.devspec`.
 - Distinct from Claude's built-in `/remote-control`.
