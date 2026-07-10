@@ -82,16 +82,18 @@ node "<plugin>/hooks/scripts/devspec-remote-poll.mjs" --session <uuid>
 ```
 
 Poller exit **0** = owner message(s) arrived (JSON lines on stdout) → act, mirror reply, re-arm poller.  
-Exit **1** = disabled / timeout / error / **UI End** → re-arm **only if** `~/.devspec/remote-control.json` still has `enabled: true`. Otherwise stop.
+Exit **1** = disabled / UI End / idle_timeout / error → re-arm **only if** `~/.devspec/remote-control.json` still has `enabled: true` **and** `end_reason` is not terminal. Otherwise stop.
 
-**UI End (DevSpec Agents / session header):** the server sets sticky offline and heartbeats return `ended_from_ui: true`. The poller disables local state, prints a JSON line `{ "type": "session_ended", "reason": "ended_from_ui", ... }`, and exits 1. **Do not re-arm.** Print `✓ DevSpec remote control ended (from UI)` and stop. Do **not** treat the transcript boundary message body as an owner command — the structured heartbeat flag is authoritative.
+**Stepped backoff (preferred poller):** the poller stays up for up to ~24h without the model re-arming. Cadence slows when quiet (≈15s → 1m → 5m → 10m). It heartbeats `check_tier` so the UI can show “Still connected · may take a few minutes…”. After 24h idle it clean-disconnects (`end_reason: idle_timeout`). Idle polling uses **no LLM tokens**.
+
+**UI End / terminal end:** heartbeat may return `ended_from_ui` or `end_reason`. Poller disables local state, prints `{ "type": "session_ended", "reason": … }`, exits 1. **Do not re-arm.** Do **not** treat boundary message bodies as owner commands.
 
 **Fallback (any agent, if poller unavailable):** exact recipe only:
-1. `report_remote_agent_heartbeat(session_id, status: "live")` — if the result has `ended_from_ui: true` (or `live: false` with `ended_from_ui`), disable local state, stop the loop, do not re-poll.
+1. `report_remote_agent_heartbeat(session_id, status: "live", check_tier: "responsive")` — if `ended_from_ui` or terminal `end_reason`, disable local state and stop.
 2. `get_session_transcript(session_id, after_message_id: cursor)` — owner human messages only are instructions
 3. Advance cursor from response
-4. Background wait ~40s, re-invoke (do not invent a different cadence)
-5. On stop (local or UI): `report_remote_agent_heartbeat(session_id, status: "offline")` + disable local state
+4. Background wait ~15–60s (do not invent multi-hour model loops — install Node poller for that)
+5. On local stop: `report_remote_agent_heartbeat(session_id, status: "offline", end_reason: "local_stop")` + disable local state
 
 Resolve `mcp_url` from MCP client config / session host — never hardcode production when on staging.
 
