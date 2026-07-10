@@ -84,7 +84,7 @@ node "<plugin>/hooks/scripts/devspec-remote-poll.mjs" --session <uuid>
 Poller exit **0** = owner message(s) arrived (JSON lines on stdout) → act, mirror reply, re-arm poller.  
 Exit **1** = disabled / UI End / idle_timeout / error → re-arm **only if** `~/.devspec/remote-control.json` still has `enabled: true` **and** `end_reason` is not terminal. Otherwise stop.
 
-**Stepped backoff (preferred poller):** the poller stays up for up to ~24h without the model re-arming. Cadence slows when quiet (≈15s → 1m → 5m → 10m). It heartbeats `check_tier` so the UI can show “Still connected · may take a few minutes…”. After 24h idle it clean-disconnects (`end_reason: idle_timeout`). Idle polling uses **no LLM tokens**.
+**Stepped backoff (preferred poller):** the poller stays up for up to ~24h without the model re-arming. Cadence slows when quiet (≈15s → 30s → 1m → 5m → 10m). It heartbeats `check_tier` so the UI can show “Still connected · may take a few minutes…”. After 24h idle it clean-disconnects (`end_reason: idle_timeout`). Idle polling uses **no LLM tokens**.
 
 **UI End / terminal end:** heartbeat may return `ended_from_ui` or `end_reason`. Poller disables local state, prints `{ "type": "session_ended", "reason": … }`, exits 1. **Do not re-arm.** Do **not** treat boundary message bodies as owner commands.
 
