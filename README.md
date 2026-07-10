@@ -94,6 +94,7 @@ Antigravity: *"Install the DevSpec skills from `<repo-url>`."* See **Distributio
 |---|---|
 | `devspec-autopilot` | Autonomously process staged work: claim → implement in an isolated worktree → push/merge → report. Handles staged, review, and planning items. |
 | `devspec-work` | Pick up a named/ID'd item, optionally brainstorm, implement, push/merge, record the implementation. `--unattended` for fire-and-forget. |
+| `devspec-remote` | Connect this session as a **DevSpec remote-control** target (private Agents-page channel). |
 | `devspec-done` | Log work you already finished — infers title, summary, testing notes, and commits from git history. |
 | `devspec-commit` | Generate a `[devspec:<id>]` deployment-tracked commit message and commit staged changes. |
 | `devspec-create` | Create an action item (bug/feature/improvement/task/query) from the terminal. |
