@@ -59,12 +59,15 @@ This is **DevSpec** remote control — not Claude Code's built-in `/remote-contr
    - Update the cursor from the response (`cursor.next_after_message_id` / `cursor.next_since_created_at`).
 
 6. **Mirror OUT (your turns).** After each reply you give the user **locally**, also call:
-   `post_session_message(session_id, <your reply as markdown>, agent_name: "Antigravity")`.
+   `post_session_message(session_id, <your reply as markdown>, agent_name: "Antigravity", turn_kind: "agent")`.
    Prefer the final user-facing answer (not long internal tool dumps). Keep posts useful for a remote phone viewer.
+   **Hooks:** when remote-control state is enabled, plugin `Stop` / `UserPromptSubmit` hooks also post via `mirror-turn.mjs` (mechanical, no LLM). Prefer hooks for reliability; still skill-post important replies if hooks fail.
 
-7. **Mirror the owner's local prompts (recommended).** When the owner types a prompt **in this terminal**, also post a short two-sided transcript line, e.g.:
-   `post_session_message(session_id, "👤 **Local prompt:** …", agent_name: "Antigravity")`
-   — skip if that content was already posted from the web.
+7. **Mirror the owner's local prompts (literal, every turn).**
+   - **Primary:** plugin `UserPromptSubmit` → `hooks/scripts/mirror-turn.mjs user_prompt` posts the **raw** local prompt with `turn_kind: "local_prompt"` (UI: right-aligned "You · local" bubble). No model mediation.
+   - **Fallback only** (host has no UserPromptSubmit, or you know hooks did not fire):  
+     `post_session_message(session_id, <exact owner text>, agent_name: "Antigravity", turn_kind: "local_prompt")`.  
+     Do **not** summarise. Do **not** also post when hooks already mirrored the same turn (avoids doubles). Skip if the text was already posted from the web.
 
 8. **Disconnect.** On "stop remote" / "disconnect" / user ends:
    - `post_session_message(session_id, "🔌 **Local agent disconnected**.", agent_name: "Antigravity")`
