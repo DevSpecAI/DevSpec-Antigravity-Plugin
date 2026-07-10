@@ -10,13 +10,17 @@
  *
  * Usage:
  *   node remote-control-state.mjs write --session <uuid> [--agent "Claude Code"] [--cwd <path>]
+ *       [--codename "Colorful Possum"] [--title "…"]
  *   node remote-control-state.mjs disable --session <uuid>
  *   node remote-control-state.mjs read [--session <uuid>]
  *   node remote-control-state.mjs list
+ *   node remote-control-state.mjs mint-codename
+ *     Print a unique friendly channel name (Adjective Animal) for create_session.
  *   node remote-control-state.mjs find-reconnect [--cwd <path>] [--agent "Grok Build"] [--max-age-minutes 30]
  *     Rejoin ONLY after a recent local stop of the same control channel.
  *     Default: create_session. Does NOT pick arbitrary old sessions for this cwd —
  *     a fresh agent conversation that never ran remote must open a new channel.
+ *     When reconnecting, returns session_codename / title so the agent knows which channel.
  *   node remote-control-state.mjs stop-poller --session <uuid>
  *     Kill only poller processes whose argv includes this session UUID.
  *     Never kills other sessions' pollers.
@@ -58,6 +62,8 @@ function parseArgs(argv) {
     else if (a === '--agent' || a === '--agent_name') out.agent = argv[++i]
     else if (a === '--cwd') out.cwd = argv[++i]
     else if (a === '--url') out.url = argv[++i]
+    else if (a === '--codename' || a === '--session_codename') out.codename = argv[++i]
+    else if (a === '--title') out.title = argv[++i]
     else if (a === '--max-age-minutes' || a === '--max_age_minutes') out['max-age-minutes'] = argv[++i]
     else out._.push(a)
   }
@@ -122,6 +128,26 @@ if (cmd === 'resolve-auth') {
   process.exit(auth.ok ? 0 : 1)
 }
 
+/** Friendly unique channel labels (mirrors server generateRemoteControlCodename). */
+const CODENAME_ADJECTIVES = [
+  'Amber', 'Bold', 'Bright', 'Calm', 'Clever', 'Colorful', 'Cosmic', 'Crimson',
+  'Curious', 'Dapper', 'Ember', 'Fierce', 'Gentle', 'Golden', 'Hidden', 'Ivory',
+  'Jade', 'Keen', 'Lucky', 'Mighty', 'Noble', 'Quiet', 'Rapid', 'Rusty',
+  'Silent', 'Silver', 'Swift', 'Velvet', 'Wild', 'Zealous',
+]
+const CODENAME_ANIMALS = [
+  'Badger', 'Beaver', 'Coyote', 'Dolphin', 'Eagle', 'Falcon', 'Fox', 'Heron',
+  'Ibis', 'Jaguar', 'Koala', 'Lynx', 'Marten', 'Newt', 'Otter', 'Panda',
+  'Possum', 'Quail', 'Raven', 'Seal', 'Tiger', 'Urchin', 'Viper', 'Wolf',
+  'Yak', 'Zebra',
+]
+
+function mintCodename() {
+  const adj = CODENAME_ADJECTIVES[Math.floor(Math.random() * CODENAME_ADJECTIVES.length)]
+  const animal = CODENAME_ANIMALS[Math.floor(Math.random() * CODENAME_ANIMALS.length)]
+  return `${adj} ${animal}`
+}
+
 function listSessionStates() {
   const out = []
   try {
@@ -135,6 +161,8 @@ function listSessionStates() {
             enabled: s.enabled !== false,
             agent_name: s.agent_name || null,
             cwd: s.cwd || null,
+            session_codename: s.session_codename || s.codename || null,
+            title: s.title || null,
             end_reason: s.end_reason || null,
             ended_from_ui: s.ended_from_ui === true,
             cursor_after_message_id: s.cursor_after_message_id || null,
@@ -161,6 +189,24 @@ function isRecoverableEndReason(endReason) {
 /** Default window for stop → remote again in the same local conversation. */
 const DEFAULT_RECONNECT_MAX_AGE_MINUTES = 30
 
+if (cmd === 'mint-codename') {
+  const codename = mintCodename()
+  process.stdout.write(
+    JSON.stringify(
+      {
+        ok: true,
+        session_codename: codename,
+        // Suggested full title when agent/host/cwd known — skill fills remaining parts.
+        title_hint: codename,
+        note: 'Pass session_codename (or title starting with this) to create_session; store on write --codename.',
+      },
+      null,
+      2,
+    ) + '\n',
+  )
+  process.exit(0)
+}
+
 if (cmd === 'list') {
   const out = listSessionStates()
   const legacy = readJson(LEGACY_PATH)
@@ -173,6 +219,8 @@ if (cmd === 'list') {
               session_id: legacy.session_id,
               enabled: legacy.enabled,
               cwd: legacy.cwd || null,
+              session_codename: legacy.session_codename || legacy.codename || null,
+              title: legacy.title || null,
               end_reason: legacy.end_reason || null,
             }
           : null,
@@ -245,6 +293,8 @@ if (cmd === 'find-reconnect') {
     found: !!best,
     session_id: best?.session_id || null,
     agent_name: best?.agent_name || null,
+    session_codename: best?.session_codename || null,
+    title: best?.title || null,
     end_reason: best?.end_reason || null,
     enabled: best ? best.enabled : null,
     cursor_after_message_id: best?.cursor_after_message_id || null,
@@ -253,6 +303,8 @@ if (cmd === 'find-reconnect') {
     candidates: candidates.slice(0, 5).map((c) => ({
       session_id: c.session_id,
       agent_name: c.agent_name,
+      session_codename: c.session_codename,
+      title: c.title,
       enabled: c.enabled,
       end_reason: c.end_reason,
       updated_at: c.updated_at,
@@ -261,8 +313,8 @@ if (cmd === 'find-reconnect') {
     rejected,
     action: best ? 'reconnect' : 'create_session',
     note: best
-      ? 'Recent local stop found — reconnect: live heartbeat → write state → post reconnect → poller. If live refuses (UI end), create_session instead.'
-      : `No recent recoverable local stop for this cwd within ${maxAgeMinutes}m (or only stale/unrelated sessions). Call create_session — do NOT invent a reconnect to an old channel.`,
+      ? `Recent local stop of channel "${best.session_codename || best.session_id?.slice(0, 8)}" — reconnect that session only. live heartbeat → write state → post reconnect → poller.`
+      : `No recent recoverable local stop for this cwd within ${maxAgeMinutes}m. Call create_session (mint a new codename) — do NOT invent a reconnect to an old channel.`,
   }
   process.stdout.write(JSON.stringify(result, null, 2) + '\n')
   process.exit(0)
@@ -346,15 +398,19 @@ if (cmd === 'write') {
   }
   const cwd = args.cwd || process.cwd()
   const auth = resolveDevspecMcpAuth(cwd)
+  const prev = readJson(sessionPath(args.session)) || {}
   const state = {
+    ...prev,
     enabled: true,
     session_id: args.session,
-    agent_name: args.agent || 'Claude Code',
-    mcp_url: args.url || auth.mcp_url || 'https://devspec.ai/api/mcp',
-    token: auth.token || undefined,
-    auth_source: auth.source || auth.error || null,
-    auth_ok: !!auth.ok,
+    agent_name: args.agent || prev.agent_name || 'Claude Code',
+    mcp_url: args.url || auth.mcp_url || prev.mcp_url || 'https://devspec.ai/api/mcp',
+    token: auth.token || prev.token || undefined,
+    auth_source: auth.source || auth.error || prev.auth_source || null,
+    auth_ok: !!auth.ok || !!prev.auth_ok,
     cwd,
+    session_codename: args.codename || prev.session_codename || prev.codename || null,
+    title: args.title || prev.title || null,
     ended_from_ui: false,
     end_reason: null,
     updated_at: new Date().toISOString(),
@@ -369,6 +425,8 @@ if (cmd === 'write') {
     path: perPath,
     legacy_path: LEGACY_PATH,
     session_id: state.session_id,
+    session_codename: state.session_codename,
+    title: state.title,
     mcp_url: state.mcp_url,
     auth_ok: state.auth_ok,
     auth_source: state.auth_source,

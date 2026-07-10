@@ -39,25 +39,40 @@ This is **DevSpec** remote control — not Claude Code's built-in `/remote-contr
       ```
    b. If `action` is **`create_session`** (the common case for a fresh Grok/Claude session, or stop older than the TTL): **skip reconnect.** Go to **3d** and call `create_session`.
    c. If `action` is **`reconnect`** and `session_id` is set (recent `local_stop` / recoverable end only):
-      1. `report_remote_agent_heartbeat(session_id, status: "live", check_tier: "responsive", agent_name: "Antigravity")`
-      2. If the response has `live: false` / UI-end refuse → fall through to **3d**. `disable --session` that id.
-      3. On `live: true` (including `reconnected: true`):
+      1. Note `session_codename` / `title` from find-reconnect — that is the **true channel identity** (e.g. Colorful Possum), not "whatever is in this cwd".
+      2. `report_remote_agent_heartbeat(session_id, status: "live", check_tier: "responsive", agent_name: "Antigravity")`
+      3. If the response has `live: false` / UI-end refuse → fall through to **3d**. `disable --session` that id.
+      4. On `live: true` (including `reconnected: true`):
          - `get_session_transcript(session_id)` with **no** cursor (seed) → re-inject custom instructions
          - Resume cursor from local `cursor_after_message_id` if present
-         - `post_session_message(session_id, "🖥️ **Local agent reconnected** — same remote-control session.", agent_name: "Antigravity")`
-         - Write state + start poller
-         - Print Status: **reconnected** and continue at the poll loop (**skip** create_session).
-   d. **Create (default path):** call `create_session` with:
+         - `post_session_message(session_id, "🖥️ **Local agent reconnected** — channel **{session_codename or title}**.", agent_name: "Antigravity")`
+         - Write state with `--codename` / `--title` + start poller
+         - Print Status: **reconnected** and **Channel: {codename}** and continue at the poll loop (**skip** create_session).
+   d. **Create (default path):** mint a unique channel name, then create:
+      ```bash
+      node "<plugin>/hooks/scripts/remote-control-state.mjs" mint-codename
+      # → session_codename e.g. "Colorful Possum"
+      HOST="$(hostname -s 2>/dev/null || hostname)"
+      ```
+      Call `create_session` with:
       - `session_type: "agent_remote_control"`
       - `access: "private"` (unless the user explicitly asked otherwise)
       - `agent_name: "Antigravity"`
-      - `title` if provided
+      - `session_codename` from mint-codename (required for identity — do **not** skip)
+      - `machine_hostname: $HOST`, `cwd: $(pwd)` so the server title becomes `Colorful Possum · Antigravity · host · repo`
+      - `title` only if the user passed `--title="…"` (overrides default; still prefer including the codename)
       - `project_id` if resolved
       - optional `initial_message` from free-text note
-      - Prefer also `machine_hostname` + `cwd` for distinctive default titles
-      Store the returned **`session_id`** exactly (full UUID). Print:
+      Store returned **`session_id`**, **`session_codename`**, and **`title`** exactly. Write local state:
+      ```bash
+      node "<plugin>/hooks/scripts/remote-control-state.mjs" write \
+        --session <uuid> --agent "Antigravity" --cwd "$(pwd)" \
+        --codename "<session_codename>" --title "<title>"
+      ```
+      Print:
       ```
       ━━━ DevSpec Remote Control ━━━
+      Channel:  Colorful Possum
       Session:  {first 8 of session_id}…
       Status:   connected (private)
       Agent:    Antigravity
@@ -101,8 +116,10 @@ This is **DevSpec** remote control — not Claude Code's built-in `/remote-contr
 **Preferred (Claude Code plugin):** after connect, write state with the plugin helper that resolves the MCP token from `.mcp.json`, then run the packaged poller in the background:
 
 ```bash
-# After create_session OR successful reconnect (same commands either way):
-node "<plugin>/hooks/scripts/remote-control-state.mjs" write --session <uuid> --agent "Antigravity" --cwd "$(pwd)"
+# After create_session OR successful reconnect (include codename/title when known):
+node "<plugin>/hooks/scripts/remote-control-state.mjs" write \
+  --session <uuid> --agent "Antigravity" --cwd "$(pwd)" \
+  --codename "<session_codename>" --title "<title>"
 node "<plugin>/hooks/scripts/devspec-remote-poll.mjs" --session <uuid>
 ```
 
@@ -157,6 +174,7 @@ After `create_session` for `agent_remote_control` (or the initial `get_session_t
 
 - **Default is create_session.** Reconnect only when `find-reconnect` returns `action: reconnect` (recent local stop for this cwd, ~30m). Never pick an old Agents session because it shared the repo/cwd.
 - First remote in a **new** local agent conversation → **new** DevSpec remote-control session, always (unless that conversation itself just stopped remote).
+- **Channel identity = session_codename** (e.g. Colorful Possum) + full `session_id`. Always mint/store/print the codename; never rely on agent·host·cwd alone (those collide).
 - Full `session_id` UUID always — never truncate when calling tools.
 - Heartbeat at least every ~60s while connected (15s preferred) so the Agents page shows live.
 - Do not open `access: shared` unless the human explicitly asks.
