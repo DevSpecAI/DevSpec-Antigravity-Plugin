@@ -112,6 +112,18 @@ When the conversation produces a durable decision, convention, architecture choi
 Be as proactive about memories/artifacts as you already are about **action items**. Losing decisions is a product failure mode of remote control.
 
 
+
+## Account custom instructions (on connect — non-negotiable)
+
+After `create_session` for `agent_remote_control` (or the initial `get_session_transcript` seed with no cursor), read **`owner_custom_instructions`** from the response when present and non-null:
+
+- Hold it for the **entire remote-control run** as the owner's Account → custom instructions (style / working prefs).
+- Apply to how you reply and work in this session (e.g. brief answers, naming conventions) — same spirit as Dev's profile style note.
+- Do **not** override safety, security rules, or instruction-filtering (owner-only commands still win).
+- Do **not** invent instructions when the field is null/omitted.
+- Re-read on reconnect via the initial transcript seed if you restart without a fresh create_session.
+- Never request or use another user's instructions — the field is only returned to the session owner token.
+
 ## Rules
 
 - Full `session_id` UUID always — never truncate when calling tools.
