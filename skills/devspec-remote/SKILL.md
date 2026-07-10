@@ -28,25 +28,36 @@ This is **DevSpec** remote control — not Claude Code's built-in `/remote-contr
 
 2. **Resolve project.** Call `list_projects` with `git_remote` from `git remote get-url origin` (or omit if single-project context). Use `remote_match.resolved_project_id` as `project_id` when multi-project. If no match, stop with `✗ No DevSpec project tracks this repo`.
 
-3. **Open the remote-control session.** Call `create_session` with:
-   - `session_type: "agent_remote_control"`
-   - `access: "private"` (unless the user explicitly asked otherwise)
-   - `agent_name: "Antigravity"`
-   - `title` if provided
-   - `project_id` if resolved
-   - optional `initial_message` from free-text note
-   Store the returned **`session_id`** exactly (full UUID). Print:
-   ```
-   ━━━ DevSpec Remote Control ━━━
-   Session:  {first 8 of session_id}…
-   Status:   connected (private)
-   Agent:    Antigravity
-   Open:     Agents page → Remote control
-   ─────────────────────────────
-   ```
+3. **Reconnect first (non-negotiable) — do NOT always create_session.**
+   After a local stop, the DevSpec session and transcript still exist. Prefer rejoining that channel over opening a new Agents-page row.
 
-4. **Connected signal.** If create_session did not already post one, call:
+   a. Run:
+      ```bash
+      node "<plugin>/hooks/scripts/remote-control-state.mjs" find-reconnect --cwd "$(pwd)" --agent "Antigravity"
+      ```
+   b. If `action` is `reconnect` and `session_id` is set:
+      1. `report_remote_agent_heartbeat(session_id, status: "live", check_tier: "responsive", agent_name: "Antigravity")`
+      2. If the response has `live: false` / `reconnected: false` / message about UI end → **do not** keep that id; fall through to **create** (step 3c). Clear local state for that id with `disable --session`.
+      3. On `live: true` (including `reconnected: true`):
+         - `get_session_transcript(session_id)` with **no** cursor (seed) → re-inject `owner_custom_instructions` / `project_custom_instructions`
+         - Resume cursor from local file `cursor_after_message_id` if present, else from seed cursor
+         - `post_session_message(session_id, "🖥️ **Local agent reconnected** — same remote-control session.", agent_name: "Antigravity")`
+         - Write state + start poller (step after connect)
+         - Print status **reconnected** (same banner as connect, Status: reconnected)
+         - **Skip create_session.** Continue at the poll loop.
+   c. **Only if** find-reconnect returned `create_session`, no usable candidate, user passed `--new`, or live heartbeat refused: call `create_session` with:
+      - `session_type: "agent_remote_control"`
+      - `access: "private"` (unless the user explicitly asked otherwise)
+      - `agent_name: "Antigravity"`
+      - `title` if provided
+      - `project_id` if resolved
+      - optional `initial_message` from free-text note
+      - Prefer also `machine_hostname` + `cwd` for distinctive default titles
+      Store the returned **`session_id`** exactly (full UUID). Print connected banner as before.
+
+4. **Connected signal (new sessions only).** If create_session did not already post one, call:
    `post_session_message(session_id, "🖥️ **Local agent connected** — ready for remote control from DevSpec. Will capture decisions as memories/artifacts interactively — not only action items.", agent_name: "Antigravity")`.
+   Reconnects already posted the reconnected line in step 3b.
 
 5. **Poll-and-react loop** (until the user says stop / disconnect / exit remote):
    - Keep a cursor: `after_message_id` (and/or `since_created_at`) from the last poll.
@@ -133,6 +144,7 @@ After `create_session` for `agent_remote_control` (or the initial `get_session_t
 
 ## Rules
 
+- **Reconnect before create** after a prior remote-stop in this cwd. Spawning a new session when a recoverable one exists is a product bug.
 - Full `session_id` UUID always — never truncate when calling tools.
 - Heartbeat at least every ~60s while connected (15s preferred) so the Agents page shows live.
 - Do not open `access: shared` unless the human explicitly asks.

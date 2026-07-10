@@ -13,6 +13,9 @@
  *   node remote-control-state.mjs disable --session <uuid>
  *   node remote-control-state.mjs read [--session <uuid>]
  *   node remote-control-state.mjs list
+ *   node remote-control-state.mjs find-reconnect [--cwd <path>] [--agent "Grok Build"]
+ *     Pick the best prior local session to rejoin after remote-stop (same cwd).
+ *     Prefer most recently updated disabled session for this cwd over inventing create_session.
  *   node remote-control-state.mjs stop-poller --session <uuid>
  *     Kill only poller processes whose argv includes this session UUID.
  *     Never kills other sessions' pollers.
@@ -117,7 +120,7 @@ if (cmd === 'resolve-auth') {
   process.exit(auth.ok ? 0 : 1)
 }
 
-if (cmd === 'list') {
+function listSessionStates() {
   const out = []
   try {
     if (fs.existsSync(SESSIONS_DIR)) {
@@ -129,6 +132,10 @@ if (cmd === 'list') {
             session_id: s.session_id || f.replace(/\.json$/, ''),
             enabled: s.enabled !== false,
             agent_name: s.agent_name || null,
+            cwd: s.cwd || null,
+            end_reason: s.end_reason || null,
+            ended_from_ui: s.ended_from_ui === true,
+            cursor_after_message_id: s.cursor_after_message_id || null,
             updated_at: s.updated_at || null,
             path: path.join(SESSIONS_DIR, f),
           })
@@ -138,11 +145,88 @@ if (cmd === 'list') {
   } catch {
     /* ignore */
   }
+  return out
+}
+
+/**
+ * Recoverable ends a live heartbeat can clear (mirrors server isRecoverableRemoteEndReason).
+ * UI end is non-recoverable — skill must create_session.
+ */
+function isRecoverableLocalEnd(s) {
+  if (s.ended_from_ui === true) return false
+  if (s.end_reason === 'ui') return false
+  // disabled without terminal UI end → candidate (local_stop / idle / auth / soft)
+  return true
+}
+
+if (cmd === 'list') {
+  const out = listSessionStates()
   const legacy = readJson(LEGACY_PATH)
   process.stdout.write(
-    JSON.stringify({ sessions: out, legacy: legacy ? { session_id: legacy.session_id, enabled: legacy.enabled } : null }, null, 2) +
-      '\n',
+    JSON.stringify(
+      {
+        sessions: out,
+        legacy: legacy
+          ? {
+              session_id: legacy.session_id,
+              enabled: legacy.enabled,
+              cwd: legacy.cwd || null,
+              end_reason: legacy.end_reason || null,
+            }
+          : null,
+      },
+      null,
+      2,
+    ) + '\n',
   )
+  process.exit(0)
+}
+
+if (cmd === 'find-reconnect') {
+  const cwd = path.resolve(args.cwd || process.cwd())
+  const preferAgent = (args.agent || '').trim().toLowerCase()
+  const sessions = listSessionStates()
+  const candidates = sessions
+    .filter((s) => s.session_id && s.cwd && path.resolve(s.cwd) === cwd)
+    .filter((s) => isRecoverableLocalEnd(s))
+    .map((s) => {
+      // Primary: most recently touched session for this cwd (stop → remote again
+      // should rejoin that stop, not an older local_stop from earlier in the day).
+      let score = Date.parse(s.updated_at || '') || 0
+      // Small tie-breakers only — never outweigh hours of recency
+      if (preferAgent && (s.agent_name || '').toLowerCase() === preferAgent) score += 60_000 // +1 min
+      if (s.end_reason === 'local_stop') score += 30_000
+      if (s.enabled === false) score += 10_000
+      return { ...s, score }
+    })
+    .sort((a, b) => b.score - a.score)
+
+  const best = candidates[0] || null
+  const result = {
+    ok: true,
+    cwd,
+    found: !!best,
+    session_id: best?.session_id || null,
+    agent_name: best?.agent_name || null,
+    end_reason: best?.end_reason || null,
+    enabled: best ? best.enabled : null,
+    cursor_after_message_id: best?.cursor_after_message_id || null,
+    updated_at: best?.updated_at || null,
+    candidates: candidates.slice(0, 5).map((c) => ({
+      session_id: c.session_id,
+      agent_name: c.agent_name,
+      enabled: c.enabled,
+      end_reason: c.end_reason,
+      updated_at: c.updated_at,
+    })),
+    action: best
+      ? 'reconnect'
+      : 'create_session',
+    note: best
+      ? 'Reconnect: report_remote_agent_heartbeat(live) → write state → post reconnect message → start poller. Only create_session if live heartbeat refuses (UI end).'
+      : 'No prior local remote-control session for this cwd — call create_session.',
+  }
+  process.stdout.write(JSON.stringify(result, null, 2) + '\n')
   process.exit(0)
 }
 
