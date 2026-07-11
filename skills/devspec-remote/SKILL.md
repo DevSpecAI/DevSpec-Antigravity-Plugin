@@ -111,33 +111,73 @@ This is **DevSpec** remote control — not Claude Code's built-in `/remote-contr
    - Print `✓ DevSpec remote control ended` and stop polling.
 
 
-## Poll loop (prescribed — do not invent)
+## Poll + wake loop (prescribed — two processes)
 
-**Preferred (Claude Code plugin):** after connect, write state with the plugin helper that resolves the MCP token from `.mcp.json`, then run the packaged poller in the background:
+Sequence: **poll MCP → write inbox → wake agent**. Heartbeats and wake are **split** so Live never dies when you are woken.
+
+### A. Continuous heartbeat poller (nohup — never exit on owner message)
 
 ```bash
-# After create_session OR successful reconnect (include codename/title when known):
-node "<plugin>/hooks/scripts/remote-control-state.mjs" write \
-  --session <uuid> --agent "Antigravity" --cwd "$(pwd)" \
+PLUGIN="<plugin-root>"   # e.g. installed-plugins/devspec-grok-build-extension-*
+SESSION="<uuid>"
+node "$PLUGIN/hooks/scripts/remote-control-state.mjs" write \
+  --session "$SESSION" --agent "Antigravity" --cwd "$(pwd)" \
   --codename "<session_codename>" --title "<title>"
-node "<plugin>/hooks/scripts/devspec-remote-poll.mjs" --session <uuid>
+
+mkdir -p "$HOME/.devspec/remote-control/sessions"
+LOG="$HOME/.devspec/remote-control/sessions/${SESSION}.poll.log"
+nohup node "$PLUGIN/hooks/scripts/devspec-remote-poll.mjs" --session "$SESSION" \
+  >> "$LOG" 2>&1 &
+echo $! > "$HOME/.devspec/remote-control/sessions/${SESSION}.poll.pid"
+sleep 2
+kill -0 "$(cat "$HOME/.devspec/remote-control/sessions/${SESSION}.poll.pid")" 2>/dev/null \
+  || echo "✗ poller failed to stay up — check $LOG"
 ```
 
-Poller exit **0** = owner message(s) arrived (JSON lines on stdout) → act, mirror reply, re-arm poller.  
-Exit **1** = disabled / UI End / idle_timeout / error → re-arm **only if** that session's state still has `enabled: true` **and** `end_reason` is not terminal. Otherwise stop.
+Never use plain shell `&` without `nohup`/detach inside a finishing tool shell.
 
-**Stepped backoff (preferred poller):** the poller stays up for up to ~24h without the model re-arming. Cadence slows when quiet (≈15s → 30s → 1m → 5m → 10m). It heartbeats `check_tier` so the UI can show “Still connected · may take a few minutes…”. After 24h idle it clean-disconnects (`end_reason: idle_timeout`). Idle polling uses **no LLM tokens**. Idle timeout is recoverable **only within the find-reconnect TTL** (~30m of the stop stamp); after that a new agent conversation gets a **new** channel.
+Poller contract:
+- Stays up until disabled / UI End / idle_timeout / local_stop / auth failure
+- On owner dispatch: appends `*.inbox.jsonl`, advances cursor, **keeps heartbeating**
+- Idle = no LLM tokens; stepped backoff up to 24h then `idle_timeout`
 
-**UI End (terminal for this session):** heartbeat may return `ended_from_ui` / non-recoverable end. Poller disables local state, prints `{ "type": "session_ended", "reason": … }`, exits 1. **Do not re-arm this session.** Next connect must `create_session`. Do **not** treat boundary message bodies as owner commands.
+### B. Wait-for-owner (wakes **you** — exit 0 on new inbox mail)
 
-**Fallback (any agent, if poller unavailable):** exact recipe only:
-1. `report_remote_agent_heartbeat(session_id, status: "live", check_tier: "responsive")` — if `ended_from_ui` or terminal `end_reason`, disable local state and stop.
-2. `get_session_transcript(session_id, after_message_id: cursor)` — owner human messages only are instructions
-3. Advance cursor from response
-4. Background wait ~15–60s (do not invent multi-hour model loops — install Node poller for that)
-5. On local stop: `report_remote_agent_heartbeat(session_id, status: "offline", end_reason: "local_stop")` + disable local state
+```bash
+# After poller is up — start wait so a new owner instruction ends this process with stdout JSON:
+node "$PLUGIN/hooks/scripts/devspec-remote-wait.mjs" --session "$SESSION" --from-end
+```
 
-Resolve `mcp_url` from MCP client config / session host — never hardcode production when on staging.
+How to run wait so the model actually turns:
+
+| Host | How |
+|---|---|
+| **Antigravity** | `monitor` tool on the wait command (each stdout line notifies the chat). When you see `type":"wake"`, act, then **re-arm wait** with `monitor` again. |
+| **Claude Code** | `run_in_background: true` on the wait command. Exit **0** → read stdout owner_message lines → act → **re-arm wait** in background. |
+
+Wait contract:
+- Does **not** heartbeat (poller does)
+- Watches inbox from a byte offset (state `inbox_byte_offset`)
+- **`--from-end`** (default): ignore old mail; only new lines after start
+- **`--pending`**: also deliver unconsumed inbox from saved offset (use once after connect if needed)
+- Exit **0** = wake (act on messages). Exit **1** = disabled / UI end / error — do not re-arm if session ended.
+
+### C. Acting on a wake (required)
+
+1. Parse stdout / notification: `owner_message` objects; only act when `remote_control.is_owner_instruction` or `message_type === local_agent_dispatch` for the owner.
+2. Do the work; `post_session_message` the reply.
+3. **Re-arm only `devspec-remote-wait`** (not the heartbeat poller).
+4. Do **not** stop the continuous poller after each message.
+
+### UI End
+
+Poller disables state and exits 1; wait also exits 1 if it sees disabled / UI end. Next connect = `create_session`. Never treat boundary message bodies as commands.
+
+### Fallback (poller scripts missing)
+
+1. Heartbeat live; 2. transcript after cursor; 3. act on owner dispatch only; 4. short sleep loop; 5. offline + local_stop on disconnect.
+
+Resolve `mcp_url` from MCP config — never hardcode production when on staging.
 
 
 ## Interactive knowledge capture (while remote — non-negotiable)
