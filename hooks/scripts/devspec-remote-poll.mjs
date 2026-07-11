@@ -1,31 +1,37 @@
 #!/usr/bin/env node
 /**
- * devspec-remote-poll — background long-poller for DevSpec remote control.
+ * devspec-remote-poll — long-lived background poller for DevSpec remote control.
  *
  * Runs outside the model context (plain Node HTTP MCP — **no LLM tokens**).
- * Heartbeats the session, polls transcript, and **exits 0 only when a new
- * owner-authored human message arrives**, printing those messages as JSON lines
- * so the agent can re-invoke and act.
+ * Heartbeats the session for the whole connection lifetime and polls the
+ * transcript for owner instructions.
  *
- * Stepped backoff (idle without owner message — does NOT exit for re-arm):
+ * Owner instructions do **NOT** terminate this process. They are:
+ *   1. Appended to ~/.devspec/remote-control/sessions/<id>.inbox.jsonl
+ *   2. Printed as JSON lines on stdout (type: owner_message / wake)
+ *   3. Cursor advanced in session state
+ * Heartbeats continue so the Agents UI stays Live while the agent works.
+ *
+ * Exit only for terminal conditions:
+ *   1  — disabled / UI end / idle_timeout / auth failure / error
+ *   2  — bad args
+ * (Exit 0 is reserved for clean manual stop if needed; owner messages never use it.)
+ *
+ * Stepped backoff (idle without owner message):
  *   0–10 min:   transcript ~15s, heartbeat ~15s, check_tier=responsive
  *   10 min–1 h: transcript ~30s, heartbeat ~30s, check_tier=normal
  *   1–2 h:      transcript ~60s, heartbeat ~60s, check_tier=normal
  *   2–12 h:     transcript ~5 min, heartbeat ~60s, check_tier=relaxed
  *   12–24 h:    transcript ~10 min, heartbeat ~60s, check_tier=sparse
- *   >24 h idle: clean disconnect (offline + idle_timeout), exit 1 — do not re-arm
- *
- * Exit codes:
- *   0  — owner message(s) arrived (agent should wake and process)
- *   1  — disabled / UI end / idle_timeout / auth failure / error
- *        (do not treat as an owner instruction; re-arm only if state.enabled
- *         and end_reason is not terminal)
- *   2  — bad args
+ *   >24 h idle: clean disconnect (offline + idle_timeout), exit 1
  *
  * Usage:
  *   node devspec-remote-poll.mjs --session <uuid> [--cursor <id>]
  *
- * Requires token in ~/.devspec/remote-control.json or DEVSPEC_MCP_TOKEN.
+ * Start detached so tool shells cannot kill the process:
+ *   nohup node …/devspec-remote-poll.mjs --session <uuid> >> ~/.devspec/remote-control/sessions/<uuid>.poll.log 2>&1 &
+ *
+ * Requires token in per-session state / ~/.devspec/remote-control.json or DEVSPEC_MCP_TOKEN.
  */
 
 import fs from 'node:fs'
@@ -45,12 +51,19 @@ function statePathForSession(sessionId) {
   return LEGACY_STATE_PATH
 }
 
+function inboxPathForSession(sessionId) {
+  return path.join(SESSIONS_DIR, `${sessionId}.inbox.jsonl`)
+}
+
+function pollLogPathForSession(sessionId) {
+  return path.join(SESSIONS_DIR, `${sessionId}.poll.log`)
+}
+
 /** @type {Array<{ untilMs: number, pollMs: number, heartbeatMs: number, tier: string }>} */
 const BACKOFF_TIERS = [
-  // untilMs = upper bound of idle time for this tier (exclusive)
   { untilMs: 10 * 60 * 1000, pollMs: 15_000, heartbeatMs: 15_000, tier: 'responsive' },
-  { untilMs: 60 * 60 * 1000, pollMs: 30_000, heartbeatMs: 30_000, tier: 'normal' }, // 10m–1h
-  { untilMs: 2 * 60 * 60 * 1000, pollMs: 60_000, heartbeatMs: 60_000, tier: 'normal' }, // 1–2h
+  { untilMs: 60 * 60 * 1000, pollMs: 30_000, heartbeatMs: 30_000, tier: 'normal' },
+  { untilMs: 2 * 60 * 60 * 1000, pollMs: 60_000, heartbeatMs: 60_000, tier: 'normal' },
   { untilMs: 12 * 60 * 60 * 1000, pollMs: 5 * 60_000, heartbeatMs: 60_000, tier: 'relaxed' },
   { untilMs: 24 * 60 * 60 * 1000, pollMs: 10 * 60_000, heartbeatMs: 60_000, tier: 'sparse' },
 ]
@@ -63,7 +76,6 @@ function parseArgs(argv) {
     if (a === '--session' || a === '--session_id') out.session = argv[++i]
     else if (a === '--cursor') out.cursor = argv[++i]
     else if (a === '--owner-user-id') out.ownerUserId = argv[++i]
-    // Legacy flags ignored (tiers own cadence); keep parse so old skills don't crash
     else if (a === '--interval-ms' || a === '--heartbeat-ms' || a === '--max-ms') i++
   }
   return out
@@ -109,6 +121,28 @@ function writeState(state, sessionId) {
   }
 }
 
+/**
+ * Append owner instructions for the coding agent to consume without killing this process.
+ * Agents may also read stdout when attached; inbox survives detached nohup.
+ */
+function appendInbox(sessionId, ownerMsgs, meta = {}) {
+  if (!sessionId || !ownerMsgs?.length) return
+  try {
+    fs.mkdirSync(SESSIONS_DIR, { recursive: true })
+    const line = JSON.stringify({
+      type: 'owner_messages',
+      session_id: sessionId,
+      received_at: new Date().toISOString(),
+      count: ownerMsgs.length,
+      next_after_message_id: meta.next_after_message_id ?? null,
+      messages: ownerMsgs,
+    })
+    fs.appendFileSync(inboxPathForSession(sessionId), line + '\n', { mode: 0o600 })
+  } catch (e) {
+    process.stderr.write(`devspec-remote-poll: inbox write failed: ${e.message}\n`)
+  }
+}
+
 /** Disable THIS session only — never other remotes on the machine. */
 function disableLocalState({ sessionId, reason }) {
   try {
@@ -140,7 +174,6 @@ function isEndedFromUi(hb) {
 function isTerminalEnded(hb) {
   if (!hb || typeof hb !== 'object') return false
   if (isEndedFromUi(hb)) return true
-  // Sticky end from a previous offline (idle_timeout / local_stop)
   if (hb.live === false && hb.end_reason && hb.end_reason !== null) {
     return true
   }
@@ -163,20 +196,54 @@ function isOwnerMessage(msg, ownerUserId) {
   if (msg.remote_control && typeof msg.remote_control.is_owner_instruction === 'boolean') {
     return msg.remote_control.is_owner_instruction === true
   }
-  if (!ownerUserId) return false
-  if (msg.role !== 'user') return false
-  const mt = msg.message_type
-  if (mt === 'external_agent' || mt === 'local_agent_handoff' || mt === 'system') return false
-  const author = msg.author
-  if (author?.kind && author.kind !== 'human') return false
-  const uid = author?.user_id || msg.user_id
-  if (!uid) return false
-  return uid === ownerUserId
+  // Fail closed for untagged rows once server stamps dispatch kinds:
+  // only explicit local_agent_dispatch (or server remote_control flag) is a command.
+  if (msg.message_type === 'local_agent_dispatch') {
+    if (!ownerUserId) return false
+    const author = msg.author
+    if (author?.kind && author.kind !== 'human') return false
+    const uid = author?.user_id || msg.user_id
+    return uid === ownerUserId
+  }
+  return false
+}
+
+/**
+ * Deliver owner messages without exiting — heartbeats keep running.
+ * @returns {string|null} next cursor id
+ */
+function deliverOwnerMessages(sessionId, ownerMsgs, nextCursor, ownerUserId) {
+  for (const m of ownerMsgs) {
+    process.stdout.write(JSON.stringify({ type: 'owner_message', message: m }) + '\n')
+  }
+  process.stdout.write(
+    JSON.stringify({
+      type: 'wake',
+      reason: 'owner_message',
+      count: ownerMsgs.length,
+      next_after_message_id: nextCursor,
+      // Hint for skills: process stays up; read inbox if stdout was discarded (nohup).
+      inbox: inboxPathForSession(sessionId),
+      continuous: true,
+    }) + '\n',
+  )
+  appendInbox(sessionId, ownerMsgs, { next_after_message_id: nextCursor })
+  try {
+    const s = readState(sessionId) || {}
+    s.cursor_after_message_id = nextCursor
+    s.owner_user_id = ownerUserId
+    s.session_id = sessionId
+    s.last_owner_wake_at = new Date().toISOString()
+    s.updated_at = new Date().toISOString()
+    writeState(s, sessionId)
+  } catch {
+    /* ignore */
+  }
+  return nextCursor
 }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2))
-  // Session id must come from argv when possible so multi-remote is safe.
   let sessionId = args.session || null
   let state = readState(sessionId)
   if (!sessionId) sessionId = state?.session_id
@@ -184,7 +251,6 @@ async function main() {
     process.stderr.write('devspec-remote-poll: missing --session and no state file session_id\n')
     process.exit(2)
   }
-  // Re-read with known session id (per-session file)
   state = readState(sessionId) || state
 
   if (state && state.enabled === false) {
@@ -206,16 +272,20 @@ async function main() {
     process.exit(1)
   }
   mcpUrl = mcpUrl || 'https://devspec.ai/api/mcp'
-  const agentName = state?.agent_name || 'Claude Code'
+  const agentName = state?.agent_name || 'Grok Build'
 
   let cursor = args.cursor || state?.cursor_after_message_id || null
   let ownerUserId = args.ownerUserId || state?.owner_user_id || null
   let lastHeartbeat = 0
   let lastTier = null
-  // Idle clock resets when we see an owner message (we exit 0) or on start.
-  const idleStarted = Date.now()
+  // Idle clock resets when we deliver owner messages (connection still active).
+  let idleStarted = Date.now()
 
-  // Initial transcript to seed cursor + owner id
+  process.stderr.write(
+    `devspec-remote-poll: continuous mode session=${sessionId} inbox=${inboxPathForSession(sessionId)}\n`,
+  )
+
+  // Initial transcript to seed cursor + owner id; deliver any pending owner msgs without exiting.
   try {
     const initial = await mcpToolsCall({
       mcpUrl,
@@ -232,26 +302,21 @@ async function main() {
     }
     const msgs = Array.isArray(initial?.messages) ? initial.messages : []
     const ownerMsgs = msgs.filter((m) => isOwnerMessage(m, ownerUserId))
-    if (cursor && ownerMsgs.length > 0) {
-      for (const m of ownerMsgs) {
-        process.stdout.write(JSON.stringify({ type: 'owner_message', message: m }) + '\n')
-      }
-      process.stdout.write(
-        JSON.stringify({
-          type: 'wake',
-          reason: 'owner_message',
-          count: ownerMsgs.length,
-          next_after_message_id: initial?.cursor?.next_after_message_id || cursor,
-        }) + '\n',
-      )
-      process.exit(0)
+    if (ownerMsgs.length > 0) {
+      const next =
+        initial?.cursor?.next_after_message_id ||
+        ownerMsgs[ownerMsgs.length - 1]?.id ||
+        cursor
+      deliverOwnerMessages(sessionId, ownerMsgs, next, ownerUserId)
+      cursor = next
+      idleStarted = Date.now()
     }
   } catch (e) {
     process.stderr.write(`devspec-remote-poll: initial transcript failed: ${e.message}\n`)
     process.exit(1)
   }
 
-  // Long-running loop — stepped backoff; no flat 10m exit for re-arm.
+  // Long-running loop — never exit solely because an owner instruction arrived.
   // eslint-disable-next-line no-constant-condition
   while (true) {
     const liveState = readState(sessionId)
@@ -283,15 +348,17 @@ async function main() {
           type: 'session_ended',
           reason: 'idle_timeout',
           session_id: sessionId,
-          message:
-            'Remote control ended after 24h idle. Local poller stopping; do not re-arm.',
         }) + '\n',
       )
-      process.stderr.write('devspec-remote-poll: idle_timeout (24h) — disabling and exiting\n')
+      process.stderr.write('devspec-remote-poll: idle timeout — offline and exiting\n')
       process.exit(1)
     }
 
-    const tier = tierForIdleMs(idleMs) || BACKOFF_TIERS[BACKOFF_TIERS.length - 1]
+    const tier = tierForIdleMs(idleMs)
+    if (!tier) {
+      process.stderr.write('devspec-remote-poll: no backoff tier — exiting\n')
+      process.exit(1)
+    }
     if (tier.tier !== lastTier) {
       lastTier = tier.tier
       process.stderr.write(
@@ -333,7 +400,7 @@ async function main() {
               reason,
               session_id: sessionId,
               message:
-                'Remote control was ended. Local poller stopping; do not re-arm.',
+                'Remote control was ended. Local poller stopping; do not restart this session.',
             }) + '\n',
           )
           process.stderr.write(
@@ -360,32 +427,25 @@ async function main() {
       const msgs = Array.isArray(delta?.messages) ? delta.messages : []
       const ownerMsgs = msgs.filter((m) => isOwnerMessage(m, ownerUserId))
       if (ownerMsgs.length > 0) {
-        for (const m of ownerMsgs) {
-          process.stdout.write(JSON.stringify({ type: 'owner_message', message: m }) + '\n')
-        }
-        const next = delta?.cursor?.next_after_message_id || ownerMsgs[ownerMsgs.length - 1]?.id
-        process.stdout.write(
-          JSON.stringify({
-            type: 'wake',
-            reason: 'owner_message',
-            count: ownerMsgs.length,
-            next_after_message_id: next,
-          }) + '\n',
-        )
+        const next =
+          delta?.cursor?.next_after_message_id ||
+          ownerMsgs[ownerMsgs.length - 1]?.id ||
+          cursor
+        deliverOwnerMessages(sessionId, ownerMsgs, next, ownerUserId)
+        cursor = next
+        idleStarted = Date.now()
+        // Continue loop — do NOT process.exit(0). Heartbeats keep the UI live.
+      } else if (delta?.cursor?.next_after_message_id) {
+        cursor = delta.cursor.next_after_message_id
         try {
           const s = readState(sessionId) || {}
-          s.cursor_after_message_id = next
-          s.owner_user_id = ownerUserId
+          s.cursor_after_message_id = cursor
           s.session_id = sessionId
           s.updated_at = new Date().toISOString()
           writeState(s, sessionId)
         } catch {
           /* ignore */
         }
-        process.exit(0)
-      }
-      if (delta?.cursor?.next_after_message_id) {
-        cursor = delta.cursor.next_after_message_id
       }
     } catch (e) {
       process.stderr.write(`devspec-remote-poll: poll failed: ${e.message}\n`)
