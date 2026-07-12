@@ -25,6 +25,11 @@
  *   12–24 h:    transcript ~10 min, heartbeat ~60s, check_tier=sparse
  *   >24 h idle: clean disconnect (offline + idle_timeout), exit 1
  *
+ * Heartbeat and transcript poll are **independent**: the loop sleeps until the
+ * next of (heartbeat due, poll due). Never sleep the full poll interval alone —
+ * that made relaxed/sparse heartbeats only fire every 5–10 min and the UI
+ * (90s default freshness) flipped to Disconnected while still connected.
+ *
  * Usage:
  *   node devspec-remote-poll.mjs --session <uuid> [--cursor <id>]
  *
@@ -316,6 +321,11 @@ async function main() {
     process.exit(1)
   }
 
+  // Heartbeat and transcript poll are independent timers. Sleep until the
+  // sooner of "next heartbeat" / "next poll" so long transcript backoff never
+  // starves presence updates.
+  let lastPoll = 0
+
   // Long-running loop — never exit solely because an owner instruction arrived.
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -389,7 +399,7 @@ async function main() {
             check_tier: tier.tier,
           },
         })
-        lastHeartbeat = now
+        lastHeartbeat = Date.now()
 
         if (isTerminalEnded(hb)) {
           const reason = isEndedFromUi(hb) ? 'ended_from_ui' : hb.end_reason || 'ended_from_ui'
@@ -413,45 +423,54 @@ async function main() {
       }
     }
 
-    try {
-      const delta = await mcpToolsCall({
-        mcpUrl,
-        token,
-        name: 'get_session_transcript',
-        arguments: {
-          session_id: sessionId,
-          ...(cursor ? { after_message_id: cursor } : {}),
-        },
-      })
-      if (delta?.owner_user_id) ownerUserId = delta.owner_user_id
-      const msgs = Array.isArray(delta?.messages) ? delta.messages : []
-      const ownerMsgs = msgs.filter((m) => isOwnerMessage(m, ownerUserId))
-      if (ownerMsgs.length > 0) {
-        const next =
-          delta?.cursor?.next_after_message_id ||
-          ownerMsgs[ownerMsgs.length - 1]?.id ||
-          cursor
-        deliverOwnerMessages(sessionId, ownerMsgs, next, ownerUserId)
-        cursor = next
-        idleStarted = Date.now()
-        // Continue loop — do NOT process.exit(0). Heartbeats keep the UI live.
-      } else if (delta?.cursor?.next_after_message_id) {
-        cursor = delta.cursor.next_after_message_id
-        try {
-          const s = readState(sessionId) || {}
-          s.cursor_after_message_id = cursor
-          s.session_id = sessionId
-          s.updated_at = new Date().toISOString()
-          writeState(s, sessionId)
-        } catch {
-          /* ignore */
+    if (now - lastPoll >= tier.pollMs) {
+      try {
+        const delta = await mcpToolsCall({
+          mcpUrl,
+          token,
+          name: 'get_session_transcript',
+          arguments: {
+            session_id: sessionId,
+            ...(cursor ? { after_message_id: cursor } : {}),
+          },
+        })
+        lastPoll = Date.now()
+        if (delta?.owner_user_id) ownerUserId = delta.owner_user_id
+        const msgs = Array.isArray(delta?.messages) ? delta.messages : []
+        const ownerMsgs = msgs.filter((m) => isOwnerMessage(m, ownerUserId))
+        if (ownerMsgs.length > 0) {
+          const next =
+            delta?.cursor?.next_after_message_id ||
+            ownerMsgs[ownerMsgs.length - 1]?.id ||
+            cursor
+          deliverOwnerMessages(sessionId, ownerMsgs, next, ownerUserId)
+          cursor = next
+          idleStarted = Date.now()
+          // Continue loop — do NOT process.exit(0). Heartbeats keep the UI live.
+        } else if (delta?.cursor?.next_after_message_id) {
+          cursor = delta.cursor.next_after_message_id
+          try {
+            const s = readState(sessionId) || {}
+            s.cursor_after_message_id = cursor
+            s.session_id = sessionId
+            s.updated_at = new Date().toISOString()
+            writeState(s, sessionId)
+          } catch {
+            /* ignore */
+          }
         }
+      } catch (e) {
+        process.stderr.write(`devspec-remote-poll: poll failed: ${e.message}\n`)
+        lastPoll = Date.now()
       }
-    } catch (e) {
-      process.stderr.write(`devspec-remote-poll: poll failed: ${e.message}\n`)
     }
 
-    await sleep(tier.pollMs)
+    const after = Date.now()
+    const untilHb = Math.max(0, tier.heartbeatMs - (after - lastHeartbeat))
+    const untilPoll = Math.max(0, tier.pollMs - (after - lastPoll))
+    // Wake for the sooner of heartbeat or transcript poll (floor 250ms).
+    const sleepFor = Math.max(250, Math.min(untilHb || tier.heartbeatMs, untilPoll || tier.pollMs))
+    await sleep(sleepFor)
   }
 }
 
