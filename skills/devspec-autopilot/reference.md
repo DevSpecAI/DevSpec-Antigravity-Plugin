@@ -74,9 +74,11 @@ Get project settings including autopilot configuration. Call this at startup to 
     "branch_prefix": "work/action-item-",
     "commit_message_prefix": "",
     "custom_instructions": "...",
+    "agent_rules": "...",
     "test_commands": { "unit": "", "e2e": "", "typecheck": "" },
     "protected_paths": []
   },
+  "owner_agent_rules": "...",
   "autopilot": { "stale_claim_timeout_minutes": 30 }
 }
 ```
@@ -88,7 +90,9 @@ Read execution settings from the unified **`execution`** block. For back-compat 
 - `auto_merge`: Whether to merge feature branches into the repo's target branch after push (default **true**; implies auto_push)
 - `branch_prefix`: Prefix for feature branches (e.g., "work/action-item-")
 - `commit_message_prefix`: Optional prefix prepended to commit messages
-- `custom_instructions`: Additional instructions to follow during processing
+- `custom_instructions`: Team **Principles** — engineering philosophy / quality bar. Shapes *how* you build.
+- `agent_rules` (execution): Team **Agent Execution Rules** — concrete execution mechanics (run typecheck/build before pushing, never `git stash`, commit only your own files, honour the target branch). Mandatory for a coding agent.
+- `owner_agent_rules` (top-level, not in `execution`): The runner owner's **Personal Agent Rules** — machine/tooling context. Precedence: personal rules govern local working-style; shared-repo-safety rules always hold. Absent on older MCP versions.
 - `test_commands`: `{ unit, e2e, typecheck }` — commands to verify work; skip when unset (no toolchain assumed)
 - `protected_paths`: Glob patterns of files that must not be modified
 - `stale_claim_timeout_minutes` (orchestration, on `autopilot`): stale-claim reset threshold

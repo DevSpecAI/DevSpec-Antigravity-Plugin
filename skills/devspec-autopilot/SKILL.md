@@ -90,12 +90,14 @@ Your DevSpec MCP token is **account-wide** — it is not pinned to a single proj
    - the `repos` array — `[{ id, full_name, target_branch, default_branch }]`, the branch DevSpec tracks for EACH repo; the source of truth for the merge target (Step 16). Do NOT assume one branch for the whole project.
    - `branch_prefix` (default: "work/action-item-")
    - `commit_message_prefix` (default: "")
-   - `custom_instructions` (default: "")
+   - `custom_instructions` (default: "") — the team's **Principles** (philosophy / quality bar)
+   - `agent_rules` (default: "") — the team's **Agent Execution Rules** (build/test/ship mechanics)
+   - `owner_agent_rules` (top-level, not in the `execution` block; absent on older MCP versions) — the runner owner's **Personal Agent Rules** (machine / tooling)
    - `test_commands` ({ unit, e2e, typecheck }; default: none configured — tests are skipped, see Step 9)
    - `protected_paths` (default: [] — glob patterns of files that must not be modified)
    - `stale_claim_timeout_minutes` (default: 30) — this is **orchestration**, read from the top-level `autopilot` settings object (not the execution block); otherwise 30. Used in Step 1 to reset in-progress items whose `agent_claimed_at` is older than this threshold (assumed crashed/abandoned runners). Must be a positive integer; if the value is non-numeric, missing, or ≤ 0, fall back to 30.
 3. If `auto_merge` is true, treat `auto_push` as true regardless of its stored value. (Unattended honours the stored `auto_push`/`auto_merge` — there is no live human override in this path.)
-4. If `custom_instructions` is non-empty, read and follow those instructions throughout this session.
+4. **Store the instruction tiers** from the response as session variables (Layer 2 of the prompt), each followed during every execution cycle if set: `custom_instructions` (team **Principles** — philosophy/quality bar), `agent_rules` (team **Agent Execution Rules** — build/test/ship mechanics), and `owner_agent_rules` (the runner owner's **Personal Agent Rules** — machine/tooling). Skip whichever are empty/missing.
 5. **Initialize local storage** (see reference.md → *Local Storage*):
    - Ensure directories exist:
      ```
@@ -325,6 +327,12 @@ All implementation work happens inside a git worktree — a sibling directory wi
 6. **Read existing code**: Examine the affected files and their surrounding context to understand the codebase patterns. Always read a file before editing it. Read from the worktree path — the files are the same content but the worktree is the correct working copy for this branch.
 
 7. **Make changes**: Write clean, well-structured code following the project's existing conventions.
+
+   **Principles + Agent Rules (Layer 2):** Apply the instruction tiers stored at startup, each mandatory if set:
+   - `custom_instructions` (team **Principles**) — engineering philosophy and quality bar (no hacky workarounds, prefer the proper/secure solution, use platform tools properly). Shapes *how* you build.
+   - `agent_rules` (team **Agent Execution Rules**) + `owner_agent_rules` (the runner owner's **Personal Agent Rules**) — concrete execution mechanics: run typecheck/build (and any test commands) before pushing, never `git stash`, commit only your own files, honour the target branch, plus any personal tooling. These are agent mechanics (deliberately hidden from the in-session Dev), so they apply to you here.
+
+   Treat all three as mandatory, not suggestions. Precedence: personal rules govern local working-style; shared-repo-safety rules always hold. Skip any tier whose field is empty/missing.
 
 8. **Record an implementation note**: Call `add_implementation_note` with `action_item_id` and a markdown summary of what you changed and why. Best-effort — if it fails, continue.
 

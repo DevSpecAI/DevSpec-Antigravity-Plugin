@@ -66,12 +66,13 @@ See the `devspec-remote` / `devspec.remote` skill for full details.
      - **no match** → tell the user `✗ No DevSpec project tracks this repo (<remote_url>). Connect it in the DevSpec dashboard, then re-run.` and stop.
    - Reuse `remote_url` for the `repositories` array in step 3a (no need to re-capture).
 
-2. **Load project settings.** Call `get_project_summary({ project_id })` and read the unified **`execution`** block: `auto_push`, `auto_merge`, `branch_prefix`, `commit_message_prefix`, `custom_instructions`, `test_commands` ({ unit, e2e, typecheck }), `protected_paths`. For back-compat with older web/MCP versions that don't serve it, fall back to the legacy `local_plugin_settings` object, then the legacy `autopilot` execution fields. Use these defaults if a field is absent everywhere:
+2. **Load project settings.** Call `get_project_summary({ project_id })` and read the unified **`execution`** block: `auto_push`, `auto_merge`, `branch_prefix`, `commit_message_prefix`, `custom_instructions`, `agent_rules`, `test_commands` ({ unit, e2e, typecheck }), `protected_paths`. Also read the top-level **`owner_agent_rules`** (your own personal machine/tooling rules). Note the two instruction tiers: `custom_instructions` is the team **Principles** (philosophy/quality bar), while `agent_rules` (team) + `owner_agent_rules` (yours) are **execution mechanics** for a coding agent — how you build, test, and ship. For back-compat with older web/MCP versions that don't serve it, fall back to the legacy `local_plugin_settings` object, then the legacy `autopilot` execution fields. Use these defaults if a field is absent everywhere:
    - `auto_push`: true
    - `auto_merge`: true
    - `branch_prefix`: "work/action-item-"
    - `commit_message_prefix`: "" (none)
    - `custom_instructions`: ""
+   - `agent_rules`: "" — and `owner_agent_rules` absent on older MCP versions
    - `test_commands`: none configured (tests are skipped — see step 14)
    - `protected_paths`: none
 
@@ -248,7 +249,11 @@ See the `devspec-remote` / `devspec.remote` skill for full details.
 
 13. **Implement the changes.** Follow the action item description and any `ai_instructions`. Read existing files before editing. Follow code conventions. Read from the worktree path — the worktree is the correct working copy for this branch.
 
-    **Custom Instructions:** If `custom_instructions` is set, follow them as mandatory requirements throughout implementation.
+    **Principles + Agent Rules (mandatory):** Apply the instruction tiers you loaded in step 2:
+    - `custom_instructions` (team **Principles**): engineering philosophy and quality bar — no hacky workarounds, prefer the proper/secure solution, use platform tools properly. These shape *how* you build.
+    - `agent_rules` (team **Agent Execution Rules**) + `owner_agent_rules` (**your** personal machine/tooling rules): concrete execution mechanics — e.g. run typecheck/build (and any test commands) before pushing, never `git stash`, commit only your own files, honour the target branch, plus any personal tooling you have set up. These are mechanics for a coding agent, so they apply to you here (they are deliberately hidden from the in-session Dev).
+
+    Treat all three as mandatory requirements, not suggestions. Precedence: your personal rules govern local working-style, but the shared-repo-safety rules always hold. Skip any tier whose field is empty/absent.
 
     Call `add_implementation_note` at significant milestones to keep a running log on DevSpec. Also append a short line to `~/.devspec/logs/<exec_id>.log` at each milestone (e.g. `Branch created`, `Files modified: N`, `Tests passed`, `Committed <short_sha>`, `Pushed to origin`, `Merged into <target>`) using the per-task log helper from reference.md. Run the *rotate* helper before each log append. All local log calls are best-effort.
 

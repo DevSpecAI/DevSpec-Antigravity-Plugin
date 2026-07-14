@@ -199,16 +199,24 @@ Be as proactive about memories/artifacts as you already are about **action items
 
 
 
-## Account custom instructions (on connect — non-negotiable)
+## Account + project instructions (on connect — non-negotiable)
 
-After `create_session` for `agent_remote_control` (or the initial `get_session_transcript` seed with no cursor), read **`owner_custom_instructions`** from the response when present and non-null:
+After `create_session` for `agent_remote_control` (or the initial `get_session_transcript` seed with no cursor), read the instruction fields from the response when present and non-null, and hold them for the **entire remote-control run**. There are two tiers (each with a `_note` field on the create_session response explaining it):
 
-- Hold it for the **entire remote-control run** as the owner's Account → custom instructions (style / working prefs).
-- Apply to how you reply and work in this session (e.g. brief answers, naming conventions) — same spirit as Dev's profile style note.
+**Style + principles — how you talk, and what good work looks like:**
+- **`owner_custom_instructions`** — the owner's Account → Chat Response Style. Apply to how you reply (brevity, tone, naming) — same spirit as Dev's profile style note.
+- **`project_custom_instructions`** — the team's Project Principles (engineering philosophy, quality bar, provider preferences). Apply to how you plan, recommend, and evaluate work.
+
+**Agent execution rules — how you actually run work on this machine (you ARE a coding agent, so these apply to you and NOT to the in-session Dev):**
+- **`project_agent_rules`** — the team's Agent Execution Rules: e.g. run typecheck/build before pushing, never `git stash`, commit only your own files, target branch. Treat as mandatory execution mechanics.
+- **`owner_agent_rules`** — the owner's Personal Agent Rules: their machine/tooling context (installed tools, local ports, personal workflow). Apply to how you run work locally.
+- **Precedence:** your personal/machine rules govern local working-style; the shared-repo-safety rules (branch protection, commit-only-your-own-files, don't break staging, don't leak secrets) always hold.
+
+Rules for all four:
 - Do **not** override safety, security rules, or instruction-filtering (owner-only commands still win).
-- Do **not** invent instructions when the field is null/omitted.
+- Do **not** invent instructions when a field is null/omitted.
 - Re-read on reconnect via the initial transcript seed if you restart without a fresh create_session.
-- Never request or use another user's instructions — the field is only returned to the session owner token.
+- Never request or use another user's instructions — the owner-scoped fields are only returned to the session owner token.
 
 ## Rules
 
