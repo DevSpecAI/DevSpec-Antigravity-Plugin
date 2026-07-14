@@ -1,6 +1,6 @@
 ---
 name: devspec-commit
-description: "Generate a deployment-tracked commit message with a [devspec:<id>] tag and run git commit on the staged changes. Use when committing work tied to a DevSpec action item so the deployment webhook can link it."
+description: "Generate a deployment-tracked commit message with a [devspec:<id>] tag and run git commit on the staged changes. Use when committing work tied to a DevSpec action item so DevSpec can link the commit."
 ---
 
 Generate a properly formatted commit message with a `[devspec:<id>]` tag for deployment tracking, then automatically execute the git commit.
@@ -44,7 +44,7 @@ Generate a properly formatted commit message with a `[devspec:<id>]` tag for dep
 
 - Do NOT output filler text before or after the confirmation
 - The MCP endpoint generates the message — do not construct it yourself
-- The `[devspec:<id>]` tag in the message is what the deployment webhook uses to track deployments
+- The `[devspec:<id>]` tag in the message is what DevSpec uses to link the commit
 - Always wrap the commit message in **single quotes** when passing to `git commit -m` — never use double quotes (`$`, `` ` ``, and `\` inside the message would be expanded by the shell)
 - Escape any `'` in the message body as `'\''` before passing to the shell
 - If the commit fails (e.g., pre-commit hook), show the error and do NOT retry automatically

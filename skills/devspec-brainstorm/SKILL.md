@@ -82,7 +82,7 @@ Interactively brainstorm on an action item to sharpen its scope, surface edge ca
      ```
    - If no: output `↻ Action item not updated — summary is above if you need it later.`
 
-7. **Persist durable conclusions to DevSpec memory.** If the brainstorm settled something durable about the project beyond this one item — a decision, a convention, an architectural constraint, a risk — record it with `record_memory` so the conclusion isn't lost or kept only in local notes. `search_memories` FIRST and `supersede_memory` the closest existing match rather than duplicating. DevSpec memory is the team's SHARED source of truth (the in-app DevSpec assistant reads it every turn); keep personal or machine-specific notes in your own local agent memory instead. Skip this when nothing durable emerged — don't record transient or obvious details.
+7. **Persist durable conclusions to DevSpec memory.** If the brainstorm settled something durable about the project beyond this one item — a decision, a convention, an architectural constraint, a risk — record it with `record_memory` so the conclusion isn't lost or kept only in local notes. `search_memories` FIRST and `supersede_memory` the closest existing match rather than duplicating. DevSpec memory is the team's SHARED source of truth; keep personal or machine-specific notes in your own local agent memory instead. Skip this when nothing durable emerged — don't record transient or obvious details.
 
 ## Rules
 

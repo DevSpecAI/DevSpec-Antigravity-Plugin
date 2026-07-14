@@ -58,7 +58,7 @@ On EVERY DevSpec MCP **write** call in this run — no exceptions — pass `runn
 
 ### Record what you learn
 
-When you discover something worth persisting — a deviation from the item's stated approach ("the item said X, we did Y because Z"), a non-obvious constraint, an architectural finding — record it with `record_memory` (`decision`/`convention`/`architecture`/`risk`/`insight`). ALWAYS `search_memories` first and `supersede_memory` the closest match instead of duplicating. Do NOT record transient details or anything obvious from the code. DevSpec memory is the team's SHARED source of truth — the in-app DevSpec assistant reads it every turn — distinct from your OWN local agent memory (e.g. `AGENTS.md`): shared durable project knowledge goes to DevSpec via `record_memory`; personal or machine-specific notes stay in your local memory. Your writes land **unconfirmed** and capped at `in_discussion` — you propose; the human ratifies.
+When you discover something worth persisting — a deviation from the item's stated approach ("the item said X, we did Y because Z"), a non-obvious constraint, an architectural finding — record it with `record_memory` (`decision`/`convention`/`architecture`/`risk`/`insight`). ALWAYS `search_memories` first and `supersede_memory` the closest match instead of duplicating. Do NOT record transient details or anything obvious from the code. DevSpec memory is the team's SHARED source of truth — distinct from your OWN local agent memory (e.g. `AGENTS.md`): shared durable project knowledge goes to DevSpec via `record_memory`; personal or machine-specific notes stay in your local memory. Your writes land **unconfirmed** and capped at `in_discussion` — you propose; the human ratifies.
 
 ### Keep artifacts current
 
@@ -127,14 +127,14 @@ Send an initial heartbeat **before fetching any work** so runner-gating conditio
    - `status: "idle"`
    - `cycle_count: 0`
    - `tasks_completed: 0`
-   - `runner_type: "ephemeral"` (Gemini processes one item per invocation — not a persistent poller)
+   - `runner_type: "ephemeral"` (Antigravity processes one item per invocation — not a persistent poller)
    - `repositories` (from Step 0a.6)
 
 2. **Process the response** (see reference.md → *Heartbeat Response Processing & Runner Gating*). Read the `validation_state` field from the response object:
 
    - **`"aligned"` or `"manual_override"`** — runner is in good standing. Proceed to Step 1 normally.
 
-   - **`"branch_mismatch"` or `"repo_not_found"`** — runner is **gated**. The Gemini extension processes one item per invocation and has no polling loop, so gating means "exit cleanly without fetching or claiming any work." Specifically:
+   - **`"branch_mismatch"` or `"repo_not_found"`** — runner is **gated**. Antigravity processes one item per invocation and has no polling loop, so gating means "exit cleanly without fetching or claiming any work." Specifically:
      - Output (sanitize `validation_details.message` per Rule 4 before printing):
        ```
        ⚠ Runner gated: <validation_details.message>
@@ -166,7 +166,7 @@ Call `get_next_work_item({ project_id })` **and in parallel** `get_action_items(
    - If `age_min ≤ stale_claim_timeout_minutes`, skip the item — it belongs to an active runner and is NOT yours to reset.
 3. After processing the in-progress list, continue to the staged branch below regardless of how many items were reset. Stale recovery is a side operation, not a replacement for normal processing.
 
-**Ownership rule — never reset an item you own.** The Gemini extension runs ephemerally (one action item per invocation), so at this point in the workflow you have NOT yet claimed anything this run. Any item in the in-progress list was claimed by a different runner or a past invocation. Still, apply the age check strictly — a healthy runner sending heartbeats may legitimately have an item in-progress well under the timeout, and resetting it would clobber active work. The age check IS the ownership check; do not skip it.
+**Ownership rule — never reset an item you own.** Antigravity runs ephemerally (one action item per invocation), so at this point in the workflow you have NOT yet claimed anything this run. Any item in the in-progress list was claimed by a different runner or a past invocation. Still, apply the age check strictly — a healthy runner sending heartbeats may legitimately have an item in-progress well under the timeout, and resetting it would clobber active work. The age check IS the ownership check; do not skip it.
 
 If `get_action_items` itself fails (401, 500, network error), log a one-line warning, skip stale recovery for this cycle, and continue with the `get_next_work_item` result. Stale recovery is best-effort — a failure here must never block normal processing.
 
@@ -217,7 +217,7 @@ Call `claim_work_item` with `action_item_id` and `agent_branch: branch_name`.
   2. Capture `started_at` ISO timestamp: `node -e "console.log(new Date().toISOString())"`.
   3. Append the starting JSONL record (best-effort — continue on error):
      ```
-     node -e "const fs=require('fs'),path=require('path'),os=require('os'); const file=path.join(os.homedir(),'.devspec','execution-history.jsonl'); fs.mkdirSync(path.dirname(file),{recursive:true}); fs.appendFileSync(file,process.argv[1]+'\n');" '{"id":"<exec_id>","actionItemId":"<action_item_id>","actionItemTitle":"<title>","project":"DevSpec","startedAt":"<started_at>","status":"running","triggeredBy":"autopilot","agentBranch":"<branch_name>"}'
+     node -e "const fs=require('fs'),path=require('path'),os=require('os'); const file=path.join(os.homedir(),'.devspec','execution-history.jsonl'); fs.mkdirSync(path.dirname(file),{recursive:true}); fs.appendFileSync(file,process.argv[1]+'\n');" '{"id":"<exec_id>","actionItemId":"<action_item_id>","actionItemTitle":"<title>","project":"<project name or id>","startedAt":"<started_at>","status":"running","triggeredBy":"autopilot","agentBranch":"<branch_name>"}'
      ```
      **Shell safety (Rule 1 + Rule 4):** the JSON argument is wrapped in single quotes. Before interpolating `<title>`, replace every `'` with `'\''` (to keep the outer single-quoted wrapper closed) and every `"` with `\"` (to keep the inner JSON string valid). Also strip `$ ` `` ` `` ` \\`. Truncate to 500 chars.
   4. Write the first line to the per-task log:
@@ -330,7 +330,7 @@ All implementation work happens inside a git worktree — a sibling directory wi
 
    **Principles + Agent Rules (Layer 2):** Apply the instruction tiers stored at startup, each mandatory if set:
    - `custom_instructions` (team **Principles**) — engineering philosophy and quality bar (no hacky workarounds, prefer the proper/secure solution, use platform tools properly). Shapes *how* you build.
-   - `agent_rules` (team **Agent Execution Rules**) + `owner_agent_rules` (the runner owner's **Personal Agent Rules**) — concrete execution mechanics: run typecheck/build (and any test commands) before pushing, never `git stash`, commit only your own files, honour the target branch, plus any personal tooling. These are agent mechanics (deliberately hidden from the in-session Dev), so they apply to you here.
+   - `agent_rules` (team **Agent Execution Rules**) + `owner_agent_rules` (the runner owner's **Personal Agent Rules**) — concrete execution mechanics: run typecheck/build (and any test commands) before pushing, never `git stash`, commit only your own files, honour the target branch, plus any personal tooling. These are agent mechanics, so they apply to you here.
 
    Treat all three as mandatory, not suggestions. Precedence: personal rules govern local working-style; shared-repo-safety rules always hold. Skip any tier whose field is empty/missing.
 
@@ -342,7 +342,7 @@ All implementation work happens inside a git worktree — a sibling directory wi
 
 10. **Run type checking**: If a typecheck command exists, run it from the worktree and fix errors.
 
-10a. **Database migrations (if this item adds or edits a DB migration).** Do NOT assume which database to apply it to — the wrong one is a real, destructive failure. The `get_project_summary` settings and the `get_next_work_item` result both include a `database_targets` array: each connected database with its non-secret `identity` (for Supabase, `identity.externalId` is the project ref), `environment`, and the `branch_name` whose migrations target it. (a) Pick the target whose `branch_name` matches the merge target you resolved for the repo (its `target_branch`), or one with `branch_name: null`. (b) Apply the migration with your OWN database tooling pointed at that target's `identity` — for Supabase, ensure your Supabase tooling targets that exact project ref, not whatever it defaults to. DevSpec does not apply migrations for you and never hands you the credential. (c) Never select the target by `name` (it can mislead — the bug this prevents). If the matching target has `needs_reconnect: true` / a null `identity`, or you cannot reach it, STOP and fail the item via Step 6 (`"Requires human judgment: cannot reach migration target <identity.externalId>"`). Be especially careful when `environment` is `production`.
+10a. **Database migrations (if this item adds or edits a DB migration).** Do NOT assume which database to apply it to — the wrong one is a real, destructive failure. The `get_project_summary` settings and the `get_next_work_item` result both include a `database_targets` array: each connected database with its non-secret `identity` (for Supabase, `identity.externalId` is the project ref), `environment`, and the `branch_name` whose migrations target it. (a) Pick the target whose `branch_name` matches the merge target you resolved for the repo (its `target_branch`), or one with `branch_name: null`. (b) Apply the migration with your OWN database tooling pointed at that target's `identity` — for Supabase, ensure your Supabase tooling targets that exact project ref, not whatever it defaults to. DevSpec does not apply migrations for you and never hands you the credential. (c) Never select the target by `name` (names can collide). If the matching target has `needs_reconnect: true` / a null `identity`, or you cannot reach it, STOP and fail the item via Step 6 (`"Requires human judgment: cannot reach migration target <identity.externalId>"`). Be especially careful when `environment` is `production`.
 
 11. **Validate protected paths**: Run `git diff --name-only` from the worktree and check each changed file against `protected_paths` from Step 0a. If any match, fail the item via Step 6 — do not commit. (Step 6 will attempt worktree cleanup before calling `fail_work_item`.)
 
@@ -502,7 +502,7 @@ This step runs only when Step 1b found a planning item and no staged work exists
    2. Capture `started_at` ISO timestamp: `node -e "console.log(new Date().toISOString())"`.
    3. Append the starting JSONL record with `agentBranch: ""` (no branch in planning mode) and `actionItemTitle` sanitized per Rule 4. Example record:
       ```
-      {"id":"<exec_id>","actionItemId":"<action_item_id>","actionItemTitle":"<title>","project":"DevSpec","startedAt":"<started_at>","status":"running","triggeredBy":"autopilot","agentBranch":""}
+      {"id":"<exec_id>","actionItemId":"<action_item_id>","actionItemTitle":"<title>","project":"<project name or id>","startedAt":"<started_at>","status":"running","triggeredBy":"autopilot","agentBranch":""}
       ```
       Pass as the single shell argument exactly as in Step 2. All Rule 1 + Rule 4 escaping applies (replace every `'` with `'\\''`, every `"` with `\\"`, strip `$ ` `` ` `` ` \\ | & < > #`, truncate the title to 500 chars).
    4. Write the first per-task log line via the helper from reference.md: `Starting planning-mode analysis for <title>` (same escaping).
@@ -584,7 +584,7 @@ This step runs only when Step 1b found a review item (`agent_activity: 'under_hu
    2. Capture `started_at` ISO timestamp: `node -e "console.log(new Date().toISOString())"`.
    3. Append the starting JSONL record with `agentBranch: ""` (no branch in review mode), `triggeredBy: "autopilot"`, and `actionItemTitle` sanitized per Rule 4. Example record:
       ```
-      {"id":"<exec_id>","actionItemId":"<action_item_id>","actionItemTitle":"<title>","project":"DevSpec","startedAt":"<started_at>","status":"running","triggeredBy":"autopilot","agentBranch":""}
+      {"id":"<exec_id>","actionItemId":"<action_item_id>","actionItemTitle":"<title>","project":"<project name or id>","startedAt":"<started_at>","status":"running","triggeredBy":"autopilot","agentBranch":""}
       ```
       Rule 1 + Rule 4 escaping applies to the title argument (replace every `'` with `'\\''`, every `"` with `\\"`, strip `$ ` `` ` `` ` \\ | & < > #`, truncate to 500 chars).
    4. Write the first per-task log line via the helper from reference.md: `Starting review-mode analysis for <title>` (same escaping).

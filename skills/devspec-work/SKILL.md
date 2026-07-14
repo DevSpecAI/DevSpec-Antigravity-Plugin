@@ -118,7 +118,7 @@ See the `devspec-remote` / `devspec.remote` skill for full details.
           ⚠ Runner gated: <validation_details.message>
           → Resolve this in the DevSpec dashboard. The next /devspec:work run will proceed automatically once the mismatch is fixed.
           ```
-        - Do NOT proceed to Phase 1 (no item resolution, no claim, no work). Do NOT attempt to fix the mismatch yourself (NEVER `git checkout`, NEVER switch repos, NEVER modify local git state — resolution happens via the DevSpec dashboard, not via Gemini).
+        - Do NOT proceed to Phase 1 (no item resolution, no claim, no work). Do NOT attempt to fix the mismatch yourself (NEVER `git checkout`, NEVER switch repos, NEVER modify local git state — resolution happens via the DevSpec dashboard, not via Antigravity).
         - Exit cleanly. Do NOT call `fail_work_item` — no item was claimed.
 
       - **`validation_state` absent, null, or unrecognized** — backwards compatibility. Proceed normally.
@@ -204,7 +204,7 @@ See the `devspec-remote` / `devspec.remote` skill for full details.
     2. Capture `started_at` ISO timestamp.
     3. Append a starting JSONL record with `triggeredBy: "work"`:
        ```
-       node -e "const fs=require('fs'),path=require('path'),os=require('os'); const file=path.join(os.homedir(),'.devspec','execution-history.jsonl'); fs.mkdirSync(path.dirname(file),{recursive:true}); fs.appendFileSync(file,process.argv[1]+'\n');" '{"id":"<exec_id>","actionItemId":"<action_item_id>","actionItemTitle":"<title>","project":"DevSpec","startedAt":"<started_at>","lifecycle":"running","triggeredBy":"work","agentBranch":"<branch_name>"}'
+       node -e "const fs=require('fs'),path=require('path'),os=require('os'); const file=path.join(os.homedir(),'.devspec','execution-history.jsonl'); fs.mkdirSync(path.dirname(file),{recursive:true}); fs.appendFileSync(file,process.argv[1]+'\n');" '{"id":"<exec_id>","actionItemId":"<action_item_id>","actionItemTitle":"<title>","project":"<project name or id>","startedAt":"<started_at>","lifecycle":"running","triggeredBy":"work","agentBranch":"<branch_name>"}'
        ```
        **Shell safety (Rule 1 + Rule 4):** sanitize `<title>` — escape `'` as `'\''` and `"` as `\"`, strip `$ ` `` ` `` ` \\`, truncate to 500 chars.
     4. Write the first line to `~/.devspec/logs/<exec_id>.log` using the helper from reference.md.
@@ -251,7 +251,7 @@ See the `devspec-remote` / `devspec.remote` skill for full details.
 
     **Principles + Agent Rules (mandatory):** Apply the instruction tiers you loaded in step 2:
     - `custom_instructions` (team **Principles**): engineering philosophy and quality bar — no hacky workarounds, prefer the proper/secure solution, use platform tools properly. These shape *how* you build.
-    - `agent_rules` (team **Agent Execution Rules**) + `owner_agent_rules` (**your** personal machine/tooling rules): concrete execution mechanics — e.g. run typecheck/build (and any test commands) before pushing, never `git stash`, commit only your own files, honour the target branch, plus any personal tooling you have set up. These are mechanics for a coding agent, so they apply to you here (they are deliberately hidden from the in-session Dev).
+    - `agent_rules` (team **Agent Execution Rules**) + `owner_agent_rules` (**your** personal machine/tooling rules): concrete execution mechanics — e.g. run typecheck/build (and any test commands) before pushing, never `git stash`, commit only your own files, honour the target branch, plus any personal tooling you have set up. These are mechanics for a coding agent, so they apply to you here.
 
     Treat all three as mandatory requirements, not suggestions. Precedence: your personal rules govern local working-style, but the shared-repo-safety rules always hold. Skip any tier whose field is empty/absent.
 
@@ -260,7 +260,7 @@ See the `devspec-remote` / `devspec.remote` skill for full details.
     **Database migrations (if this item adds or edits a DB migration).** Do NOT assume which database to apply it to — applying to the wrong one is a real, destructive failure. The `get_project_summary` response you loaded in Phase 0 includes a `database_targets` array: each connected database with its non-secret `identity` (for Supabase, `identity.externalId` is the project ref), declared `environment`, and the `branch_name` whose migrations target it.
     - **(a)** Pick the target whose `branch_name` matches the merge target you resolved for the repo (its `target_branch`), or one with `branch_name: null` (applies to all branches).
     - **(b)** Apply the migration with your OWN database tooling pointed at that target's `identity` — for Supabase, ensure your Supabase tooling targets that exact project ref, not whatever it defaults to. DevSpec does not apply migrations for you and never hands you the credential.
-    - **(c)** Never select the target by `name` (it can be misleading — that is the bug this prevents). If the matching target has `needs_reconnect: true` / a null `identity`, or your tooling cannot reach it, STOP and fail the item (`"Requires human judgment: cannot reach migration target <identity.externalId>"`) rather than applying to a different or default database. Be especially careful when `environment` is `production`.
+    - **(c)** Never select the target by `name` (names can collide). If the matching target has `needs_reconnect: true` / a null `identity`, or your tooling cannot reach it, STOP and fail the item (`"Requires human judgment: cannot reach migration target <identity.externalId>"`) rather than applying to a different or default database. Be especially careful when `environment` is `production`.
 
 14. **Test.** After implementation, run the project's configured `test_commands` from the execution settings loaded in step 2 — each only if it is set:
     - Unit: `{test_commands.unit}` (if configured)
@@ -288,7 +288,7 @@ See the `devspec-remote` / `devspec.remote` skill for full details.
     ```
     git commit -m '{generated_message}'
     ```
-    Do NOT construct the message yourself — the `[devspec:<id>]` tag is what the deployment webhook uses.
+    Do NOT construct the message yourself — the `[devspec:<id>]` tag is what DevSpec uses to link the commit.
 
 16. **Integrate the fresh target, then push** (if auto_push enabled or implied by auto_merge).
 
@@ -361,7 +361,7 @@ See the `devspec-remote` / `devspec.remote` skill for full details.
         - `confidence`: 0.0–1.0
       - `provider`: always pass `"antigravity"`
 
-    **d)** `record_memory` — *only if this work surfaced something durable about the project* (a decision made, a convention followed or established, an architecture fact, a risk). `search_memories` FIRST for the closest existing match and `supersede_memory`/`retract_memory` it rather than recording a duplicate. Record only SHARED project knowledge the whole team should inherit — DevSpec memory is the team's source of truth and the in-app DevSpec assistant reads it every turn — never transient or obvious details, and never personal or machine-specific notes, which belong in your OWN local agent memory (e.g. `AGENTS.md`), not DevSpec. Skip this step entirely when nothing durable was learned.
+    **d)** `record_memory` — *only if this work surfaced something durable about the project* (a decision made, a convention followed or established, an architecture fact, a risk). `search_memories` FIRST for the closest existing match and `supersede_memory`/`retract_memory` it rather than recording a duplicate. Record only SHARED project knowledge the whole team should inherit — DevSpec memory is the team's source of truth — never transient or obvious details, and never personal or machine-specific notes, which belong in your OWN local agent memory (e.g. `AGENTS.md`), not DevSpec. Skip this step entirely when nothing durable was learned.
 
     **e)** Write completion to local storage (see reference.md → *Local Storage*, best-effort):
     - Capture `completed_at` and compute `duration` (ms from `started_at`).

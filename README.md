@@ -19,8 +19,8 @@ It is the Antigravity sibling of the DevSpec plugins for Claude Code, Codex CLI,
 - Antigravity CLI (`agy`) **or** the Antigravity desktop app.
 - A DevSpec account, with an **account-wide MCP token** (DevSpec → **Settings → Autopilot**) — one
   token works across all projects in your account. The skills resolve which project a run is for
-  from the repo's git remote (`git remote get-url origin`), so the token is no longer pinned to a
-  single project.
+  from the repo's git remote (`git remote get-url origin`), so one token works across every
+  project.
 - `git` and **`node` (Node.js 18+)** on your PATH. Autopilot/work skills use git worktrees and
   small Node helpers for logging. **DevSpec remote control** (`devspec-remote`) also needs Node:
   it runs a local poller so the agent can stay connected to the Agents page without burning LLM
@@ -124,8 +124,8 @@ DevSpec exposes one MCP server. Each editor/agent gets a thin, native wrapper:
 | Gemini CLI | `gemini-extension.json` | `httpUrl` | `.toml` commands |
 | **Antigravity** | `mcp_config.json` | `serverUrl` | **`SKILL.md` skills** |
 
-The intelligence lives server-side in DevSpec. This repo is just the Antigravity packaging, so it
-stays small and tracks the others' behaviour.
+The intelligence lives server-side in DevSpec; each client is just native packaging around the
+same tools.
 
 ---
 
@@ -138,8 +138,8 @@ This repo is the distributable artifact. Three channels:
    install directly from the URL.
 3. **Bundled** — drop the `skills/` folder into a project's `.agents/skills/` and commit it.
 
-The repo contains **no secrets**: the MCP config ships with a token *placeholder*, and `.gitignore`
-blocks any filled-in `mcp_config.json` from being committed.
+The MCP config ships with a token *placeholder*, and `.gitignore` blocks any filled-in
+`mcp_config.json` from being committed.
 
 ---
 
@@ -154,14 +154,12 @@ fail, update, commit-reference, …) self-resolve their project from the item id
 `project_id`. If a repo is tracked by more than one project, an unattended run fails with the
 candidate list rather than guessing; an interactive run asks which project to use.
 
-## Known follow-ups
+## Notes
 
 - **Provider attribution.** The skills report completed work with `provider: "antigravity"` so
-  Antigravity runs show up distinctly in the dashboard. That value must exist in the DevSpec MCP
-  server's provider enum (`lib/mcp/tool-definitions.ts`) — make sure the running server is on a
-  build that includes it, or completion calls will fail validation.
-- **Env-var interpolation** (`${TOKEN}`) in Antigravity's `mcp_config.json` is unverified — the
-  template uses a literal token placeholder, which always works.
+  Antigravity runs show up distinctly in the dashboard. This requires a current DevSpec server.
+- **Token in config.** Use a literal token in `mcp_config.json` — the template ships a literal
+  placeholder to replace. Avoid env-var interpolation like `${TOKEN}`.
 
 ---
 

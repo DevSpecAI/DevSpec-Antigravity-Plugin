@@ -9,7 +9,7 @@ Cleanly disconnect **this** local agent / **this** remote-control session so the
 
 ## Multi-session safety (non-negotiable)
 
-One machine may run **several** remote-control sessions at once (multiple Grok/Claude terminals).
+One machine may run **several** remote-control sessions at once (multiple Antigravity terminals).
 
 - Stop **only** the session you intend to stop (from `~/.devspec/remote-control/sessions/<uuid>.json` or `--session`).
 - **Never** kill every `devspec-remote-poll` process on the machine.
@@ -29,12 +29,12 @@ One machine may run **several** remote-control sessions at once (multiple Grok/C
      session_id,
      status: "offline",
      end_reason: "local_stop",
-     agent_name: "Grok Build"
+     agent_name: "Antigravity"
    })
    ```
 
 3. **Post disconnect** (best-effort, same session only):
-   `post_session_message(session_id, "🔌 **Local agent disconnected**.", agent_name: "Grok Build")`
+   `post_session_message(session_id, "🔌 **Local agent disconnected**.", agent_name: "Antigravity")`
 
 4. **Disable local state + stop THIS poller only:**
    ```bash
@@ -54,4 +54,4 @@ One machine may run **several** remote-control sessions at once (multiple Grok/C
 
 - Always offline **this** session even if post fails.
 - Do not delete the DevSpec session — history remains. `end_reason: local_stop` is recoverable **only soon after** (find-reconnect TTL ~30m, same cwd): remote → stop → remote again in the same conversation reuses the channel. A **new** agent chat later must not rejoin this session just because files remain under `~/.devspec`.
-- Distinct from Claude's built-in `/remote-control`.
+- This is DevSpec remote control — distinct from any built-in remote-control feature of your host app.

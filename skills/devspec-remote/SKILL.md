@@ -7,7 +7,7 @@ description: "Connect this Antigravity session as a DevSpec remote-control targe
 
 Connect **this** local Antigravity session to DevSpec so you can be driven from the **Agents page** (or phone/web) while your work is mirrored into a private DevSpec transcript.
 
-This is **DevSpec** remote control — not Claude Code's built-in `/remote-control` (Claude mobile/desktop apps).
+This is **DevSpec** remote control — distinct from any built-in remote-control feature of your host app.
 
 **Requirement:** preferred remote-control path needs **Node.js 18+** (`node` on PATH) for the packaged poller scripts. Idle polling is mechanical MCP HTTP — it does **not** consume LLM tokens. Without Node, use the fallback in-agent poll loop (less reliable).
 
@@ -37,7 +37,7 @@ This is **DevSpec** remote control — not Claude Code's built-in `/remote-contr
       ```bash
       node "<plugin>/hooks/scripts/remote-control-state.mjs" find-reconnect --cwd "$(pwd)" --agent "Antigravity"
       ```
-   b. If `action` is **`create_session`** (the common case for a fresh Grok/Claude session, or stop older than the TTL): **skip reconnect.** Go to **3d** and call `create_session`.
+   b. If `action` is **`create_session`** (the common case for a fresh Antigravity session, or stop older than the TTL): **skip reconnect.** Go to **3d** and call `create_session`.
    c. If `action` is **`reconnect`** and `session_id` is set (recent `local_stop` / recoverable end only):
       1. Note `session_codename` / `title` from find-reconnect — that is the **true channel identity** (e.g. Colorful Possum), not "whatever is in this cwd".
       2. `report_remote_agent_heartbeat(session_id, status: "live", check_tier: "responsive", agent_name: "Antigravity")`
@@ -118,7 +118,7 @@ Sequence: **poll MCP → write inbox → wake agent**. Heartbeats and wake are *
 ### A. Continuous heartbeat poller (nohup — never exit on owner message)
 
 ```bash
-PLUGIN="<plugin-root>"   # e.g. installed-plugins/devspec-grok-build-extension-*
+PLUGIN="<plugin-root>"   # e.g. installed-plugins/devspec-antigravity-*
 SESSION="<uuid>"
 node "$PLUGIN/hooks/scripts/remote-control-state.mjs" write \
   --session "$SESSION" --agent "Antigravity" --cwd "$(pwd)" \
@@ -177,7 +177,7 @@ Poller disables state and exits 1; wait also exits 1 if it sees disabled / UI en
 
 1. Heartbeat live; 2. transcript after cursor; 3. act on owner dispatch only; 4. short sleep loop; 5. offline + local_stop on disconnect.
 
-Resolve `mcp_url` from MCP config — never hardcode production when on staging.
+Resolve `mcp_url` from MCP config — don't hardcode it.
 
 
 ## Interactive knowledge capture (while remote — non-negotiable)
@@ -204,7 +204,7 @@ Be as proactive about memories/artifacts as you already are about **action items
 After `create_session` for `agent_remote_control` (or the initial `get_session_transcript` seed with no cursor), read the instruction fields from the response when present and non-null, and hold them for the **entire remote-control run**. There are two tiers (each with a `_note` field on the create_session response explaining it):
 
 **Style + principles — how you talk, and what good work looks like:**
-- **`owner_custom_instructions`** — the owner's Account → Chat Response Style. Apply to how you reply (brevity, tone, naming) — same spirit as Dev's profile style note.
+- **`owner_custom_instructions`** — the owner's Account → Chat Response Style. Apply to how you reply (brevity, tone, naming).
 - **`project_custom_instructions`** — the team's Project Principles (engineering philosophy, quality bar, provider preferences). Apply to how you plan, recommend, and evaluate work.
 
 **Agent execution rules — how you actually run work on this machine (you ARE a coding agent, so these apply to you and NOT to the in-session Dev):**

@@ -532,7 +532,7 @@ node -e "console.log(require('crypto').randomUUID())"
 {
   "project_id": "4d753b6a-28d9-4d2d-8f23-af3103af76db",
   "session_id": "fdd1a2b3-c4d5-e6f7-8901-234567890abc",
-  "machine_hostname": "brandons-macbook.local",
+  "machine_hostname": "your-machine.local",
   "status": "idle",
   "cycle_count": 1,
   "tasks_completed": 1,
@@ -541,9 +541,9 @@ node -e "console.log(require('crypto').randomUUID())"
   "last_error": "Typecheck failed: 2 errors in src/auth/handler.ts",
   "repositories": [
     {
-      "name": "DevSpecV2",
-      "remote_url": "github.com/DevSpecAI/DevSpecV2",
-      "branch": "staging",
+      "name": "my-app",
+      "remote_url": "github.com/your-org/my-app",
+      "branch": "main",
       "short_sha": "a1b2c3d"
     }
   ]
@@ -677,7 +677,7 @@ Every field is a string unless noted. Missing fields default to `null`/absent (v
   "id": "<uuid>",
   "actionItemId": "<uuid>",
   "actionItemTitle": "<string>",
-  "project": "DevSpec",
+  "project": "<project name or id>",
   "startedAt": "<ISO-8601>",
   "status": "running",
   "triggeredBy": "autopilot",
