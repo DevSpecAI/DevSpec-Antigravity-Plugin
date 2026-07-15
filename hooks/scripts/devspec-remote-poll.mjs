@@ -23,7 +23,8 @@
  *   1–2 h:      transcript ~60s, heartbeat ~60s, check_tier=normal
  *   2–12 h:     transcript ~5 min, heartbeat ~60s, check_tier=relaxed
  *   12–24 h:    transcript ~10 min, heartbeat ~60s, check_tier=sparse
- *   >24 h idle: clean disconnect (offline + idle_timeout), exit 1
+ *   24–72 h:    transcript ~60 min, heartbeat ~60 min, check_tier=dormant
+ *   >72 h idle: clean disconnect (offline + idle_timeout), exit 1
  *
  * Heartbeat and transcript poll are **independent**: the loop sleeps until the
  * next of (heartbeat due, poll due). Never sleep the full poll interval alone —
@@ -71,8 +72,33 @@ const BACKOFF_TIERS = [
   { untilMs: 2 * 60 * 60 * 1000, pollMs: 60_000, heartbeatMs: 60_000, tier: 'normal' },
   { untilMs: 12 * 60 * 60 * 1000, pollMs: 5 * 60_000, heartbeatMs: 60_000, tier: 'relaxed' },
   { untilMs: 24 * 60 * 60 * 1000, pollMs: 10 * 60_000, heartbeatMs: 60_000, tier: 'sparse' },
+  // Dormant: 24–72h idle. Back off to ~hourly checks so a very quiet connection
+  // stays reachable up to the 72h lifetime cap without churn. Server freshness
+  // for 'dormant' is 90 min, which covers the hourly heartbeat + grace.
+  { untilMs: 72 * 60 * 60 * 1000, pollMs: 60 * 60_000, heartbeatMs: 60 * 60_000, tier: 'dormant' },
 ]
-const IDLE_DISCONNECT_MS = 24 * 60 * 60 * 1000
+const IDLE_DISCONNECT_MS = 72 * 60 * 60 * 1000
+
+// A turn's busy assertion is re-asserted on heartbeats while a turn marker
+// (written by mirror-turn on turn start, removed on stop) is present and younger
+// than this cap. The cap bounds a stranded "working" to at most this long if the
+// agent is killed mid-turn (Stop never fires) while this poller survives: after
+// the cap we stop re-asserting and the server's busy freshness decays it to idle.
+const MAX_TURN_MS = 60 * 60 * 1000
+
+function turnMarkerPath(sessionId) {
+  return path.join(SESSIONS_DIR, `${sessionId}.turn`)
+}
+function readTurnMarker(sessionId) {
+  try {
+    const p = turnMarkerPath(sessionId)
+    if (!fs.existsSync(p)) return null
+    const m = JSON.parse(fs.readFileSync(p, 'utf8'))
+    return typeof m?.startedAt === 'number' ? m : null
+  } catch {
+    return null
+  }
+}
 
 function parseArgs(argv) {
   const out = {}
@@ -283,6 +309,9 @@ async function main() {
   let ownerUserId = args.ownerUserId || state?.owner_user_id || null
   let lastHeartbeat = 0
   let lastTier = null
+  // Tracks the last busy value we sent so we clear "working" exactly once when a
+  // turn ends (marker gone) rather than spamming busy:false on every idle beat.
+  let lastBusySent = null
   // Idle clock resets when we deliver owner messages (connection still active).
   let idleStarted = Date.now()
 
@@ -385,6 +414,18 @@ async function main() {
       }
     }
 
+    // Agent-authoritative "working": re-assert busy while a fresh turn marker is
+    // present (mirror-turn writes it on turn start, removes it on stop). This
+    // refreshes the server's busy freshness so long turns stay "working"; when
+    // the turn ends we send busy:false exactly once. An active turn also keeps
+    // the poller responsive so the re-assert cadence stays tight.
+    const marker = readTurnMarker(sessionId)
+    const turnActive = !!marker && Date.now() - marker.startedAt < MAX_TURN_MS
+    if (turnActive) idleStarted = Date.now()
+    let busyArg = null
+    if (turnActive) busyArg = true
+    else if (lastBusySent === true) busyArg = false
+
     const now = Date.now()
     if (now - lastHeartbeat >= tier.heartbeatMs) {
       try {
@@ -397,9 +438,11 @@ async function main() {
             agent_name: agentName,
             status: 'live',
             check_tier: tier.tier,
+            ...(busyArg !== null ? { busy: busyArg } : {}),
           },
         })
         lastHeartbeat = Date.now()
+        if (busyArg !== null) lastBusySent = busyArg
 
         if (isTerminalEnded(hb)) {
           const reason = isEndedFromUi(hb) ? 'ended_from_ui' : hb.end_reason || 'ended_from_ui'

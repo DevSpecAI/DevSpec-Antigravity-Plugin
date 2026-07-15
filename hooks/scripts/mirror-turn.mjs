@@ -18,6 +18,33 @@ const mode = process.argv[2] === 'user_prompt' ? 'user_prompt' : 'stop'
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
 const SESSIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'sessions')
 
+// Turn marker — the connected agent is the SOLE authority for the "working"
+// state. UserPromptSubmit (turn start) writes it; Stop (turn end) clears it. The
+// long-lived poller reads it to re-assert busy on heartbeats while a turn runs
+// (so long turns stay "working" and the server's busy freshness doesn't decay).
+function turnMarkerPath(sessionId) {
+  return path.join(SESSIONS_DIR, `${sessionId}.turn`)
+}
+function writeTurnMarker(sessionId) {
+  if (!sessionId) return
+  try {
+    fs.mkdirSync(SESSIONS_DIR, { recursive: true })
+    fs.writeFileSync(turnMarkerPath(sessionId), JSON.stringify({ startedAt: Date.now() }), {
+      mode: 0o600,
+    })
+  } catch {
+    /* non-fatal — the immediate busy heartbeat below still fires */
+  }
+}
+function clearTurnMarker(sessionId) {
+  if (!sessionId) return
+  try {
+    fs.rmSync(turnMarkerPath(sessionId), { force: true })
+  } catch {
+    /* ignore */
+  }
+}
+
 function readStdin() {
   try {
     return fs.readFileSync(0, 'utf8')
@@ -143,11 +170,23 @@ async function main() {
         },
       })
     }
+    // Turn lifecycle → "working" authority. user_prompt starts a turn
+    // (busy:true + marker so the poller re-asserts); stop ends it (busy:false +
+    // clear marker). The server never sets busy itself, so this is the ONLY
+    // thing that lights up "working".
+    const turnActive = mode === 'user_prompt'
+    if (turnActive) writeTurnMarker(sessionId)
+    else clearTurnMarker(sessionId)
     await mcpToolsCall({
       mcpUrl,
       token,
       name: 'report_remote_agent_heartbeat',
-      arguments: { session_id: sessionId, agent_name: agentName, status: 'live' },
+      arguments: {
+        session_id: sessionId,
+        agent_name: agentName,
+        status: 'live',
+        busy: turnActive,
+      },
     })
   } catch (e) {
     process.stderr.write(`[devspec-remote] ${e instanceof Error ? e.message : String(e)}\n`)
