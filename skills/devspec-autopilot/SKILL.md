@@ -260,7 +260,7 @@ Call `claim_work_item` with `action_item_id` and `agent_branch: branch_name`.
 - Stop. Do not call fail_work_item (the item is not yours).
 
 **If claim fails with 401 (Unauthorized):**
-- Output: "Authentication failed. Regenerate your token in DevSpec: Settings > Autopilot."
+- Output: "Authentication failed. Regenerate your token in DevSpec: You → Connections."
 - Stop.
 
 **If claim fails with any other error:**
