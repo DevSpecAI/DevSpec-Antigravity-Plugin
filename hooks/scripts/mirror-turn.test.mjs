@@ -24,6 +24,14 @@ describe('resolveHookConversationId', () => {
     assert.equal(resolveHookConversationId('{}', { CLAUDE_SESSION_ID: 'alt-conv' }), 'alt-conv')
   })
 
+  it('resolves a non-Claude tool env id via the shared detectLocalId', () => {
+    // Regression guard: the resolver must be tool-agnostic (symmetric with
+    // connect-time detectLocalId). A Claude-only resolver silently fail-closes
+    // every other plugin's mirror.
+    assert.equal(resolveHookConversationId('{}', { GROK_SESSION_ID: 'grok-conv' }), 'grok-conv')
+    assert.equal(resolveHookConversationId('{}', { CODEX_THREAD_ID: 'codex-conv' }), 'codex-conv')
+  })
+
   it('falls back to hook stdin session_id when no env id', () => {
     assert.equal(resolveHookConversationId('{"session_id":"stdin-conv"}', {}), 'stdin-conv')
   })

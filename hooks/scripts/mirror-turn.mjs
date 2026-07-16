@@ -15,6 +15,7 @@ import { pathToFileURL } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
+import { detectLocalId } from './remote-control-state.mjs'
 
 const mode = process.argv[2] === 'user_prompt' ? 'user_prompt' : 'stop'
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
@@ -56,14 +57,17 @@ function readStdin() {
 }
 
 /**
- * The DevSpec session to mirror into belongs to THIS Claude Code conversation.
- * Resolve its id the SAME way remote-control-state.mjs `write` stamped it:
- * env CLAUDE_CODE_SESSION_ID (the value detectLocalId used at connect), else
- * CLAUDE_SESSION_ID, else the hook stdin session_id. Never a machine-global
+ * The DevSpec session to mirror into belongs to THIS local conversation. Resolve
+ * its id the SAME way remote-control-state.mjs `write` stamped it — via the shared
+ * detectLocalId, which probes whichever conversation-id env var THIS tool exposes
+ * (CLAUDE_CODE_SESSION_ID, GROK_SESSION_ID, CODEX_THREAD_ID, TERM/SHELL_SESSION_ID,
+ * …), then the hook stdin session_id. Tool-agnostic and SYMMETRIC with connect, so
+ * it works for every plugin — not just Claude Code. (A Claude-only resolver here
+ * silently fail-closes every other plugin's mirror.) Never a machine-global
  * pointer — that is exactly what caused concurrent sessions to cross-post.
  */
 export function resolveHookConversationId(hookInput, env = process.env) {
-  const fromEnv = String(env.CLAUDE_CODE_SESSION_ID || env.CLAUDE_SESSION_ID || '').trim()
+  const fromEnv = detectLocalId({}, env).local_id
   if (fromEnv) return fromEnv
   try {
     const parsed = JSON.parse(hookInput || '{}')
