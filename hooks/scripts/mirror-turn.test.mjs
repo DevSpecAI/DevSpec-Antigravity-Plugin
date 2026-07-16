@@ -88,4 +88,28 @@ describe('selectBoundState', () => {
     const r = selectBoundState([null, undefined, mk(own, 5)], conv)
     assert.equal(r?.session_id, 'sess-A')
   })
+
+  // Fallback for tools that expose NO per-conversation id to hooks (Cursor,
+  // Antigravity): the single enabled session for THIS agent is unambiguous.
+  it('falls back to the single enabled session for THIS agent when no conversation id', () => {
+    const cur = { enabled: true, session_id: 'sess-C', local_id: null, agent_name: 'Cursor' }
+    assert.equal(selectBoundState([mk(cur, 1)], null, 'Cursor')?.session_id, 'sess-C')
+  })
+
+  it('fails closed with two concurrent sessions of the same agent (cannot disambiguate)', () => {
+    const a = { enabled: true, session_id: 'sess-1', local_id: null, agent_name: 'Cursor' }
+    const b = { enabled: true, session_id: 'sess-2', local_id: null, agent_name: 'Cursor' }
+    assert.equal(selectBoundState([mk(a, 1), mk(b, 2)], null, 'Cursor'), null)
+  })
+
+  it('the single-agent fallback ignores other agents; a precise bond still wins', () => {
+    const cur = { enabled: true, session_id: 'sess-CU', local_id: null, agent_name: 'Cursor' }
+    // no conv id → the single Cursor session, never the Claude one
+    assert.equal(selectBoundState([mk(own, 5), mk(cur, 1)], null, 'Cursor')?.session_id, 'sess-CU')
+    // a matching conv id still binds precisely for the id-bearing tool
+    assert.equal(
+      selectBoundState([mk(own, 5), mk(cur, 1)], 'conv-A', 'Claude Code')?.session_id,
+      'sess-A',
+    )
+  })
 })

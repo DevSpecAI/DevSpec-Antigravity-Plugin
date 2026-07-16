@@ -81,18 +81,39 @@ export function resolveHookConversationId(hookInput, env = process.env) {
 }
 
 /**
- * Choose the state file bound to this exact conversation. Fails closed: no
- * conversation id, or no enabled per-session state stamped with it, means no
- * mirror. A machine-newer session belonging to a DIFFERENT conversation is
- * never selected — every hook must prove the state is its own.
+ * Choose the state file bound to THIS conversation.
+ *
+ * Primary — a precise conversation bond: tools that expose a stable conversation
+ * id (Claude/Grok/Codex, via detectLocalId) select the state whose local_id
+ * matches. A machine-newer session for a DIFFERENT conversation is never picked.
+ *
+ * Fallback — for tools that expose NO per-conversation id to their hooks (e.g.
+ * Cursor, Antigravity): select the single enabled remote session for THIS agent.
+ * Safe ONLY because "exactly one" means there is nothing to disambiguate, so no
+ * cross-session bleed is possible; two+ concurrent sessions of the same agent
+ * fall closed (no mirror) rather than guess. Never a newest-mtime / machine-global
+ * pick across different conversations.
  */
-export function selectBoundState(candidates, conversationId) {
-  if (!conversationId) return null
-  return candidates
+export function selectBoundState(candidates, conversationId, agentName = null) {
+  const enabled = candidates
     .filter(Boolean)
     .filter(({ raw }) => raw?.enabled === true && raw?.session_id)
-    .filter(({ raw }) => raw.local_id === conversationId)
-    .sort((a, b) => b.mtime - a.mtime)[0]?.raw ?? null
+
+  if (conversationId) {
+    const bound = enabled
+      .filter(({ raw }) => raw.local_id === conversationId)
+      .sort((a, b) => b.mtime - a.mtime)[0]?.raw
+    if (bound) return bound
+  }
+
+  if (agentName) {
+    const mine = enabled.filter(
+      ({ raw }) => String(raw.agent_name || '').toLowerCase() === String(agentName).toLowerCase(),
+    )
+    if (mine.length === 1) return mine[0].raw
+  }
+
+  return null
 }
 
 function loadState(conversationId) {
@@ -122,7 +143,7 @@ function loadState(conversationId) {
   } catch {
     /* selection below fails closed when no readable matching state exists */
   }
-  return selectBoundState(candidates, conversationId)
+  return selectBoundState(candidates, conversationId, AGENT_NAME)
 }
 
 function extractLastText(hookInput, which) {
