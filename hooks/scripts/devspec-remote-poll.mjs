@@ -45,6 +45,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { AGENT_NAME } from './agent-identity.mjs'
 
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
 const SESSIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'sessions')
@@ -303,7 +304,7 @@ async function main() {
     process.exit(1)
   }
   mcpUrl = mcpUrl || 'https://devspec.ai/api/mcp'
-  const agentName = state?.agent_name || 'Grok Build'
+  const agentName = AGENT_NAME
 
   let cursor = args.cursor || state?.cursor_after_message_id || null
   let ownerUserId = args.ownerUserId || state?.owner_user_id || null

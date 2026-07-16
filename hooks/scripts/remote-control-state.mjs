@@ -31,6 +31,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { AGENT_NAME } from './agent-identity.mjs'
 
 const DEVSPEC_DIR = path.join(os.homedir(), '.devspec')
 const LEGACY_PATH = path.join(DEVSPEC_DIR, 'remote-control.json')
@@ -403,7 +404,7 @@ if (cmd === 'write') {
     ...prev,
     enabled: true,
     session_id: args.session,
-    agent_name: args.agent || prev.agent_name || 'Claude Code',
+    agent_name: args.agent || prev.agent_name || AGENT_NAME,
     mcp_url: args.url || auth.mcp_url || prev.mcp_url || 'https://devspec.ai/api/mcp',
     token: auth.token || prev.token || undefined,
     auth_source: auth.source || auth.error || prev.auth_source || null,
