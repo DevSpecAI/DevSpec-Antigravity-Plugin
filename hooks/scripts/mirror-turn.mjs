@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
  * DevSpec remote-control mirror hook (Stop / UserPromptSubmit).
- * Uses token from ~/.devspec/remote-control.json (or per-session state) /
- * resolve-mcp-auth. Posts mechanically — no LLM tokens.
+ * Resolves ONLY the session bound to THIS local conversation — never a
+ * machine-global "latest session" pointer. Posts mechanically — no LLM tokens.
  *
  * user_prompt mode → turn_kind=local_prompt (literal owner text in Agents UI)
  * stop mode        → turn_kind=agent (assistant reply)
@@ -11,6 +11,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
@@ -54,37 +55,70 @@ function readStdin() {
   }
 }
 
-function loadState() {
-  // Prefer enabled legacy pointer; fall back to newest enabled per-session file.
+/**
+ * The DevSpec session to mirror into belongs to THIS Claude Code conversation.
+ * Resolve its id the SAME way remote-control-state.mjs `write` stamped it:
+ * env CLAUDE_CODE_SESSION_ID (the value detectLocalId used at connect), else
+ * CLAUDE_SESSION_ID, else the hook stdin session_id. Never a machine-global
+ * pointer — that is exactly what caused concurrent sessions to cross-post.
+ */
+export function resolveHookConversationId(hookInput, env = process.env) {
+  const fromEnv = String(env.CLAUDE_CODE_SESSION_ID || env.CLAUDE_SESSION_ID || '').trim()
+  if (fromEnv) return fromEnv
+  try {
+    const parsed = JSON.parse(hookInput || '{}')
+    if (typeof parsed.session_id === 'string' && parsed.session_id.trim()) {
+      return parsed.session_id.trim()
+    }
+  } catch {
+    /* fall through — fail closed below */
+  }
+  return null
+}
+
+/**
+ * Choose the state file bound to this exact conversation. Fails closed: no
+ * conversation id, or no enabled per-session state stamped with it, means no
+ * mirror. A machine-newer session belonging to a DIFFERENT conversation is
+ * never selected — every hook must prove the state is its own.
+ */
+export function selectBoundState(candidates, conversationId) {
+  if (!conversationId) return null
+  return candidates
+    .filter(Boolean)
+    .filter(({ raw }) => raw?.enabled === true && raw?.session_id)
+    .filter(({ raw }) => raw.local_id === conversationId)
+    .sort((a, b) => b.mtime - a.mtime)[0]?.raw ?? null
+}
+
+function loadState(conversationId) {
+  // Gather every candidate (legacy singleton + per-session files) but NEVER
+  // trust "most recent" — selectBoundState keeps only THIS conversation's state.
+  const candidates = []
   try {
     if (fs.existsSync(LEGACY_STATE_PATH)) {
       const raw = JSON.parse(fs.readFileSync(LEGACY_STATE_PATH, 'utf8'))
-      if (raw && raw.enabled === true && raw.session_id) return raw
+      candidates.push({ raw, mtime: fs.statSync(LEGACY_STATE_PATH).mtimeMs })
     }
   } catch {
-    /* continue */
+    /* continue with per-session state */
   }
   try {
-    if (!fs.existsSync(SESSIONS_DIR)) return null
-    const files = fs
-      .readdirSync(SESSIONS_DIR)
-      .filter((f) => f.endsWith('.json'))
-      .map((f) => {
+    if (fs.existsSync(SESSIONS_DIR)) {
+      for (const file of fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.json'))) {
         try {
-          const p = path.join(SESSIONS_DIR, f)
+          const p = path.join(SESSIONS_DIR, file)
           const raw = JSON.parse(fs.readFileSync(p, 'utf8'))
-          return { raw, mtime: fs.statSync(p).mtimeMs }
+          candidates.push({ raw, mtime: fs.statSync(p).mtimeMs })
         } catch {
-          return null
+          /* ignore an incomplete or concurrently-replaced state file */
         }
-      })
-      .filter(Boolean)
-      .filter((x) => x.raw && x.raw.enabled === true && x.raw.session_id)
-      .sort((a, b) => b.mtime - a.mtime)
-    return files[0]?.raw ?? null
+      }
+    }
   } catch {
-    return null
+    /* selection below fails closed when no readable matching state exists */
   }
+  return selectBoundState(candidates, conversationId)
 }
 
 function extractLastText(hookInput, which) {
@@ -133,8 +167,29 @@ function extractLastText(hookInput, which) {
   return null
 }
 
+/**
+ * Claude Code re-invokes the model after a background task completes by
+ * injecting a synthetic user prompt — a <task-notification> block, a
+ * [SYSTEM NOTIFICATION …] banner, or a <system-reminder>. Those are harness
+ * plumbing, never owner-typed input, and must not be mirrored into the
+ * transcript as local_prompt bubbles. This guard is Claude-Code-specific:
+ * other tools never surface this text on UserPromptSubmit, so shipping it
+ * only here keeps the working plugins untouched.
+ */
+function isHarnessInjection(text) {
+  const t = String(text)
+  return (
+    t.includes('<task-notification') ||
+    t.includes('[SYSTEM NOTIFICATION - NOT USER INPUT]') ||
+    t.includes('This is an automated background-task event') ||
+    t.includes('<system-reminder>')
+  )
+}
+
 async function main() {
-  const state = loadState()
+  const raw = readStdin()
+  const conversationId = resolveHookConversationId(raw)
+  const state = loadState(conversationId)
   if (!state) process.exit(0)
 
   let token = state.token
@@ -147,14 +202,20 @@ async function main() {
   if (!token) process.exit(0) // silent — skill still posts instructionally
 
   mcpUrl = mcpUrl || 'https://devspec.ai/api/mcp'
+  // Identity is a fixed property of THIS plugin — never trust state/args for it.
   const agentName = AGENT_NAME
   const sessionId = state.session_id
 
-  const raw = readStdin()
   const text = extractLastText(raw, mode)
 
+  // In user_prompt mode, mirror only genuine owner-typed prompts. Skip harness
+  // plumbing (task-notification / system-reminder injections) so it never shows
+  // as a fake "local prompt" bubble. The heartbeat below still runs regardless,
+  // so presence is unaffected.
+  const skipMirror = mode === 'user_prompt' && !!text && isHarnessInjection(text)
+
   try {
-    if (text && String(text).trim()) {
+    if (text && String(text).trim() && !skipMirror) {
       const cleaned = String(text).trim().slice(0, 12000)
       const isLocalPrompt = mode === 'user_prompt'
       await mcpToolsCall({
@@ -195,4 +256,5 @@ async function main() {
   process.exit(0)
 }
 
-main()
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
+if (isMain) main()

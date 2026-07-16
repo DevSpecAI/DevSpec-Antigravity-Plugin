@@ -304,6 +304,7 @@ async function main() {
     process.exit(1)
   }
   mcpUrl = mcpUrl || 'https://devspec.ai/api/mcp'
+  // Identity is a fixed property of THIS plugin — never trust state/args for it.
   const agentName = AGENT_NAME
 
   let cursor = args.cursor || state?.cursor_after_message_id || null

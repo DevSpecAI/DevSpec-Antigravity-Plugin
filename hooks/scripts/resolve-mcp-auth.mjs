@@ -7,6 +7,9 @@
  * 2. Project .mcp.json (cwd and parents)
  * 3. ~/.claude.json project entries that match cwd (mcpServers.devspec)
  * 4. ~/.claude.json top-level mcpServers.devspec
+ * 5. CLAUDE_PLUGIN_OPTION_DEVSPEC_TOKEN — the plugin userConfig token
+ *    (keychain-stored; Claude Code exports it to hook/tool subprocesses).
+ *    Lowest priority so a developer's own .mcp.json (e.g. staging) still wins.
  *
  * Prints JSON: { ok, token?, mcp_url?, source?, error? }
  * Never prints the full token in human logs — only to stdout JSON for piping.
@@ -129,6 +132,23 @@ export function resolveDevspecMcpAuth(cwd = process.cwd()) {
     }
   }
 
+  // Plugin userConfig token (sensitive; stored in the OS keychain, exported to
+  // subprocesses as CLAUDE_PLUGIN_OPTION_<KEY>). This is how a marketplace-
+  // installed user's token reaches the remote-control hooks/poller — they never
+  // put it in .mcp.json. Kept last so an explicit local .mcp.json wins.
+  const pluginOptionToken =
+    process.env.CLAUDE_PLUGIN_OPTION_DEVSPEC_TOKEN ||
+    process.env.CLAUDE_PLUGIN_OPTION_devspec_token ||
+    null
+  if (pluginOptionToken) {
+    return {
+      ok: true,
+      token: pluginOptionToken,
+      mcp_url: envUrl || fromProject?.mcp_url || DEFAULT_PROD_URL,
+      source: 'plugin_user_config',
+    }
+  }
+
   // URL-only from project file (token missing)
   if (fromProject?.mcp_url) {
     return {
@@ -144,7 +164,7 @@ export function resolveDevspecMcpAuth(cwd = process.cwd()) {
     ok: false,
     mcp_url: envUrl || DEFAULT_PROD_URL,
     error:
-      'No DevSpec MCP token found. Set DEVSPEC_MCP_TOKEN, or configure mcpServers.devspec.headers.Authorization in project .mcp.json.',
+      'No DevSpec MCP token found. Provide your token via the plugin configuration, set DEVSPEC_MCP_TOKEN, or configure mcpServers.devspec.headers.Authorization in project .mcp.json.',
   }
 }
 
