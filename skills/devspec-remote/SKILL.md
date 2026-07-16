@@ -120,13 +120,20 @@ Sequence: **poll MCP → write inbox → wake agent**. Heartbeats and wake are *
 ```bash
 PLUGIN="<plugin-root>"   # e.g. installed-plugins/devspec-antigravity-*
 SESSION="<uuid>"
+# Durable owning process for THIS session (a tool subshell's parent = the agent
+# process). The poller anchors to it and self-terminates when it dies, so a closed
+# session never leaves a zombie "Live" agent on the Agents page.
+OWNER_PID="$PPID"
 node "$PLUGIN/hooks/scripts/remote-control-state.mjs" write \
   --session "$SESSION" --agent "Antigravity" --cwd "$(pwd)" \
-  --codename "<session_codename>" --title "<title>"
+  --codename "<session_codename>" --title "<title>" --owner-pid "$OWNER_PID"
+
+# Backstop: reap any provably-dead pollers from hard-closed sessions before we start.
+node "$PLUGIN/hooks/scripts/remote-control-state.mjs" reap --agent "Antigravity" --except-session "$SESSION" 2>/dev/null || true
 
 mkdir -p "$HOME/.devspec/remote-control/sessions"
 LOG="$HOME/.devspec/remote-control/sessions/${SESSION}.poll.log"
-nohup node "$PLUGIN/hooks/scripts/devspec-remote-poll.mjs" --session "$SESSION" \
+nohup node "$PLUGIN/hooks/scripts/devspec-remote-poll.mjs" --session "$SESSION" --owner-pid "$OWNER_PID" \
   >> "$LOG" 2>&1 &
 echo $! > "$HOME/.devspec/remote-control/sessions/${SESSION}.poll.pid"
 sleep 2
@@ -137,7 +144,8 @@ kill -0 "$(cat "$HOME/.devspec/remote-control/sessions/${SESSION}.poll.pid")" 2>
 Never use plain shell `&` without `nohup`/detach inside a finishing tool shell.
 
 Poller contract:
-- Stays up until disabled / UI End / idle_timeout / local_stop / auth failure
+- Stays up until disabled / UI End / idle_timeout / local_stop / **owner gone** / auth failure
+- Self-terminates (offline + exit) the moment its `--owner-pid` process dies — no zombie "Live" agents
 - On owner dispatch: appends `*.inbox.jsonl`, advances cursor, **keeps heartbeating**
 - Idle = no LLM tokens; stepped backoff up to 24h then `idle_timeout`
 
@@ -145,7 +153,7 @@ Poller contract:
 
 ```bash
 # After poller is up — start wait so a new owner instruction ends this process with stdout JSON:
-node "$PLUGIN/hooks/scripts/devspec-remote-wait.mjs" --session "$SESSION" --from-end
+node "$PLUGIN/hooks/scripts/devspec-remote-wait.mjs" --session "$SESSION" --owner-pid "$OWNER_PID" --from-end
 ```
 
 How to run wait so the model actually turns:

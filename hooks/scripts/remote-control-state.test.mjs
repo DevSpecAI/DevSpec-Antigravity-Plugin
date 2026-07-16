@@ -9,6 +9,8 @@ import {
   detectLocalId,
   isRecoverableEndReason,
   mintLocalId,
+  ownerAlive,
+  reapDeadPollers,
   resolveLocalAction,
 } from './remote-control-state.mjs'
 
@@ -252,5 +254,106 @@ describe('resolveLocalAction', () => {
     assert.equal(ra.action, 'already_live')
     assert.equal(rb.action, 'already_live')
     assert.notEqual(ra.session_id, rb.session_id)
+  })
+})
+
+describe('ownerAlive', () => {
+  it('this process is alive; pid 1 / bad input are not adopted', () => {
+    assert.equal(ownerAlive(process.pid), true)
+    assert.equal(ownerAlive(1), false)
+    assert.equal(ownerAlive(0), false)
+    assert.equal(ownerAlive(null), false)
+    assert.equal(ownerAlive(-5), false)
+    assert.equal(ownerAlive(2_147_483_646), false) // implausible pid → ESRCH
+  })
+})
+
+describe('reapDeadPollers', () => {
+  const agent = 'Claude Code'
+  // A poller "runs" for every session by default in these tests.
+  const findPidsAll = (sid) => [`pid-${sid}`]
+  const noneAlive = () => false
+  const allAlive = () => true
+
+  function run(states, opts = {}) {
+    const killed = []
+    const reaped = reapDeadPollers({
+      agent,
+      listStates: () => states,
+      findPids: opts.findPids || findPidsAll,
+      isOwnerAlive: opts.isOwnerAlive || allAlive,
+      kill: (pid) => {
+        killed.push(pid)
+        return true
+      },
+      ...opts.args,
+    })
+    return { reaped, killed }
+  }
+
+  it('reaps a disabled session', () => {
+    const { reaped, killed } = run([
+      { session_id: 's-disabled', agent_name: agent, enabled: false },
+    ])
+    assert.equal(reaped.length, 1)
+    assert.equal(reaped[0].reason, 'disabled')
+    assert.deepEqual(killed, ['pid-s-disabled'])
+  })
+
+  it('reaps an owner-gone session (owner_pid recorded but dead)', () => {
+    const { reaped } = run(
+      [{ session_id: 's-orphan', agent_name: agent, enabled: true, owner_pid: 4242 }],
+      { isOwnerAlive: noneAlive },
+    )
+    assert.equal(reaped.length, 1)
+    assert.equal(reaped[0].reason, 'owner_gone')
+  })
+
+  it('reaps an ended-from-ui session', () => {
+    const { reaped } = run([
+      { session_id: 's-ui', agent_name: agent, enabled: true, ended_from_ui: true, owner_pid: 10 },
+    ])
+    assert.equal(reaped.length, 1)
+    assert.equal(reaped[0].reason, 'ended_from_ui')
+  })
+
+  it('NEVER reaps a live session (enabled + owner alive)', () => {
+    const { reaped, killed } = run(
+      [{ session_id: 's-live', agent_name: agent, enabled: true, owner_pid: 999 }],
+      { isOwnerAlive: allAlive },
+    )
+    assert.equal(reaped.length, 0)
+    assert.deepEqual(killed, [])
+  })
+
+  it('does NOT reap an enabled session with no owner_pid (cannot prove dead)', () => {
+    const { reaped } = run([{ session_id: 's-legacy', agent_name: agent, enabled: true }])
+    assert.equal(reaped.length, 0)
+  })
+
+  it('skips the exceptSessionId (the one we are about to (re)use)', () => {
+    const { reaped } = run(
+      [{ session_id: 's-keep', agent_name: agent, enabled: false }],
+      { args: { exceptSessionId: 's-keep' } },
+    )
+    assert.equal(reaped.length, 0)
+  })
+
+  it('only reaps this agent — a different agent is left alone', () => {
+    const { reaped } = run([
+      { session_id: 's-other', agent_name: 'Grok Build', enabled: false },
+      { session_id: 's-mine', agent_name: agent, enabled: false },
+    ])
+    assert.deepEqual(
+      reaped.map((r) => r.session_id),
+      ['s-mine'],
+    )
+  })
+
+  it('skips sessions with no running poller', () => {
+    const { reaped } = run([{ session_id: 's-nopoller', agent_name: agent, enabled: false }], {
+      findPids: () => [],
+    })
+    assert.equal(reaped.length, 0)
   })
 })

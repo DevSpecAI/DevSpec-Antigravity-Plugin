@@ -46,8 +46,20 @@ function parseArgs(argv) {
       out.fromEnd = false
     }
     else if (a === '--poll-ms') out.pollMs = Number(argv[++i]) || POLL_MS
+    else if (a === '--owner-pid') out.ownerPid = argv[++i]
   }
   return out
+}
+
+/** Owner (agent) process liveness — see devspec-remote-poll.mjs. EPERM = alive. */
+function ownerAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 1) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (e) {
+    return !!e && e.code === 'EPERM'
+  }
 }
 
 function statePath(sessionId) {
@@ -169,6 +181,13 @@ async function main() {
     process.exit(1)
   }
 
+  // Owner-process anchor (see devspec-remote-poll.mjs). Adopt only if alive at
+  // startup; once adopted, exit when the owning agent process disappears so a wait
+  // never lingers for a dead conversation.
+  const ownerPidRaw = Number.parseInt(String(args.ownerPid ?? state?.owner_pid ?? ''), 10)
+  const ownerPid = Number.isInteger(ownerPidRaw) && ownerPidRaw > 1 ? ownerPidRaw : null
+  const ownerAnchor = ownerPid && ownerAlive(ownerPid) ? ownerPid : null
+
   const file = inboxPath(sessionId)
   fs.mkdirSync(SESSIONS_DIR, { recursive: true })
   if (!fs.existsSync(file)) {
@@ -197,6 +216,13 @@ async function main() {
     const live = readState(sessionId)
     if (live && live.enabled === false) {
       process.stderr.write('devspec-remote-wait: disabled — exit 1\n')
+      process.exit(1)
+    }
+    if (ownerAnchor && !ownerAlive(ownerAnchor)) {
+      process.stdout.write(
+        JSON.stringify({ type: 'session_ended', reason: 'owner_gone', session_id: sessionId }) + '\n',
+      )
+      process.stderr.write(`devspec-remote-wait: owner process ${ownerAnchor} gone — exit 1\n`)
       process.exit(1)
     }
     if (live?.end_reason === 'ui' || live?.ended_from_ui) {

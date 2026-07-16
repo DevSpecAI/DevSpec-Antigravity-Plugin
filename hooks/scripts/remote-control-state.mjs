@@ -22,6 +22,10 @@
  *   node remote-control-state.mjs write --session <uuid> [--agent "Grok Build"] [--cwd <path>]
  *       [--codename "Colorful Possum"] [--title "…"] [--local-id <id>]
  *   node remote-control-state.mjs disable --session <uuid>
+ *   node remote-control-state.mjs disable-local [--agent "Grok Build"] [--local-id <id>]
+ *     SessionEnd teardown: resolve THIS conversation's bound session and disable it.
+ *   node remote-control-state.mjs reap [--agent "Grok Build"] [--except-session <uuid>]
+ *     Connect-time backstop: SIGTERM provably-dead pollers (disabled / ended / owner gone).
  *   node remote-control-state.mjs read [--session <uuid>]
  *   node remote-control-state.mjs list
  *   node remote-control-state.mjs mint-codename
@@ -85,6 +89,10 @@ function parseArgs(argv) {
       out['local-id'] = argv[++i]
     } else if (a === '--max-age-minutes' || a === '--max_age_minutes') {
       out['max-age-minutes'] = argv[++i]
+    } else if (a === '--owner-pid') {
+      out['owner-pid'] = argv[++i]
+    } else if (a === '--except-session') {
+      out['except-session'] = argv[++i]
     } else if (a === '--force-new' || a === '--new') {
       out.forceNew = true
     } else out._.push(a)
@@ -135,6 +143,129 @@ function stopPollerForSession(sessionId) {
     }
   }
   return { session_id: sessionId, pids_found: pids, pids_killed: killed }
+}
+
+/**
+ * Session-scoped disable: mark this session's state disabled, stop its poller, and
+ * mark matching local bonds stopped. Shared by the `disable` (explicit --session)
+ * and `disable-local` (SessionEnd, resolve session from the conversation bond)
+ * commands. Never touches another session's state or poller.
+ */
+function disableSessionState(sessionId, { agent = null, localId = null } = {}) {
+  const perPath = sessionPath(sessionId)
+  const prev = readJson(perPath) || readJson(LEGACY_PATH) || {}
+  const next = {
+    ...prev,
+    session_id: sessionId,
+    enabled: false,
+    end_reason: prev.end_reason || 'local_stop',
+    updated_at: new Date().toISOString(),
+  }
+  writeJson(perPath, next)
+  // Update legacy only if it currently points at this session (or is empty).
+  const legacy = readJson(LEGACY_PATH)
+  if (!legacy || !legacy.session_id || legacy.session_id === sessionId) {
+    writeJson(LEGACY_PATH, next)
+  }
+  // Mark the exact conversation bond stopped (so soft-reconnect can find it).
+  if (localId && agent) {
+    const bond = readLocalBond(agent, localId)
+    if (bond && bond.session_id === sessionId) {
+      writeLocalBond(agent, localId, {
+        ...bond,
+        status: 'stopped',
+        end_reason: 'local_stop',
+        session_id: sessionId,
+      })
+    }
+  }
+  const bonds = markBondsStoppedForSession(sessionId, 'local_stop')
+  const killResult = stopPollerForSession(sessionId)
+  return {
+    ok: true,
+    enabled: false,
+    session_id: sessionId,
+    path: perPath,
+    poller: killResult,
+    bonds_stopped: bonds.length,
+  }
+}
+
+/** Owner (agent) process liveness — see devspec-remote-poll.mjs. EPERM = alive. */
+export function ownerAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 1) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (e) {
+    return !!e && e.code === 'EPERM'
+  }
+}
+
+/** Every per-session state object on disk (raw). */
+function scanSessionStates() {
+  const out = []
+  try {
+    if (!fs.existsSync(SESSIONS_DIR)) return out
+    for (const f of fs.readdirSync(SESSIONS_DIR)) {
+      if (!f.endsWith('.json')) continue
+      const s = readJson(path.join(SESSIONS_DIR, f))
+      if (s && s.session_id) out.push(s)
+    }
+  } catch {
+    /* ignore */
+  }
+  return out
+}
+
+/**
+ * Reap PROVABLY-DEAD pollers — the connect-time / SessionStart backstop for the
+ * self-terminating poller. A poller is reaped only when its session is provably
+ * dead (state disabled, ended-from-UI, or its recorded owner process is gone), so
+ * a live sibling terminal's poller is NEVER touched. A poller with no recorded
+ * owner_pid and an enabled session cannot be proven dead → left alone (it either
+ * self-terminates via its own owner anchor or ages out at the idle cap).
+ * Injectable for tests.
+ */
+export function reapDeadPollers({
+  agent = AGENT_NAME,
+  exceptSessionId = null,
+  listStates = scanSessionStates,
+  findPids = findPollerPidsForSession,
+  isOwnerAlive = ownerAlive,
+  kill = (pid) => {
+    try {
+      process.kill(pid, 'SIGTERM')
+      return true
+    } catch {
+      return false
+    }
+  },
+} = {}) {
+  const reaped = []
+  for (const s of listStates()) {
+    if (!s || !s.session_id) continue
+    if (exceptSessionId && s.session_id === exceptSessionId) continue
+    if (agent && s.agent_name && String(s.agent_name).toLowerCase() !== String(agent).toLowerCase()) {
+      continue
+    }
+    const pids = findPids(s.session_id)
+    if (!pids.length) continue
+    const ownerPid = Number.isInteger(s.owner_pid) && s.owner_pid > 1 ? s.owner_pid : null
+    const provablyDead =
+      s.enabled === false ||
+      s.ended_from_ui === true ||
+      (ownerPid !== null && !isOwnerAlive(ownerPid))
+    if (!provablyDead) continue
+    const killed = pids.filter((pid) => kill(pid))
+    reaped.push({
+      session_id: s.session_id,
+      agent_name: s.agent_name || null,
+      killed,
+      reason: s.enabled === false ? 'disabled' : s.ended_from_ui ? 'ended_from_ui' : 'owner_gone',
+    })
+  }
+  return reaped
 }
 
 function agentSlug(name) {
@@ -613,6 +744,17 @@ if (isMain) {
     process.exit(s ? 0 : 1)
   }
 
+  if (cmd === 'reap') {
+    // Connect-time / SessionStart backstop: SIGTERM provably-dead pollers only.
+    const agentName = args.agent || AGENT_NAME
+    const reaped = reapDeadPollers({
+      agent: agentName,
+      exceptSessionId: args['except-session'] || args.session || null,
+    })
+    process.stdout.write(JSON.stringify({ ok: true, agent: agentName, count: reaped.length, reaped }) + '\n')
+    process.exit(0)
+  }
+
   if (cmd === 'disable') {
     // Session-scoped disable. Without --session, only disable legacy pointer —
     // never kill all pollers.
@@ -624,51 +766,38 @@ if (isMain) {
       )
       process.exit(2)
     }
-
-    const perPath = sessionPath(sessionId)
-    const prev = readJson(perPath) || readJson(LEGACY_PATH) || {}
-    const next = {
-      ...prev,
-      session_id: sessionId,
-      enabled: false,
-      end_reason: prev.end_reason || 'local_stop',
-      updated_at: new Date().toISOString(),
-    }
-    writeJson(perPath, next)
-
-    // Update legacy only if it currently points at this session (or is empty)
-    const legacy = readJson(LEGACY_PATH)
-    if (!legacy || !legacy.session_id || legacy.session_id === sessionId) {
-      writeJson(LEGACY_PATH, next)
-    }
-
-    // Mark matching local bonds stopped (so soft-reconnect can find them)
     const localId = detectLocalId(args, process.env).local_id
-    if (localId && args.agent) {
-      const bond = readLocalBond(args.agent, localId)
-      if (bond && bond.session_id === sessionId) {
-        writeLocalBond(args.agent, localId, {
-          ...bond,
-          status: 'stopped',
-          end_reason: 'local_stop',
-          session_id: sessionId,
-        })
+    const result = disableSessionState(sessionId, { agent: args.agent, localId })
+    process.stdout.write(JSON.stringify(result) + '\n')
+    process.exit(0)
+  }
+
+  if (cmd === 'disable-local') {
+    // SessionEnd teardown: resolve THIS conversation's bound session (no --session
+    // needed) and disable it. Bonus promptness for graceful ends (/clear, logout);
+    // the self-terminating poller + reaper cover the ends SessionEnd never fires for.
+    const agentName = args.agent || AGENT_NAME
+    let localId = detectLocalId(args, process.env).local_id
+    // SessionEnd hook delivers the conversation id on stdin as { session_id }.
+    if (!localId && !process.stdin.isTTY) {
+      try {
+        const raw = fs.readFileSync(0, 'utf8')
+        const j = JSON.parse(raw || '{}')
+        if (typeof j.session_id === 'string') localId = sanitizeLocalId(j.session_id)
+      } catch {
+        /* no stdin payload */
       }
     }
-    const bonds = markBondsStoppedForSession(sessionId, 'local_stop')
-
-    const killResult = stopPollerForSession(sessionId)
-
-    process.stdout.write(
-      JSON.stringify({
-        ok: true,
-        enabled: false,
-        session_id: sessionId,
-        path: perPath,
-        poller: killResult,
-        bonds_stopped: bonds.length,
-      }) + '\n',
-    )
+    const bond = localId ? readLocalBond(agentName, localId) : null
+    const sessionId = bond?.session_id || null
+    if (!sessionId) {
+      process.stdout.write(
+        JSON.stringify({ ok: true, skipped: 'no live bond for this conversation', local_id: localId || null }) + '\n',
+      )
+      process.exit(0)
+    }
+    const result = disableSessionState(sessionId, { agent: agentName, localId })
+    process.stdout.write(JSON.stringify({ ...result, local_id: localId }) + '\n')
     process.exit(0)
   }
 
@@ -685,12 +814,18 @@ if (isMain) {
     // so the mirror hook can bind strictly to THIS conversation (never a global
     // "latest session" pointer). See mirror-turn.mjs selectBoundState.
     const localId = detectLocalId(args, process.env).local_id
+    // Owner-process anchor for self-termination (see devspec-remote-poll.mjs). The
+    // poller also records this itself at startup; storing it here lets the reaper
+    // and a re-launched poller pick it up too.
+    const ownerPidArg = Number.parseInt(String(args['owner-pid'] ?? ''), 10)
+    const ownerPid = Number.isInteger(ownerPidArg) && ownerPidArg > 1 ? ownerPidArg : prev.owner_pid ?? null
     const state = {
       ...prev,
       enabled: true,
       session_id: args.session,
       agent_name: agentName,
       local_id: localId ?? prev.local_id ?? null,
+      owner_pid: ownerPid,
       mcp_url: args.url || auth.mcp_url || prev.mcp_url || 'https://devspec.ai/api/mcp',
       token: auth.token || prev.token || undefined,
       auth_source: auth.source || auth.error || prev.auth_source || null,

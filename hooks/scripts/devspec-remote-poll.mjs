@@ -101,6 +101,24 @@ function readTurnMarker(sessionId) {
   }
 }
 
+/**
+ * Owner (agent) process liveness. The poller is launched with --owner-pid = the
+ * DURABLE agent process (e.g. the `claude` session process — a Bash-tool subshell's
+ * PPID is that process). When the agent dies (terminal close, crash, SIGKILL,
+ * /clear — every mode, including the ones SessionEnd never fires for) the poller
+ * must stop heartbeating, or the Agents page shows a zombie "Live" agent for up to
+ * 72h. EPERM means the pid exists but is not ours → still alive.
+ */
+function ownerAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 1) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (e) {
+    return !!e && e.code === 'EPERM'
+  }
+}
+
 function parseArgs(argv) {
   const out = {}
   for (let i = 0; i < argv.length; i++) {
@@ -108,6 +126,7 @@ function parseArgs(argv) {
     if (a === '--session' || a === '--session_id') out.session = argv[++i]
     else if (a === '--cursor') out.cursor = argv[++i]
     else if (a === '--owner-user-id') out.ownerUserId = argv[++i]
+    else if (a === '--owner-pid') out.ownerPid = argv[++i]
     else if (a === '--interval-ms' || a === '--heartbeat-ms' || a === '--max-ms') i++
   }
   return out
@@ -313,6 +332,55 @@ async function main() {
   // Identity is a fixed property of THIS plugin — never trust state/args for it.
   const agentName = AGENT_NAME
 
+  // Owner-process anchor. Adopt --owner-pid (or a value persisted in state) ONLY if
+  // it is alive right now: a pid already gone at startup was mis-captured (e.g. a
+  // transient launch shell), so ignore it and fall back to the reaper + idle
+  // timeout rather than exiting immediately. Once adopted, the loop exits the moment
+  // the owner disappears — this is the primary defence against zombie "Live" agents.
+  const ownerPidRaw = Number.parseInt(String(args.ownerPid ?? state?.owner_pid ?? ''), 10)
+  const ownerPid = Number.isInteger(ownerPidRaw) && ownerPidRaw > 1 ? ownerPidRaw : null
+  let ownerAnchor = ownerPid && ownerAlive(ownerPid) ? ownerPid : null
+  if (ownerPid && !ownerAnchor) {
+    process.stderr.write(
+      `devspec-remote-poll: owner-pid ${ownerPid} not alive at startup — ignoring anchor\n`,
+    )
+  } else if (ownerAnchor) {
+    process.stderr.write(`devspec-remote-poll: owner-pid anchor ${ownerAnchor} adopted\n`)
+    try {
+      const s = readState(sessionId) || {}
+      s.owner_pid = ownerAnchor
+      s.session_id = sessionId
+      s.updated_at = new Date().toISOString()
+      writeState(s, sessionId)
+    } catch {
+      /* non-fatal */
+    }
+  }
+
+  // Single teardown path: best-effort offline heartbeat so the Agents page flips to
+  // Disconnected immediately (not after the ~90s freshness window), disable local
+  // state so nothing restarts this session, then exit. Used by owner-death, SIGTERM
+  // (the reaper) and SIGINT.
+  let shuttingDown = false
+  async function offlineAndExit(reason, code) {
+    if (shuttingDown) return
+    shuttingDown = true
+    try {
+      await mcpToolsCall({
+        mcpUrl,
+        token,
+        name: 'report_remote_agent_heartbeat',
+        arguments: { session_id: sessionId, agent_name: agentName, status: 'offline', end_reason: reason },
+      })
+    } catch (e) {
+      process.stderr.write(`devspec-remote-poll: offline heartbeat failed: ${e.message}\n`)
+    }
+    disableLocalState({ sessionId, reason })
+    process.exit(code)
+  }
+  process.once('SIGTERM', () => void offlineAndExit('local_stop', 0))
+  process.once('SIGINT', () => void offlineAndExit('local_stop', 0))
+
   let cursor = args.cursor || state?.cursor_after_message_id || null
   let ownerUserId = args.ownerUserId || state?.owner_user_id || null
   let lastHeartbeat = 0
@@ -370,6 +438,16 @@ async function main() {
     if (liveState && liveState.enabled === false) {
       process.stderr.write('devspec-remote-poll: disabled — exiting\n')
       process.exit(1)
+    }
+
+    // Owner gone (terminal closed / crashed / SIGKILLed) → stop being a zombie.
+    if (ownerAnchor && !ownerAlive(ownerAnchor)) {
+      process.stderr.write(`devspec-remote-poll: owner process ${ownerAnchor} gone — stopping\n`)
+      process.stdout.write(
+        JSON.stringify({ type: 'session_ended', reason: 'owner_gone', session_id: sessionId }) + '\n',
+      )
+      await offlineAndExit('local_stop', 1)
+      return
     }
 
     const idleMs = Date.now() - idleStarted
