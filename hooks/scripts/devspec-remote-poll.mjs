@@ -225,11 +225,17 @@ function tierForIdleMs(idleMs) {
 
 function isOwnerMessage(msg, ownerUserId) {
   if (!msg) return false
+  // PRIMARY GATE: the server-stamped remote_control flag, computed PER-TOKEN against
+  // the caller's connected identity (is_owner_instruction === is_controller_instruction).
+  // It already means "authored by the user whose token runs THIS agent" — NOT session
+  // ownership — so trust it directly.
   if (msg.remote_control && typeof msg.remote_control.is_owner_instruction === 'boolean') {
     return msg.remote_control.is_owner_instruction === true
   }
-  // Fail closed for untagged rows once server stamps dispatch kinds:
-  // only explicit local_agent_dispatch (or server remote_control flag) is a command.
+  // DEGRADED FALLBACK for untagged rows only (server didn't stamp the flag): accept an
+  // explicit local_agent_dispatch whose human author matches this connection's user
+  // (ownerUserId = the token running this agent). Command authority is per-token —
+  // never inferred from session ownership.
   if (msg.message_type === 'local_agent_dispatch') {
     if (!ownerUserId) return false
     const author = msg.author
