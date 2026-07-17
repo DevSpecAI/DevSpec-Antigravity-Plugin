@@ -20,7 +20,10 @@
  *
  * Usage:
  *   node remote-control-state.mjs write --session <uuid> [--agent "Grok Build"] [--cwd <path>]
- *       [--codename "Colorful Possum"] [--title "…"] [--local-id <id>]
+ *       [--codename "Colorful Possum"] [--title "…"] [--local-id <id>] [--owner-pid <pid>]
+ *       [--no-poller]   (default: auto-start the continuous heartbeat poller after an auth-ok write)
+ *   node remote-control-state.mjs ensure-poller --session <uuid> [--owner-pid <pid>]
+ *     Stop any prior poller for this session, then spawn a detached continuous poller.
  *   node remote-control-state.mjs disable --session <uuid>
  *   node remote-control-state.mjs disable-local [--agent "Grok Build"] [--local-id <id>]
  *     SessionEnd teardown: resolve THIS conversation's bound session and disable it.
@@ -42,6 +45,7 @@
  */
 
 import crypto from 'node:crypto'
+import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -52,6 +56,16 @@ import { AGENT_NAME } from './agent-identity.mjs'
 const DEVSPEC_DIR = path.join(os.homedir(), '.devspec')
 const LEGACY_PATH = path.join(DEVSPEC_DIR, 'remote-control.json')
 const SESSIONS_DIR = path.join(DEVSPEC_DIR, 'remote-control', 'sessions')
+const THIS_DIR = path.dirname(fileURLToPath(import.meta.url))
+const POLLER_SCRIPT = path.join(THIS_DIR, 'devspec-remote-poll.mjs')
+
+function pollerPidPath(sessionId) {
+  return path.join(SESSIONS_DIR, `${sessionId}.poll.pid`)
+}
+
+function pollerLogPath(sessionId) {
+  return path.join(SESSIONS_DIR, `${sessionId}.poll.log`)
+}
 const LOCAL_DIR = path.join(DEVSPEC_DIR, 'remote-control', 'local')
 
 /** Default window for stop → remote again in the same local conversation. */
@@ -93,6 +107,8 @@ function parseArgs(argv) {
       out['owner-pid'] = argv[++i]
     } else if (a === '--except-session') {
       out['except-session'] = argv[++i]
+    } else if (a === '--no-poller' || a === '--skip-poller') {
+      out.noPoller = true
     } else if (a === '--force-new' || a === '--new') {
       out.forceNew = true
     } else out._.push(a)
@@ -101,34 +117,52 @@ function parseArgs(argv) {
 }
 
 /**
- * List node poller PIDs whose cmdline includes both the poller script and session id.
- * Session-scoped: never match other sessions.
+ * Poller PIDs for this session — session-scoped, never matches other sessions.
+ * Two sources, deduped: the pidfile the launcher records (all platforms) and a
+ * Linux /proc cmdline scan (catches pollers with a missing/stale pidfile).
  */
 function findPollerPidsForSession(sessionId) {
   if (!sessionId || sessionId.length < 8) return []
-  const pids = []
-  let entries
+  const pids = new Set()
+
+  // Pidfile — the detached-launch path records the poller pid here.
   try {
-    entries = fs.readdirSync('/proc')
-  } catch {
-    return []
-  }
-  for (const name of entries) {
-    if (!/^\d+$/.test(name)) continue
-    let cmd
-    try {
-      cmd = fs.readFileSync(`/proc/${name}/cmdline`).toString().replace(/\0/g, ' ')
-    } catch {
-      continue
+    const pidFile = pollerPidPath(sessionId)
+    if (fs.existsSync(pidFile)) {
+      const n = Number(fs.readFileSync(pidFile, 'utf8').trim())
+      if (Number.isFinite(n) && n > 0) {
+        try {
+          process.kill(n, 0)
+          pids.add(n)
+        } catch {
+          /* stale pid file */
+        }
+      }
     }
-    if (!cmd.includes('devspec-remote-poll')) continue
-    // Require session id as its own argv token (poller always passes --session <uuid>)
-    if (!cmd.includes(sessionId)) continue
-    // Prefer node processes (skip shells that only mention the path in their script text)
-    if (!/\bnode\b/.test(cmd) && !cmd.includes('node ')) continue
-    pids.push(Number(name))
+  } catch {
+    /* ignore */
   }
-  return pids
+
+  // /proc scan (Linux) — require the poller script AND session id in the cmdline.
+  try {
+    for (const name of fs.readdirSync('/proc')) {
+      if (!/^\d+$/.test(name)) continue
+      let cmd
+      try {
+        cmd = fs.readFileSync(`/proc/${name}/cmdline`).toString().replace(/\0/g, ' ')
+      } catch {
+        continue
+      }
+      if (!cmd.includes('devspec-remote-poll')) continue
+      if (!cmd.includes(sessionId)) continue
+      if (!/\bnode\b/.test(cmd) && !cmd.includes('node ')) continue
+      pids.add(Number(name))
+    }
+  } catch {
+    /* non-Linux or no /proc */
+  }
+
+  return [...pids]
 }
 
 function stopPollerForSession(sessionId) {
@@ -142,7 +176,80 @@ function stopPollerForSession(sessionId) {
       /* already gone */
     }
   }
+  try {
+    const pidFile = pollerPidPath(sessionId)
+    if (fs.existsSync(pidFile)) fs.unlinkSync(pidFile)
+  } catch {
+    /* ignore */
+  }
   return { session_id: sessionId, pids_found: pids, pids_killed: killed }
+}
+
+/**
+ * Ensure exactly one continuous heartbeat poller for this session: stop any prior
+ * one (so reconnects never multiply orphans), then spawn a fresh detached poller.
+ * Pass ownerPid so the spawned poller anchors to the owning agent process and
+ * self-terminates when it dies (the two halves of the anti-zombie contract:
+ * auto-start here, self-terminate in the poller). Detached spawn works uniformly
+ * across hosts — no per-tool nohup/run_in_background dance.
+ */
+export function ensurePollerForSession(sessionId, opts = {}) {
+  if (!sessionId || sessionId.length < 8) return { ok: false, error: 'missing session id' }
+  if (!fs.existsSync(POLLER_SCRIPT)) {
+    return { ok: false, error: `poller script missing: ${POLLER_SCRIPT}` }
+  }
+  const stopped = stopPollerForSession(sessionId)
+  fs.mkdirSync(SESSIONS_DIR, { recursive: true })
+
+  const ownerPidRaw = Number.parseInt(String(opts.ownerPid ?? ''), 10)
+  const ownerPid = Number.isInteger(ownerPidRaw) && ownerPidRaw > 1 ? ownerPidRaw : null
+  const logPath = pollerLogPath(sessionId)
+  const pidPath = pollerPidPath(sessionId)
+  const cwd = opts.cwd || process.cwd()
+
+  let logFd
+  try {
+    logFd = fs.openSync(logPath, 'a')
+  } catch (e) {
+    return { ok: false, error: `could not open poll log: ${e.message}`, stopped }
+  }
+
+  const pollerArgs = [POLLER_SCRIPT, '--session', sessionId]
+  if (ownerPid) pollerArgs.push('--owner-pid', String(ownerPid))
+
+  let child
+  try {
+    child = spawn(process.execPath, pollerArgs, {
+      cwd,
+      detached: true,
+      stdio: ['ignore', logFd, logFd],
+      windowsHide: true,
+      env: process.env,
+    })
+  } catch (e) {
+    try {
+      fs.closeSync(logFd)
+    } catch {
+      /* ignore */
+    }
+    return { ok: false, error: `spawn failed: ${e.message}`, stopped }
+  }
+  try {
+    fs.closeSync(logFd)
+  } catch {
+    /* ignore */
+  }
+  child.unref()
+
+  const pid = child.pid
+  if (!pid) return { ok: false, error: 'spawn returned no pid', stopped }
+  try {
+    fs.writeFileSync(pidPath, `${pid}\n`, { mode: 0o600 })
+  } catch (e) {
+    return { ok: false, error: `wrote poller but failed pid file: ${e.message}`, pid, log: logPath, stopped }
+  }
+
+  return { ok: true, session_id: sessionId, pid, owner_pid: ownerPid, pid_file: pidPath, log: logPath, stopped }
 }
 
 /**
@@ -755,6 +862,19 @@ if (isMain) {
     process.exit(0)
   }
 
+  if (cmd === 'ensure-poller' || cmd === 'start-poller') {
+    if (!args.session) {
+      process.stderr.write('Usage: remote-control-state.mjs ensure-poller --session <uuid> [--owner-pid <pid>] [--cwd <path>]\n')
+      process.exit(2)
+    }
+    const result = ensurePollerForSession(args.session, {
+      cwd: args.cwd ? path.resolve(args.cwd) : process.cwd(),
+      ownerPid: args['owner-pid'],
+    })
+    process.stdout.write(JSON.stringify(result, null, 2) + '\n')
+    process.exit(result.ok ? 0 : 1)
+  }
+
   if (cmd === 'disable') {
     // Session-scoped disable. Without --session, only disable legacy pointer —
     // never kill all pollers.
@@ -877,8 +997,34 @@ if (isMain) {
       result.warning_local =
         'No --local-id / conversation env; soft-reconnect and already_live will not work until write is called with a local id.'
     }
+
+    // Default: start the continuous heartbeat poller after a successful write, so
+    // Live presence never depends on the model remembering launch steps. The poller
+    // is anchored to ownerPid, so it self-terminates when this session's process
+    // dies (no zombie "Live" agents). Opt out with --no-poller (tests / callers that
+    // manage the process themselves).
+    const wantPoller = state.auth_ok && !args.noPoller
+    if (wantPoller) {
+      // Self-heal on connect: sweep provably-dead pollers for THIS agent (disabled /
+      // ended / owner-gone), never a live sibling, before starting ours.
+      try {
+        const reaped = reapDeadPollers({ agent: agentName, exceptSessionId: args.session })
+        if (reaped.length) result.reaped = reaped
+      } catch {
+        /* non-fatal */
+      }
+      const poller = ensurePollerForSession(args.session, { cwd, ownerPid })
+      result.poller = poller
+      if (!poller.ok) {
+        result.warning_poller = poller.error
+        process.stderr.write(`remote-control-state: ensure-poller failed — ${poller.error}\n`)
+      }
+    } else if (args.noPoller) {
+      result.poller = { ok: true, skipped: true, reason: 'no-poller' }
+    }
+
     process.stdout.write(JSON.stringify(result, null, 2) + '\n')
-    process.exit(0)
+    process.exit(state.auth_ok ? 0 : 1)
   }
 
   process.stderr.write(`Unknown command: ${cmd}\n`)

@@ -7,6 +7,7 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
   detectLocalId,
+  ensurePollerForSession,
   isRecoverableEndReason,
   mintLocalId,
   ownerAlive,
@@ -355,5 +356,13 @@ describe('reapDeadPollers', () => {
       findPids: () => [],
     })
     assert.equal(reaped.length, 0)
+  })
+})
+
+describe('ensurePollerForSession (guards)', () => {
+  it('rejects a missing/too-short session id without spawning', () => {
+    assert.equal(ensurePollerForSession('').ok, false)
+    assert.equal(ensurePollerForSession('short').ok, false)
+    assert.match(ensurePollerForSession(null).error, /missing session id/)
   })
 })

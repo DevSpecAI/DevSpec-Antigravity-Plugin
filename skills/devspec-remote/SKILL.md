@@ -115,33 +115,24 @@ This is **DevSpec** remote control — distinct from any built-in remote-control
 
 Sequence: **poll MCP → write inbox → wake agent**. Heartbeats and wake are **split** so Live never dies when you are woken.
 
-### A. Continuous heartbeat poller (nohup — never exit on owner message)
+### A. Continuous heartbeat poller (auto-started by `write` — never launch a second)
 
 ```bash
 PLUGIN="<plugin-root>"   # e.g. installed-plugins/devspec-antigravity-*
 SESSION="<uuid>"
-# Durable owning process for THIS session (a tool subshell's parent = the agent
-# process). The poller anchors to it and self-terminates when it dies, so a closed
-# session never leaves a zombie "Live" agent on the Agents page.
-OWNER_PID="$PPID"
+# write auth-smokes, persists state, reaps provably-dead orphans, and AUTO-STARTS the
+# continuous poller — anchored to --owner-pid ($PPID = the owning Antigravity process),
+# so it self-terminates the moment this session's process dies (terminal close / crash /
+# SIGKILL). No manual nohup launch. Opt out with --no-poller (tests only).
 node "$PLUGIN/hooks/scripts/remote-control-state.mjs" write \
   --session "$SESSION" --agent "Antigravity" --cwd "$(pwd)" \
-  --codename "<session_codename>" --title "<title>" --owner-pid "$OWNER_PID"
-
-# Backstop: reap any provably-dead pollers from hard-closed sessions before we start.
-node "$PLUGIN/hooks/scripts/remote-control-state.mjs" reap --agent "Antigravity" --except-session "$SESSION" 2>/dev/null || true
-
-mkdir -p "$HOME/.devspec/remote-control/sessions"
-LOG="$HOME/.devspec/remote-control/sessions/${SESSION}.poll.log"
-nohup node "$PLUGIN/hooks/scripts/devspec-remote-poll.mjs" --session "$SESSION" --owner-pid "$OWNER_PID" \
-  >> "$LOG" 2>&1 &
-echo $! > "$HOME/.devspec/remote-control/sessions/${SESSION}.poll.pid"
-sleep 2
-kill -0 "$(cat "$HOME/.devspec/remote-control/sessions/${SESSION}.poll.pid")" 2>/dev/null \
-  || echo "✗ poller failed to stay up — check $LOG"
+  --codename "<session_codename>" --title "<title>" --owner-pid "$PPID"
+# Confirm poller.ok / poller.pid in the JSON stdout. If it failed: check
+#   ~/.devspec/remote-control/sessions/${SESSION}.poll.log
+# Manual re-arm (rare): node "$PLUGIN/hooks/scripts/remote-control-state.mjs" ensure-poller --session "$SESSION" --owner-pid "$PPID"
 ```
 
-Never use plain shell `&` without `nohup`/detach inside a finishing tool shell.
+Never spawn a second poller with plain shell `&` / `nohup` after a successful write — that multiplies orphans. Prefer `write` / `ensure-poller`.
 
 Poller contract:
 - Stays up until disabled / UI End / idle_timeout / local_stop / **owner gone** / auth failure
@@ -152,8 +143,8 @@ Poller contract:
 ### B. Wait-for-owner (wakes **you** — exit 0 on new inbox mail)
 
 ```bash
-# After poller is up — start wait so a new owner instruction ends this process with stdout JSON:
-node "$PLUGIN/hooks/scripts/devspec-remote-wait.mjs" --session "$SESSION" --owner-pid "$OWNER_PID" --from-end
+# After poller is up (write started it) — start wait so a new owner instruction ends this process with stdout JSON:
+node "$PLUGIN/hooks/scripts/devspec-remote-wait.mjs" --session "$SESSION" --owner-pid "$PPID" --from-end
 ```
 
 How to run wait so the model actually turns:
