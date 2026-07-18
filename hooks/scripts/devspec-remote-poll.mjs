@@ -610,6 +610,35 @@ async function main() {
           process.stderr.write(`devspec-remote-poll: ended (${reason}) — disabling and exiting\n`)
           process.exit(1)
         }
+
+        // Server-authoritative attachment: a live heartbeat reports which session
+        // (if any) this connection is attached to. A web attach/detach from the
+        // Agents page changes it server-side without touching local state, so adopt
+        // hb.session_id here — otherwise a sessionless agent that gets web-attached
+        // would never start polling the room (and a web-detach would never stop it).
+        // Guarded to real responses; a not_found omits session_id and means
+        // re-register, so it must never be read as a detach.
+        if (hb && hb.status !== 'not_found') {
+          const hbSession =
+            typeof hb.session_id === 'string' && hb.session_id ? hb.session_id : null
+          if (hbSession !== sessionId) {
+            process.stderr.write(
+              `devspec-remote-poll: server attachment ${sessionId || '(none)'} → ${hbSession || '(none)'}\n`,
+            )
+            sessionId = hbSession
+            cursor = null // fresh room → reseed the transcript cursor
+            try {
+              const s = readState(connectionId) || {}
+              s.session_id = hbSession
+              s.cursor_after_message_id = null
+              s.connection_id = connectionId
+              s.updated_at = new Date().toISOString()
+              writeState(s, connectionId)
+            } catch {
+              /* ignore */
+            }
+          }
+        }
       } catch (e) {
         process.stderr.write(`devspec-remote-poll: heartbeat failed: ${e.message}\n`)
       }

@@ -101,7 +101,7 @@ node "<plugin>/hooks/scripts/remote-control-state.mjs" resolve-local \
 Then **register the connection** (idempotent on the conversation bond — returns the same `connection_id` if already live):
 
 ```
-register_connection({ project_id, local_id: "<local_id>", agent_name: "Antigravity", machine_hostname?, cwd? })
+register_connection({ project_id, local_id: "<local_id>", agent_name: "Antigravity", machine_hostname?, cwd?, name?: "<--name value, only if the user passed one>" })
 ```
 
 Store the returned **`connection_id`** (full UUID) **and the returned `codename`** — this agent's own adjective-animal identity (e.g. `Brave Otter`), auto-minted server-side so two of your Antigravity agents are never confused. If `--name "…"` was passed, that becomes the codename instead. **Tell the user which agent this terminal is** (see the status block), so a phone/web driver can pick the right one.
