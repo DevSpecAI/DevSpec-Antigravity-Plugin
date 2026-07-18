@@ -1,28 +1,28 @@
 #!/usr/bin/env node
 /**
- * devspec-remote-wait — wake the coding agent when a new owner instruction arrives.
+ * devspec-remote-wait — wake the coding agent when a new OWNER COMMAND arrives
+ * (CONNECTION-NATIVE, item fd51d80b).
  *
  * Complements continuous `devspec-remote-poll.mjs` (heartbeats + inbox writer).
- * This process does **not** heartbeat. It only watches the per-session inbox
- * written by the poller and **exits 0** when a new owner_messages line appears
- * after the saved byte offset — so:
+ * This process does **not** heartbeat. It watches the per-connection inbox written
+ * by the poller and **exits 0** when a new `owner_messages` line appears after the
+ * saved byte offset — so:
  *   - Claude Code: run_in_background → process exit wakes the model
  *   - Grok Build:  monitor tool on this process stdout → chat notification
+ *
+ * It wakes ONLY on `owner_messages` (server-stamped owner commands / dispatches).
+ * `advisory_context` inbox entries (teammate / Dev / other-agent room context) are
+ * DELIBERATELY ignored here — advisory must never force a model wake or an
+ * autonomous response; the agent reads accumulated advisory when it next acts.
  *
  * After the agent acts, re-arm THIS wait process only (not the poller).
  *
  * Usage:
- *   node devspec-remote-wait.mjs --session <uuid> [--from-end]
- *
- * --from-end (default): ignore existing inbox contents; only wake on *new* lines
- *   written after start. Use when the agent already processed pending mail.
- * --from-offset / state: resume from session state `inbox_byte_offset` if set.
- * --pending: also emit any unconsumed lines from the current offset (then exit 0
- *   if any; else wait for new). Useful right after connect if inbox has mail.
+ *   node devspec-remote-wait.mjs --connection-id <uuid> [--from-end] [--owner-pid <pid>]
  *
  * Exit codes:
  *   0  — one or more new owner_messages batches printed to stdout; agent should act
- *   1  — remote disabled / session ended in state / error
+ *   1  — remote disabled / connection ended in state / owner gone / error
  *   2  — bad args
  */
 
@@ -30,7 +30,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-const SESSIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'sessions')
+const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
 const POLL_MS = 500
 const MAX_WAIT_MS = 24 * 60 * 60 * 1000
@@ -39,13 +39,13 @@ function parseArgs(argv) {
   const out = { fromEnd: true, pending: false }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
-    if (a === '--session' || a === '--session_id') out.session = argv[++i]
-    else if (a === '--from-end') out.fromEnd = true
+    if (a === '--connection-id' || a === '--connection_id' || a === '--connection') {
+      out.connectionId = argv[++i]
+    } else if (a === '--from-end') out.fromEnd = true
     else if (a === '--pending') {
       out.pending = true
       out.fromEnd = false
-    }
-    else if (a === '--poll-ms') out.pollMs = Number(argv[++i]) || POLL_MS
+    } else if (a === '--poll-ms') out.pollMs = Number(argv[++i]) || POLL_MS
     else if (a === '--owner-pid') out.ownerPid = argv[++i]
   }
   return out
@@ -62,21 +62,22 @@ function ownerAlive(pid) {
   }
 }
 
-function statePath(sessionId) {
-  return path.join(SESSIONS_DIR, `${sessionId}.json`)
+function statePath(connectionId) {
+  return path.join(CONNECTIONS_DIR, `${connectionId}.json`)
 }
 
-function inboxPath(sessionId) {
-  return path.join(SESSIONS_DIR, `${sessionId}.inbox.jsonl`)
+function inboxPath(connectionId) {
+  return path.join(CONNECTIONS_DIR, `${connectionId}.inbox.jsonl`)
 }
 
-function readState(sessionId) {
-  const paths = [statePath(sessionId), LEGACY_STATE_PATH]
+function readState(connectionId) {
+  const paths = [statePath(connectionId), LEGACY_STATE_PATH]
   for (const p of paths) {
     try {
       if (!fs.existsSync(p)) continue
       const s = JSON.parse(fs.readFileSync(p, 'utf8'))
-      if (sessionId && s.session_id && s.session_id !== sessionId && p === LEGACY_STATE_PATH) continue
+      if (connectionId && s.connection_id && s.connection_id !== connectionId && p === LEGACY_STATE_PATH)
+        continue
       return s
     } catch {
       /* next */
@@ -85,25 +86,29 @@ function readState(sessionId) {
   return null
 }
 
-function writeStatePatch(sessionId, patch) {
+function writeStatePatch(connectionId, patch) {
   try {
-    const prev = readState(sessionId) || { session_id: sessionId }
+    const prev = readState(connectionId) || { connection_id: connectionId }
     const next = {
       ...prev,
       ...patch,
-      session_id: sessionId,
+      connection_id: connectionId,
       updated_at: new Date().toISOString(),
     }
-    fs.mkdirSync(SESSIONS_DIR, { recursive: true })
-    fs.writeFileSync(statePath(sessionId), JSON.stringify(next, null, 2) + '\n', { mode: 0o600 })
-    // Mirror offset into legacy only if it points at this session
+    fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
+    fs.writeFileSync(statePath(connectionId), JSON.stringify(next, null, 2) + '\n', { mode: 0o600 })
+    // Mirror offset into legacy only if it points at this connection.
     try {
       if (fs.existsSync(LEGACY_STATE_PATH)) {
         const leg = JSON.parse(fs.readFileSync(LEGACY_STATE_PATH, 'utf8'))
-        if (!leg.session_id || leg.session_id === sessionId) {
+        if (!leg.connection_id || leg.connection_id === connectionId) {
           fs.writeFileSync(
             LEGACY_STATE_PATH,
-            JSON.stringify({ ...leg, ...patch, session_id: sessionId, updated_at: next.updated_at }, null, 2) + '\n',
+            JSON.stringify(
+              { ...leg, ...patch, connection_id: connectionId, updated_at: next.updated_at },
+              null,
+              2,
+            ) + '\n',
             { mode: 0o600 },
           )
         }
@@ -130,7 +135,7 @@ function fileSize(p) {
 
 /**
  * Read new bytes from offset; return { lines, newOffset }.
- * Incomplete trailing line (no final \\n) is left for the next read.
+ * Incomplete trailing line (no final \n) is left for the next read.
  */
 function readNewLines(file, offset) {
   const size = fileSize(file)
@@ -152,6 +157,10 @@ function readNewLines(file, offset) {
   }
 }
 
+/**
+ * Owner-command batches ONLY. `advisory_context` entries are intentionally excluded
+ * so room awareness never wakes the model or triggers an autonomous response.
+ */
 function parseOwnerBatches(lines) {
   const batches = []
   for (const line of lines) {
@@ -169,27 +178,24 @@ function parseOwnerBatches(lines) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2))
-  const sessionId = args.session
-  if (!sessionId) {
-    process.stderr.write('devspec-remote-wait: missing --session\n')
+  const connectionId = args.connectionId
+  if (!connectionId) {
+    process.stderr.write('devspec-remote-wait: missing --connection-id\n')
     process.exit(2)
   }
 
-  const state = readState(sessionId)
+  const state = readState(connectionId)
   if (state && state.enabled === false) {
     process.stderr.write('devspec-remote-wait: remote control disabled\n')
     process.exit(1)
   }
 
-  // Owner-process anchor (see devspec-remote-poll.mjs). Adopt only if alive at
-  // startup; once adopted, exit when the owning agent process disappears so a wait
-  // never lingers for a dead conversation.
   const ownerPidRaw = Number.parseInt(String(args.ownerPid ?? state?.owner_pid ?? ''), 10)
   const ownerPid = Number.isInteger(ownerPidRaw) && ownerPidRaw > 1 ? ownerPidRaw : null
   const ownerAnchor = ownerPid && ownerAlive(ownerPid) ? ownerPid : null
 
-  const file = inboxPath(sessionId)
-  fs.mkdirSync(SESSIONS_DIR, { recursive: true })
+  const file = inboxPath(connectionId)
+  fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
   if (!fs.existsSync(file)) {
     fs.writeFileSync(file, '', { mode: 0o600 })
   }
@@ -199,7 +205,7 @@ async function main() {
     offset = state.inbox_byte_offset
   } else if (args.fromEnd) {
     offset = fileSize(file)
-    writeStatePatch(sessionId, { inbox_byte_offset: offset })
+    writeStatePatch(connectionId, { inbox_byte_offset: offset })
   } else if (typeof state?.inbox_byte_offset === 'number') {
     offset = state.inbox_byte_offset
   } else {
@@ -209,25 +215,25 @@ async function main() {
   const pollMs = args.pollMs || POLL_MS
   const started = Date.now()
   process.stderr.write(
-    `devspec-remote-wait: watching ${file} offset=${offset} session=${sessionId}\n`,
+    `devspec-remote-wait: watching ${file} offset=${offset} connection=${connectionId}\n`,
   )
 
   while (Date.now() - started < MAX_WAIT_MS) {
-    const live = readState(sessionId)
+    const live = readState(connectionId)
     if (live && live.enabled === false) {
       process.stderr.write('devspec-remote-wait: disabled — exit 1\n')
       process.exit(1)
     }
     if (ownerAnchor && !ownerAlive(ownerAnchor)) {
       process.stdout.write(
-        JSON.stringify({ type: 'session_ended', reason: 'owner_gone', session_id: sessionId }) + '\n',
+        JSON.stringify({ type: 'session_ended', reason: 'owner_gone', connection_id: connectionId }) + '\n',
       )
       process.stderr.write(`devspec-remote-wait: owner process ${ownerAnchor} gone — exit 1\n`)
       process.exit(1)
     }
     if (live?.end_reason === 'ui' || live?.ended_from_ui) {
       process.stdout.write(
-        JSON.stringify({ type: 'session_ended', reason: 'ended_from_ui', session_id: sessionId }) + '\n',
+        JSON.stringify({ type: 'session_ended', reason: 'ended_from_ui', connection_id: connectionId }) + '\n',
       )
       process.exit(1)
     }
@@ -236,7 +242,7 @@ async function main() {
     if (lines.length > 0) {
       const batches = parseOwnerBatches(lines)
       offset = newOffset
-      writeStatePatch(sessionId, { inbox_byte_offset: offset })
+      writeStatePatch(connectionId, { inbox_byte_offset: offset })
 
       if (batches.length > 0) {
         for (const batch of batches) {

@@ -1,11 +1,16 @@
 #!/usr/bin/env node
 /**
- * DevSpec remote-control mirror hook (Stop / UserPromptSubmit).
- * Resolves ONLY the session bound to THIS local conversation — never a
- * machine-global "latest session" pointer. Posts mechanically — no LLM tokens.
+ * DevSpec remote-control mirror hook (Stop / UserPromptSubmit) — CONNECTION-NATIVE
+ * (item fd51d80b). Resolves ONLY the connection bound to THIS local conversation —
+ * never a machine-global "latest" pointer. Posts mechanically — no LLM tokens.
  *
  * user_prompt mode → turn_kind=local_prompt (literal owner text in Agents UI)
  * stop mode        → turn_kind=agent (assistant reply)
+ *
+ * When the connection is ATTACHED to a session, the turn is mirrored into that
+ * session's transcript. When it is SESSIONLESS (available, no room), there is no
+ * transcript to post into, so mirroring is skipped — but the busy/working heartbeat
+ * still fires (heartbeat_connection) so the Agents page shows the agent working.
  */
 
 import fs from 'node:fs'
@@ -19,30 +24,30 @@ import { detectLocalId } from './remote-control-state.mjs'
 
 const mode = process.argv[2] === 'user_prompt' ? 'user_prompt' : 'stop'
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
-const SESSIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'sessions')
+const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 
-// Turn marker — the connected agent is the SOLE authority for the "working"
-// state. UserPromptSubmit (turn start) writes it; Stop (turn end) clears it. The
-// long-lived poller reads it to re-assert busy on heartbeats while a turn runs
-// (so long turns stay "working" and the server's busy freshness doesn't decay).
-function turnMarkerPath(sessionId) {
-  return path.join(SESSIONS_DIR, `${sessionId}.turn`)
+// Turn marker — the connected agent is the SOLE authority for the "working" state.
+// UserPromptSubmit (turn start) writes it; Stop (turn end) clears it. The long-lived
+// poller reads it (by connection_id) to re-assert busy on heartbeats while a turn
+// runs, so long turns stay "working" and the server's busy freshness doesn't decay.
+function turnMarkerPath(connectionId) {
+  return path.join(CONNECTIONS_DIR, `${connectionId}.turn`)
 }
-function writeTurnMarker(sessionId) {
-  if (!sessionId) return
+function writeTurnMarker(connectionId) {
+  if (!connectionId) return
   try {
-    fs.mkdirSync(SESSIONS_DIR, { recursive: true })
-    fs.writeFileSync(turnMarkerPath(sessionId), JSON.stringify({ startedAt: Date.now() }), {
+    fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
+    fs.writeFileSync(turnMarkerPath(connectionId), JSON.stringify({ startedAt: Date.now() }), {
       mode: 0o600,
     })
   } catch {
     /* non-fatal — the immediate busy heartbeat below still fires */
   }
 }
-function clearTurnMarker(sessionId) {
-  if (!sessionId) return
+function clearTurnMarker(connectionId) {
+  if (!connectionId) return
   try {
-    fs.rmSync(turnMarkerPath(sessionId), { force: true })
+    fs.rmSync(turnMarkerPath(connectionId), { force: true })
   } catch {
     /* ignore */
   }
@@ -57,14 +62,10 @@ function readStdin() {
 }
 
 /**
- * The DevSpec session to mirror into belongs to THIS local conversation. Resolve
- * its id the SAME way remote-control-state.mjs `write` stamped it — via the shared
- * detectLocalId, which probes whichever conversation-id env var THIS tool exposes
- * (CLAUDE_CODE_SESSION_ID, GROK_SESSION_ID, CODEX_THREAD_ID, TERM/SHELL_SESSION_ID,
- * …), then the hook stdin session_id. Tool-agnostic and SYMMETRIC with connect, so
- * it works for every plugin — not just Claude Code. (A Claude-only resolver here
- * silently fail-closes every other plugin's mirror.) Never a machine-global
- * pointer — that is exactly what caused concurrent sessions to cross-post.
+ * The DevSpec connection to mirror for belongs to THIS local conversation. Resolve
+ * its conversation id the SAME way remote-control-state.mjs `write` stamped it — via
+ * the shared detectLocalId (probes whichever conversation-id env var THIS tool
+ * exposes), then the hook stdin session_id. Tool-agnostic and SYMMETRIC with connect.
  */
 export function resolveHookConversationId(hookInput, env = process.env) {
   const fromEnv = detectLocalId({}, env).local_id
@@ -81,23 +82,21 @@ export function resolveHookConversationId(hookInput, env = process.env) {
 }
 
 /**
- * Choose the state file bound to THIS conversation.
+ * Choose the connection state bound to THIS conversation.
  *
- * Primary — a precise conversation bond: tools that expose a stable conversation
- * id (Claude/Grok/Codex, via detectLocalId) select the state whose local_id
- * matches. A machine-newer session for a DIFFERENT conversation is never picked.
+ * Primary — a precise conversation bond: tools that expose a stable conversation id
+ * (Claude/Grok/Codex, via detectLocalId) select the state whose local_id matches.
+ * A machine-newer connection for a DIFFERENT conversation is never picked.
  *
- * Fallback — for tools that expose NO per-conversation id to their hooks (e.g.
- * Cursor, Antigravity): select the single enabled remote session for THIS agent.
- * Safe ONLY because "exactly one" means there is nothing to disambiguate, so no
- * cross-session bleed is possible; two+ concurrent sessions of the same agent
- * fall closed (no mirror) rather than guess. Never a newest-mtime / machine-global
- * pick across different conversations.
+ * Fallback — for tools that expose NO per-conversation id to their hooks (Cursor,
+ * Antigravity): the single enabled connection for THIS agent. Safe ONLY because
+ * "exactly one" means nothing to disambiguate; two+ concurrent connections of the
+ * same agent fall closed (no mirror) rather than guess.
  */
 export function selectBoundState(candidates, conversationId, agentName = null) {
   const enabled = candidates
     .filter(Boolean)
-    .filter(({ raw }) => raw?.enabled === true && raw?.session_id)
+    .filter(({ raw }) => raw?.enabled === true && raw?.connection_id)
 
   if (conversationId) {
     const bound = enabled
@@ -117,7 +116,7 @@ export function selectBoundState(candidates, conversationId, agentName = null) {
 }
 
 function loadState(conversationId) {
-  // Gather every candidate (legacy singleton + per-session files) but NEVER
+  // Gather every candidate (legacy singleton + per-connection files) but NEVER
   // trust "most recent" — selectBoundState keeps only THIS conversation's state.
   const candidates = []
   try {
@@ -126,13 +125,13 @@ function loadState(conversationId) {
       candidates.push({ raw, mtime: fs.statSync(LEGACY_STATE_PATH).mtimeMs })
     }
   } catch {
-    /* continue with per-session state */
+    /* continue with per-connection state */
   }
   try {
-    if (fs.existsSync(SESSIONS_DIR)) {
-      for (const file of fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.json'))) {
+    if (fs.existsSync(CONNECTIONS_DIR)) {
+      for (const file of fs.readdirSync(CONNECTIONS_DIR).filter((f) => f.endsWith('.json'))) {
         try {
-          const p = path.join(SESSIONS_DIR, file)
+          const p = path.join(CONNECTIONS_DIR, file)
           const raw = JSON.parse(fs.readFileSync(p, 'utf8'))
           candidates.push({ raw, mtime: fs.statSync(p).mtimeMs })
         } catch {
@@ -155,7 +154,6 @@ function extractLastText(hookInput, which) {
   }
 
   if (which === 'user_prompt') {
-    // Claude Code / Grok / Cursor / Codex payload field names vary.
     return (
       data.prompt ||
       data.user_prompt ||
@@ -193,13 +191,10 @@ function extractLastText(hookInput, which) {
 }
 
 /**
- * Claude Code re-invokes the model after a background task completes by
- * injecting a synthetic user prompt — a <task-notification> block, a
- * [SYSTEM NOTIFICATION …] banner, or a <system-reminder>. Those are harness
- * plumbing, never owner-typed input, and must not be mirrored into the
- * transcript as local_prompt bubbles. This guard is Claude-Code-specific:
- * other tools never surface this text on UserPromptSubmit, so shipping it
- * only here keeps the working plugins untouched.
+ * Claude Code re-invokes the model after a background task by injecting a synthetic
+ * user prompt (a <task-notification> block, a [SYSTEM NOTIFICATION …] banner, or a
+ * <system-reminder>). Those are harness plumbing, never owner-typed input, and must
+ * not be mirrored as local_prompt bubbles.
  */
 function isHarnessInjection(text) {
   const t = String(text)
@@ -229,18 +224,16 @@ async function main() {
   mcpUrl = mcpUrl || 'https://devspec.ai/api/mcp'
   // Identity is a fixed property of THIS plugin — never trust state/args for it.
   const agentName = AGENT_NAME
-  const sessionId = state.session_id
+  const connectionId = state.connection_id
+  const sessionId = state.session_id || null // null = sessionless (no room to mirror into)
+  const localId = state.local_id || null
 
   const text = extractLastText(raw, mode)
-
-  // In user_prompt mode, mirror only genuine owner-typed prompts. Skip harness
-  // plumbing (task-notification / system-reminder injections) so it never shows
-  // as a fake "local prompt" bubble. The heartbeat below still runs regardless,
-  // so presence is unaffected.
   const skipMirror = mode === 'user_prompt' && !!text && isHarnessInjection(text)
 
   try {
-    if (text && String(text).trim() && !skipMirror) {
+    // Mirror the turn into the attached session's transcript — only when attached.
+    if (sessionId && text && String(text).trim() && !skipMirror) {
       const cleaned = String(text).trim().slice(0, 12000)
       const isLocalPrompt = mode === 'user_prompt'
       await mcpToolsCall({
@@ -249,32 +242,48 @@ async function main() {
         name: 'post_session_message',
         arguments: {
           session_id: sessionId,
-          // Raw body for local prompts — server turn_kind + strip handles UX.
-          // Agent replies post the final assistant text as-is.
           message: cleaned,
           agent_name: agentName,
           turn_kind: isLocalPrompt ? 'local_prompt' : 'agent',
         },
       })
     }
-    // Turn lifecycle → "working" authority. user_prompt starts a turn
-    // (busy:true + marker so the poller re-asserts); stop ends it (busy:false +
-    // clear marker). The server never sets busy itself, so this is the ONLY
-    // thing that lights up "working".
+
+    // Turn lifecycle → "working" authority. user_prompt starts a turn (busy:true +
+    // marker so the poller re-asserts); stop ends it (busy:false + clear marker).
+    // Marker is keyed by connection_id (the poller reads it by connection_id).
     const turnActive = mode === 'user_prompt'
-    if (turnActive) writeTurnMarker(sessionId)
-    else clearTurnMarker(sessionId)
-    await mcpToolsCall({
-      mcpUrl,
-      token,
-      name: 'report_remote_agent_heartbeat',
-      arguments: {
-        session_id: sessionId,
-        agent_name: agentName,
-        status: 'live',
-        busy: turnActive,
-      },
-    })
+    if (turnActive) writeTurnMarker(connectionId)
+    else clearTurnMarker(connectionId)
+
+    // Busy heartbeat: attached → session heartbeat (keeps session presence + the
+    // bond-aware connection dual-write); sessionless → connection heartbeat.
+    if (sessionId) {
+      await mcpToolsCall({
+        mcpUrl,
+        token,
+        name: 'report_remote_agent_heartbeat',
+        arguments: {
+          session_id: sessionId,
+          agent_name: agentName,
+          status: 'live',
+          busy: turnActive,
+          ...(localId ? { local_id: localId } : {}),
+        },
+      })
+    } else if (connectionId) {
+      await mcpToolsCall({
+        mcpUrl,
+        token,
+        name: 'heartbeat_connection',
+        arguments: {
+          connection_id: connectionId,
+          agent_name: agentName,
+          status: 'live',
+          busy: turnActive,
+        },
+      })
+    }
   } catch (e) {
     process.stderr.write(`[devspec-remote] ${e instanceof Error ? e.message : String(e)}\n`)
   }
