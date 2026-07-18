@@ -256,22 +256,10 @@ async function main() {
     if (turnActive) writeTurnMarker(connectionId)
     else clearTurnMarker(connectionId)
 
-    // Busy heartbeat: attached → session heartbeat (keeps session presence + the
-    // bond-aware connection dual-write); sessionless → connection heartbeat.
-    if (sessionId) {
-      await mcpToolsCall({
-        mcpUrl,
-        token,
-        name: 'report_remote_agent_heartbeat',
-        arguments: {
-          session_id: sessionId,
-          agent_name: agentName,
-          status: 'live',
-          busy: turnActive,
-          ...(localId ? { local_id: localId } : {}),
-        },
-      })
-    } else if (connectionId) {
+    // Busy heartbeat — one connection-native path (attached or sessionless). The
+    // server broadcasts agent_status for the attached session, so no session-keyed
+    // heartbeat is needed.
+    if (connectionId) {
       await mcpToolsCall({
         mcpUrl,
         token,

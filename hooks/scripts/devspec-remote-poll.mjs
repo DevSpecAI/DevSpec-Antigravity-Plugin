@@ -374,26 +374,10 @@ async function main() {
     }
   }
 
-  // Heartbeat branch: attached → session heartbeat (keeps session presence AND, via
-  // the server's bond-aware dual-write, the connection row) with local_id;
-  // sessionless → connection heartbeat. reason is required for offline.
+  // Heartbeat — one connection-native path (attached or sessionless). The server
+  // keeps presence on agent_connections and broadcasts agent_status for the attached
+  // session, so no session-keyed heartbeat is needed. reason is required for offline.
   async function sendHeartbeat({ status, checkTier = null, busy = null, endReason = null }) {
-    if (sessionId) {
-      return mcpToolsCall({
-        mcpUrl,
-        token,
-        name: 'report_remote_agent_heartbeat',
-        arguments: {
-          session_id: sessionId,
-          agent_name: agentName,
-          status,
-          ...(localId ? { local_id: localId } : {}),
-          ...(checkTier ? { check_tier: checkTier } : {}),
-          ...(busy !== null ? { busy } : {}),
-          ...(status === 'offline' && endReason ? { end_reason: endReason } : {}),
-        },
-      })
-    }
     return mcpToolsCall({
       mcpUrl,
       token,
