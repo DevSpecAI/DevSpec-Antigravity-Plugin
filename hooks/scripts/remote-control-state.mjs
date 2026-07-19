@@ -655,17 +655,31 @@ if (isMain) {
     process.exit(auth.ok ? 0 : 1)
   }
 
-  /** Friendly unique channel labels (mirrors server generateRemoteControlCodename). */
+  /** Friendly unique channel labels (mirrors server generateRemoteControlCodename).
+   *  First word: trait adjectives, colours, and motion verbs; second: animal.
+   */
   const CODENAME_ADJECTIVES = [
-    'Amber', 'Bold', 'Bright', 'Calm', 'Clever', 'Colorful', 'Cosmic', 'Crimson',
-    'Curious', 'Dapper', 'Ember', 'Fierce', 'Gentle', 'Golden', 'Hidden', 'Ivory',
-    'Jade', 'Keen', 'Lucky', 'Mighty', 'Noble', 'Quiet', 'Rapid', 'Rusty',
-    'Silent', 'Silver', 'Swift', 'Velvet', 'Wild', 'Zealous',
+    'Amber', 'Bold', 'Brave', 'Bright', 'Calm', 'Clever', 'Colorful', 'Cosmic',
+    'Curious', 'Dapper', 'Daring', 'Eager', 'Ember', 'Fearless', 'Fierce', 'Gentle',
+    'Hidden', 'Honest', 'Humble', 'Jolly', 'Keen', 'Lively', 'Lucky', 'Merry',
+    'Mighty', 'Nimble', 'Noble', 'Patient', 'Playful', 'Proud', 'Quiet', 'Rapid',
+    'Restless', 'Rusty', 'Silent', 'Steady', 'Sturdy', 'Swift', 'Velvet', 'Wary',
+    'Wild', 'Witty', 'Zealous', 'Azure', 'Copper', 'Crimson', 'Emerald', 'Golden',
+    'Green', 'Indigo', 'Ivory', 'Jade', 'Obsidian', 'Orange', 'Purple', 'Scarlet',
+    'Silver', 'Teal', 'Violet', 'Bounding', 'Climbing', 'Dashing', 'Drifting', 'Flying',
+    'Gliding', 'Leaping', 'Racing', 'Roaming', 'Running', 'Soaring', 'Sprinting', 'Vaulting',
+    'Wandering',
   ]
   const CODENAME_ANIMALS = [
-    'Badger', 'Beaver', 'Coyote', 'Dolphin', 'Eagle', 'Falcon', 'Fox', 'Heron',
-    'Ibis', 'Jaguar', 'Koala', 'Lynx', 'Marten', 'Newt', 'Otter', 'Panda',
-    'Possum', 'Quail', 'Raven', 'Seal', 'Tiger', 'Urchin', 'Viper', 'Wolf',
+    'Alpaca', 'Badger', 'Beaver', 'Bison', 'Bobcat', 'Caracal', 'Condor', 'Coyote',
+    'Crane', 'Crocodile', 'Dolphin', 'Dragonfly', 'Eagle', 'Egret', 'Falcon', 'Ferret',
+    'Finch', 'Fox', 'Gecko', 'Gibbon', 'Hare', 'Hawk', 'Heron', 'Ibis',
+    'Iguana', 'Jackal', 'Jaguar', 'Kestrel', 'Kingfisher', 'Koala', 'Lemur', 'Lizard',
+    'Llama', 'Lynx', 'Mantis', 'Marten', 'Meerkat', 'Mongoose', 'Narwhal', 'Newt',
+    'Ocelot', 'Octopus', 'Osprey', 'Otter', 'Owl', 'Panda', 'Panther', 'Pelican',
+    'Penguin', 'Phoenix', 'Pika', 'Possum', 'Puma', 'Quail', 'Quokka', 'Rabbit',
+    'Raccoon', 'Raven', 'Salmon', 'Seal', 'Sparrow', 'Squirrel', 'Stork', 'Tiger',
+    'Toucan', 'Turtle', 'Urchin', 'Viper', 'Walrus', 'Weasel', 'Wombat', 'Wolf',
     'Yak', 'Zebra',
   ]
 
