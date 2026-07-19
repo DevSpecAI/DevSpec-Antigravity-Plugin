@@ -35,6 +35,20 @@ const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.js
 const POLL_MS = 500
 const MAX_WAIT_MS = 24 * 60 * 60 * 1000
 
+/**
+ * Idle = wait is armed (agent not mid-turn). Clear the connection turn marker so
+ * the continuous poller stops re-asserting busy. Without this, Grok (no Stop
+ * hook) and reconnect seeds leave a phantom "working" forever.
+ */
+function clearTurnMarker(connectionId) {
+  if (!connectionId) return
+  try {
+    fs.rmSync(path.join(CONNECTIONS_DIR, `${connectionId}.turn`), { force: true })
+  } catch {
+    /* ignore */
+  }
+}
+
 function parseArgs(argv) {
   const out = { fromEnd: true, pending: false }
   for (let i = 0; i < argv.length; i++) {
@@ -211,6 +225,10 @@ async function main() {
   } else {
     offset = fileSize(file)
   }
+
+  // Agent is idle while waiting — end any leftover working phase from a prior
+  // turn or from a reconnect seed that re-delivered history with busy:true.
+  clearTurnMarker(connectionId)
 
   const pollMs = args.pollMs || POLL_MS
   const started = Date.now()

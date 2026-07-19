@@ -497,7 +497,9 @@ async function main() {
 
   // --- Poll an attached session's room transcript ---------------------------
   // Owner instructions → commands (wake). Everything else → advisory (inbox only).
-  async function pollRoom() {
+  // seed:true = advance cursor only — do NOT re-wake / re-busy historical owner
+  // messages (reconnect was stranding Working forever when combined with busy-on-deliver).
+  async function pollRoom({ seed = false } = {}) {
     if (!sessionId) return
     try {
       const delta = await mcpToolsCall({
@@ -508,6 +510,25 @@ async function main() {
       })
       if (delta?.owner_user_id) ownerUserId = delta.owner_user_id
       const msgs = Array.isArray(delta?.messages) ? delta.messages : []
+      const next = delta?.cursor?.next_after_message_id || msgs[msgs.length - 1]?.id || cursor
+
+      if (seed) {
+        // Catch up the cursor so the next real poll only sees new mail.
+        if (next && next !== cursor) {
+          cursor = next
+          try {
+            const s = readState(connectionId) || {}
+            s.cursor_after_message_id = cursor
+            s.connection_id = connectionId
+            s.updated_at = new Date().toISOString()
+            writeState(s, connectionId)
+          } catch {
+            /* ignore */
+          }
+        }
+        return
+      }
+
       const commands = []
       const advisory = []
       for (const m of msgs) {
@@ -515,7 +536,6 @@ async function main() {
         if (cls === 'command') commands.push(m)
         else if (cls === 'advisory') advisory.push(m)
       }
-      const next = delta?.cursor?.next_after_message_id || msgs[msgs.length - 1]?.id || cursor
       // Advisory first (awareness lands before the command the agent will act on).
       if (advisory.length > 0) deliverAdvisory(connectionId, advisory, sessionId)
       if (commands.length > 0) {
@@ -547,10 +567,11 @@ async function main() {
     }
   }
 
-  // Initial seed: dispatches + (if attached) the room, delivering anything pending.
+  // Initial seed: advance room cursor without replaying history as new commands;
+  // still surface fresh dispatches (sessionless work can land while offline).
   try {
     await pollDispatches()
-    await pollRoom()
+    await pollRoom({ seed: true })
   } catch (e) {
     process.stderr.write(`devspec-remote-poll: initial poll failed: ${e.message}\n`)
     process.exit(1)
