@@ -78,6 +78,22 @@ function readTurnMarker(connectionId) {
     return null
   }
 }
+/**
+ * Start a turn at honest owner-command pickup (remote UI / dispatch delivery).
+ * The long-lived poller re-asserts busy while this marker is fresh; Stop /
+ * mirror-turn clears it when the agent turn ends.
+ */
+function writeTurnMarker(connectionId) {
+  if (!connectionId) return
+  try {
+    fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
+    fs.writeFileSync(turnMarkerPath(connectionId), JSON.stringify({ startedAt: Date.now() }), {
+      mode: 0o600,
+    })
+  } catch {
+    /* non-fatal — immediate busy heartbeat at call site still fires */
+  }
+}
 
 /** Owner (agent) process liveness — see the anti-zombie contract. EPERM = alive. */
 function ownerAlive(pid) {
@@ -262,6 +278,11 @@ export function classifyRoomMessage(msg, ownerUserId) {
 /**
  * Deliver owner commands without exiting — heartbeats keep running. Writes an
  * `owner_messages` inbox entry (woken by the wait watcher) + a `wake` stdout line.
+ *
+ * Honest pickup: writing the turn marker (and the caller's immediate busy
+ * heartbeat) flips UI pending → working the moment the command lands here —
+ * not when/if a UserPromptSubmit hook fires. Remote phone/web wakes never go
+ * through that hook; this is the one reliable pickup signal.
  */
 function deliverOwnerMessages(connectionId, ownerMsgs, nextCursor, ownerUserId, sessionId) {
   for (const m of ownerMsgs) {
@@ -278,6 +299,8 @@ function deliverOwnerMessages(connectionId, ownerMsgs, nextCursor, ownerUserId, 
     }) + '\n',
   )
   appendInbox(connectionId, ownerMsgs, { type: 'owner_messages', nextCursor, sessionId })
+  // Turn start at pickup — poller re-asserts busy while the marker is fresh.
+  writeTurnMarker(connectionId)
   try {
     const s = readState(connectionId) || {}
     s.cursor_after_message_id = nextCursor
@@ -449,6 +472,14 @@ async function main() {
         }))
         deliverOwnerMessages(connectionId, asMessages, cursor, ownerUserId, sessionId)
         idleStarted = Date.now()
+        // Immediate busy so UI leaves pending without waiting for the next HB tick.
+        try {
+          await sendHeartbeat({ status: 'live', busy: true })
+          lastHeartbeat = Date.now()
+          lastBusySent = true
+        } catch (e) {
+          process.stderr.write(`devspec-remote-poll: pickup busy heartbeat failed: ${e.message}\n`)
+        }
         try {
           const s = readState(connectionId) || {}
           s.delivered_dispatch_ids = [...deliveredDispatchIds].slice(-200)
@@ -491,6 +522,14 @@ async function main() {
         deliverOwnerMessages(connectionId, commands, next, ownerUserId, sessionId)
         cursor = next
         idleStarted = Date.now()
+        // Immediate busy so UI leaves pending without waiting for the next HB tick.
+        try {
+          await sendHeartbeat({ status: 'live', busy: true })
+          lastHeartbeat = Date.now()
+          lastBusySent = true
+        } catch (e) {
+          process.stderr.write(`devspec-remote-poll: pickup busy heartbeat failed: ${e.message}\n`)
+        }
       } else if (next && next !== cursor) {
         cursor = next
         try {
