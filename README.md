@@ -17,14 +17,17 @@ It is the Antigravity sibling of the DevSpec plugins for Claude Code, Codex CLI,
 ## Requirements
 
 - Antigravity CLI (`agy`) **or** the Antigravity desktop app.
-- A DevSpec account, with an **account-wide MCP token** (DevSpec → **Settings → Autopilot**) — one
-  token works across all projects in your account. The skills resolve which project a run is for
-  from the repo's git remote (`git remote get-url origin`), so one token works across every
-  project.
-- `git` and **`node` (Node.js 18+)** on your PATH. Autopilot/work skills use git worktrees and
-  small Node helpers for logging. **DevSpec remote control** (`devspec-remote`) also needs Node:
-  it runs a local poller so the agent can stay connected to the Agents page without burning LLM
-  tokens while waiting for instructions.
+- A DevSpec account, with an **account-wide MCP token**. Create one in DevSpec under
+  **You → Connections** → **Connect a tool** (pick **Read & write**); it starts with `dvs_`. The
+  skills resolve which project a run is for from the repo's git remote (`git remote get-url origin`),
+  so one token works across every project in your account.
+  - **One token, everywhere:** it's account-wide, so use the *same* token in every tool and on
+    every machine — don't mint one per machine. It's now **retrievable** too: reveal and copy it
+    again any time at **You → Connections** (no more show-once).
+- `git` on your PATH for any repo work. **Node.js 18+** is only needed for the **autopilot/work**
+  skills (git worktrees + small Node helpers for logging) and **DevSpec remote control**
+  (`devspec-remote`) — the latter runs a local poller so the agent can stay connected to the Agents
+  page without burning LLM tokens while waiting for instructions. The other skills work without it.
 
 ---
 
@@ -53,12 +56,14 @@ Start from [`mcp/devspec.mcp.json`](mcp/devspec.mcp.json):
 ```
 
 - Replace `dvs_YOUR_DEVSPEC_MCP_TOKEN` with your **account-wide** token from DevSpec →
-  **Settings → Autopilot**. One token covers every project in your account — the skills resolve
-  which project each run targets from the repo's git remote, so you do not configure a project here.
+  **You → Connections** → **Connect a tool** (pick **Read & write**). One token covers every project
+  in your account — the skills resolve which project each run targets from the repo's git remote, so
+  you do not configure a project here.
 - Replace the host if your DevSpec instance lives elsewhere.
 
-**Antigravity CLI** — merge that `devspec` block into `~/.gemini/antigravity-cli/mcp_config.json`,
-then run `/mcp` to confirm it connected.
+**Antigravity CLI** — merge that `devspec` block into `~/.gemini/antigravity-cli/mcp_config.json`
+(on Windows: `%USERPROFILE%\.gemini\antigravity-cli\mcp_config.json`), then run `/mcp` to confirm it
+connected.
 
 **Antigravity desktop app** — **Settings → MCP → Add server**, choose HTTP, paste the `serverUrl`
 and the `Authorization: Bearer …` header.
