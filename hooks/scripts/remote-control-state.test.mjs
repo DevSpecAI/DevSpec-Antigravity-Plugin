@@ -363,9 +363,40 @@ describe('reapDeadPollers (connection-native)', () => {
     assert.deepEqual(killed, [])
   })
 
-  it('does NOT reap an enabled connection with no owner_pid (cannot prove dead)', () => {
-    const { reaped } = run([{ connection_id: 'c-legacy', agent_name: agent, enabled: true }])
-    assert.equal(reaped.length, 0)
+  it('does NOT reap a no-owner_pid connection with no/fresh timestamp (unknown → leave alone)', () => {
+    // No updated_at → staleness unknown → not reaped.
+    const noStamp = run([{ connection_id: 'c-legacy', agent_name: agent, enabled: true }])
+    assert.equal(noStamp.reaped.length, 0)
+    // Fresh updated_at → clearly active → not reaped.
+    const fresh = run(
+      [
+        {
+          connection_id: 'c-legacy-fresh',
+          agent_name: agent,
+          enabled: true,
+          updated_at: '2026-07-20T11:59:00.000Z',
+        },
+      ],
+      { args: { now: Date.parse('2026-07-20T12:00:00.000Z') } },
+    )
+    assert.equal(fresh.reaped.length, 0)
+  })
+
+  it('reaps a STALE no-owner_pid connection (legacy backstop — zombie gap 00bd4f6e)', () => {
+    const { reaped, killed } = run(
+      [
+        {
+          connection_id: 'c-legacy-stale',
+          agent_name: agent,
+          enabled: true,
+          updated_at: '2026-07-20T10:00:00.000Z', // 2h before `now`, threshold 1h
+        },
+      ],
+      { args: { now: Date.parse('2026-07-20T12:00:00.000Z') } },
+    )
+    assert.equal(reaped.length, 1)
+    assert.equal(reaped[0].reason, 'stale_no_owner')
+    assert.deepEqual(killed, ['pid-c-legacy-stale'])
   })
 
   it('skips the exceptConnectionId (the one we are about to (re)use)', () => {
@@ -400,5 +431,16 @@ describe('ensurePollerForConnection (guards)', () => {
     assert.equal(ensurePollerForConnection('').ok, false)
     assert.equal(ensurePollerForConnection('short').ok, false)
     assert.match(ensurePollerForConnection(null).error, /missing connection id/)
+  })
+
+  it('refuses to spawn without a valid --owner-pid (no anchor → would zombie)', () => {
+    // Valid-length connection id, script present, but no owner pid → refuse before
+    // stopping/spawning anything, so the reaper can always prove a poller dead.
+    const r = ensurePollerForConnection('11111111-1111-1111-1111-111111111111')
+    assert.equal(r.ok, false)
+    assert.match(r.error, /owner-pid/)
+    const bad = ensurePollerForConnection('11111111-1111-1111-1111-111111111111', { ownerPid: 1 })
+    assert.equal(bad.ok, false)
+    assert.match(bad.error, /owner-pid/)
   })
 })

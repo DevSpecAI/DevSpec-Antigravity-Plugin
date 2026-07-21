@@ -33,7 +33,7 @@
  * Usage:
  *   node remote-control-state.mjs write --connection-id <uuid> [--session <uuid>]
  *       [--agent "Grok Build"] [--cwd <path>] [--codename "Colorful Possum"]
- *       [--title "…"] [--local-id <id>] [--owner-pid <pid>] [--no-poller]
+ *       [--title "…"] [--local-id <id>] [--owner-pid <pid>] [--host-token <bearer>] [--no-poller]
  *   node remote-control-state.mjs ensure-poller --connection-id <uuid> [--session <uuid>] [--owner-pid <pid>]
  *   node remote-control-state.mjs disable --connection-id <uuid>
  *   node remote-control-state.mjs disable-local [--agent "Grok Build"] [--local-id <id>]
@@ -56,7 +56,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 
 const DEVSPEC_DIR = path.join(os.homedir(), '.devspec')
@@ -113,6 +113,8 @@ function parseArgs(argv) {
       out['max-age-minutes'] = argv[++i]
     } else if (a === '--owner-pid') {
       out['owner-pid'] = argv[++i]
+    } else if (a === '--host-token' || a === '--host_token') {
+      out['host-token'] = argv[++i]
     } else if (a === '--except-connection' || a === '--except-session') {
       out['except-connection'] = argv[++i]
     } else if (a === '--no-poller' || a === '--skip-poller') {
@@ -206,11 +208,29 @@ export function ensurePollerForConnection(connectionId, opts = {}) {
   if (!fs.existsSync(POLLER_SCRIPT)) {
     return { ok: false, error: `poller script missing: ${POLLER_SCRIPT}` }
   }
+
+  // Owner-process anchor — REQUIRED before we spawn anything. A poller with no
+  // recorded owner_pid can never be proven dead by the reaper (owner-death is the
+  // liveness proof it keys on), so it lingers as a zombie "Live" agent
+  // (item 00bd4f6e). We refuse rather than fall back to process.ppid: inside this
+  // short-lived state-writer subprocess ppid is the ephemeral invoking shell, not
+  // the owning agent — recording it would make the reaper SIGTERM a LIVE agent's
+  // poller the instant that shell exits. Callers pass the agent explicitly as
+  // --owner-pid "$PPID", so every poller we spawn carries a trustworthy anchor and
+  // the reaper's owner-death check covers it. (This is the guard behind Fix 1.)
+  const ownerPidRaw = Number.parseInt(String(opts.ownerPid ?? ''), 10)
+  const ownerPid = Number.isInteger(ownerPidRaw) && ownerPidRaw > 1 ? ownerPidRaw : null
+  if (ownerPid === null) {
+    return {
+      ok: false,
+      error:
+        'refusing to spawn a poller without a valid --owner-pid (no trustworthy owner anchor → the reaper could never prove it dead → zombie "Live" agent). Pass --owner-pid "$PPID".',
+    }
+  }
+
   const stopped = stopPollerForConnection(connectionId)
   fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
 
-  const ownerPidRaw = Number.parseInt(String(opts.ownerPid ?? ''), 10)
-  const ownerPid = Number.isInteger(ownerPidRaw) && ownerPidRaw > 1 ? ownerPidRaw : null
   const logPath = pollerLogPath(connectionId)
   const pidPath = pollerPidPath(connectionId)
   const cwd = opts.cwd || process.cwd()
@@ -346,16 +366,29 @@ function scanConnectionStates() {
 }
 
 /**
+ * Legacy backstop threshold. A still-running poller whose connection state carries
+ * NO recorded owner_pid can't be proven dead by owner-death — this was the exact
+ * zombie gap (item 00bd4f6e). New pollers always record an owner_pid
+ * (ensurePollerForConnection refuses to spawn without one), so a live no-owner_pid
+ * state is a pre-fix artifact. We reap it only once its local state has been
+ * untouched this long, so a freshly-active legacy poller is never killed.
+ */
+const STALE_NO_OWNER_REAP_MS = 60 * 60 * 1000 // 1h
+
+/**
  * Reap PROVABLY-DEAD pollers — the connect-time / SessionStart backstop for the
- * self-terminating poller. A poller is reaped only when its connection is provably
- * dead (state disabled, ended-from-UI, or its recorded owner process is gone), so a
- * live sibling terminal's poller is NEVER touched. A poller with no recorded
- * owner_pid and an enabled connection cannot be proven dead → left alone.
- * Injectable for tests.
+ * self-terminating poller. A poller is reaped when its connection is provably dead
+ * (state disabled, ended-from-UI, or its recorded owner process is gone), so a live
+ * sibling terminal's poller is NEVER touched. As a legacy safety net, a poller with
+ * NO recorded owner_pid (pre-owner-pid-contract artifact — new spawns always record
+ * one) is reaped only once its local state has gone stale beyond STALE_NO_OWNER_REAP_MS,
+ * so a freshly-active one is left alone. Injectable for tests.
  */
 export function reapDeadPollers({
   agent = AGENT_NAME,
   exceptConnectionId = null,
+  now = Date.now(),
+  staleNoOwnerReapMs = STALE_NO_OWNER_REAP_MS,
   listStates = scanConnectionStates,
   findPids = findPollerPidsForConnection,
   isOwnerAlive = ownerAlive,
@@ -378,17 +411,33 @@ export function reapDeadPollers({
     const pids = findPids(s.connection_id)
     if (!pids.length) continue
     const ownerPid = Number.isInteger(s.owner_pid) && s.owner_pid > 1 ? s.owner_pid : null
-    const provablyDead =
-      s.enabled === false ||
-      s.ended_from_ui === true ||
-      (ownerPid !== null && !isOwnerAlive(ownerPid))
-    if (!provablyDead) continue
+    const ownerGone = ownerPid !== null && !isOwnerAlive(ownerPid)
+    const provablyDead = s.enabled === false || s.ended_from_ui === true || ownerGone
+
+    // Legacy backstop: with no owner_pid there is nothing to prove death by, so
+    // reap only when the connection is still nominally enabled but its local state
+    // has been untouched beyond the stale threshold (never a freshly-active one; a
+    // missing/unparsable updated_at is treated as "unknown → leave alone").
+    let staleNoOwner = false
+    if (!provablyDead && ownerPid === null && s.enabled !== false && s.ended_from_ui !== true) {
+      const t = Date.parse(s.updated_at || '')
+      if (Number.isFinite(t) && now - t >= staleNoOwnerReapMs) staleNoOwner = true
+    }
+
+    if (!provablyDead && !staleNoOwner) continue
     const killed = pids.filter((pid) => kill(pid))
     reaped.push({
       connection_id: s.connection_id,
       agent_name: s.agent_name || null,
       killed,
-      reason: s.enabled === false ? 'disabled' : s.ended_from_ui ? 'ended_from_ui' : 'owner_gone',
+      reason:
+        s.enabled === false
+          ? 'disabled'
+          : s.ended_from_ui
+            ? 'ended_from_ui'
+            : ownerGone
+              ? 'owner_gone'
+              : 'stale_no_owner',
     })
   }
   return reaped
@@ -646,7 +695,11 @@ if (isMain) {
   const cmd = args._[0] || 'read'
 
   if (cmd === 'resolve-auth') {
-    const auth = resolveDevspecMcpAuth(args.cwd || process.cwd())
+    const hostToken =
+      (typeof args['host-token'] === 'string' && args['host-token'].trim()
+        ? args['host-token'].trim()
+        : null) || hostTokenFromEnv(process.env)
+    const auth = resolveDevspecMcpAuth(args.cwd || process.cwd(), { hostToken })
     if (process.argv.includes('--mask') && auth.token) {
       auth.token_preview = auth.token.slice(0, 8) + '…' + auth.token.slice(-4)
       delete auth.token
@@ -977,7 +1030,19 @@ if (isMain) {
       process.exit(2)
     }
     const cwd = args.cwd || process.cwd()
-    const auth = resolveDevspecMcpAuth(cwd)
+    // Token symmetry (item 74b29c76): prefer the SAME bearer the host MCP client
+    // used for register_connection so the poller heartbeats THIS connection under
+    // the same identity — otherwise the server rejects with "connection belongs to
+    // a different token" and dispatch delivery spams. The host token comes from an
+    // explicit --host-token (the write "receives one") or the reachable plugin
+    // userConfig env Claude Code exports (an env "carries it"); it wins over the
+    // .mcp.json walk but not an explicit DEVSPEC_MCP_TOKEN. Absent on non-Claude
+    // plugins / dev-from-source setups → resolution is unchanged. See resolve-mcp-auth.mjs.
+    const hostToken =
+      (typeof args['host-token'] === 'string' && args['host-token'].trim()
+        ? args['host-token'].trim()
+        : null) || hostTokenFromEnv(process.env)
+    const auth = resolveDevspecMcpAuth(cwd, { hostToken })
     const prev = readJson(connectionPath(connectionId)) || {}
     const agentName = args.agent || prev.agent_name || AGENT_NAME
     // The conversation this write belongs to — stamped INTO the per-connection state

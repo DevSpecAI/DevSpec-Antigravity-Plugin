@@ -3,13 +3,30 @@
  * Resolve DevSpec MCP URL + Bearer token for remote-control hooks/poller.
  *
  * Lookup order:
- * 1. DEVSPEC_MCP_TOKEN / DEVSPEC_TOKEN (+ DEVSPEC_MCP_URL)
- * 2. Project .mcp.json (cwd and parents)
- * 3. ~/.claude.json project entries that match cwd (mcpServers.devspec)
- * 4. ~/.claude.json top-level mcpServers.devspec
- * 5. CLAUDE_PLUGIN_OPTION_DEVSPEC_TOKEN — the plugin userConfig token
+ * 1. DEVSPEC_MCP_TOKEN / DEVSPEC_TOKEN (+ DEVSPEC_MCP_URL) — explicit human override.
+ * 2. opts.hostToken — the bearer the HOST MCP client used to call register_connection,
+ *    when the caller can supply it (token symmetry, item 74b29c76). Wins over the
+ *    .mcp.json / ~/.claude.json walk so the poller heartbeats the connection under
+ *    the SAME identity register used — otherwise the server rejects with "This
+ *    connection belongs to a different token" and dispatch delivery spams. Absent →
+ *    resolution is unchanged (backward compatible).
+ * 3. Project .mcp.json (cwd and parents)
+ * 4. ~/.claude.json project entries that match cwd (mcpServers.devspec)
+ * 5. ~/.claude.json top-level mcpServers.devspec
+ * 6. CLAUDE_PLUGIN_OPTION_DEVSPEC_TOKEN — the plugin userConfig token
  *    (keychain-stored; Claude Code exports it to hook/tool subprocesses).
  *    Lowest priority so a developer's own .mcp.json (e.g. staging) still wins.
+ *
+ * MULTI-TOKEN SETUPS. When more than one DevSpec token is reachable (e.g. a
+ * marketplace plugin userConfig token AND a project .mcp.json staging token), the
+ * HOST MCP client and the poller could otherwise resolve DIFFERENT ones — the poller
+ * then heartbeats a connection register created under another token and every
+ * dispatch is rejected. hostTokenFromEnv() surfaces the host's own token (the plugin
+ * userConfig env Claude Code exports — the token register_connection runs on for the
+ * plugin-declared `devspec` server); passing it as opts.hostToken keeps register and
+ * poller on ONE token from the start. To force a specific token regardless, set
+ * DEVSPEC_MCP_TOKEN (step 1). On the non-Claude local-poller plugins the plugin env
+ * is never set, so hostTokenFromEnv() returns null and nothing changes.
  *
  * Prints JSON: { ok, token?, mcp_url?, source?, error? }
  * Never prints the full token in human logs — only to stdout JSON for piping.
@@ -100,7 +117,23 @@ function fromClaudeJson(cwd) {
   return null
 }
 
-export function resolveDevspecMcpAuth(cwd = process.cwd()) {
+/**
+ * The bearer the HOST MCP client is expected to have used for register_connection,
+ * drawn from the reachable process env. The one host-token carrier that reaches
+ * hook/tool subprocesses today is CLAUDE_PLUGIN_OPTION_DEVSPEC_TOKEN — the plugin
+ * userConfig token Claude Code exports, which IS the token the host uses for the
+ * plugin-declared `devspec` MCP server (so register_connection runs on it). Pass the
+ * result as resolveDevspecMcpAuth(cwd, { hostToken }) at connect/write time to keep
+ * the poller on the same token. Returns null where the plugin env is unset (a
+ * dev-from-source .mcp.json setup, or the non-Claude local-poller plugins) → the
+ * caller's resolution is unchanged.
+ */
+export function hostTokenFromEnv(env = process.env) {
+  const t = env.CLAUDE_PLUGIN_OPTION_DEVSPEC_TOKEN || env.CLAUDE_PLUGIN_OPTION_devspec_token || null
+  return typeof t === 'string' && t.trim() ? t.trim() : null
+}
+
+export function resolveDevspecMcpAuth(cwd = process.cwd(), opts = {}) {
   const envToken = process.env.DEVSPEC_MCP_TOKEN || process.env.DEVSPEC_TOKEN || null
   const envUrl = process.env.DEVSPEC_MCP_URL || null
   if (envToken) {
@@ -113,6 +146,21 @@ export function resolveDevspecMcpAuth(cwd = process.cwd()) {
   }
 
   const fromProject = walkMcpJson(cwd)
+
+  // Host-provided token wins over the .mcp.json / ~/.claude.json walk (token
+  // symmetry, item 74b29c76) but stays below the explicit DEVSPEC_MCP_TOKEN
+  // override. Backward compatible: absent → the walk below is unchanged.
+  const hostToken =
+    typeof opts.hostToken === 'string' && opts.hostToken.trim() ? opts.hostToken.trim() : null
+  if (hostToken) {
+    return {
+      ok: true,
+      token: hostToken,
+      mcp_url: envUrl || fromProject?.mcp_url || DEFAULT_PROD_URL,
+      source: 'host',
+    }
+  }
+
   if (fromProject?.token) {
     return {
       ok: true,
@@ -170,7 +218,8 @@ export function resolveDevspecMcpAuth(cwd = process.cwd()) {
 
 // CLI
 if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith('resolve-mcp-auth.mjs')) {
-  const result = resolveDevspecMcpAuth(process.cwd())
+  // Reflect the same host-token preference the write path uses, for diagnostics.
+  const result = resolveDevspecMcpAuth(process.cwd(), { hostToken: hostTokenFromEnv(process.env) })
   process.stdout.write(JSON.stringify(result) + '\n')
   process.exit(result.ok ? 0 : 1)
 }
