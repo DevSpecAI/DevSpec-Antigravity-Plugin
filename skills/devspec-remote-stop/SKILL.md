@@ -26,20 +26,16 @@ Multiple remotes may run on one machine (several Antigravity terminals).
 
 2. **Mark the connection offline (this connection only):**
    - `heartbeat_connection({ connection_id, status: "offline", end_reason: "local_stop" })` (one path, attached or sessionless), then optionally `detach_connection({ connection_id })`.
+   - **Do not** `post_session_message` disconnect chrome — presence updates via the offline heartbeat / Agents page.
 
-3. **Post disconnect** (best-effort, only when attached):
-   ```
-   post_session_message(session_id, "🔌 **Local agent disconnected**.", agent_name: "Antigravity")
-   ```
-
-4. **Disable state + kill only this poller + mark bond stopped:**
+3. **Disable state + kill only this poller + mark bond stopped:**
    ```bash
    node "<plugin>/hooks/scripts/remote-control-state.mjs" disable \
      --connection-id '<connection_id>' --agent "Antigravity" --local-id "<local_id>"
    ```
    Connection-scoped: writes that connection's state `enabled: false`, marks matching local bonds `stopped` (soft-reconnect only for this conversation within ~30m), and SIGTERMs pollers whose argv includes this connection UUID only.
 
-5. **Print:**
+4. **Print in this local terminal only** (never into the session transcript):
    ```
    ✓ DevSpec remote control stopped
      Connection: {first 8}…
@@ -49,7 +45,7 @@ Multiple remotes may run on one machine (several Antigravity terminals).
 
 ## Rules
 
-- Always offline **this** connection even if the post fails.
+- Always offline **this** connection.
 - Do not delete the DevSpec session — history remains.
 - Soft-reconnect is bond-scoped (same conversation `local_id`), never by cwd/repo: `end_reason: local_stop` is recoverable only soon after (~30m), so remote → stop → remote again in the same conversation resumes the connection. A new agent chat later must not rejoin just because files remain under `~/.devspec`.
 - This is DevSpec remote control — distinct from any built-in remote-control feature of your host app.
