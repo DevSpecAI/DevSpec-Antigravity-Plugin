@@ -115,7 +115,31 @@ export function selectBoundState(candidates, conversationId, agentName = null) {
   return null
 }
 
-function loadState(conversationId) {
+/**
+ * Marker set by mark-explicit-reply.mjs (PostToolUse on the devspec
+ * post_session_message tool) when the agent itself already posted a reply this
+ * turn. Checked here so Stop never ALSO mirrors the turn's end-of-turn
+ * narration as a second, redundant session message (item b9fb49a9 — the
+ * "double post, real reply missing" symptom was this narration landing
+ * alongside an explicit reply, not instead of one). Cleared unconditionally
+ * once read so it can never leak into a later turn.
+ */
+export function explicitReplyMarkerPath(connectionId) {
+  return path.join(CONNECTIONS_DIR, `${connectionId}.explicit-reply`)
+}
+export function consumeExplicitReplyMarker(connectionId) {
+  if (!connectionId) return false
+  const p = explicitReplyMarkerPath(connectionId)
+  try {
+    const existed = fs.existsSync(p)
+    if (existed) fs.rmSync(p, { force: true })
+    return existed
+  } catch {
+    return false
+  }
+}
+
+export function loadState(conversationId) {
   // Gather every candidate (legacy singleton + per-connection files) but NEVER
   // trust "most recent" — selectBoundState keeps only THIS conversation's state.
   const candidates = []
@@ -206,6 +230,66 @@ function isHarnessInjection(text) {
   )
 }
 
+const REMOTE_STATUS_BANNER = '━━━ DevSpec Remote Control ━━━'
+
+/**
+ * Strip the terminal status block agents often paste into Stop output.
+ * Removes from the banner header through the trailing rule line.
+ */
+export function stripRemoteControlBanner(text) {
+  const t = String(text ?? '')
+  const start = t.indexOf(REMOTE_STATUS_BANNER)
+  if (start < 0) return t
+  const afterHeader = t.slice(start + REMOTE_STATUS_BANNER.length)
+  // Prefer the unicode rule line used in skills; fall back to ASCII dashes.
+  const ruleMatch = afterHeader.match(/\n[─-]{3,}\s*\n?/)
+  let end = start + REMOTE_STATUS_BANNER.length
+  if (ruleMatch && typeof ruleMatch.index === 'number') {
+    end += ruleMatch.index + ruleMatch[0].length
+  } else {
+    // No rule line — drop from banner to end of that paragraph block.
+    const nextBlank = afterHeader.search(/\n\s*\n/)
+    end = nextBlank >= 0 ? start + REMOTE_STATUS_BANNER.length + nextBlank : t.length
+  }
+  return `${t.slice(0, start)}${t.slice(end)}`.replace(/^\s+|\s+$/g, '')
+}
+
+/**
+ * True when Stop (or agent) text is operational chrome that must not become a
+ * session chat bubble. Fail open for ambiguous / real replies.
+ */
+export function isOperationalChrome(text) {
+  let t = String(text ?? '').trim()
+  if (!t) return true
+
+  if (/^🔌?\s*\*{0,2}Local agent disconnected\*{0,2}\.?\s*$/i.test(t)) return true
+  if (/^You're connected to .+ agent on their local machine\.?\s*$/i.test(t)) return true
+  if (/^Connected and waiting for your next command\b/i.test(t) && t.length < 280) return true
+
+  if (t.includes(REMOTE_STATUS_BANNER)) {
+    t = stripRemoteControlBanner(t).trim()
+    if (!t) return true
+    if (/^Connected and waiting for your next command\b/i.test(t) && t.length < 280) return true
+    if (/^🔌?\s*\*{0,2}Local agent disconnected\*{0,2}\.?\s*$/i.test(t)) return true
+    if (/^You're connected to .+ agent on their local machine\.?\s*$/i.test(t)) return true
+    // Banner plus a tiny leftover (e.g. "Open: Agents page") — still chrome.
+    if (t.length < 80 && /^(Agent|Connection|Session|Status|Open|Stop with):/m.test(t)) return true
+  }
+
+  return false
+}
+
+/**
+ * Prepare agent Stop text for mirroring: strip known chrome; return null to skip.
+ */
+export function prepareAgentMirrorText(text) {
+  let t = String(text ?? '').trim()
+  if (!t) return null
+  if (t.includes(REMOTE_STATUS_BANNER)) t = stripRemoteControlBanner(t).trim()
+  if (!t || isOperationalChrome(t)) return null
+  return t.slice(0, 12000)
+}
+
 async function main() {
   const raw = readStdin()
   const conversationId = resolveHookConversationId(raw)
@@ -231,22 +315,40 @@ async function main() {
   const text = extractLastText(raw, mode)
   const skipMirror = mode === 'user_prompt' && !!text && isHarnessInjection(text)
 
+  // Consume any explicit-reply marker so it cannot bleed into a later turn.
+  // Agent answers are skill-posted (ADR b98a39a9); Stop no longer mirrors full
+  // assistant text as a primary path — dual writers caused wrong-voice dupes
+  // and silent misses when bonding failed.
+  if (mode === 'stop') consumeExplicitReplyMarker(connectionId)
+
   try {
-    // Mirror the turn into the attached session's transcript — only when attached.
-    if (sessionId && text && String(text).trim() && !skipMirror) {
+    // LOCAL PROMPT only: mirror owner text typed in the terminal into the room
+    // when attached (two-sided transcript). Agent Stop text is NOT posted here —
+    // the skill must post_session_message the direct answer (prefer connection_id).
+    if (
+      mode === 'user_prompt' &&
+      sessionId &&
+      text &&
+      String(text).trim() &&
+      !skipMirror
+    ) {
       const cleaned = String(text).trim().slice(0, 12000)
-      const isLocalPrompt = mode === 'user_prompt'
-      await mcpToolsCall({
-        mcpUrl,
-        token,
-        name: 'post_session_message',
-        arguments: {
-          session_id: sessionId,
+      if (cleaned) {
+        const postArgs = {
           message: cleaned,
           agent_name: agentName,
-          turn_kind: isLocalPrompt ? 'local_prompt' : 'agent',
-        },
-      })
+          turn_kind: 'local_prompt',
+        }
+        // Prefer connection_id so reattach is server-resolved (delivery contract).
+        if (connectionId) postArgs.connection_id = connectionId
+        else postArgs.session_id = sessionId
+        await mcpToolsCall({
+          mcpUrl,
+          token,
+          name: 'post_session_message',
+          arguments: postArgs,
+        })
+      }
     }
 
     // Turn lifecycle → "working" authority. user_prompt starts a turn (busy:true +

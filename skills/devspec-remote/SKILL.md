@@ -185,7 +185,9 @@ node "<plugin>/hooks/scripts/devspec-remote-wait.mjs" --connection-id "$CONNECTI
 
 Run it under the Antigravity **`monitor`** tool so each stdout line notifies the chat. When you see a `type":"wake"` / `owner_message` line → act → **re-arm only this wait** with `monitor` again. Exit **1** → connection ended/disabled/owner gone — stop. The wait watches the inbox from a byte offset; `--from-end` (default) ignores old mail, `--pending` also delivers unconsumed inbox from the saved offset (use once after connect if needed). It wakes **only** on `owner_messages` — `advisory_context` is deliberately ignored here.
 
-**Turn mirroring (hooks — automatic):** when connection state is enabled, plugin hooks post mechanically (no LLM): `UserPromptSubmit` → `mirror-turn.mjs user_prompt` posts the **raw** local prompt (`turn_kind: local_prompt`, a right-aligned "You · local" bubble); `Stop` → `mirror-turn.mjs stop` posts the agent reply (`turn_kind: agent`). When sessionless there is no room, so hooks only update the working indicator. Still `post_session_message` important **reply-only** answers yourself if hooks fail.
+**Delivery contract (ADR — binding):** Agent posts answers; Stop does **not** mirror full assistant text. Prefer `post_session_message({ connection_id, message })`. See DevSpecV2 `docs/REMOTE-CONTROL-DELIVERY-CONTRACT.md`.
+
+**Turn mirroring (hooks — local_prompt only; Stop = busy):** when connection state is enabled, plugin hooks post mechanically (no LLM): `UserPromptSubmit` → `mirror-turn.mjs user_prompt` posts the **raw** local prompt (`turn_kind: local_prompt`, a right-aligned "You · local" bubble); `Stop` → `mirror-turn.mjs stop` posts the agent reply (`turn_kind: agent`). When sessionless there is no room, so hooks only update the working indicator. Still `post_session_message` important **reply-only** answers yourself if hooks fail.
 
 ### Session transcript posts (non-negotiable)
 
