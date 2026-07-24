@@ -50,7 +50,12 @@ function clearTurnMarker(connectionId) {
 }
 
 function parseArgs(argv) {
-  const out = { fromEnd: true, pending: false }
+  // Default: resume from saved inbox_byte_offset so owner commands that arrived
+  // while the agent was mid-turn are NOT skipped. --from-end is only for the
+  // first arm after connect (ignore historical inbox). Live bug 2026-07-24:
+  // re-arm with --from-end after a wake permanently dropped concurrent owner
+  // mail that the poller had already written to the inbox.
+  const out = { fromEnd: false, pending: false }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--connection-id' || a === '--connection_id' || a === '--connection') {

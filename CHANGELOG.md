@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1 - 2026-07-24
+
+### Remote control — never drop owner mail that arrives mid-turn
+
+- `devspec-remote-wait` **defaults to resuming from `inbox_byte_offset`** (not EOF).
+- Skill: **re-arm with `--pending`** after every wake. `--from-end` is first-connect only.
+- Live bug: re-arming with `--from-end` after a wake skipped owner commands the poller had already written while the agent was mid-turn.
+
 ## 0.2.0 - 2026-07-24
 
 ### Remote control — agent-canonical, connection-scoped, session optional
