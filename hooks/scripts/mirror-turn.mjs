@@ -1,16 +1,14 @@
 #!/usr/bin/env node
 /**
- * DevSpec remote-control mirror hook (Stop / UserPromptSubmit) — CONNECTION-NATIVE
- * (item fd51d80b). Resolves ONLY the connection bound to THIS local conversation —
- * never a machine-global "latest" pointer. Posts mechanically — no LLM tokens.
+ * DevSpec remote-control mirror hook (Stop / UserPromptSubmit) — CONNECTION-NATIVE.
+ * Resolves ONLY the connection bound to THIS local conversation — never a
+ * machine-global "latest" pointer. Posts mechanically — no LLM tokens.
  *
- * user_prompt mode → turn_kind=local_prompt (literal owner text in Agents UI)
- * stop mode        → turn_kind=agent (assistant reply)
+ * user_prompt → optional local_prompt bubble when attached (literal owner text)
+ * stop        → busy/heartbeat + turn marker only (NO assistant text)
  *
- * When the connection is ATTACHED to a session, the turn is mirrored into that
- * session's transcript. When it is SESSIONLESS (available, no room), there is no
- * transcript to post into, so mirroring is skipped — but the busy/working heartbeat
- * still fires (heartbeat_connection) so the Agents page shows the agent working.
+ * Answers are agent-canonical: skills call post_session_message({ connection_id }).
+ * ADR b98a39a9 — no dual writers.
  */
 
 import fs from 'node:fs'
