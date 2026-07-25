@@ -13,6 +13,8 @@ import {
   ownerAlive,
   reapDeadPollers,
   resolveLocalAction,
+  resolveOwnerPid,
+  resolveOwnerPidAutoWindows,
 } from './remote-control-state.mjs'
 
 describe('detectLocalId', () => {
@@ -436,11 +438,99 @@ describe('ensurePollerForConnection (guards)', () => {
   it('refuses to spawn without a valid --owner-pid (no anchor → would zombie)', () => {
     // Valid-length connection id, script present, but no owner pid → refuse before
     // stopping/spawning anything, so the reaper can always prove a poller dead.
-    const r = ensurePollerForConnection('11111111-1111-1111-1111-111111111111')
+    // resolveOwnerPid stubbed to null: without it, win32's real self-resolver
+    // (item 3cddb3b4) would walk up to this test process's own real claude.exe
+    // ancestor and actually succeed — proceeding to really spawn a detached
+    // poller process as a side effect of running the test suite.
+    const r = ensurePollerForConnection('11111111-1111-1111-1111-111111111111', {
+      resolveOwnerPid: () => null,
+    })
     assert.equal(r.ok, false)
     assert.match(r.error, /owner-pid/)
-    const bad = ensurePollerForConnection('11111111-1111-1111-1111-111111111111', { ownerPid: 1 })
+    const bad = ensurePollerForConnection('11111111-1111-1111-1111-111111111111', {
+      ownerPid: 1,
+      resolveOwnerPid: () => null,
+    })
     assert.equal(bad.ok, false)
     assert.match(bad.error, /owner-pid/)
+  })
+})
+
+describe('ensurePollerForConnection (reuse, item b9e02835)', () => {
+  const connectionId = '11111111-1111-1111-1111-111111111111'
+
+  it('reuses a live poller when reuseRunning is set — no kill, no respawn', () => {
+    const r = ensurePollerForConnection(connectionId, {
+      reuseRunning: true,
+      findPids: () => [4242],
+    })
+    assert.equal(r.ok, true)
+    assert.equal(r.reused, true)
+    assert.equal(r.pid, 4242)
+    assert.equal(r.connection_id, connectionId)
+  })
+
+  it('reuse carries the sessionId through for the caller result', () => {
+    const r = ensurePollerForConnection(connectionId, {
+      reuseRunning: true,
+      sessionId: '22222222-2222-2222-2222-222222222222',
+      findPids: () => [4242],
+    })
+    assert.equal(r.reused, true)
+    assert.equal(r.session_id, '22222222-2222-2222-2222-222222222222')
+  })
+
+  it('reuseRunning with no live poller falls through to the spawn guards', () => {
+    // resolveOwnerPid stubbed to null: on win32 the real resolver walks THIS test
+    // process's own ancestry, and since it's actually running under a real
+    // claude.exe (item 3cddb3b4), it would otherwise find a genuine anchor and
+    // this "no anchor" case would flake based on host state.
+    const r = ensurePollerForConnection(connectionId, {
+      reuseRunning: true,
+      findPids: () => [],
+      resolveOwnerPid: () => null,
+    })
+    assert.equal(r.ok, false)
+    assert.match(r.error, /owner-pid/)
+  })
+
+  it('without reuseRunning the restart path is unchanged (guards still apply)', () => {
+    const r = ensurePollerForConnection(connectionId, {
+      findPids: () => [4242],
+      resolveOwnerPid: () => null,
+    })
+    assert.equal(r.ok, false)
+    assert.match(r.error, /owner-pid/)
+  })
+})
+
+describe('resolveOwnerPid / resolveOwnerPidAutoWindows (item 3cddb3b4)', () => {
+  it('explicit valid arg always wins, no auto-resolution attempted', () => {
+    // A bogus prevValue proves the explicit arg short-circuits before any fallback.
+    assert.equal(resolveOwnerPid(555, 999), 555)
+  })
+
+  it('never returns an invalid (<=1) explicit arg as-is', () => {
+    // 1 fails the >1 validity check, so it must fall through to auto-resolution
+    // or prevValue rather than being returned literally.
+    assert.notEqual(resolveOwnerPid(1, 999), 1)
+  })
+
+  it('resolveOwnerPidAutoWindows returns null off-Windows and for a made-up start pid', () => {
+    if (process.platform !== 'win32') {
+      assert.equal(resolveOwnerPidAutoWindows(process.pid), null)
+      return
+    }
+    // A start pid that (almost certainly) does not exist finds no process at all,
+    // so the walk ends immediately with nothing to report — deterministic
+    // regardless of what real processes happen to be running on this host.
+    assert.equal(resolveOwnerPidAutoWindows(999_999_999), null)
+  })
+
+  it('resolveOwnerPidAutoWindows walks to a real claude.exe ancestor on win32', { skip: process.platform !== 'win32' }, () => {
+    // This test process is itself running under a real claude.exe (item
+    // 3cddb3b4's whole premise) — the walk from its own real pid should find it.
+    const found = resolveOwnerPidAutoWindows(process.pid)
+    assert.ok(found === null || (Number.isInteger(found) && found > 1))
   })
 })

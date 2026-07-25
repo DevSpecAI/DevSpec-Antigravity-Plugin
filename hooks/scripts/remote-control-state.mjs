@@ -51,7 +51,7 @@
  */
 
 import crypto from 'node:crypto'
-import { spawn } from 'node:child_process'
+import { spawn, execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -175,6 +175,60 @@ function findPollerPidsForConnection(connectionId) {
   return [...pids]
 }
 
+/**
+ * Windows-only owner-pid self-resolution (item 3cddb3b4). On win32 this process is
+ * commonly invoked from Git Bash (MSYS), whose own `$$`/`$PPID` are MSYS-internal
+ * numbers that do NOT correspond to any real Win32 process — querying Win32_Process
+ * for bash's reported pid returns nothing, so a caller-supplied `--owner-pid "$PPID"`
+ * from that shell is never a trustworthy anchor (verified: MSYS bash reports PPID=1,
+ * an orphan sentinel, not a resolvable process). node.exe itself, unlike the MSYS
+ * shell, IS a genuine Win32 process, so `process.pid` (this script's own pid) is a
+ * real, queryable anchor — walk its Win32_Process ancestry until we reach the owning
+ * `claude.exe`, however many shell layers sit in between. A single short-lived
+ * PowerShell call does the whole walk (fast: one process spawn, no polling).
+ */
+export function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 12, timeoutMs = 4000 } = {}) {
+  if (process.platform !== 'win32') return null
+  const pid = Number.parseInt(String(startPid), 10)
+  if (!Number.isInteger(pid) || pid < 1) return null
+  const script = [
+    `$p = ${pid}`,
+    `for ($i = 0; $i -lt ${maxHops}; $i++) {`,
+    '  $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction SilentlyContinue',
+    '  if (-not $proc) { break }',
+    "  if ($proc.Name -ieq 'claude.exe') { Write-Output $proc.ProcessId; break }",
+    '  if (-not $proc.ParentProcessId -or $proc.ParentProcessId -eq $p) { break }',
+    '  $p = $proc.ParentProcessId',
+    '}',
+  ].join('\n')
+  try {
+    const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+      timeout: timeoutMs,
+      encoding: 'utf8',
+      windowsHide: true,
+    }).trim()
+    const found = Number.parseInt(out, 10)
+    return Number.isInteger(found) && found > 1 ? found : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Resolve the effective owner-pid for this call: an explicit, valid `--owner-pid`
+ * always wins (any platform); otherwise attempt the Windows self-resolution above;
+ * otherwise fall back to a previously-recorded value (still better than nothing on
+ * a platform/setup where auto-resolution isn't available). Returns null if none.
+ */
+export function resolveOwnerPid(explicitArg, prevValue) {
+  const explicit = Number.parseInt(String(explicitArg ?? ''), 10)
+  if (Number.isInteger(explicit) && explicit > 1) return explicit
+  const auto = resolveOwnerPidAutoWindows()
+  if (auto) return auto
+  const prev = Number.parseInt(String(prevValue ?? ''), 10)
+  return Number.isInteger(prev) && prev > 1 ? prev : null
+}
+
 function stopPollerForConnection(connectionId) {
   const pids = findPollerPidsForConnection(connectionId)
   const killed = []
@@ -209,6 +263,29 @@ export function ensurePollerForConnection(connectionId, opts = {}) {
     return { ok: false, error: `poller script missing: ${POLLER_SCRIPT}` }
   }
 
+  // Reuse a live poller instead of kill→respawn (item b9e02835). A running poller
+  // needs NO restart for a session attach/detach — the server heartbeat echo is
+  // its sole attachment authority — so a restart is only warranted when its
+  // startup-cached identity (token / mcp_url / owner anchor) went stale. Callers
+  // that verified nothing changed pass reuseRunning: true; with no live poller
+  // this falls through to the normal spawn (and its guards) below.
+  const findPids = opts.findPids || findPollerPidsForConnection
+  if (opts.reuseRunning) {
+    const running = findPids(connectionId)
+    if (running.length) {
+      return {
+        ok: true,
+        reused: true,
+        connection_id: connectionId,
+        session_id:
+          typeof opts.sessionId === 'string' && opts.sessionId.length >= 8 ? opts.sessionId : null,
+        pid: running[0],
+        pid_file: pollerPidPath(connectionId),
+        log: pollerLogPath(connectionId),
+      }
+    }
+  }
+
   // Owner-process anchor — REQUIRED before we spawn anything. A poller with no
   // recorded owner_pid can never be proven dead by the reaper (owner-death is the
   // liveness proof it keys on), so it lingers as a zombie "Live" agent
@@ -216,15 +293,20 @@ export function ensurePollerForConnection(connectionId, opts = {}) {
   // short-lived state-writer subprocess ppid is the ephemeral invoking shell, not
   // the owning agent — recording it would make the reaper SIGTERM a LIVE agent's
   // poller the instant that shell exits. Callers pass the agent explicitly as
-  // --owner-pid "$PPID", so every poller we spawn carries a trustworthy anchor and
-  // the reaper's owner-death check covers it. (This is the guard behind Fix 1.)
-  const ownerPidRaw = Number.parseInt(String(opts.ownerPid ?? ''), 10)
-  const ownerPid = Number.isInteger(ownerPidRaw) && ownerPidRaw > 1 ? ownerPidRaw : null
+  // --owner-pid "$PPID" (POSIX: correct and cheap). On win32 that shell-reported
+  // pid is commonly unusable (Git Bash's MSYS pid space isn't a real Win32 pid —
+  // see resolveOwnerPidAutoWindows), so there we self-resolve by walking THIS
+  // process's own (genuinely real) pid up to the owning claude.exe instead of
+  // refusing (item 3cddb3b4). Injectable so tests get a deterministic "no anchor
+  // found" case regardless of host OS or whether a real claude.exe happens to be
+  // an ancestor of the test runner itself.
+  const resolveOwnerPidFn = opts.resolveOwnerPid || resolveOwnerPid
+  const ownerPid = resolveOwnerPidFn(opts.ownerPid, null)
   if (ownerPid === null) {
     return {
       ok: false,
       error:
-        'refusing to spawn a poller without a valid --owner-pid (no trustworthy owner anchor → the reaper could never prove it dead → zombie "Live" agent). Pass --owner-pid "$PPID".',
+        'refusing to spawn a poller without a valid --owner-pid (no trustworthy owner anchor → the reaper could never prove it dead → zombie "Live" agent). Pass --owner-pid "$PPID" (POSIX) — on Windows this is normally self-resolved automatically; if you see this, the automatic walk to claude.exe failed too.',
     }
   }
 
@@ -968,6 +1050,9 @@ if (isMain) {
       cwd: args.cwd ? path.resolve(args.cwd) : process.cwd(),
       ownerPid: args['owner-pid'],
       sessionId: args.session || null,
+      // "ensure" semantics: a live poller for this connection already satisfies
+      // the call — never restart it from here (item b9e02835).
+      reuseRunning: true,
     })
     process.stdout.write(JSON.stringify(result, null, 2) + '\n')
     process.exit(result.ok ? 0 : 1)
@@ -1051,9 +1136,9 @@ if (isMain) {
     // Optional attached session (present for --session / --new; absent = sessionless).
     const sessionId =
       typeof args.session === 'string' && args.session.length >= 8 ? args.session : prev.session_id ?? null
-    // Owner-process anchor for self-termination (see devspec-remote-poll.mjs).
-    const ownerPidArg = Number.parseInt(String(args['owner-pid'] ?? ''), 10)
-    const ownerPid = Number.isInteger(ownerPidArg) && ownerPidArg > 1 ? ownerPidArg : prev.owner_pid ?? null
+    // Owner-process anchor for self-termination (see devspec-remote-poll.mjs and
+    // resolveOwnerPid / resolveOwnerPidAutoWindows above for the win32 self-resolve path).
+    const ownerPid = resolveOwnerPid(args['owner-pid'], prev.owner_pid)
     const state = {
       ...prev,
       enabled: true,
@@ -1125,7 +1210,22 @@ if (isMain) {
       } catch {
         /* non-fatal */
       }
-      const poller = ensurePollerForConnection(connectionId, { cwd, ownerPid, sessionId })
+      // Same token/url/owner → the live poller keeps serving this connection
+      // (session attach/detach reaches it via the server heartbeat echo), so a
+      // `write --session` never restarts it. Only a real identity change takes
+      // the kill→respawn path — and even then the dying poller exits silently
+      // (item b9e02835).
+      const reuseRunning =
+        !!prev.token &&
+        prev.token === state.token &&
+        (prev.mcp_url || null) === (state.mcp_url || null) &&
+        (Number(prev.owner_pid) || null) === (Number(state.owner_pid) || null)
+      const poller = ensurePollerForConnection(connectionId, {
+        cwd,
+        ownerPid,
+        sessionId,
+        reuseRunning,
+      })
       result.poller = poller
       if (!poller.ok) {
         result.warning_poller = poller.error

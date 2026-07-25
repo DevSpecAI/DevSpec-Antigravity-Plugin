@@ -7,8 +7,19 @@
  * belongs to a DIFFERENT conversation must never be selected for mirroring.
  */
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { describe, it } from 'node:test'
-import { resolveHookConversationId, selectBoundState } from './mirror-turn.mjs'
+import {
+  resolveHookConversationId,
+  selectBoundState,
+  stripRemoteControlBanner,
+  isOperationalChrome,
+  prepareAgentMirrorText,
+  explicitReplyMarkerPath,
+  consumeExplicitReplyMarker,
+} from './mirror-turn.mjs'
 
 describe('resolveHookConversationId', () => {
   it('prefers CLAUDE_CODE_SESSION_ID env (the value write stamps)', () => {
@@ -118,5 +129,106 @@ describe('selectBoundState (connection-native)', () => {
       selectBoundState([mk(own, 5), mk(cur, 1)], 'conv-A', 'Claude Code')?.connection_id,
       'conn-A',
     )
+  })
+})
+
+const BANNER = `━━━ DevSpec Remote Control ━━━
+Agent:      Claude Code · Climbing Toucan
+Connection: 7b3a74ae…
+Session:    46ef72c0… | attached
+Status:     registered + attached
+Open:       Agents page
+Stop with:  /devspec.remote-stop
+─────────────────────────────`
+
+describe('operational chrome filtering', () => {
+  it('strips the remote-control status banner', () => {
+    const out = stripRemoteControlBanner(`${BANNER}\n\n2`)
+    assert.equal(out, '2')
+  })
+
+  it('treats banner-only Stop text as chrome', () => {
+    assert.equal(isOperationalChrome(BANNER), true)
+    assert.equal(prepareAgentMirrorText(BANNER), null)
+  })
+
+  it('treats banner + waiting spiel as chrome', () => {
+    const t = `${BANNER}\nConnected and waiting for your next command from the session — I already replied to your "Hi" there.`
+    assert.equal(isOperationalChrome(t), true)
+    assert.equal(prepareAgentMirrorText(t), null)
+  })
+
+  it('skips connect / disconnect one-liners', () => {
+    assert.equal(
+      isOperationalChrome("You're connected to Brandon's Cursor agent on their local machine."),
+      true,
+    )
+    assert.equal(isOperationalChrome('🔌 **Local agent disconnected**.'), true)
+    assert.equal(prepareAgentMirrorText('🔌 **Local agent disconnected**.'), null)
+  })
+
+  it('keeps a real reply (fail open)', () => {
+    const reply = '1 + 1 is 2.'
+    assert.equal(isOperationalChrome(reply), false)
+    assert.equal(prepareAgentMirrorText(reply), reply)
+  })
+
+  it('keeps a real reply after stripping a leading banner', () => {
+    const mixed = `${BANNER}\n\nQueue same-tab Dev sends while streaming — done on staging.`
+    assert.equal(isOperationalChrome(mixed), false)
+    assert.equal(
+      prepareAgentMirrorText(mixed),
+      'Queue same-tab Dev sends while streaming — done on staging.',
+    )
+  })
+})
+
+describe('explicit-reply marker (double-post guard, item b9fb49a9)', () => {
+  // Use a non-UUID test id so this can never collide with a real connection's
+  // marker file under the shared ~/.devspec state dir.
+  const testConnectionId = 'test-conn-explicit-reply-marker'
+
+  function cleanup() {
+    try {
+      fs.rmSync(explicitReplyMarkerPath(testConnectionId), { force: true })
+    } catch {
+      /* ignore */
+    }
+  }
+
+  it('reports absent when no marker was written', () => {
+    cleanup()
+    try {
+      assert.equal(consumeExplicitReplyMarker(testConnectionId), false)
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('reports present once, then absent (single-consume — cannot leak into a later turn)', () => {
+    cleanup()
+    try {
+      fs.mkdirSync(path.dirname(explicitReplyMarkerPath(testConnectionId)), { recursive: true })
+      fs.writeFileSync(explicitReplyMarkerPath(testConnectionId), `${Date.now()}\n`)
+      assert.equal(fs.existsSync(explicitReplyMarkerPath(testConnectionId)), true)
+      assert.equal(consumeExplicitReplyMarker(testConnectionId), true)
+      // Consumed — gone, and a second read never re-reports it.
+      assert.equal(fs.existsSync(explicitReplyMarkerPath(testConnectionId)), false)
+      assert.equal(consumeExplicitReplyMarker(testConnectionId), false)
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('returns false for a missing/empty connection id rather than throwing', () => {
+    assert.equal(consumeExplicitReplyMarker(null), false)
+    assert.equal(consumeExplicitReplyMarker(undefined), false)
+    assert.equal(consumeExplicitReplyMarker(''), false)
+  })
+
+  it('marker path is scoped under the shared connections dir, keyed by connection id', () => {
+    const p = explicitReplyMarkerPath(testConnectionId)
+    assert.equal(path.basename(p), `${testConnectionId}.explicit-reply`)
+    assert.equal(path.dirname(p), path.join(os.homedir(), '.devspec', 'remote-control', 'connections'))
   })
 })
