@@ -25,10 +25,12 @@
  * only in a side file and Claude Code failed a live "1, 2, 3 … what's next?" test
  * while holding all three messages on disk.
  *
- * After the agent acts, re-arm THIS wait process only (not the poller).
+ * After the agent acts, re-arm THIS wait process only (not the poller) — with
+ * `--pending`, which resumes from the saved inbox offset AND leaves the working
+ * indicator alone, because a re-arm happens mid-turn by design (see armEndsTurn).
  *
  * Usage:
- *   node devspec-remote-wait.mjs --connection-id <uuid> [--from-end] [--owner-pid <pid>]
+ *   node devspec-remote-wait.mjs --connection-id <uuid> [--from-end|--pending] [--owner-pid <pid>]
  *
  * Exit codes:
  *   0  — one or more new owner_messages batches printed to stdout; agent should act
@@ -48,17 +50,50 @@ const POLL_MS = 500
 const MAX_WAIT_MS = 24 * 60 * 60 * 1000
 
 /**
- * Idle = wait is armed (agent not mid-turn). Clear the connection turn marker so
- * the continuous poller stops re-asserting busy. Without this, Grok (no Stop
- * hook) and reconnect seeds leave a phantom "working" forever.
+ * Remove the connection turn marker, so the continuous poller stops re-asserting
+ * busy and emits `report_complete` on its next tick.
  */
-function clearTurnMarker(connectionId) {
+export function clearTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
   if (!connectionId) return
   try {
-    fs.rmSync(path.join(CONNECTIONS_DIR, `${connectionId}.turn`), { force: true })
+    fs.rmSync(path.join(dir, `${connectionId}.turn`), { force: true })
   } catch {
     /* ignore */
   }
+}
+
+/**
+ * Does THIS arm mean "the agent is idle", and so end any in-flight working phase?
+ *
+ * Only a FIRST arm does (item 68f7b30c). Arming is not a turn end: `--pending`
+ * exists precisely because the documented pattern is to re-arm the instant the
+ * agent wakes, so owner mail arriving mid-turn is not dropped — so a re-arm
+ * happens DURING most turns, seconds into them. Treating every arm as idle made
+ * the poller clear the marker it had just written on delivery, drop busy, and
+ * emit `report_complete` while the agent worked on for another five minutes with
+ * the driver's UI showing nothing. **Turn end is owned by the Stop hook**
+ * (`mirror-turn.mjs stop`), which every plugin registers, plus MAX_TURN_MS in the
+ * poller as the backstop for a host whose Stop hook never fires.
+ *
+ * A first arm (`--from-end`) genuinely is idle: the agent is connecting or
+ * reconnecting and deliberately discarding the historical inbox, so a marker left
+ * by a seed delivery belongs to a turn nobody will ever wake for, and must be
+ * cleared or the connection shows a phantom "working" until MAX_TURN_MS elapses.
+ * That is the case the original unconditional clear was written for.
+ *
+ * `--pending` wins over `--from-end` if both are somehow passed, matching the
+ * offset precedence below — the safe direction, since keeping a live marker
+ * costs a stale badge while dropping one hides real work.
+ */
+export function armEndsTurn({ fromEnd, pending } = {}) {
+  return fromEnd === true && pending !== true
+}
+
+/** Apply an arm's turn semantics. Returns whether the working phase was ended. */
+export function applyArmTurnSemantics(connectionId, args, dir = CONNECTIONS_DIR) {
+  if (!armEndsTurn(args)) return false
+  clearTurnMarker(connectionId, dir)
+  return true
 }
 
 function parseArgs(argv) {
@@ -472,9 +507,9 @@ async function main() {
     offset = fileSize(file)
   }
 
-  // Agent is idle while waiting — end any leftover working phase from a prior
-  // turn or from a reconnect seed that re-delivered history with busy:true.
-  clearTurnMarker(connectionId)
+  // Only a FIRST arm ends the working phase — a re-arm happens mid-turn by design
+  // (see armEndsTurn). Turn end is the Stop hook's job, not the wait's.
+  applyArmTurnSemantics(connectionId, args)
 
   const pollMs = args.pollMs || POLL_MS
   const started = Date.now()
