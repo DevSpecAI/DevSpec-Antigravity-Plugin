@@ -259,6 +259,112 @@ export function parseOwnerBatches(lines) {
   return batches
 }
 
+/** Small text payloads are cheap and immediately useful, so they stay inline. */
+export const MAX_INLINE_ATTACHMENT_CHARS = 2048
+
+/** Filesystem-safe leaf name; never lets a filename escape the attachment dir. */
+function safeAttachmentName(filename) {
+  const base = path.basename(String(filename || 'attachment'))
+  const cleaned = base.replace(/[^a-zA-Z0-9._-]/g, '_').replace(/^\.+/, '')
+  return cleaned.slice(0, 120) || 'attachment'
+}
+
+/**
+ * Turn one server attachment into something a model can actually use, WITHOUT
+ * putting its payload in the wake event (item 99165e12).
+ *
+ * The server sends `content` (base64) and, for images, `dataUrl` — which is the same
+ * bytes again with a prefix. Printing that verbatim is what the shared pollers used to
+ * do, and it is the worse half of this bug: a 500KB screenshot became a **1.37MB**
+ * stdout payload, ~341k tokens of base64 that the model cannot see as an image anyway.
+ * Silently dropping it (what OpenCode did) at least stayed cheap; this detonated the
+ * context window AND still failed to deliver the picture.
+ *
+ * So: decode once to a real file on disk and hand back a path. Every host in this
+ * family can open a local file, and an image read from disk is a genuine image rather
+ * than a base64 string. Small text stays inline because a path would be pure overhead.
+ *
+ * `writeFile` is injected so the decision is testable without touching a filesystem.
+ */
+export function describeAttachment(a, { dir, messageId, index, writeFile } = {}) {
+  if (!a || typeof a !== 'object') return null
+  const filename = safeAttachmentName(a.filename)
+  const mimeType = typeof a.mimeType === 'string' ? a.mimeType : 'application/octet-stream'
+  const type = typeof a.type === 'string' ? a.type : 'document'
+  const sizeBytes = typeof a.sizeBytes === 'number' ? a.sizeBytes : null
+
+  // dataUrl is content re-encoded; prefer content and never carry both.
+  let b64 = typeof a.content === 'string' && a.content ? a.content : null
+  if (!b64 && typeof a.dataUrl === 'string') {
+    const comma = a.dataUrl.indexOf(',')
+    if (comma !== -1) b64 = a.dataUrl.slice(comma + 1)
+  }
+  if (!b64) return null
+
+  const base = { filename, mimeType, type, sizeBytes }
+
+  // Small text/markdown/json inline — a file path for 300 bytes helps nobody.
+  const isTextual = type === 'text' || /^text\/|json|xml|yaml/.test(mimeType)
+  if (isTextual) {
+    let decoded = null
+    try {
+      decoded = Buffer.from(b64, 'base64').toString('utf8')
+    } catch {
+      decoded = null
+    }
+    if (decoded !== null && decoded.length <= MAX_INLINE_ATTACHMENT_CHARS) {
+      return { ...base, delivery: 'inline', content: decoded }
+    }
+  }
+
+  if (!dir || typeof writeFile !== 'function') {
+    // No landing place — say so rather than pretend, and never inline the base64.
+    return {
+      ...base,
+      delivery: 'unavailable',
+      note: 'Attachment could not be written to disk; re-read it with get_session_transcript.',
+    }
+  }
+
+  const leaf = `${String(messageId || 'msg').slice(0, 12)}-${index}-${filename}`
+  const target = path.join(dir, leaf)
+  try {
+    writeFile(target, Buffer.from(b64, 'base64'))
+  } catch (e) {
+    return {
+      ...base,
+      delivery: 'unavailable',
+      note: `Attachment could not be written to disk (${e.message}); re-read it with get_session_transcript.`,
+    }
+  }
+  return {
+    ...base,
+    delivery: 'file',
+    path: target,
+    note:
+      type === 'image'
+        ? 'Image saved locally — OPEN THIS PATH to see it. It is part of the command, not decoration.'
+        : 'Saved locally — read this path if the command refers to it.',
+  }
+}
+
+/**
+ * Replace a command's `attachments` with payload-free descriptors. Returns a NEW
+ * message object; the inbox line on disk keeps the full payload as the durable record.
+ */
+export function materialiseAttachments(message, opts = {}) {
+  const list = Array.isArray(message?.attachments) ? message.attachments : null
+  if (!list || list.length === 0) return message
+  const described = list
+    .map((a, i) => describeAttachment(a, { ...opts, messageId: message.id, index: i }))
+    .filter(Boolean)
+  if (described.length === 0) {
+    const { attachments, ...rest } = message
+    return rest
+  }
+  return { ...message, attachments: described }
+}
+
 /**
  * Build the stdout events for one owner-command batch:
  *   1. an optional `room_context` event — the room the command arrived into,
@@ -275,7 +381,7 @@ export function parseOwnerBatches(lines) {
  * stream had no live signal for which session a command belonged to and fell back to a
  * value cached at attach time — stale after a server-side reattach.
  */
-export function buildOwnerMessageEvents(batch, { inboxFile } = {}) {
+export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, writeFile } = {}) {
   const sessionId = batch?.session_id ?? null
   const messages = Array.isArray(batch?.messages) ? batch.messages : []
   const ownerAmbient = Array.isArray(batch?.context?.owner_ambient) ? batch.context.owner_ambient : []
@@ -303,7 +409,13 @@ export function buildOwnerMessageEvents(batch, { inboxFile } = {}) {
   }
 
   for (const m of messages) {
-    events.push({ type: 'owner_message', session_id: sessionId, message: m })
+    // Attachments become on-disk files + descriptors. Emitting the server's base64
+    // verbatim used to blow the turn up ~2.7x the source image (item 99165e12).
+    events.push({
+      type: 'owner_message',
+      session_id: sessionId,
+      message: materialiseAttachments(m, { dir: attachmentDir, writeFile }),
+    })
   }
 
   events.push({
@@ -397,8 +509,16 @@ async function main() {
       writeStatePatch(connectionId, { inbox_byte_offset: offset })
 
       if (batches.length > 0) {
+        const attachmentDir = path.join(CONNECTIONS_DIR, `${connectionId}.attachments`)
         for (const batch of batches) {
-          for (const event of buildOwnerMessageEvents(batch, { inboxFile: file })) {
+          for (const event of buildOwnerMessageEvents(batch, {
+            inboxFile: file,
+            attachmentDir,
+            writeFile: (target, buf) => {
+              fs.mkdirSync(path.dirname(target), { recursive: true })
+              fs.writeFileSync(target, buf, { mode: 0o600 })
+            },
+          })) {
             process.stdout.write(JSON.stringify(event) + '\n')
           }
         }
