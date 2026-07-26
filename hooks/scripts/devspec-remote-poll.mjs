@@ -369,6 +369,30 @@ export function unansweredCommands(commands, roomContext) {
 }
 
 /**
+ * Split one packaged turn's ROOM half into what may wake the agent and what is only
+ * advisory. Pure — the caller performs the inbox writes.
+ *
+ * This exists to make ONE invariant testable (item 55655986): `seed` filters the
+ * COMMAND half only. Advisory is never filtered by seed, because a cold launch or
+ * reattach is precisely the moment the agent has no in-memory context and needs the
+ * room most. Filtering the command half stops the agent re-waking on history that was
+ * already answered before this poller existed; filtering the advisory half would
+ * restore the original bug, where a reconnecting agent's inbox held nothing at all for
+ * that window and only a skill instruction to call get_session_transcript saved it.
+ *
+ * The asymmetry is the whole point, so it is asserted rather than left to a comment.
+ */
+export function splitRoomWindow({ commands, ownerAmbient, roomContext, seed = false } = {}) {
+  const cmds = Array.isArray(commands) ? commands : []
+  const ambient = Array.isArray(ownerAmbient) ? ownerAmbient : []
+  const room = Array.isArray(roomContext) ? roomContext : []
+  return {
+    wake: seed ? unansweredCommands(cmds, room) : cmds,
+    advisory: [...ambient, ...room],
+  }
+}
+
+/**
  * Map a turn-active transition (previous loop tick → this loop tick) to the
  * connection activity verb the poller emits DIRECTLY (item 71a8b201). This is the
  * clean end state: the poller drives the activity state machine from its own
@@ -781,13 +805,20 @@ async function main() {
       remote_control: { is_owner_instruction: true, is_advisory: false, role: 'owner_instruction' },
     }))
 
-    const commands = [...dispatchCommands, ...(seed ? unansweredCommands(roomCommands, roomContext) : roomCommands)]
-    const advisoryCount = ownerAmbient.length + roomContext.length
+    // seed filters the COMMAND half only — advisory always survives (item 55655986).
+    const { wake: roomWake, advisory } = splitRoomWindow({
+      commands: roomCommands,
+      ownerAmbient,
+      roomContext,
+      seed,
+    })
+    const commands = [...dispatchCommands, ...roomWake]
+    const advisoryCount = advisory.length
 
     // Advisory always lands in the inbox as its own entry (unchanged contract, and
     // the durable record), AND is carried forward for the next command's payload.
     if (advisoryCount > 0) {
-      deliverAdvisory(connectionId, [...ownerAmbient, ...roomContext], sessionId)
+      deliverAdvisory(connectionId, advisory, sessionId)
       carryAdvisory(ownerAmbient, roomContext)
     }
 
@@ -846,7 +877,7 @@ async function main() {
       process.stdout.write(
         JSON.stringify({ type: 'session_ended', reason: 'owner_gone', connection_id: connectionId }) + '\n',
       )
-      await offlineAndExit('local_stop', 1)
+      await offlineAndExit('owner_gone', 1)
       return
     }
 
@@ -913,7 +944,7 @@ async function main() {
         process.stdout.write(
           JSON.stringify({ type: 'session_ended', reason: 'owner_gone', connection_id: connectionId }) + '\n',
         )
-        await offlineAndExit('local_stop', 1)
+        await offlineAndExit('owner_gone', 1)
         return
       }
       consecutiveErrors++

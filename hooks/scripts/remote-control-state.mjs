@@ -574,11 +574,26 @@ export function mintLocalId() {
 }
 
 /**
- * Recoverable ends a live heartbeat can clear (mirrors server isRecoverableRemoteEndReason).
+ * Recoverable ends: this conversation may soft-reconnect its own prior connection
+ * rather than registering a fresh one. Purely a LOCAL decision — the server has no
+ * end_reason allowlist (resolveActiveConnection filters on `ended_at is null` only,
+ * and a live heartbeat clears both columns), so this list is not mirrored anywhere.
+ *
+ * `owner_gone` MUST be here: it is the single most common way a Claude Code
+ * conversation's poller dies (the host process exited), and it is exactly the case
+ * where the user relaunches and expects their agent back. Omitting it would silently
+ * downgrade every restart to a brand-new connection — a new codename on the Agents
+ * page and a lost bond (item 937c78b0).
+ *
  * UI end stops this poller process; a new instance may re-attach only with explicit --session.
  */
 export function isRecoverableEndReason(endReason) {
-  return endReason === 'local_stop' || endReason === 'idle_timeout' || endReason === 'auth'
+  return (
+    endReason === 'local_stop' ||
+    endReason === 'owner_gone' ||
+    endReason === 'idle_timeout' ||
+    endReason === 'auth'
+  )
 }
 
 function readLocalBond(agent, localId) {

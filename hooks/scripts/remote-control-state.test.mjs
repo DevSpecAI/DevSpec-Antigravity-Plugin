@@ -46,12 +46,21 @@ describe('detectLocalId', () => {
 })
 
 describe('isRecoverableEndReason', () => {
-  it('accepts local_stop idle_timeout auth only', () => {
+  it('accepts local_stop owner_gone idle_timeout auth only', () => {
     assert.equal(isRecoverableEndReason('local_stop'), true)
+    assert.equal(isRecoverableEndReason('owner_gone'), true)
     assert.equal(isRecoverableEndReason('idle_timeout'), true)
     assert.equal(isRecoverableEndReason('auth'), true)
     assert.equal(isRecoverableEndReason('ui'), false)
     assert.equal(isRecoverableEndReason(null), false)
+  })
+
+  it('owner_gone is recoverable — the host process exiting is the COMMON restart', () => {
+    // Regression guard for item 937c78b0. The poller used to stamp owner-death as
+    // `local_stop`; splitting it out makes the drop data readable, but if this list
+    // did not learn the new value, every Claude Code relaunch would silently register
+    // a brand-new connection (new codename, lost bond) instead of resuming.
+    assert.equal(isRecoverableEndReason('owner_gone'), true)
   })
 })
 
