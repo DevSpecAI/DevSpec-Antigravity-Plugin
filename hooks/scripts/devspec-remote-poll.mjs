@@ -546,6 +546,39 @@ function deliverAdvisory(connectionId, advisoryMsgs, sessionId) {
   appendInbox(connectionId, advisoryMsgs, { type: 'advisory_context', sessionId })
 }
 
+/**
+ * Wake text for a dispatched PLAYBOOK RUN (DevSpecV2 child ae168718).
+ *
+ * A playbook is not an action item — it is a job the owner saved to run again and
+ * again, and it never completes. So this deliberately does NOT send the agent down
+ * the assignment protocol; it sends it to the playbook run tools instead.
+ *
+ * The permission line matters: a look-only playbook must not be "helpfully" fixed
+ * while the agent is in there.
+ */
+function playbookRunCommandText(d) {
+  const permission =
+    d.permission === 'can_push'
+      ? 'You MAY edit, commit and push.'
+      : d.permission === 'can_commit'
+        ? 'You MAY edit and commit locally, but MUST NOT push.'
+        : 'This playbook is LOOK ONLY — investigate and report, do not edit, commit or push anything.'
+
+  return [
+    `▶️ Playbook run dispatched to this connection: "${d.playbook_name}" (run ${d.run_id}).`,
+    '',
+    'What to do:',
+    `1. claim_playbook_run({ run_id: "${d.run_id}" }) — if it comes back claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
+    '2. Do the work described below, in this repo.',
+    '3. record_playbook_run — report status, a verdict for EACH acceptance criterion WITH evidence, and whatever the run produced as artifacts.',
+    '',
+    `Permission: ${permission}`,
+    '',
+    'The instruction:',
+    d.instruction || '(claim the run to read it)',
+  ].join('\n')
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2))
   let connectionId = args.connectionId || null
@@ -801,7 +834,10 @@ async function main() {
       id: d.id,
       message_type: 'local_agent_dispatch',
       dispatch: d,
-      content: `📦 DevSpec assignment dispatched to this connection (assignment ${d.id}). Work it via the assignment protocol: get_assignment → acknowledge_assignment → claim_work_item per member → resolve_assignment.`,
+      content:
+        d.kind === 'playbook_run'
+          ? playbookRunCommandText(d)
+          : `📦 DevSpec assignment dispatched to this connection (assignment ${d.id}). Work it via the assignment protocol: get_assignment → acknowledge_assignment → claim_work_item per member → resolve_assignment.`,
       remote_control: { is_owner_instruction: true, is_advisory: false, role: 'owner_instruction' },
     }))
 
