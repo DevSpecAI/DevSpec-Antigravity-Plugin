@@ -1,97 +1,124 @@
 #!/usr/bin/env node
 /**
- * Unit tests for MCP token resolution order — focus on the host-token symmetry
- * fix (item 74b29c76): the poller must resolve the SAME bearer the host used for
- * register_connection, or every dispatch is rejected as "connection belongs to a
- * different token".
+ * Unit tests for the Antigravity DevSpec MCP auth resolver.
  * Run: node --test hooks/scripts/resolve-mcp-auth.test.mjs
+ *
+ * The load-bearing property: the token lives in Antigravity's own MCP config
+ * (~/.gemini/antigravity-cli/mcp_config.json — mcpServers.devspec.serverUrl +
+ * headers.Authorization), so that MUST win over a generic project .mcp.json —
+ * otherwise the poller heartbeats a different token and the server rejects
+ * "connection belongs to a different token".
  */
 import assert from 'node:assert/strict'
-import { after, before, describe, it } from 'node:test'
+import { afterEach, beforeEach, describe, it } from 'node:test'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { hostTokenFromEnv, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
 
-describe('resolveDevspecMcpAuth token precedence (host symmetry, item 74b29c76)', () => {
-  let tmp
-  const saved = {}
+let root
+let fakeHome
+const savedEnv = {}
 
-  before(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-mcp-auth-'))
-    fs.writeFileSync(
-      path.join(tmp, '.mcp.json'),
-      JSON.stringify({
-        mcpServers: {
-          devspec: {
-            url: 'https://staging.devspec.ai/api/mcp',
-            headers: { Authorization: 'Bearer from-mcp-json' },
-          },
-        },
-      }),
-    )
-    // Neutralise ambient env overrides so precedence is deterministic on any machine.
-    for (const k of ['DEVSPEC_MCP_TOKEN', 'DEVSPEC_TOKEN', 'DEVSPEC_MCP_URL']) {
-      saved[k] = process.env[k]
-      delete process.env[k]
-    }
-  })
-
-  after(() => {
-    for (const [k, v] of Object.entries(saved)) {
-      if (v === undefined) delete process.env[k]
-      else process.env[k] = v
-    }
-    try {
-      fs.rmSync(tmp, { recursive: true, force: true })
-    } catch {
-      /* ignore */
-    }
-  })
-
-  it('host token wins over the project .mcp.json walk', () => {
-    const r = resolveDevspecMcpAuth(tmp, { hostToken: 'from-host' })
-    assert.equal(r.ok, true)
-    assert.equal(r.token, 'from-host')
-    assert.equal(r.source, 'host')
-  })
-
-  it('falls back to .mcp.json when no host token (backward compatible)', () => {
-    const r = resolveDevspecMcpAuth(tmp, {})
-    assert.equal(r.ok, true)
-    assert.equal(r.token, 'from-mcp-json')
-    assert.match(String(r.source), /\.mcp\.json$/)
-  })
-
-  it('a blank/whitespace host token is ignored (backward compatible)', () => {
-    const r = resolveDevspecMcpAuth(tmp, { hostToken: '   ' })
-    assert.equal(r.token, 'from-mcp-json')
-  })
-
-  it('explicit DEVSPEC_MCP_TOKEN still overrides even a host token', () => {
-    process.env.DEVSPEC_MCP_TOKEN = 'from-env'
-    try {
-      const r = resolveDevspecMcpAuth(tmp, { hostToken: 'from-host' })
-      assert.equal(r.token, 'from-env')
-      assert.equal(r.source, 'env')
-    } finally {
-      delete process.env.DEVSPEC_MCP_TOKEN
-    }
-  })
+beforeEach(() => {
+  root = fs.mkdtempSync(path.join(os.tmpdir(), 'agres-'))
+  fakeHome = path.join(root, 'home')
+  fs.mkdirSync(fakeHome, { recursive: true })
+  for (const k of ['HOME', 'USERPROFILE', 'DEVSPEC_MCP_TOKEN', 'DEVSPEC_TOKEN', 'DEVSPEC_MCP_URL']) savedEnv[k] = process.env[k]
+  process.env.HOME = fakeHome
+  process.env.USERPROFILE = fakeHome
+  delete process.env.DEVSPEC_MCP_TOKEN
+  delete process.env.DEVSPEC_TOKEN
+  delete process.env.DEVSPEC_MCP_URL
 })
 
-describe('hostTokenFromEnv', () => {
-  it('reads the plugin userConfig token Claude Code exports', () => {
-    assert.equal(hostTokenFromEnv({ CLAUDE_PLUGIN_OPTION_DEVSPEC_TOKEN: 'plug' }), 'plug')
-    assert.equal(hostTokenFromEnv({ CLAUDE_PLUGIN_OPTION_devspec_token: 'plug2' }), 'plug2')
+afterEach(() => {
+  for (const [k, v] of Object.entries(savedEnv)) {
+    if (v === undefined) delete process.env[k]
+    else process.env[k] = v
+  }
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+function proj(name) {
+  const d = path.join(root, name)
+  fs.mkdirSync(d, { recursive: true })
+  return d
+}
+function agConfig(dir, token, url = 'https://devspec.ai/api/mcp') {
+  const c = path.join(dir, '.gemini', 'antigravity-cli')
+  fs.mkdirSync(c, { recursive: true })
+  fs.writeFileSync(
+    path.join(c, 'mcp_config.json'),
+    JSON.stringify({ mcpServers: { devspec: { type: 'http', serverUrl: url, headers: { Authorization: `Bearer ${token}` } } } }),
+  )
+}
+function mcpJson(dir, token) {
+  fs.writeFileSync(
+    path.join(dir, '.mcp.json'),
+    JSON.stringify({ mcpServers: { devspec: { url: 'https://devspec.ai/api/mcp', headers: { Authorization: `Bearer ${token}` } } } }),
+  )
+}
+
+describe('resolveDevspecMcpAuth (Antigravity)', () => {
+  it('prefers mcp_config.json over a generic project .mcp.json (the fix)', () => {
+    const d = proj('both')
+    mcpJson(d, 'dvs_from_mcpjson')
+    agConfig(d, 'dvs_from_ag')
+    const auth = resolveDevspecMcpAuth(d)
+    assert.equal(auth.ok, true)
+    assert.equal(auth.token, 'dvs_from_ag')
+    assert.match(auth.source, /mcp_config\.json$/)
   })
 
-  it('returns null where the plugin env is unset (dev-from-source / non-Claude plugins)', () => {
-    assert.equal(hostTokenFromEnv({}), null)
+  it('reads ~/.gemini/antigravity-cli/mcp_config.json (home) when the project has none', () => {
+    const d = proj('homeonly')
+    agConfig(fakeHome, 'dvs_home_ag')
+    const auth = resolveDevspecMcpAuth(d)
+    assert.equal(auth.token, 'dvs_home_ag')
+    assert.equal(hostTokenFromEnv(process.env), 'dvs_home_ag')
   })
 
-  it('trims and ignores blank', () => {
-    assert.equal(hostTokenFromEnv({ CLAUDE_PLUGIN_OPTION_DEVSPEC_TOKEN: '  x ' }), 'x')
-    assert.equal(hostTokenFromEnv({ CLAUDE_PLUGIN_OPTION_DEVSPEC_TOKEN: '   ' }), null)
+  it('parses the serverUrl key (Antigravity shape), not just url', () => {
+    const d = proj('serverurl')
+    agConfig(d, 'dvs_ag', 'https://devspec.internal/api/mcp')
+    const auth = resolveDevspecMcpAuth(d)
+    assert.equal(auth.token, 'dvs_ag')
+    assert.equal(auth.mcp_url, 'https://devspec.internal/api/mcp')
+  })
+
+  it('falls back to .mcp.json when no Antigravity config token is reachable', () => {
+    const d = proj('mcponly')
+    mcpJson(d, 'dvs_only_mcp')
+    const auth = resolveDevspecMcpAuth(d)
+    assert.equal(auth.token, 'dvs_only_mcp')
+    assert.match(auth.source, /\.mcp\.json$/)
+  })
+
+  it('DEVSPEC_MCP_TOKEN overrides the config files', () => {
+    const d = proj('envwin')
+    agConfig(d, 'dvs_ag')
+    process.env.DEVSPEC_MCP_TOKEN = 'dvs_env_override'
+    const auth = resolveDevspecMcpAuth(d)
+    assert.equal(auth.token, 'dvs_env_override')
+    assert.equal(auth.source, 'env')
+  })
+
+  it('an explicit opts.hostToken wins over the Antigravity config (below env)', () => {
+    const d = proj('hosttok')
+    agConfig(d, 'dvs_ag')
+    const auth = resolveDevspecMcpAuth(d, { hostToken: 'dvs_explicit_host' })
+    assert.equal(auth.token, 'dvs_explicit_host')
+    assert.equal(auth.source, 'host')
+  })
+
+  it('reports an Antigravity-shaped error when a URL is present but no token', () => {
+    const d = proj('urlonly')
+    const c = path.join(d, '.gemini', 'antigravity-cli')
+    fs.mkdirSync(c, { recursive: true })
+    fs.writeFileSync(path.join(c, 'mcp_config.json'), JSON.stringify({ mcpServers: { devspec: { serverUrl: 'https://devspec.ai/api/mcp' } } }))
+    const auth = resolveDevspecMcpAuth(d)
+    assert.equal(auth.ok, false)
+    assert.match(auth.error, /antigravity-cli[\\/]mcp_config\.json/)
   })
 })
