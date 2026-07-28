@@ -184,14 +184,66 @@ describe('trimAdvisoryCarry', () => {
   })
 })
 
+/**
+ * Regression cover for brief e691c68a.
+ *
+ * On 2026-07-28 a Coolify redeploy of staging made poll_connection briefly answer
+ * `not_found` for connections that were perfectly alive. This function turned that
+ * into the string 'ended_from_ui' — asserting a human had clicked End on the Agents
+ * page — and every connected agent on every machine disabled itself and refused to
+ * restart. Nobody had touched the Agents page.
+ *
+ * The rule: only a deliberate human act is permanent. Absence of a reason means we
+ * do not know, and "we do not know" is recoverable.
+ */
 describe('pollTerminalReason', () => {
-  it('not_found (ended before the call) is terminal', () => {
-    assert.equal(pollTerminalReason({ status: 'not_found' }), 'ended_from_ui')
+  it('treats a reasonless not_found as RECOVERABLE, not as a UI end', () => {
+    // THE regression. This used to return the string 'ended_from_ui'.
+    assert.deepEqual(pollTerminalReason({ status: 'not_found' }), {
+      reason: null,
+      recoverable: true,
+      status: 'not_found',
+    })
   })
 
-  it('ended mid-hold is terminal and keeps the server-reported reason', () => {
-    assert.equal(pollTerminalReason({ status: 'ended', end_reason: 'idle_timeout' }), 'idle_timeout')
-    assert.equal(pollTerminalReason({ status: 'ended' }), 'ended_from_ui')
+  it('treats a reasonless ended as RECOVERABLE too', () => {
+    assert.deepEqual(pollTerminalReason({ status: 'ended' }), {
+      reason: null,
+      recoverable: true,
+      status: 'ended',
+    })
+  })
+
+  it('keeps a real Agents-page End permanent', () => {
+    // Must not regress item 32e423fb: a UI End has to stop a zombie poller dead.
+    assert.deepEqual(pollTerminalReason({ status: 'ended', end_reason: 'ui' }), {
+      reason: 'ui',
+      recoverable: false,
+      status: 'ended',
+    })
+  })
+
+  it('keeps /devspec.remote-stop permanent', () => {
+    // Re-registering would resurrect an agent the human just switched off.
+    assert.equal(pollTerminalReason({ status: 'ended', end_reason: 'local_stop' }).recoverable, false)
+  })
+
+  it('still honours the legacy ended_from_ui label as permanent', () => {
+    assert.equal(
+      pollTerminalReason({ status: 'ended', end_reason: 'ended_from_ui' }).recoverable,
+      false,
+    )
+  })
+
+  it('treats every non-human end reason as recoverable', () => {
+    for (const reason of ['idle_timeout', 'owner_gone', 'auth', 'server_ended']) {
+      assert.equal(
+        pollTerminalReason({ status: 'ended', end_reason: reason }).recoverable,
+        true,
+        `${reason} should be recoverable`,
+      )
+      assert.equal(pollTerminalReason({ status: 'ended', end_reason: reason }).reason, reason)
+    }
   })
 
   it('an ordinary poll — changed or not — is never terminal', () => {

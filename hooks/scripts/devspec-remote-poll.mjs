@@ -253,7 +253,11 @@ function disableLocalState({ connectionId, reason }) {
         ...prev,
         enabled: false,
         connection_id: connectionId || prev.connection_id,
-        ended_from_ui: reason === 'ended_from_ui',
+        // The server's real word for an Agents-page End is 'ui'; 'ended_from_ui' is
+        // this poller's own legacy label. Both must set the flag, or a genuine UI
+        // End would stop stamping it the moment the server started telling the
+        // truth (brief e691c68a) — and devspec-remote-wait.mjs:533 reads this flag.
+        ended_from_ui: reason === 'ui' || reason === 'ended_from_ui',
         end_reason: reason,
         updated_at: new Date().toISOString(),
       },
@@ -308,20 +312,63 @@ export function trimAdvisoryCarry(
 }
 
 /**
+ * Ends that a HUMAN deliberately caused, and which must therefore stick.
+ *
+ * `ui` is the Agents-page End (the server stamps it in end-remote-control.ts).
+ * `local_stop` is /devspec.remote-stop. Coming back from either would resurrect an
+ * agent somebody just switched off, so these — and ONLY these — are permanent.
+ *
+ * Everything else (an idle timeout, a stale owner_gone, an auth blip, or no reason
+ * at all) is the server saying "gone, but not because a person said so", which is
+ * recoverable: keep polling and let it come back.
+ */
+export const PERMANENT_END_REASONS = ['ui', 'local_stop', 'ended_from_ui']
+
+/**
  * Terminal condition from a poll response, or null to keep polling.
  *
- * Replaces isTerminalEnded(heartbeat): `poll_connection` reports teardown two ways —
- * `not_found` (the row is gone / already ended, e.g. an Agents-page End before the
- * call) and `ended` (torn down DURING the hold, so the server stops holding rather
- * than making us wait out the full 25s to discover it).
+ * `poll_connection` reports teardown two ways — `not_found` (the row is gone /
+ * already ended, e.g. an Agents-page End before the call) and `ended` (torn down
+ * DURING the hold, so the server stops holding rather than making us wait out the
+ * full 25s to discover it).
+ *
+ * WHAT THIS USED TO DO, AND WHY IT WAS WRONG (brief e691c68a):
+ *
+ *   return end_reason || 'ended_from_ui'
+ *
+ * When the server gave no reason, we supplied the one reason that means "stay
+ * dead" — asserting a human had clicked End. On 2026-07-28 a Coolify redeploy of
+ * staging made every `poll_connection` briefly answer `not_found`, and every
+ * connected agent across every machine disabled itself and refused to restart.
+ * Nobody had touched the Agents page.
+ *
+ * Absence of proof is not proof of a UI End. So the verdict is now structured, and
+ * `recoverable` is the default for anything the server will not vouch for. A caller
+ * cannot re-create the old bug by reading a bare string, because there isn't one.
+ *
+ * @returns {null | { reason: string | null, recoverable: boolean, status: string }}
  */
 export function pollTerminalReason(res) {
   if (!res || typeof res !== 'object') return null
-  if (res.status === 'not_found' || res.status === 'ended') {
-    return typeof res.end_reason === 'string' && res.end_reason ? res.end_reason : 'ended_from_ui'
+  if (res.status !== 'not_found' && res.status !== 'ended') return null
+  const reason = typeof res.end_reason === 'string' && res.end_reason ? res.end_reason : null
+  return {
+    reason,
+    // No reason → NOT permanent. That is the whole fix in one line.
+    recoverable: !reason || !PERMANENT_END_REASONS.includes(reason),
+    status: res.status,
   }
-  return null
 }
+
+/**
+ * How many CONSECUTIVE recoverable teardowns to ride out before giving up.
+ *
+ * A redeploy is over in seconds, so this only has to outlast a container swap. At
+ * the idle cadence's backoff that is comfortably minutes of trying. If the row is
+ * genuinely gone for good the count runs out and we exit cleanly — without ever
+ * claiming a human ended it.
+ */
+export const RECOVERABLE_TERMINAL_MAX = 10
 
 /**
  * Backoff after a poll that reported change but delivered nothing new.
@@ -892,6 +939,9 @@ async function main() {
   let needsSeed = true
   let consecutiveEmpty = 0
   let consecutiveErrors = 0
+  // Consecutive teardowns the server would not attribute to a person. Reset by any
+  // clean poll, so only a SUSTAINED absence stands the poller down (brief e691c68a).
+  let consecutiveRecoverableEnds = 0
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -996,19 +1046,62 @@ async function main() {
     // Terminal end (UI End / already ended / torn down mid-hold). One check now
     // covers what isTerminalEnded(heartbeat) used to: the poll IS the heartbeat.
     const terminal = pollTerminalReason(res)
-    if (terminal) {
-      disableLocalState({ connectionId, reason: terminal })
+    if (terminal && terminal.recoverable) {
+      // The server says gone, but will not attribute it to a person — so we do not
+      // treat it as one. This is the redeploy case: during a container swap
+      // poll_connection briefly cannot see a row that is perfectly alive, and the
+      // old code disabled the agent permanently on the strength of it. Ride it out.
+      consecutiveRecoverableEnds++
+      const label = terminal.reason ? `${terminal.status} (${terminal.reason})` : terminal.status
+      if (consecutiveRecoverableEnds < RECOVERABLE_TERMINAL_MAX) {
+        const backoff = errorBackoffMs(consecutiveRecoverableEnds)
+        process.stderr.write(
+          `devspec-remote-poll: ${label} — recoverable, not a UI end; ` +
+            `retrying in ${backoff}ms (${consecutiveRecoverableEnds}/${RECOVERABLE_TERMINAL_MAX})\n`,
+        )
+        await sleep(backoff)
+        continue
+      }
+      // Out of patience. Stand down, but stamp the REAL reason: the wait reads
+      // `enabled:false` and wakes the agent, and because ended_from_ui stays false
+      // the agent is free to re-register this bond rather than staying dead.
+      process.stderr.write(
+        `devspec-remote-poll: ${label} — still gone after ${RECOVERABLE_TERMINAL_MAX} tries; ` +
+          `standing down (recoverable — re-register to resume)\n`,
+      )
+      disableLocalState({ connectionId, reason: terminal.reason || 'server_ended' })
       process.stdout.write(
         JSON.stringify({
           type: 'session_ended',
-          reason: terminal,
+          reason: terminal.reason || 'server_ended',
+          recoverable: true,
+          connection_id: connectionId,
+          message:
+            'Connection is no longer on the server. This was NOT a UI end — ' +
+            're-register the same bond to resume.',
+        }) + '\n',
+      )
+      process.exit(1)
+    }
+    if (terminal) {
+      // A deliberate human end ('ui' / 'local_stop'). This is the one case that
+      // must stick — item 32e423fb exists so a UI End stops a zombie poller.
+      const reason = terminal.reason || 'ended_from_ui'
+      disableLocalState({ connectionId, reason })
+      process.stdout.write(
+        JSON.stringify({
+          type: 'session_ended',
+          reason,
+          recoverable: false,
           connection_id: connectionId,
           message: 'Remote control was ended. Local poller stopping; do not restart.',
         }) + '\n',
       )
-      process.stderr.write(`devspec-remote-poll: ended (${terminal}) — disabling and exiting\n`)
+      process.stderr.write(`devspec-remote-poll: ended (${reason}) — disabling and exiting\n`)
       process.exit(1)
     }
+    // A clean poll clears the recoverable streak — a blip that resolves is over.
+    consecutiveRecoverableEnds = 0
 
     // Server-authoritative attachment — still the SOLE adoption path, now sourced
     // from the poll response's `session_id` (read from the markers, so it is the
