@@ -27,10 +27,26 @@ describe('detectLocalId', () => {
     assert.equal(r.source, 'arg')
   })
 
-  it('prefers CODEX_THREAD_ID over SHELL_SESSION_ID', () => {
-    const r = detectLocalId({}, { CODEX_THREAD_ID: 'thread-1', SHELL_SESSION_ID: 'shell-1' })
+  it('prefers CODEX_THREAD_ID over other conversation env', () => {
+    const r = detectLocalId({}, { CODEX_THREAD_ID: 'thread-1', GROK_SESSION_ID: 'grok-1' })
     assert.equal(r.local_id, 'thread-1')
     assert.equal(r.source, 'env:CODEX_THREAD_ID')
+  })
+
+  it('does NOT bond on SHELL_SESSION_ID / TERM_SESSION_ID (terminal, not conversation)', () => {
+    // Regression guard for the Working-stuck bug (Grok a6b3f881, Claude 87117120).
+    // A shell id in env hijacked the env leg of resolveHookConversationId, so the
+    // correct hook-stdin conversation id was never reached, the bond matched no
+    // connection, and the turn marker was never cleared.
+    const r = detectLocalId({}, { SHELL_SESSION_ID: 'shell-only', TERM_SESSION_ID: 'term-only' })
+    assert.equal(r.local_id, null)
+    assert.equal(r.source, null)
+  })
+
+  it('uses CLAUDE_CODE_SESSION_ID even when a shell id is also present', () => {
+    const r = detectLocalId({}, { CLAUDE_CODE_SESSION_ID: 'claude-conv', SHELL_SESSION_ID: 'shell' })
+    assert.equal(r.local_id, 'claude-conv')
+    assert.equal(r.source, 'env:CLAUDE_CODE_SESSION_ID')
   })
 
   it('does not invent an id from cwd or empty env', () => {

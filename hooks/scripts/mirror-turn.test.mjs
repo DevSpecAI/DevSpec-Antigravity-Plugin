@@ -44,6 +44,21 @@ describe('resolveHookConversationId', () => {
     assert.equal(resolveHookConversationId('{"session_id":"stdin-conv"}', {}), 'stdin-conv')
   })
 
+  it('reaches the stdin session_id even when the host shell exports a shell id', () => {
+    // THE Working-stuck regression (Grok a6b3f881, Claude 87117120). SHELL_SESSION_ID
+    // is set in real Claude Code environments. While detectLocalId still probed it,
+    // it won the env leg and this fallback never ran, so Stop resolved a bond that
+    // matched no connection — and with 2+ live connections of the same agent
+    // selectBoundState fails closed, leaving the turn marker (and Working) forever.
+    assert.equal(
+      resolveHookConversationId('{"session_id":"stdin-conv"}', {
+        SHELL_SESSION_ID: 'w0t0p0:AAAA-BBBB',
+        TERM_SESSION_ID: 'term-1',
+      }),
+      'stdin-conv',
+    )
+  })
+
   it('returns null when nothing identifies the conversation (fail closed)', () => {
     assert.equal(resolveHookConversationId('{}', {}), null)
     assert.equal(resolveHookConversationId('not json', {}), null)

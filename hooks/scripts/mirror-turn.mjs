@@ -371,6 +371,23 @@ async function main() {
           busy: turnActive,
         },
       })
+      // End the activity attempt immediately on Stop. The poller also emits
+      // report_complete when the marker disappears, but that waits for the next
+      // long-poll tick — so Working / dots linger for seconds after the answer has
+      // already landed. Calling it here drops them as soon as the turn ends, and
+      // means a healthy Stop no longer depends on the poller to finish the turn.
+      if (!turnActive) {
+        try {
+          await mcpToolsCall({
+            mcpUrl,
+            token,
+            name: 'report_complete',
+            arguments: { connection_id: connectionId, reason: 'turn_end' },
+          })
+        } catch {
+          /* non-fatal — the poller's marker-driven backstop still runs */
+        }
+      }
     }
   } catch (e) {
     process.stderr.write(`[devspec-remote] ${e instanceof Error ? e.message : String(e)}\n`)

@@ -546,7 +546,23 @@ function localBondPath(agent, localId) {
 /**
  * Detect local conversation identity.
  * Prefer explicit arg / env that uniquely identifies this agent conversation.
- * Never use cwd. SHELL_SESSION_ID is a last-resort same-terminal fallback.
+ * Never use cwd.
+ *
+ * CONVERSATION-SCOPED IDS ONLY. Deliberately does NOT probe SHELL_SESSION_ID /
+ * TERM_SESSION_ID: those identify the host TERMINAL, not this conversation, so one
+ * shell running several conversations in sequence bonds them all to one id.
+ *
+ * The damage is worse than a wrong bond, because callers try env FIRST and fall back
+ * to the host's own conversation id second (hooks: `resolveHookConversationId` reads
+ * the stdin `session_id`). A shell id present in env HIJACKS that first leg and the
+ * correct fallback is never reached. Stop then resolves a bond that matches no
+ * connection, `selectBoundState` fails closed once 2+ connections of this agent are
+ * live, the `.turn` marker is never cleared, and the poller re-asserts busy until
+ * MAX_TURN_MS (1h). Live bug: Working / bouncing dots stuck after every remote reply
+ * (Grok item a6b3f881, Claude item 87117120 — same root cause, both plugins).
+ *
+ * Tools with no per-conversation id at all (Cursor, Antigravity) correctly resolve
+ * null here and are disambiguated by selectBoundState's single-connection fallback.
  */
 export function detectLocalId(args = {}, env = process.env) {
   const fromArg = sanitizeLocalId(args['local-id'] || args.localId || args.local_id)
@@ -559,8 +575,6 @@ export function detectLocalId(args = {}, env = process.env) {
     ['CLAUDE_SESSION_ID', env.CLAUDE_SESSION_ID],
     ['GROK_SESSION_ID', env.GROK_SESSION_ID],
     ['GROK_CONVERSATION_ID', env.GROK_CONVERSATION_ID],
-    ['SHELL_SESSION_ID', env.SHELL_SESSION_ID],
-    ['TERM_SESSION_ID', env.TERM_SESSION_ID],
   ]
   for (const [name, val] of envPairs) {
     const id = sanitizeLocalId(val)
