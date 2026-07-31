@@ -33,65 +33,33 @@ It is the Antigravity sibling of the DevSpec plugins for Claude Code, Codex CLI,
 
 ## Install
 
-There are **two independent pieces**: the MCP connection (required) and the skills (the commands).
+This extension is built as a unified **Antigravity Plugin**, containing the skills, MCP configuration, and hooks. 
 
-### 1. Connect the DevSpec MCP server  *(required)*
+### 1. Configure your MCP token
+Before installing the plugin, edit the `mcp_config.json` file at the root of this plugin directory and insert your DevSpec MCP token. 
+Replace `dvs_YOUR_DEVSPEC_MCP_TOKEN` with your **account-wide** token from DevSpec → **You → Connections** → **Connect a tool** (pick **Read & write**). 
+One token covers every project in your account.
 
-The skills are thin wrappers — they call DevSpec MCP tools. Without the server connected, nothing
-works. Antigravity uses the `serverUrl` key (note: Claude Code and Codex use `url`/`http_headers`
-instead — same server, different client schema).
+### 2. Add the plugin to Antigravity
+To install the plugin, simply move or copy this entire repository directory into one of Antigravity's plugin directories. Antigravity will automatically load the skills, MCP connection, and hooks.
 
-Start from [`mcp/devspec.mcp.json`](mcp/devspec.mcp.json):
-
-```json
-{
-  "mcpServers": {
-    "devspec": {
-      "type": "http",
-      "serverUrl": "https://devspec.ai/api/mcp",
-      "headers": { "Authorization": "Bearer dvs_YOUR_DEVSPEC_MCP_TOKEN" }
-    }
-  }
-}
-```
-
-- Replace `dvs_YOUR_DEVSPEC_MCP_TOKEN` with your **account-wide** token from DevSpec →
-  **You → Connections** → **Connect a tool** (pick **Read & write**). One token covers every project
-  in your account — the skills resolve which project each run targets from the repo's git remote, so
-  you do not configure a project here.
-- Replace the host if your DevSpec instance lives elsewhere.
-
-**Antigravity CLI** — merge that `devspec` block into `~/.gemini/antigravity-cli/mcp_config.json`
-(on Windows: `%USERPROFILE%\.gemini\antigravity-cli\mcp_config.json`), then run `/mcp` to confirm it
-connected.
-
-**Antigravity desktop app** — **Settings → MCP → Add server**, choose HTTP, paste the `serverUrl`
-and the `Authorization: Bearer …` header.
-
-### 2. Install the skills
-
-**Workspace** (recommended — scoped to one repo, travels with it):
-
+**Workspace level (recommended)**:
+Place this folder inside `.agents/plugins/` at the root of your workspace:
 ```bash
-./scripts/install.sh                  # installs into ./.agents/skills
-./scripts/install.sh --workspace /path/to/repo
-```
-```powershell
-./scripts/install.ps1                 # Windows
+# E.g.
+mkdir -p .agents/plugins
+cp -R path/to/antigravity-devspec-autopilot-extension .agents/plugins/
 ```
 
-This copies each skill into `.agents/skills/<name>/`. Antigravity (CLI and desktop) discovers
-`SKILL.md` skills there automatically.
-
-**Global** (available in every repo):
-
+**Global level (available in all repos)**:
+Place this folder inside `~/.gemini/config/plugins/` (or your OS equivalent):
 ```bash
-./scripts/install.sh --global         # ~/.gemini/antigravity/skills
+mkdir -p ~/.gemini/config/plugins
+cp -R path/to/antigravity-devspec-autopilot-extension ~/.gemini/config/plugins/
 ```
 
-**Marketplace / agent install** — Antigravity has a built-in skill marketplace, and the agent can
-install skills straight from a public repo. Once this repo is published you can simply tell
-Antigravity: *"Install the DevSpec skills from `<repo-url>`."* See **Distribution** below.
+**Marketplace / Agent install**: 
+Once published, you can simply tell Antigravity to install the plugin directly from the repository URL. Antigravity will handle placing it in the correct directory.
 
 ---
 
@@ -139,9 +107,9 @@ same tools.
 This repo is the distributable artifact. Three channels:
 
 1. **Antigravity skill marketplace** — publish so users install with one click (CLI and desktop).
-2. **Public GitHub repo** — users `git clone` + run `scripts/install.sh`, or ask the agent to
-   install directly from the URL.
-3. **Bundled** — drop the `skills/` folder into a project's `.agents/skills/` and commit it.
+2. **Public GitHub repo** — users `git clone` this repo into `.agents/plugins/`, or ask the agent to
+   install the plugin directly from the URL.
+3. **Bundled** — drop this entire folder into a project's `.agents/plugins/` and commit it.
 
 The MCP config ships with a token *placeholder*, and `.gitignore` blocks any filled-in
 `mcp_config.json` from being committed.

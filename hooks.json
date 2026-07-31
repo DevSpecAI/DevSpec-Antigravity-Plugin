@@ -1,0 +1,18 @@
+{
+  "devspec-remote-control-mirror": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "node \"./scripts/mirror-turn.mjs\" stop",
+        "timeout": 30
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "type": "command",
+        "command": "node \"./scripts/mirror-turn.mjs\" user_prompt",
+        "timeout": 30
+      }
+    ]
+  }
+}
