@@ -602,6 +602,9 @@ function deliverAdvisory(connectionId, advisoryMsgs, sessionId) {
  *
  * The permission line matters: a look-only playbook must not be "helpfully" fixed
  * while the agent is in there.
+ *
+ * Always pass provider on claim (hard match against preferred_provider). Omitting
+ * it fails even when this agent is the named one — same habit as claim_work_item.
  */
 function playbookRunCommandText(d) {
   const permission =
@@ -615,7 +618,7 @@ function playbookRunCommandText(d) {
     `▶️ Playbook run dispatched to this connection: "${d.playbook_name}" (run ${d.run_id}).`,
     '',
     'What to do:',
-    `1. claim_playbook_run({ run_id: "${d.run_id}" }) — if it comes back claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
+    `1. claim_playbook_run({ run_id: "${d.run_id}", provider: "antigravity" }) — always pass provider (and model if the playbook names one). If claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
     '2. Do the work described below, in this repo.',
     '3. record_playbook_run — report status, a verdict for EACH acceptance criterion WITH evidence, and whatever the run produced as artifacts.',
     '',
