@@ -245,7 +245,7 @@ A dispatch arrives as an owner command carrying an **assignment reference** (UUI
 3. For each member **in `position` order**: **`claim_work_item(action_item_id, agent_branch)`** (the reservation is recognised for you; a claim rejected as reserved-for-someone-else is a normal non-fatal skip). Implement in an isolated worktree as the `devspec-work` skill prescribes; **`record_implementation`** when done (`report_progress` for long items; `release_work_item` to hand one back).
 4. When the batch is done: **`resolve_assignment(assignment_id, outcome: "completed")`** (or `"released"`).
 
-Never force past a `possible_conflict` blindly — surface it and act only on confirmation. Progress: attached → optional `post_session_message({ connection_id, … })`; sessionless → `report_progress` only.
+Settle a `possible_conflict` yourself when the facts are plain: `related` / `not_a_conflict` close nothing and reverse nothing, so resolve them via `resolve_action_item_conflict` with a recorded `basis`. Ask first only for `supersedes` (something gets closed), a counterpart authored by someone else, or a user who has not shown they grasp — at the INTENT level, never the code level — what would be reversed; then state the consequence, not that a flag exists. A flag informs your reasoning; it is not a permission slip. Never force blindly. Progress: attached → optional `post_session_message({ connection_id, … })`; sessionless → `report_progress` only.
 
 ### 9. Stopping
 
