@@ -2,7 +2,8 @@
 /**
  * Resolve DevSpec MCP URL + Bearer token for Antigravity remote-control hooks/poller.
  *
- * WHY THIS IS ANTIGRAVITY-SPECIFIC (this plugin OWNS this file in sync-hooks). The
+ * WHY THIS IS ANTIGRAVITY-SPECIFIC (this repo owns every script in it — the plugins
+ * are independent implementations and nothing is synced between them). The
  * DevSpec token lives in Antigravity's OWN MCP config —
  * `~/.gemini/antigravity-cli/mcp_config.json` (the CLI) or the desktop app's MCP
  * settings — as `mcpServers.devspec.serverUrl` + `headers.Authorization`, NOT in a
@@ -11,7 +12,7 @@
  * otherwise register_connection ran on one token while the poller heartbeats another
  * and the server rejects with "connection belongs to a different token" (dispatch
  * delivery spams). So Antigravity's mcp_config.json is the source of truth and wins
- * over a generic project `.mcp.json`. (The canonical Claude resolver reads
+ * over a generic project `.mcp.json`. (The Claude Code plugin's resolver reads
  * `CLAUDE_PLUGIN_OPTION_*` + `~/.claude.json`, which are meaningless for Antigravity.)
  *
  * Lookup order:

@@ -32,18 +32,18 @@
  *
  * Usage:
  *   node remote-control-state.mjs write --connection-id <uuid> [--session <uuid>]
- *       [--agent "Grok Build"] [--cwd <path>] [--codename "Colorful Possum"]
+ *       [--agent "Antigravity"] [--cwd <path>] [--codename "Colorful Possum"]
  *       [--title "…"] [--local-id <id>] [--owner-pid <pid>] [--host-token <bearer>] [--no-poller]
  *   node remote-control-state.mjs ensure-poller --connection-id <uuid> [--session <uuid>] [--owner-pid <pid>]
  *   node remote-control-state.mjs disable --connection-id <uuid>
- *   node remote-control-state.mjs disable-local [--agent "Grok Build"] [--local-id <id>]
- *   node remote-control-state.mjs reap [--agent "Grok Build"] [--except-connection <uuid>]
+ *   node remote-control-state.mjs disable-local [--agent "Antigravity"] [--local-id <id>]
+ *   node remote-control-state.mjs reap [--agent "Antigravity"] [--except-connection <uuid>]
  *   node remote-control-state.mjs read [--connection-id <uuid>]
  *   node remote-control-state.mjs list
  *   node remote-control-state.mjs mint-codename
  *   node remote-control-state.mjs mint-local-id
- *   node remote-control-state.mjs resolve-local-id [--local-id <id>] [--agent "Grok Build"]
- *   node remote-control-state.mjs resolve-local --agent "Grok Build" [--local-id <id>]
+ *   node remote-control-state.mjs resolve-local-id [--local-id <id>] [--agent "Antigravity"]
+ *   node remote-control-state.mjs resolve-local --agent "Antigravity" [--local-id <id>]
  *       [--max-age-minutes 30] [--force-new]
  *     → action: already_live | reconnect | register | create_and_attach
  *   node remote-control-state.mjs stop-poller --connection-id <uuid>
