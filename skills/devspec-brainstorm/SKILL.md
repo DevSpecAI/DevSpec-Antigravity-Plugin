@@ -82,7 +82,9 @@ Interactively brainstorm on an action item to sharpen its scope, surface edge ca
      ```
    - If no: output `↻ Action item not updated — summary is above if you need it later.`
 
-7. **Persist durable conclusions to DevSpec memory.** If the brainstorm settled something durable about the project beyond this one item — a decision, a convention, an architectural constraint, a risk — record it with `record_memory` so the conclusion isn't lost or kept only in local notes. `search_memories` FIRST and `supersede_memory` the closest existing match rather than duplicating. DevSpec memory is the team's SHARED source of truth; keep personal or machine-specific notes in your own local agent memory instead. Skip this when nothing durable emerged — don't record transient or obvious details.
+7. **Persist durable conclusions to DevSpec memory.** If the brainstorm settled something durable about the project beyond this one item — a decision, a convention, an architectural constraint, a risk — record it with `record_memory` so the conclusion isn't lost or kept only in local notes. `search_memories` FIRST and `supersede_memory` the closest existing match rather than duplicating. DevSpec memory is the team's SHARED source of truth; keep personal or machine-specific notes in your own local agent memory instead.
+
+**Is it a memory or a rule?** Not the same question as the one above — a rule is durable and shared too. Judge by what it IS: a decision or fact with a reason someone might revisit is a **memory** (`record_memory`); a standing instruction to act on every time is a **rule** (`write_project_instruction_rule`). "We chose Broadcast over postgres_changes because RLS made client CDC undeliverable" is a memory; "never add client postgres_changes without documenting it" is a rule. A rule filed as a memory is one nobody follows. After writing a rule, report its `outcome` as given — `queued_for_review` means a maintainer has yet to accept it, so it is not in force. Skip this when nothing durable emerged — don't record transient or obvious details.
 
 ## Rules
 
