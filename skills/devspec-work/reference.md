@@ -2,11 +2,11 @@
 
 ## What is DevSpec?
 
-DevSpec is an AI-native project planning and code intelligence platform. Teams use DevSpec to create, prioritize, and track action items (bugs, features, improvements, tasks). The autopilot system enables AI agents to autonomously pick up staged action items, implement them, and report results back to the team.
+DevSpec is an AI-native project planning and code intelligence platform. Teams use DevSpec to create, prioritize, and track action items (bugs, features, improvements, tasks). Staged items are dispatched by the server to an idle connection as a batch, or worked directly by name — either way the agent implements them and reports results back to the team.
 
 ## What This Plugin Does
 
-This plugin connects Antigravity to DevSpec's autopilot system. When you run `/autopilot:process`, Antigravity fetches the next staged action item, claims it, implements the required changes, and reports completion with full audit details.
+This plugin connects Antigravity to DevSpec. When you run `devspec-work` (or a staged batch arrives at a `devspec-remote` connection), Antigravity claims the action item, implements the required changes in an isolated worktree, and reports completion with full audit details.
 
 ## MCP Tools
 
@@ -372,7 +372,7 @@ Record implementation decisions and progress for the audit trail. The project ow
 Link a git commit SHA to an action item. This populates the commit history visible on the action item detail page in DevSpec.
 
 This is **separate from** the automatic commit reference that `record_implementation` records — use `add_commit_reference` for:
-- The final commit during autopilot / `/devspec:work` runs (called before `record_implementation` so the reference is written even if completion fails).
+- The final commit during `/devspec:work` / dispatched-batch runs (called before `record_implementation` so the reference is written even if completion fails).
 - Retroactively attaching commits that were made outside any DevSpec command (via the `/devspec:link` command).
 
 **Parameters**:
@@ -380,7 +380,7 @@ This is **separate from** the automatic commit reference that `record_implementa
 {
   "action_item_id": "4d753b6a-28d9-4d2d-8f23-af3103af76db",
   "commit_sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
-  "commit_message": "[autopilot] Fix login timeout on mobile [devspec:4d753b6a-28d9-4d2d-8f23-af3103af76db]"
+  "commit_message": "fix: Fix login timeout on mobile [devspec:4d753b6a-28d9-4d2d-8f23-af3103af76db]"
 }
 ```
 
@@ -459,7 +459,7 @@ Mark an action item as failed. Use this when you cannot complete the work — me
 {
   "action_item_id": "4d753b6a-28d9-4d2d-8f23-af3103af76db",
   "error": "Merge conflict in src/auth/login.ts — upstream changes conflict with the timeout modification. Manual resolution required.",
-  "partial_work": "Branch autopilot/action-item-4d753b6a pushed with partial changes. Timeout configuration added but not integrated due to merge conflict."
+  "partial_work": "Branch feat/action-item-4d753b6a pushed with partial changes. Timeout configuration added but not integrated due to merge conflict."
 }
 ```
 
@@ -500,7 +500,7 @@ Create a new action item in the project. Used by `/devspec:create` to let develo
 | `suggest_human_only` | Optional boolean. Pass `true` only for plainly off-platform work no agent could ever do (see below). It is a suggestion — a human confirms it in DevSpec. |
 | `assigned_to` | Optional user UUID. Omit for unassigned items. |
 | `parent_action_item_id` | Optional. Pass the UUID of a parent item to create this as a sub-task. Max depth 1 (no grandchildren). |
-| `session_id` | Optional. The DevSpec CHAT session this item originates from (e.g. a session handoff gave you one). The item becomes owned by that session — it appears in the session's transcript and "This session" panel. Omit in autopilot/terminal flows with no live chat session; never pass the runner heartbeat `session_id` or a `source_session_id` you merely read intent from. |
+| `session_id` | Optional. The DevSpec CHAT session this item originates from (e.g. a session handoff gave you one). The item becomes owned by that session — it appears in the session's transcript and "This session" panel. Omit in unattended/terminal flows with no live chat session; never pass the runner heartbeat `session_id` or a `source_session_id` you merely read intent from. |
 
 **Response**: The created action item object. Includes `id` (UUID assigned by the server), plus the fields you passed and defaults applied server-side (`lifecycle: "open"`, etc.). Item payloads carry `human_only`, which becomes true only once a human confirms the suggestion in DevSpec.
 
@@ -634,14 +634,14 @@ Always print both lines. Sanitize `validation_details.message` per Shell Safety 
 
 ```
 ⚠ Runner gated: <validation_details.message>
-→ Resolve this in the DevSpec dashboard. The next /autopilot:process run will pick up automatically once the mismatch is fixed.
+→ Resolve this in the DevSpec dashboard. The next run (`devspec-work` or a dispatched batch) will proceed automatically once the mismatch is fixed.
 ```
 
 For `/devspec:work`, the second line reads `… next /devspec:work run will proceed automatically …` instead.
 
 ### When the check runs
 
-- **Startup heartbeat (before any work)**: `/autopilot:process` runs the check in Step 0b; `/devspec:work` runs it in Phase 0 step 3b. This is the gating-enforcement heartbeat.
+- **Startup heartbeat (before any work)**: `/devspec:work` runs it in Phase 0 step 3b. This is the gating-enforcement heartbeat.
 - **Final heartbeat (after work)**: also processes the response, but gating at this point is informational — the cycle's work has already been pushed/reported. The next invocation's startup heartbeat will enforce the gate.
 
 ### Heartbeat transient failures
@@ -738,7 +738,7 @@ node -e "const fs=require('fs'),path=require('path'),os=require('os'); const cut
 
 ### When to log
 
-Every entry point that claims and processes an action item (currently `/autopilot:process` and `/devspec:work`) must:
+Every entry point that claims and processes an action item (`devspec-work`, or a dispatched batch under `devspec-remote`) must:
 
 1. **At startup** — run the *ensure directories* helper, then the *cleanup* helper (best-effort; ignore errors).
 2. **After claiming** — generate one `execId` UUID, capture `startedAt`, append a `status: "running"` JSONL record, and append a `Starting: <title>` line to `<execId>.log`.
@@ -751,13 +751,13 @@ All file operations are best-effort. If a logging call fails, print a short warn
 
 ### Viewing local logs
 
-`/autopilot:log` reads `~/.devspec/execution-history.jsonl`, merges start/completion records by `id`, applies optional `--status` and `--limit` filters, and prints a formatted list. This is distinct from `/autopilot:history`, which queries the DevSpec API.
+`~/.devspec/execution-history.jsonl` holds one JSONL record per run (start and completion, merged by `id`) — inspect it directly; per-item history with outcomes lives server-side on the item and its assignment.
 
 ---
 
 ## Worktree-Based Isolation
 
-All implementation work — both `/autopilot:process` and `/devspec:work` — runs inside a **git worktree**, not in the main repo working directory. This is an intentional isolation boundary.
+All implementation work runs inside a **git worktree**, not in the main repo working directory. This is an intentional isolation boundary.
 
 ### Why worktrees
 

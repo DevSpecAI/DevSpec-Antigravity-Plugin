@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0 - 2026-08-11
+
+### The autopilot skills are gone — staged batches arrive at any idle connection
+
+**Migration:** if you used `devspec-autopilot` (or `autopilot-status` / `autopilot-history` / `autopilot-log`), stage the items in DevSpec instead (**Stage for Autopilot** / approve a plan) and keep an ordinary `devspec-remote` session idle — DevSpec hands the batch to it. Status is the Agents page; stop is `devspec-remote-stop`; history is the assignment and item record.
+
+- **The plugin no longer chooses its own work.** The four autopilot skills are deleted, and with them the `get_next_work_item` self-selection path; the server routes a staged batch to a connection and the plugin only works what it was handed.
+- **Unattended is a mode, not a command.** The dispatch-protocol section of `devspec-remote` (step 8a) now states the batch contract explicitly: batch rules override conversational rules for the duration of the batch, a member that cannot be done safely is failed loudly with `fail_work_item` (never stalled on a question nobody is there to answer), and the connection returns to ordinary available capacity when the batch resolves.
+- No replacement command or flag is created. Same deletion across the Claude Code, Cursor, OpenCode, Grok and Codex plugins under the same item (`3f2f390c`).
+
 ## 0.3.6 - 2026-08-04
 
 ### Read a memory before superseding it — search now returns a card

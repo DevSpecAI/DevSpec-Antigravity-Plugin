@@ -95,7 +95,7 @@ Remote is **orthogonal** to `--unattended`. See `devspec-remote` + DevSpecV2 `do
 
    Also store the `repos` array from the same response — `[{ id, full_name, target_branch, default_branch }]`, the branch DevSpec tracks for EACH repo; the source of truth for the merge target (step 18). Do NOT assume one branch for the whole project.
 
-   If `auto_merge` is true, treat `auto_push` as true regardless of its stored value. **Interactive override:** the user may tell you not to push or merge this particular run — honour that live instruction over the stored value (this interactive skill only; the unattended `devspec-autopilot` skill honours the stored value). These execution settings apply to both interactive and unattended runs.
+   If `auto_merge` is true, treat `auto_push` as true regardless of its stored value. **Interactive override:** the user may tell you not to push or merge this particular run — honour that live instruction over the stored value (this interactive skill only; a dispatched batch honours the stored value). These execution settings apply to both interactive and unattended runs.
 
 3. **Record starting branch.** Run `git branch --show-current` and store as `starting_branch`.
 
@@ -309,7 +309,7 @@ Remote is **orthogonal** to `--unattended`. See `devspec-remote` + DevSpecV2 `do
 
 16. **Integrate the fresh target, then push** (if auto_push enabled or implied by auto_merge).
 
-    When auto_merge is enabled, first integrate the target branch into your work branch **in the worktree** — another session or a parallel autopilot runner may have landed work since you branched (resolve `{merge_target}` per step 18):
+    When auto_merge is enabled, first integrate the target branch into your work branch **in the worktree** — another session or agent may have landed work since you branched (resolve `{merge_target}` per step 18):
     ```
     git fetch origin '{merge_target}'
     git merge 'origin/{merge_target}' --no-edit

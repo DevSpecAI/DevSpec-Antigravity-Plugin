@@ -47,7 +47,7 @@ When the conversation produces a durable decision, convention, architecture choi
    - Always `search_memories` first; never duplicate — `supersede_memory` the closest match. `search_memories` returns a CARD (title, one-line summary, id) — `get_memory` the closest match and read it in full before superseding it, because a card is enough to choose WHICH memory you mean and not enough to justify replacing it. 
    - Types: `decision`, `convention`, `architecture`, `risk`, `insight`.
 2. **Artifacts** — short plans/ADRs/runbooks via `create_resource` / `update_resource` / `supersede_resource`.
-3. **Do not** rely on autopilot post-session extraction for this channel.
+3. **Do not** rely on post-session extraction for this channel.
 4. Mirror the offer + capture confirmation into `post_session_message` (when attached) so the phone transcript shows knowledge landing.
 
 ## Plugin root
@@ -244,6 +244,10 @@ A dispatch arrives as an owner command carrying an **assignment reference** (UUI
 2. **`acknowledge_assignment(assignment_id)`** — the durable receipt; do it once before claiming.
 3. For each member **in `position` order**: **`claim_work_item(action_item_id, agent_branch)`** (the reservation is recognised for you; a claim rejected as reserved-for-someone-else is a normal non-fatal skip). Implement in an isolated worktree as the `devspec-work` skill prescribes; **`record_implementation`** when done (`report_progress` for long items; `release_work_item` to hand one back).
 4. When the batch is done: **`resolve_assignment(assignment_id, outcome: "completed")`** (or `"released"`).
+
+**Batch mode overrides conversation mode — explicitly, and only for the batch.** From `acknowledge_assignment` to `resolve_assignment`, this section wins over the conversational rules above: do not answer the room, do not react to ambient chatter, do not pause for clarification. There may be nobody watching — a staged batch is exactly the case where the owner walked away. The conflict resolves in the batch's favour for its duration, then lapses: when `resolve_assignment` lands you are ordinary available capacity again, nothing about the connection has changed. This is why there is no separate unattended command, skill or flag — the mode is the dispatch, not the launch.
+
+**Fail loudly, never silently, never by chatting.** If a member cannot be implemented safely — too ambiguous to do without guessing, a gate keeps failing, a dependency is missing — call `fail_work_item` with a precise `error` (and `partial_work_notes` for what you tried), then CONTINUE with the next member: a blocked member fails the member, not the batch. What you must never do is post a question into the room and wait — nobody may be there, and the batch stalls dead.
 
 Settle a `possible_conflict` yourself when the facts are plain: `related` / `not_a_conflict` close nothing and reverse nothing, so resolve them via `resolve_action_item_conflict` with a recorded `basis`. Ask first only for `supersedes` (something gets closed), a counterpart authored by someone else, or a user who has not shown they grasp — at the INTENT level, never the code level — what would be reversed; then state the consequence, not that a flag exists. A flag informs your reasoning; it is not a permission slip. Never force blindly. Progress: attached → optional `post_session_message({ connection_id, … })`; sessionless → `report_progress` only.
 
