@@ -12,7 +12,7 @@ This plugin connects Antigravity to DevSpec. When you run `devspec-work` (or a s
 
 All tools are called via the `devspec` MCP server configured in `mcp_config.json`. Antigravity handles the MCP transport — you invoke tools by name.
 
-**Account-wide token — resolve the project first.** The MCP token is account-wide; it does not pin a project. The server resolves the project per call from the most-specific id available: an `action_item_id` self-locates its project (so item-addressed tools need no `project_id`); otherwise an explicit `project_id` argument; otherwise the account's single project; otherwise it errors. So at startup you resolve WHICH project the run is for (via `list_projects` with the repo's git remote — see below) and thread `project_id` on the project-scoped tools: `get_project_summary`, `get_next_work_item`, `send_heartbeat`, `get_action_items`, `search_memories`, `create_action_item`. Do NOT add `project_id` to item-addressed tools (`claim_work_item`, `record_implementation`, `fail_work_item`, `update_action_item`, `add_implementation_note`, `add_commit_reference`, `get_action_item_history`, `get_action_item_siblings`, `generate_commit_message`, `get_session_transcript`, `submit_plan_review`) — they self-resolve from the item id.
+**Account-wide token — resolve the project first.** The MCP token is account-wide; it does not pin a project. The server resolves the project per call from the most-specific id available: an `action_item_id` self-locates its project (so item-addressed tools need no `project_id`); otherwise an explicit `project_id` argument; otherwise the account's single project; otherwise it errors. So at startup you resolve WHICH project the run is for (via `list_projects` with the repo's git remote — see below) and thread `project_id` on the project-scoped tools: `get_project_summary`, `send_heartbeat`, `get_action_items`, `search_memories`, `create_action_item`. Do NOT add `project_id` to item-addressed tools (`claim_work_item`, `record_implementation`, `fail_work_item`, `update_action_item`, `add_implementation_note`, `add_commit_reference`, `get_action_item_history`, `get_action_item_siblings`, `generate_commit_message`, `get_session_transcript`, `submit_plan_review`) — they self-resolve from the item id.
 
 ---
 
@@ -97,46 +97,9 @@ Read execution settings from the unified **`execution`** block. For back-compat 
 
 ---
 
-### get_next_work_item
-
-Fetch the next highest-priority staged action item with full context.
-
-**Parameters**:
-```json
-{ "project_id": "4d753b6a-28d9-4d2d-8f23-af3103af76db" }
-```
-
-| Field | Requirements |
-|-------|-------------|
-| `project_id` | The project resolved from `list_projects` at startup. Required when the account has more than one project; optional for single-project accounts. |
-
-**Success Response**:
-```json
-{
-  "id": "4d753b6a-28d9-4d2d-8f23-af3103af76db",
-  "title": "Fix login timeout on mobile",
-  "description": "## Context\nThe login flow times out after 5 seconds on cellular connections...",
-  "priority": "high",
-  "type": "bug",
-  "lifecycle": "open",
-  "agent_activity": "staged",
-  "tags": ["auth", "mobile"],
-  "affected_files": ["src/auth/login.ts", "src/auth/timeout.ts"],
-  "parent_action_item_id": null
-}
-```
-
-**Empty Queue**: Returns empty/null response — no items available.
-
-**Errors**:
-- `401 Unauthorized` — Token invalid or expired. Regenerate in DevSpec UI: Settings > Autopilot.
-- `500 Internal Server Error` — Server-side failure. Retry once.
-
----
-
 ### get_action_items
 
-List action items by filter. In this plugin it is used exclusively to detect **planning-mode work** after `get_next_work_item` reports no staged work.
+List action items by filter. Used to find planning-mode work or to resolve a prose-named item the user asked you to work.
 
 **Parameters** (`project_id` required for multi-project accounts; the rest optional):
 ```json
@@ -156,12 +119,10 @@ List action items by filter. In this plugin it is used exclusively to detect **p
 | `limit` | Max results. Defaults to 20. Use `1` when you only need the next item to process. |
 | `assigned_to` | Optional user UUID or `"me"` to restrict to a specific assignee. Omit to include unassigned items. |
 
-**Response**: Array of action items. Each has the same shape as the object returned by `get_next_work_item` (id, title, description, priority, type, lifecycle, agent_activity, tags, affected_files, parent_action_item_id, etc.).
+**Response**: Array of action items (id, title, description, priority, type, lifecycle, agent_activity, tags, affected_files, parent_action_item_id, etc.).
 
 **Usage in this plugin**:
-- **Stale-claim recovery**: `get_action_items({ agent_activity: 'implementing', lifecycle: 'open', limit: 20 })` — fetch currently claimed items so the runner can reset ones that have been stuck longer than `stale_claim_timeout_minutes`. Called in parallel with `get_next_work_item` at the start of every cycle. See `## Stale Claim Recovery` below.
-- **Review-mode detection**: `get_action_items({ agent_activity: 'reporting', lifecycle: 'open', limit: 1 })` — fetch the next pending review item after `get_next_work_item` returns empty. Review items take priority over planning items.
-- **Planning-mode detection**: `get_action_items({ agent_activity: 'idle', lifecycle: 'open', limit: 1 })` — fetch the next pending planning item after both the staged and review pools are empty.
+- **Finding work**: resolving a prose-named item the user asked you to work, or listing a brief's open items.
 
 **Errors**:
 - `401 Unauthorized` — Token invalid.
@@ -277,7 +238,7 @@ Submit structured feedback on a plan (an action item in `under_human_review` sta
 
 Atomically mark an action item as in_progress. Only one runner can claim a given item — this prevents race conditions when multiple runners are active.
 
-**CRITICAL**: Call this immediately after `get_next_work_item` succeeds — before reading the description, thinking about implementation, or taking any other action. The DevSpec dashboard only shows an item as `in_progress` once it is claimed.
+**CRITICAL**: Call this immediately after choosing the item to work — before reading the description, thinking about implementation, or taking any other action. The DevSpec dashboard only shows an item as `in_progress` once it is claimed.
 
 **Parameters**:
 ```json
@@ -289,7 +250,7 @@ Atomically mark an action item as in_progress. Only one runner can claim a given
 
 | Field | Requirements |
 |-------|-------------|
-| `action_item_id` | The UUID of the item returned by `get_next_work_item`. Required. |
+| `action_item_id` | The UUID of the item being claimed. Required. |
 | `agent_branch` | The feature branch name that will be created for this item (format: `{branch_prefix}{id_first_8}`). Required. |
 
 **Success**: Item transitions from `staged` to `in_progress`.
@@ -299,7 +260,7 @@ Atomically mark an action item as in_progress. Only one runner can claim a given
 - `401 Unauthorized` — Token invalid.
 - `404 Not Found` — Item does not exist.
 
-**After claiming — fetch brief context if this is a child item:** If the claimed action item has `parent_action_item_id` set (visible in the `get_next_work_item` response shape — see `## get_next_work_item` above), call `get_action_item_siblings({ action_item_id: <claimed_id> })` **before starting implementation**. The response contains:
+**After claiming — fetch brief context if this is a child item:** If the claimed action item has `parent_action_item_id` set (visible in the claim response), call `get_action_item_siblings({ action_item_id: <claimed_id> })` **before starting implementation**. The response contains:
 
 - `parent`: the brief's title, description, and status. The description is the feature-level context the user wrote.
 - `siblings`: every other child under the same brief, each with title, description, status, agent_activity, completion_summary, and (if completed) completion_note.
@@ -852,334 +813,3 @@ The failure path MUST attempt worktree cleanup before calling `fail_work_item` /
 This guarantees the main repo is safe and clean even if the cycle is killed mid-execution. Think of it as `try { implement(); } finally { cleanup_worktree(); }` — the cleanup runs even if implementation throws.
 
 ---
-
-## Stale Claim Recovery
-
-Every `/autopilot:process` cycle begins with a **stale-claim recovery** pass that resets `in_progress` items whose claim is older than `stale_claim_timeout_minutes`. This prevents items from staying stuck forever when a runner crashes mid-execution.
-
-### Why it exists
-
-Runners can die unexpectedly: the Antigravity process is killed, the machine reboots, network drops cause the final `record_implementation` or `fail_work_item` to never land. Without stale recovery, those items sit in `in_progress` until a human manually resets them, blocking re-work. Stale recovery automates the cleanup using a simple age heuristic.
-
-### The `stale_claim_timeout_minutes` setting
-
-Read during Step 0 from `get_project_summary`. Default is **30 minutes**. A larger value is appropriate when action items routinely run long (complex migrations, large refactors); a smaller value makes recovery more aggressive at the cost of occasionally resetting a healthy runner that is merely slow.
-
-The setting MUST be a positive integer. Non-numeric, missing, or ≤ 0 values fall back to 30.
-
-### When it runs
-
-Stale recovery runs **on every cycle, alongside the normal fetch** — not as a separate step, not as a user-visible command. Specifically, at the top of Step 1, `get_next_work_item` and `get_action_items({ agent_activity: 'implementing', lifecycle: 'open', limit: 20 })` are called in parallel. The in-progress list is scanned for stale claims before the runner acts on the staged result.
-
-A failure of the in-progress fetch (401, 500, network error) skips recovery for this cycle only — it does NOT block the normal fetch. Stale recovery is best-effort.
-
-### How to compute the age
-
-Always use the `Date` constructor for timestamp parsing. **Never regex** — ISO-8601 timestamps from Supabase can include timezone offsets, fractional seconds, or `Z` suffixes that regex handles poorly.
-
-```
-# Capture current time once per cycle
-NOW_MS=$(node -e "console.log(Date.now())")
-
-# Parse each agent_claimed_at
-CLAIMED_MS=$(node -e "console.log(new Date(process.argv[1]).getTime())" '<agent_claimed_at>')
-
-# Decision
-AGE_MIN=$(( (NOW_MS - CLAIMED_MS) / 60000 ))
-# if AGE_MIN > stale_claim_timeout_minutes → reset
-```
-
-If `new Date(...).getTime()` returns `NaN` (bad input), skip the item and log a warning. Do not attempt to salvage a malformed timestamp.
-
-### Ownership rule — never reset an item you own
-
-The Antigravity plugin runs **ephemerally** (one action item per invocation), so at the moment stale recovery runs you have NOT yet claimed anything this run. Any item in the in-progress list was claimed by a different runner or a past invocation.
-
-The **age check is the ownership check**: a claim older than `stale_claim_timeout_minutes` belongs to a crashed/abandoned runner (by definition — a healthy runner with heartbeats does not exceed this threshold for tasks of typical size). Do NOT add other ownership heuristics on top — specifically:
-
-- Do NOT check the runner hostname or session — Antigravity runs have no persistent identity.
-- Do NOT assume any in-progress item is yours. If you haven't claimed anything this run (you haven't — Step 2 is after Step 1), the item is somebody else's.
-- Do NOT skip the reset because the item looks like it might still be active. That is what the age check is for.
-
-Equally important: **never reset a non-stale item**. If `age_min ≤ stale_claim_timeout_minutes`, leave it alone. Clobbering a slow-but-healthy runner's claim would destroy in-flight work.
-
-### The reset call
-
-For each stale item, call:
-```json
-{
-  "action_item_id": "<validated UUID>",
-  "agent_activity": "failed",
-  "agent_error": "Stale claim: process may have crashed or timed out"
-}
-```
-
-via `update_action_item`. The exact `agent_error` string is deliberate — it makes stale resets greppable in the DevSpec dashboard and log queries, distinguishing them from other failures.
-
-### Output and logging
-
-For each successful reset, output:
-```
-⚠ Reset stale item: <title> (claimed <age_min> minutes ago)
-```
-
-`<title>` must be sanitized per Rule 4 before printing (titles come from the DevSpec API — untrusted content).
-
-Best-effort log line to `~/.devspec/logs/stale-recovery-<YYYY-MM-DD>.log` (or the current `exec_id.log` if already generated):
-```
-[<ISO timestamp>] Reset stale claim <id> (age <age_min>m, was <title>)
-```
-
-Log failures must never block recovery.
-
-### What not to do
-
-- Do NOT call `fail_work_item` for stale recovery — that tool is for items the current runner claimed and then could not complete. Stale recovery uses `update_action_item` because the stale item belongs to a different (crashed) runner.
-- Do NOT emit a heartbeat specifically for stale recovery — heartbeats are sent at the end of the normal cycle.
-- Do NOT block the staged-work path on stale recovery. If stale resets fail or time out, continue with normal processing.
-
----
-
-## Review Mode
-
-The autopilot supports a read-only **review mode** that submits structured feedback on plans awaiting human review. This runs automatically when nothing is staged but items exist with `agent_activity: 'under_human_review'`. Review mode sits between staged and planning in priority — it never blocks on planning items.
-
-### When Review Mode Activates
-
-`/autopilot:process` resolves item selection in this priority order:
-
-1. **Staged** — `get_next_work_item` returns an item → full implementation workflow.
-2. **Review** — `get_next_work_item` empty AND `get_action_items({ agent_activity: 'reporting', lifecycle: 'open', limit: 1 })` returns an item → review-mode workflow (Step 9 of `process.toml`).
-3. **Planning** — staged empty AND review empty AND a `planning` item exists → planning-mode workflow.
-4. **Empty** — all queries empty → idle heartbeat and exit.
-
-Review mode is only reached when nothing is staged. It always takes priority over planning.
-
-### MCP Tools Used
-
-Review mode uses three MCP tools for the core workflow:
-
-- `get_action_items({ agent_activity: 'reporting', lifecycle: 'open', limit: 1 })` — fetch the next review item.
-- `get_session_transcript({ session_id: <source_session_id> })` — read the conversation that produced the plan. Skipping this produces shallow reviews.
-- `submit_plan_review` — record structured feedback (`summary`, `recommendations`, `questions`). This is the only MCP call that records a review and the only call that transitions the item out of `under_human_review`.
-
-And for runner-presence reporting:
-
-- `send_heartbeat` — idle heartbeat at the end of the run.
-
-**Explicitly NOT used in review mode:**
-
-- `claim_work_item` — review items are never claimed. They stay in `under_human_review` until `submit_plan_review` succeeds, which transitions `agent_activity` to NULL server-side.
-- `record_implementation`, `fail_work_item`, `update_action_item` — no manual lifecycle transitions. `submit_plan_review` owns the state transition.
-- `add_implementation_note` — reviews are recorded via `submit_plan_review`, NOT as implementation notes. Writing an implementation note in review mode bypasses the review contract and is a bug.
-- `add_commit_reference` — no commit is produced.
-- `git` commands of any kind — no branch, no staging, no commit, no push, no merge.
-
-### Explicitly Forbidden
-
-Review mode is strictly read-only with respect to the codebase and strictly non-authoring with respect to the plan. In review mode the runner MUST NOT:
-
-- Create a git branch or mutate local git state.
-- Modify, create, or delete any file in the repo.
-- Run `git commit`, `git push`, or `git merge`.
-- Call `claim_work_item`, `record_implementation`, `fail_work_item`, `update_action_item`, or `add_implementation_note`.
-- Change the item's `agent_activity` manually — `submit_plan_review` performs that transition server-side.
-- **Rewrite the plan.** The reviewer's contract is to validate, flag risks, and identify gaps. DevSpec rewrites plans; reviewers review them. Producing a better plan in the review is a contract violation.
-
-### Review Contract
-
-Every review submitted via `submit_plan_review` must satisfy:
-
-- **Every recommendation cites a specific code location** — a file path, a function name, or a named design decision. Vague recommendations (`"Consider adding tests"`) are rejected. Specific recommendations (`"Add a test in tests/auth/timeout.test.ts covering the mobile 30s cutoff path"`) are accepted.
-- **Every question names what it blocks.** Format: `"Blocks: <decision> — <question>"` (e.g. `"Blocks: migration ordering — does 0042 need to run before or after 0041?"`). Open-ended questions without a named blocker (`"What about edge cases?"`) are rejected.
-- **The summary states whether the plan is sound and names the single biggest risk.** A summary that says "Looks good!" and nothing else fails the contract.
-
-### Expected Output
-
-**Success**:
-```
-🔍 Review complete for: <action item title>
-  Review feedback submitted — item agent_activity transitioned to NULL.
-  Feedback is injected into source session #<source_session_id (first 8 chars)> for team discussion.
-  Log: ~/.devspec/logs/<exec_id>.log
-```
-
-**Failure** (item stays in `under_human_review` — do NOT call `fail_work_item`):
-```
-✗ Review failed: <brief reason> — item left in under_human_review state for retry
-```
-
-### Local Storage in Review Mode
-
-Review-mode runs follow the same JSONL logging schema as implementation runs (see *Local Storage* below), with the same conventions as planning mode:
-
-- `agentBranch: ""` in the start record (no branch).
-- On completion, `commitSha: ""`, `commitPushed: false`, `merged: false` (no commit).
-- `triggeredBy: "autopilot"` — review mode is a sub-mode of the autopilot runner.
-
----
-
-## Planning Mode
-
-The autopilot supports a read-only **planning mode** that generates implementation plans for action items without changing any code. This runs automatically when no staged work exists but items exist with `agent_activity: 'planning'`.
-
-### When Planning Mode Activates
-
-`/autopilot:process` resolves item selection in this priority order:
-
-1. **Staged** — `get_next_work_item` returns an item → full implementation workflow (Steps 2–7 of `process.toml`).
-2. **Review** — `get_next_work_item` empty AND `get_action_items({ agent_activity: 'reporting', lifecycle: 'open', limit: 1 })` returns an item → review-mode workflow (Step 9 of `process.toml`). See `## Review Mode` below.
-3. **Planning** — `get_next_work_item` empty AND review empty AND `get_action_items({ agent_activity: 'idle', lifecycle: 'open', limit: 1 })` returns one or more items → planning-mode workflow (Step 8 of `process.toml`).
-4. **Empty** — all three queries empty → idle heartbeat and exit.
-
-Staged items **always** take precedence, then review, then planning. Planning mode is only reached when staged and review work are both fully drained.
-
-### MCP Tools Used
-
-Planning mode uses exactly two MCP tools:
-
-- `get_action_items({ agent_activity: 'idle', lifecycle: 'open', limit: 1 })` — fetch the next pending planning item.
-- `add_implementation_note(action_item_id, content)` — record the generated plan as a markdown note on the action item.
-
-And for runner-presence reporting:
-
-- `send_heartbeat` — idle heartbeat at the end of the run (same semantics as the implementation path).
-
-**Explicitly NOT used in planning mode:**
-
-- `claim_work_item` — planning items are never claimed. They stay in `planning` state, visible to the whole team, so any runner or human can take the next step.
-- `record_implementation`, `fail_work_item`, `update_action_item` — no lifecycle transitions.
-- `add_commit_reference` — no commit is produced.
-- `git` commands of any kind — no branch, no staging, no commit, no push, no merge.
-
-### Explicitly Forbidden
-
-Planning mode is strictly read-only with respect to the codebase and the action item lifecycle. In planning mode the runner MUST NOT:
-
-- Create a git branch or otherwise mutate local git state.
-- Modify, create, or delete any file in the repo.
-- Run `git commit`, `git push`, or `git merge`.
-- Change the item's `agent_activity` — it must remain `planning` so a human can approve or reject the plan.
-- Call `claim_work_item`, `record_implementation`, `fail_work_item`, or `update_action_item`.
-
-A planning runner that violates any of these rules is broken — the whole point is that the plan is a proposal awaiting human approval, not a fait accompli.
-
-### Expected Output
-
-**Success**:
-```
-📋 Planning complete for: <action item title>
-  Item stays in `planning` state — awaiting human approval.
-  Log: ~/.devspec/logs/<exec_id>.log
-```
-
-**Failure** (item stays in planning state — do NOT call `fail_work_item`):
-```
-✗ Planning failed: <brief reason> — item left in planning state for retry
-```
-
-### Plan Content Expectations
-
-The plan written via `add_implementation_note` must be substantive markdown covering at minimum:
-
-- **Scope** — which files need modification or creation, and what the changes do
-- **Approach** — the proposed implementation strategy, with alternatives considered
-- **Risks** — edge cases, error paths, concurrency, migration safety
-- **Testing strategy** — how to validate the change (unit, integration, manual)
-
-Use clear headings (`## Scope`, `## Approach`, `## Risks`, `## Testing`) and reference files, functions, and decisions by name. The plan becomes part of the action item's permanent record and is reviewed by a human before the item is either approved (promoted to `staged` for implementation) or rejected. Vague plans are not useful — write what you would want to read if you were the reviewer.
-
-### Local Storage in Planning Mode
-
-Planning-mode runs follow the same JSONL logging schema as implementation runs (see *Local Storage* below), with two conventions:
-
-- `agentBranch` in the start record is the empty string `""` (no branch is created).
-- On completion, `commitSha: ""`, `commitPushed: false`, `merged: false` (no commit is produced).
-
-`triggeredBy` remains `"autopilot"` — planning mode is a sub-mode of the autopilot runner, not a separate triggering context.
-
----
-
-## Shell Safety
-
-Action item titles, descriptions, branch names, and file paths arrive from the DevSpec API as untrusted content. Interpolating them into shell commands without sanitization is a shell-injection risk — a malicious string like `"; rm -rf / #` in a commit message or a title could execute arbitrary commands. These rules are mandatory whenever you construct a shell command from any API-returned value.
-
-### 1. Quote all variable interpolations
-
-When an API value (title, description, branch name, file path, commit message, etc.) is inserted into a shell command, **always wrap it in single quotes**. Single quotes prevent all expansion and interpretation by the shell.
-
-- ✓ Correct:   `git commit -m '${title}'`
-- ✗ Wrong:     `git commit -m ${title}`
-- ✓ Correct:   `git add '${file_path}'`
-- ✗ Wrong:     `git add ${file_path}`
-
-Single quotes inside the value must be escaped by ending the quote, inserting an escaped quote, and reopening. Replace each `'` with `'\''`. Example: `it's` becomes `'it'\''s'`.
-
-### 2. Validate branch names
-
-Before using any branch name in a shell command, verify it matches the regex `^[a-zA-Z0-9/_.-]+$`. If the branch name contains any character outside this set, **fail the item** with an error rather than executing the command. This pattern covers standard git refs like `work/action-item-abc123` and rejects shell metacharacters.
-
-### 3. Validate file paths
-
-Before using any file path in `git add`, `git diff`, or other shell commands, verify it does not contain any of these shell metacharacters: `;` `|` `&` `$` `` ` `` `\` `(` `)` `{` `}` `<` `>` `!` `#`. If a path fails this check, **reject it** — do not stage or include it. Fail the item if all affected files fail validation.
-
-A safe-path regex you can use: `^[a-zA-Z0-9/_. ~-]+$`.
-
-### 4. Sanitize text used in commit messages
-
-Before embedding any API text (titles, descriptions, summaries) inside a git commit message:
-
-1. Replace every `'` with `'\''` (so single-quoted wrapping remains closed).
-2. Strip or replace these metacharacters: `$` `` ` `` `#` `\` `|` `&` `<` `>` (they can break argument parsing or trigger expansion even inside escaped contexts on some shells).
-3. Collapse newlines in the subject line to spaces.
-4. Truncate the subject line to **500 characters** maximum.
-
-When the `generate_commit_message` MCP tool returns a message, the MCP server has already formatted it — but the value you wrap in shell quotes still needs escape rule (1) applied defensively, because the message contains user-provided text from the action item.
-
-### 5. Never interpolate raw API responses into shell commands
-
-Always run the value through the relevant validation step above before using it in a shell command. If the value fails validation, **fail the action item** with a descriptive error — do not fall through to running a partially-sanitized command and hope for the best.
-
-### 6. Validate UUIDs before using them in paths or commands
-
-Before using any `action_item_id` or similar UUID in a shell command or a file path (e.g., per-task log files named `<id>.log`), verify it matches `^[0-9a-f-]{36}$` (36 chars, lowercase hex and hyphens only). Never construct a filesystem path from an unvalidated ID — a malicious ID could contain path-traversal segments like `../../etc/passwd`.
-
-### Quick reference — validation patterns
-
-| Value | Pattern |
-|-------|---------|
-| Git ref / branch name | `^[a-zA-Z0-9/_.-]+$` |
-| Git remote name | `^[a-zA-Z0-9_.-]+$` |
-| File path | `^[a-zA-Z0-9/_. ~-]+$` |
-| UUID | `^[0-9a-f-]{36}$` |
-
-### What to do on a validation failure
-
-Call `fail_work_item` (in autopilot) or `update_action_item` with `agent_activity: 'failed'` (in interactive `devspec:work` flow). Include the unsafe value (truncated and quoted) and which rule it failed in the error. Do not attempt to auto-correct or strip characters silently — that masks the problem and the original content is still in DevSpec for the operator to inspect.
-
----
-
-## Shell Compatibility
-
-You may be running on Windows with PowerShell. **Do not use `&&` to chain shell commands** — it is not a valid statement separator in PowerShell. Use `;` instead (e.g., `git branch --show-current; hostname`).
-
-**Windows npm/.bin fallback**: If `npm run <command>` or `npx` fails with "not recognized", "not found", or similar PATH errors (common when `node_modules/.bin` shims don't resolve through junctions), retry once using the direct node path:
-
-- `tsc` → `node ./node_modules/typescript/bin/tsc --noEmit`
-- Other binaries → `node ./node_modules/.bin/<command>` or `node ./node_modules/<package>/bin/<command>`
-
-Do not retry more than once per command. If the direct path also fails, treat it as a real test failure.
-
-## Error Handling Patterns
-
-| Scenario | What To Do |
-|----------|-----------|
-| **Nothing staged** (get_next_work_item returns null) | Print "No items staged — nothing to process." and exit cleanly. |
-| **401 Unauthorized** (any tool) | Print error: "Authentication failed. Regenerate your token in DevSpec: Settings > Autopilot." Exit. |
-| **409 Conflict** (claim_work_item) | Print: "Item already claimed by another runner. Run again to pick up the next item." Exit cleanly. |
-| **Protected path violation** (before commit) | Call `fail_work_item` listing which files matched protected patterns. Do not commit. |
-| **API timeout** (any tool) | If item was claimed, call `fail_work_item` with timeout details. Otherwise, exit with timeout error. |
-| **Test failures** (during implementation) | Attempt to fix once. If still failing, call `fail_work_item` with test failure details. |
-| **npm/.bin shim failure** (Windows) | Retry once with direct `node ./node_modules/...` path. If still failing, treat as test failure. |
-| **Merge conflicts** (during git push) | Call `fail_work_item` with conflict file list and branch name for manual resolution. |
-| **500 Server Error** (any tool) | Retry once. If still failing, treat as timeout scenario above. |

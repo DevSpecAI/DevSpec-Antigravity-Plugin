@@ -118,7 +118,7 @@ The MCP config ships with a token *placeholder*, and `.gitignore` blocks any fil
 The MCP token is account-wide and does not pin a project. At startup each skill captures the repo's
 git remote (`git remote get-url origin`) and calls `list_projects({ git_remote: <url> })`; the
 server returns `remote_match.resolved_project_id`, which the skill threads as `project_id` on every
-project-scoped call (`get_project_summary`, `get_next_work_item`, `send_heartbeat`,
+project-scoped call (`get_project_summary`, `send_heartbeat`,
 `get_action_items`, `search_memories`, `create_action_item`). Item-addressed calls (claim, record,
 fail, update, commit-reference, …) self-resolve their project from the item id and take no
 `project_id`. If a repo is tracked by more than one project, an unattended run fails with the
