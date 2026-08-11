@@ -3,7 +3,7 @@ name: devspec-link
 description: "Link an existing git commit to a DevSpec action item for traceability via add_commit_reference. Use when asked to link or associate a commit (or HEAD) with an action item."
 ---
 
-Retroactively associate a git commit with a DevSpec action item via the `add_commit_reference` MCP tool. Useful when a commit was made outside the DevSpec workflow (`/autopilot:process`, `/devspec:work`, `/devspec:commit`) and you want it to appear on the action item's history page in the DevSpec dashboard.
+Retroactively associate a git commit with a DevSpec action item via the `add_commit_reference` MCP tool. Useful when a commit was made outside the DevSpec workflow (`/devspec:work`, `/devspec:commit`) and you want it to appear on the action item's history page in the DevSpec dashboard.
 
 The `add_commit_reference` MCP tool's parameter schema is provided by the `devspec` MCP server. Follow the **Shell Safety** rules at the end of this skill whenever you build a shell command from user input (SHA, title, etc.) — wrap values in single quotes and validate against the patterns listed there.
 

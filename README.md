@@ -3,10 +3,10 @@
 Bring [DevSpec](https://devspec.ai) into [Antigravity](https://antigravity.google) — both the
 **CLI** (`agy`) and the **desktop app**. This plugin gives Antigravity two things:
 
-1. **A live connection to your DevSpec project** over MCP — action items, the autopilot queue,
+1. **A live connection to your DevSpec project** over MCP — action items, staged-batch dispatch,
    project intelligence, code search, memories, and commit/deployment tracking.
-2. **Ten skills** that turn that connection into one-shot workflows: run the autopilot queue,
-   pick up and implement an action item, log finished work, create items, commit with deployment
+2. **Skills** that turn that connection into one-shot workflows: pick up and implement an action
+   item, work a dispatched batch, log finished work, create items, commit with deployment
    tracking, and more.
 
 It is the Antigravity sibling of the DevSpec plugins for Claude Code, Codex CLI, and Gemini CLI.
@@ -24,7 +24,7 @@ It is the Antigravity sibling of the DevSpec plugins for Claude Code, Codex CLI,
   - **One token, everywhere:** it's account-wide, so use the *same* token in every tool and on
     every machine — don't mint one per machine. It's now **retrievable** too: reveal and copy it
     again any time at **You → Connections** (no more show-once).
-- `git` on your PATH for any repo work. **Node.js 18+** is only needed for the **autopilot/work**
+- `git` on your PATH for any repo work. **Node.js 18+** is only needed for the **work**
   skills (git worktrees + small Node helpers for logging) and **DevSpec remote control**
   (`devspec-remote`) — the latter runs a local poller so the agent can stay connected to the Agents
   page without burning LLM tokens while waiting for instructions. The other skills work without it.
@@ -67,7 +67,6 @@ Once published, you can simply tell Antigravity to install the plugin directly f
 
 | Skill | What it does |
 |---|---|
-| `devspec-autopilot` | Autonomously process staged work: claim → implement in an isolated worktree → push/merge → report. Handles staged, review, and planning items. |
 | `devspec-work` | Pick up a named/ID'd item, optionally brainstorm, implement, push/merge, record the implementation. `--unattended` for fire-and-forget. |
 | `devspec-remote` | Connect this session as a **DevSpec remote-control** target (private Agents-page channel). |
 | `devspec-done` | Log work you already finished — infers title, summary, testing notes, and commits from git history. |
@@ -76,13 +75,11 @@ Once published, you can simply tell Antigravity to install the plugin directly f
 | `devspec-brainstorm` | Interactively refine an item's scope, edge cases, and approach, then save the summary. |
 | `devspec-link` | Link an existing commit (or `HEAD`) to an action item for traceability. |
 | `devspec-verify-connection` | Prove the setup connection loop: push a tagged `[devspec-verify:<id>]` commit to each tracked repo's primary branch and report per-repo via `report_connection_check`. |
-| `autopilot-status` | Compact panel: staged / in-progress counts and push/merge settings. |
-| `autopilot-history` | Recent completed/failed items from the DevSpec API. |
-| `autopilot-log` | Local run log from `~/.devspec/execution-history.jsonl` (offline; written by autopilot/work). |
 
-`devspec-autopilot` and `devspec-work` bundle a `reference.md` (the full DevSpec MCP tool reference,
-shell-safety rules, local-storage schema, and worktree details) loaded on demand. The other eight
-are self-contained.
+`devspec-work` bundles a `reference.md` (the full DevSpec MCP tool reference,
+shell-safety rules, local-storage schema, and worktree details) loaded on demand. The other
+skills are self-contained. To run a batch unattended, stage the items in DevSpec (**Stage for
+Autopilot**) — an idle `devspec-remote` connection of yours is handed the batch and works it.
 
 ---
 
