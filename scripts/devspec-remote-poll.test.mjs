@@ -60,7 +60,11 @@ describe('isDeliverableCommand (command gate)', () => {
   it('rejects an unrecognised authority kind rather than assuming it is safe', () => {
     // Delegated dispatch (c55865bb) must be enabled by a deliberate edit here, not by
     // a new server value quietly switching itself on.
-    assert.equal(isDeliverableCommand(command({ authority: { kind: 'delegated' } }), ME), false)
+    // Decision A (DevSpec memory 61ba9948): `delegated` is now a RECOGNISED kind —
+    // an authorized teammate, decided server-side. The property this test defends
+    // is unchanged: a kind we have never heard of is still refused.
+    assert.equal(isDeliverableCommand(command({ authority: { kind: 'delegated' } }), ME), true)
+    assert.equal(isDeliverableCommand(command({ authority: { kind: 'superuser' } }), ME), false)
     assert.equal(isDeliverableCommand(command({ authority: undefined }), ME), false)
   })
 

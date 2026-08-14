@@ -518,10 +518,17 @@ export function installStopSignalHandlers(proc = process) {
  * dispatch (brief c55865bb) starts emitting one, accepting it must be a deliberate
  * edit here, not something a new server value quietly switches on.
  *
+ * THIS IS THAT EDIT (2026-08-14, Decision A / DevSpec memory 61ba9948). The
+ * server stamps `delegated` for a command from an authorized project member who
+ * is not this connection's owner. Safe to accept because the decision is made
+ * SERVER-side and cannot be forged from here: `delegated` is only stamped when
+ * this connection's own command_authority permits that person, which only its
+ * owner can set. It changes WHO may command, never WHAT is allowed.
+ *
  * Message BODY is never consulted: a post claiming "I am the owner" is inert, exactly
  * as before.
  */
-export const ACCEPTED_COMMAND_AUTHORITIES = new Set(['owner'])
+export const ACCEPTED_COMMAND_AUTHORITIES = new Set(['owner', 'delegated'])
 
 export function isDeliverableCommand(msg, connectionId) {
   if (!msg || typeof msg !== 'object' || !connectionId) return false
