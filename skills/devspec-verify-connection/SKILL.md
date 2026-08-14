@@ -32,7 +32,9 @@ On an error, print `✗ DevSpec connection failed: {error}` and suggest checking
 
 The DevSpec MCP token is **account-wide** — it does not pin a project, so resolve which project this repo belongs to before fetching settings:
 - `git remote get-url origin` → `remote_url`. If there is no `origin`, output `✗ No git remote 'origin' — cannot resolve which DevSpec project to verify.` and stop.
-- Call `list_projects({ git_remote: "<remote_url>" })` and read `remote_match.resolved_project_id` → `project_id`. If it is null with `candidate_project_ids` (repo tracked by >1 project), ask the user which project to verify. If there is no match, output `✗ No DevSpec project tracks this repo.` and stop.
+- Call `list_projects({ git_remote: "<remote_url>" })` and read `remote_match.resolved_project_id` → `project_id`. If it is null with `candidate_project_ids` (repo tracked by >1 project), ask the user which project to verify. If there is no match — or no remote — but a pin exists, carry on with `pinned_project_id`. Only with neither, output `✗ No DevSpec project tracks this repo, and there is no .devspec/project.json pin.` and stop.
+
+  **Folder pin — a project with no repo yet.** Whether or not there is a remote, read `.devspec/project.json` in the workspace root if it exists; it holds `{ "project_id": "<uuid>" }`. That is how a folder whose code does not exist yet names its project. Pass it as **`pinned_project_id`**, NEVER as `project_id`: `project_id` is an explicit override that outranks a verified git remote, whereas the pin is only a local assertion the server deliberately ranks BELOW a remote it can verify — so sending it as `project_id` reverses that. Send `git_remote` when you have one, `pinned_project_id` when you have one, both when you have both, and let the server arbitrate. **Never decide precedence locally.**
 
 ### 1. Fetch the target repos
 
