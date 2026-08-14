@@ -1,6 +1,6 @@
 {
   "name": "devspec-antigravity-plugin",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "description": "DevSpec skills and remote-control hooks for Antigravity.",
   "license": "MIT",

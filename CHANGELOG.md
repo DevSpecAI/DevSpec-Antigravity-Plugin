@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1 - 2026-08-14
+
+### A quiet connection stays up while the host process is alive
+
+- **Removed the 72h idle-disconnect.** The poller no longer stamps `idle_timeout` and exits after three quiet days. A connection lives as long as its Antigravity process, unless you End it or run `devspec-remote-stop`. Item `ce1758a3`.
+
 ## 0.4.0 - 2026-08-11
 
 ### The autopilot skills are gone — staged batches arrive at any idle connection
