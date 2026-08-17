@@ -43,7 +43,7 @@ If this fails, output `✗ Could not read commit message for {full_sha}` and sto
 - **If multiple matches**: present a numbered list (showing title, status, and first 8 chars of ID) and ask the user to pick one. Example:
   ```
   Multiple matches for "{input}":
-    1. [staged]   Fix login timeout on mobile          (4d753b6a)
+    1. [open]     Fix login timeout on mobile          (4d753b6a)
     2. [done]     Add login retry logic                (a1b2c3d4)
     3. [open]     Login analytics dashboard            (f9e8d7c6)
   Pick one (1-3):

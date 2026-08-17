@@ -3,7 +3,7 @@
 Bring [DevSpec](https://devspec.ai) into [Antigravity](https://antigravity.google) — both the
 **CLI** (`agy`) and the **desktop app**. This plugin gives Antigravity two things:
 
-1. **A live connection to your DevSpec project** over MCP — action items, staged-batch dispatch,
+1. **A live connection to your DevSpec project** over MCP — action items, batches of work you hand an agent,
    project intelligence, code search, memories, and commit/deployment tracking.
 2. **Skills** that turn that connection into one-shot workflows: pick up and implement an action
    item, work a dispatched batch, log finished work, create items, commit with deployment

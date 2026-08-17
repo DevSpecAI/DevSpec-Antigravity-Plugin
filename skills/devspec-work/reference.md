@@ -2,11 +2,11 @@
 
 ## What is DevSpec?
 
-DevSpec is an AI-native project planning and code intelligence platform. Teams use DevSpec to create, prioritize, and track action items (bugs, features, improvements, tasks). Staged items are dispatched by the server to an idle connection as a batch, or worked directly by name — either way the agent implements them and reports results back to the team.
+DevSpec is an AI-native project planning and code intelligence platform. Teams use DevSpec to create, prioritize, and track action items (bugs, features, improvements, tasks). 
 
 ## What This Plugin Does
 
-This plugin connects Antigravity to DevSpec. When you run `devspec-work` (or a staged batch arrives at a `devspec-remote` connection), Antigravity claims the action item, implements the required changes in an isolated worktree, and reports completion with full audit details.
+This plugin connects Antigravity to DevSpec. When you run `devspec-work` (or someone in a `/devspec-remote` room asks this connection to work some items), Antigravity claims the action item, implements the required changes in an isolated worktree, and reports completion with full audit details.
 
 ## MCP Tools
 
@@ -114,7 +114,7 @@ List action items by filter. Used to find planning-mode work or to resolve a pro
 | Field | Requirements |
 |-------|-------------|
 | `project_id` | The project resolved from `list_projects` at startup. Required when the account has more than one project; optional for single-project accounts. |
-| `agent_activity` | One of `idle`, `staged`, `implementing`, `reporting`, `finished`, `failed`. Use `idle` to find planning items, `reporting` to find items pending plan review. |
+| `agent_activity` | One of `idle`, `implementing`, `reporting`, `finished`, `failed`. Use `idle` to find work nobody holds, `reporting` to find items pending plan review. |
 | `lifecycle` | One of `open`, `in_progress`, `done`, `dismissed`, `deferred`, `blocked`, `all`. Defaults to `open`. (`deferred` = consciously parked; counts as resolved, reversible via `update_action_item(lifecycle: 'open')`.) |
 | `limit` | Max results. Defaults to 20. Use `1` when you only need the next item to process. |
 | `assigned_to` | Optional user UUID or `"me"` to restrict to a specific assignee. Omit to include unassigned items. |
@@ -253,7 +253,7 @@ Atomically mark an action item as in_progress. Only one runner can claim a given
 | `action_item_id` | The UUID of the item being claimed. Required. |
 | `agent_branch` | The feature branch name that will be created for this item (format: `{branch_prefix}{id_first_8}`). Required. |
 
-**Success**: Item transitions from `staged` to `in_progress`.
+**Success**: Item transitions from `idle` to `in_progress` — you now hold it.
 
 **Errors**:
 - `409 Conflict` — Another runner already claimed this item. This is a normal race condition. Print a message and exit — run again to get the next item.
@@ -291,7 +291,7 @@ Return the parent brief and all sibling children for an action item that belongs
     "agent_activity": "idle"
   },
   "siblings": [
-    { "id": "…", "title": "Brief list UI", "lifecycle": "open", "agent_activity": "staged", "completion_summary": null },
+    { "id": "…", "title": "Brief list UI", "lifecycle": "open", "agent_activity": "idle", "completion_summary": null },
     { "id": "…", "title": "Brief detail page", "lifecycle": "done", "agent_activity": "finished", "completion_summary": "Shows parent header + children checklist" }
   ]
 }
@@ -470,7 +470,7 @@ Create a new action item in the project. Used by `/devspec:create` to let develo
 - Purchasing something (a domain, a license)
 - External dashboard work an agent has no access to (Stripe dashboard, DNS records, vendor onboarding)
 
-**Everything else needs no flag** — any open item can be staged for autopilot or handed to an agent; the act of staging is the readiness decision. Research queries, ambiguous scope, and security-sensitive changes simply stay unstaged until a human decides an agent should run them.
+**Everything else needs no flag** — any open item can be worked by an agent; the act of staging is the readiness decision. Research queries, ambiguous scope, and security-sensitive changes simply stay unstaged until a human decides an agent should run them.
 
 **Errors**:
 - `401 Unauthorized` — Token invalid.

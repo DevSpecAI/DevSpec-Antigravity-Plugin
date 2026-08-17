@@ -1,18 +1,17 @@
 ---
 name: devspec-create
-description: "Create a new DevSpec action item (bug, feature, improvement, task, or query) from the terminal. Supports --unattended. Use when asked to create, file, or add an action item in DevSpec."
+description: "Create a new DevSpec action item (bug, feature, improvement, task, or query) from the terminal. Use when asked to create, file, or add an action item in DevSpec."
 ---
 
 Create a new DevSpec action item from inside Antigravity without leaving the terminal. This command calls the `create_action_item` MCP tool; its parameter schema is provided by the `devspec` MCP server.
 
 The `devspec` MCP tools are self-describing — call them by name. Shell Safety rules for any terminal echo are summarized at the end of this skill.
 
-## Detect mode
+## How much to ask
 
-Check the user's input for `--unattended`, `unattended`, or `no interruptions`. Store as boolean `is_unattended`.
+There is no mode. `--unattended` is gone, along with the attended/unattended split it belonged to: work the input you were given, infer what you can, and ask ONLY for what is genuinely missing — one terse question at a time. A title you were handed is not a question; a title you were not handed is.
 
-- **Unattended mode** — infer any missing fields from the provided input; never prompt the user. If a required field cannot be inferred, fail with a clear error rather than guessing.
-- **Interactive mode** — ask for any field not provided on the command line, one question at a time. Keep prompts terse.
+If a question has no one to answer it (a scripted or scheduled invocation), the answer is to fail with a clear error rather than guess. That is a property of the situation, not a flag the caller sets.
 
 ## Gather fields
 
@@ -20,15 +19,13 @@ Collect the following fields for `create_action_item`. Ask in this order; accept
 
 ### 1. `title` (required)
 
-Extract from the command input if the user wrote the title directly (e.g. `/devspec:create "Fix login timeout on mobile"`). If absent and in interactive mode, ask: `Title:` and read a one-line response. If absent in unattended mode, fail with `✗ --title is required in unattended mode`.
+Extract from the command input if the user wrote the title directly (e.g. `/devspec:create "Fix login timeout on mobile"`). If absent, ask: `Title:` and read a one-line response — and if nobody answers, fail with `✗ A title is required` rather than inventing one.
 
 Trim whitespace. Reject empty strings. No length limit enforced client-side — the server rejects titles that are too long.
 
 ### 2. `description` (optional)
 
-In interactive mode: `Description (optional, press enter to skip):`. Accept multi-line input ending on a blank line, or a single line. Skip entirely if the user sends no input.
-
-In unattended mode: use the `--description` flag value if present, otherwise leave the field unset (the server defaults to null).
+Use the `--description` value if the input carried one. Otherwise ask `Description (optional, press enter to skip):`, accepting multi-line input ending on a blank line or a single line, and leave the field unset if nothing comes back (the server defaults to null).
 
 ### 3. `type` (optional, defaults to "task")
 
@@ -41,24 +38,20 @@ Enum: `bug`, `feature`, `improvement`, `task`, `query`.
 - Title/description is a question ("why does…", "how should…", "what about…") → `query`
 - Otherwise → `task`
 
-In interactive mode, after inferring, confirm once: `Type: {inferred} — press enter to accept or type a different type (bug/feature/improvement/task/query):`. Accept the inferred value on empty input.
-
-In unattended mode, use the inference without confirmation.
+Confirm the inference once, if there is someone to confirm it: `Type: {inferred} — press enter to accept or type a different type (bug/feature/improvement/task/query):`. Accept the inferred value on empty input, and on no input at all.
 
 ### 4. `suggest_human_only` (optional, defaults to unset)
 
-Any open item can be staged for autopilot or handed to an agent — the act of staging is the readiness decision. The one exception is pure off-platform work no agent could ever do. For those items pass `suggest_human_only: true`; it is a suggestion a human confirms in DevSpec, and confirmed human-only items are never picked up by agents.
+Any open item can be worked by an agent — nothing is staged or handed out, an agent reserves what it was asked to work on. The one exception is pure off-platform work no agent could ever do. For those items pass `suggest_human_only: true`; it is a suggestion a human confirms in DevSpec, and confirmed human-only items are never picked up by agents.
 
 **When to pass `suggest_human_only: true`** — the work happens entirely off-platform:
 - Calling or emailing an external party (lawyer, vendor, stakeholder)
 - Purchasing something (a domain, a license)
 - External dashboard work an agent has no access to (Stripe dashboard, DNS records, vendor onboarding)
 
-**Everything else needs no flag** — research queries, ambiguous scope, infrastructure or security-sensitive changes are all stageable; whether an agent runs them is decided when a human stages them.
+**Everything else needs no flag** — research queries, ambiguous scope, infrastructure or security-sensitive changes are all workable by an agent; whether one picks the item up is decided when somebody asks it to.
 
-In interactive mode, ask `Suggest human-only (y/N)?` only when the work looks plainly off-platform. Default to `N` on empty input.
-
-In unattended mode: set to true if `--human-only` is in the input, otherwise leave unset.
+Set it to true if `--human-only` is in the input. Otherwise ask `Suggest human-only (y/N)?` only when the work looks plainly off-platform, defaulting to `N` on empty or absent input.
 
 ## Validate
 
@@ -78,8 +71,8 @@ Your DevSpec MCP token is **account-wide** — it is not pinned to one project, 
 - Call `list_projects({ git_remote: "<remote_url>" })` and read `remote_match.resolved_project_id` → `project_id`.
   - **Resolved** → use it as `project_id` on the create call below.
   - **No remote, or no match** → if `.devspec/project.json` exists, pass its `project_id` as `pinned_project_id` on the create call instead. **Folder pin — a project with no repo yet.** Whether or not there is a remote, read `.devspec/project.json` if it exists — look in the working directory, then each parent up to and including the git repository root, never at or above your home directory (`~/.devspec` is machine state, not project config); nearest wins. It holds `{ "project_id": "<uuid>" }`. That is how a folder whose code does not exist yet names its project. **If there is no pin and no git remote resolved, offer to create one** after the user names the project: with their agreement write `{ "project_id": "<uuid>" }` to `.devspec/project.json` at the git repository root, or at the working directory when there is no repo, so the folder answers for itself next time. Only offer when nothing else resolved — a folder whose remote already matches needs no pin. **Never write it silently**, put nothing but the project id in it (no path, hostname, user or timestamp — that is what makes it safe to commit), and if a pin already names a DIFFERENT project, say which one before replacing it. Pass it as **`pinned_project_id`**, NEVER as `project_id`: `project_id` is an explicit override that outranks a verified git remote, whereas the pin is only a local assertion the server deliberately ranks BELOW a remote it can verify — so sending it as `project_id` reverses that. Send `git_remote` when you have one, `pinned_project_id` when you have one, both when you have both, and let the server arbitrate. **Never decide precedence locally.**
-  - **null with `candidate_project_ids`** (repo tracked by >1 project): in interactive mode, ask the user which project; in unattended mode, fail with `✗ This repo is tracked by multiple DevSpec projects — pass the project explicitly or detach the duplicates.` and stop.
-  - **no match** (or no `origin` remote): if the user's account has exactly one project the server resolves it without a hint — call `list_projects()` (no `git_remote`); if it returns exactly one project, use that `project_id`. Otherwise, in interactive mode ask which project; in unattended mode fail with `✗ Cannot resolve which DevSpec project to create the item in.` and stop.
+  - **null with `candidate_project_ids`** (repo tracked by >1 project): ask the user which project. With no one to ask, fail with `✗ This repo is tracked by multiple DevSpec projects — pass the project explicitly or detach the duplicates.` and stop.
+  - **no match** (or no `origin` remote): if the user's account has exactly one project the server resolves it without a hint — call `list_projects()` (no `git_remote`); if it returns exactly one project, use that `project_id`. Otherwise ask which project, and with no one to ask fail with `✗ Cannot resolve which DevSpec project to create the item in.` and stop.
 
 ## Create the item
 
@@ -107,7 +100,7 @@ If `suggest_human_only` is true, append a second line:
 Otherwise, append:
 
 ```
-→ Added as an open item. Stage it in DevSpec when it's ready for an agent to pick up.
+→ Added as an open item. Hand it to an agent when you want it worked — it reserves the item itself.
 ```
 
 ## Shell Safety
@@ -121,9 +114,9 @@ The MCP tool call itself passes values as structured JSON (no shell interpolatio
 
 ## Rules
 
-- One question at a time in interactive mode. Do NOT dump a 5-field form; ask one at a time.
-- In unattended mode, never prompt the user. Infer or fail cleanly.
+- One question at a time. Do NOT dump a 5-field form.
+- Ask only for what you could not infer, and never re-ask for something the input already gave you.
 - Trim whitespace from every user-provided field.
 - Only suggest human-only for plainly off-platform work; everything else needs no flag.
 - Confirm in one line. No multi-line success banners.
-- If the user interrupts mid-question in interactive mode, exit cleanly without creating a partial item.
+- If the user interrupts mid-question, exit cleanly without creating a partial item.
