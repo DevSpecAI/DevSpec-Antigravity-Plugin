@@ -156,7 +156,7 @@ Update an action item's lifecycle state. In this plugin it is used **only** for 
 - Do NOT use `update_action_item` to manually set `agent_activity: 'finished'` — use `record_implementation`.
 - Do NOT use it to fail an item you claimed and worked on — use `fail_work_item`.
 - Do NOT use it to submit a review — use `submit_plan_review`.
-- Do NOT use it to reset a non-stale item (age ≤ `stale_claim_timeout_minutes`) — that would clobber active work.
+- Do NOT use it to reset an item that is merely in progress — only one whose claim is genuinely abandoned. There is no configurable staleness window to check against; DevSpec expires orphaned claims itself.
 
 **Errors**:
 - `401 Unauthorized` — Token invalid.
