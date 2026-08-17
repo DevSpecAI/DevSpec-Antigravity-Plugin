@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.0 - 2026-08-17
+
+### An agent reserves its work — nothing is dispatched to it any more
+
+The server retired `get_assignment`, `acknowledge_assignment` and `resolve_assignment`, along with `get_next_work_item` (DevSpec item 1e455001). Nothing dispatches work to an agent, so there was nothing left for them to do: no batch to receive, no receipt to give, nothing to close.
+
+One verb replaces them. **`reserve_work_items({ action_item_ids, connection_id })`** holds the ordered set you are about to work so no other agent takes one mid-run; then `claim_work_item` per item as you reach it. The batch closes itself when its last member is recorded, failed or released.
+
+**`devspec-work` now reserves up front when handed several ids**, and **`skipped`** must be read and reported: an item another agent already holds comes back with a reason naming the holder rather than failing the call.
+
+### Only the agent holding an item can release or fail it
+
+`release_work_item` and `fail_work_item` had no ownership check at all, and `claim_work_item`'s compared USERS — which cannot tell two of your own agents apart, because a DevSpec token is account-wide. On 2026-08-16 a sibling connection released work another agent was actively on, leaving the item unclaimed while its reservation still said claimed.
+
+All three now check the reservation against the `connection_id` you pass, server-side, so pass it. A stale hold is still always releasable with `force` and a reason — recorded as a takeover naming who did it.
+
 ## 0.5.0 - 2026-08-17
 
 ### `--unattended` is gone, and nothing replaced it

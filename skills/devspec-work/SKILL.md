@@ -143,6 +143,10 @@ Run the **connection-native** connect steps from the `devspec-remote` skill **be
 ## Phase 1 — Resolve
 
 4. **Resolve the action item.** Extract an identifier from the user's input.
+
+4b. **Several ids? Reserve the set before starting the first.** The app emits one command carrying every selected id (`devspec-work id1,id2,id3`) so that ONE agent works them in order. Call `reserve_work_items({ action_item_ids: [<ids in the order given>], connection_id })` once, up front: that is what stops another agent picking up the last id while you are still on the first. Then work them one at a time, claiming each as you reach it.
+
+   Read `skipped` in the response and SAY what it says — an item another agent already holds comes back with a reason naming the holder rather than an error. Work the rest; never report the whole batch as yours. There is nothing to resolve at the end: the reservation closes itself when its last member is recorded, failed or released.
    - Match by ID prefix or title keywords via `get_action_items({ project_id, lifecycle: "all" })` (thread the `project_id` resolved in Phase 0 — the account-wide token does not pin a project).
    - If ambiguous, present a numbered list and ask which one — which item was meant is not yours to decide, and nothing is claimed yet, so with no answer there is simply nothing to work on.
    - If no match found: output `✗ No action item found matching: {input}` and stop.

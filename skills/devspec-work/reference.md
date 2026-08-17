@@ -584,7 +584,7 @@ Every `send_heartbeat` call returns a response whose `validation_state` tells th
 
 Because the Antigravity plugin is **ephemeral** — one action item per invocation, no polling loop — gating means **"exit cleanly without processing work this invocation."** Specifically:
 
-- Do NOT call `get_next_work_item`, `get_action_items`, `claim_work_item`, or any tool that fetches or claims work.
+- Do NOT call `reserve_work_items`, `get_action_items`, `claim_work_item`, or any tool that fetches, reserves or claims work.
 - Do NOT attempt to fix the mismatch. NEVER `git checkout` to a different branch, NEVER switch remotes, NEVER modify local git state in any way. The runner is a **read-only observer** of the mismatch — resolution happens via the DevSpec dashboard.
 - Do NOT call `fail_work_item` — no item was claimed, so there is nothing to fail.
 - Exit with a non-zero-work outcome (the gated messages are the output).
