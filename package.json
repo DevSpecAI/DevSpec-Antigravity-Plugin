@@ -1,6 +1,6 @@
 {
   "name": "devspec-antigravity-plugin",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "private": true,
   "description": "DevSpec skills and remote-control hooks for Antigravity.",
   "license": "MIT",
@@ -8,5 +8,10 @@
     "type": "git",
     "url": "https://github.com/DevSpecAI/DevSpec-Antigravity-Plugin"
   },
-  "keywords": ["devspec", "antigravity", "autopilot", "remote-control"]
+  "keywords": [
+    "devspec",
+    "antigravity",
+    "autopilot",
+    "remote-control"
+  ]
 }

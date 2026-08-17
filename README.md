@@ -65,21 +65,36 @@ Once published, you can simply tell Antigravity to install the plugin directly f
 
 ## Skills
 
+Two, and both of them are about the connection rather than the work:
+
 | Skill | What it does |
 |---|---|
-| `devspec-work` | Pick up a named/ID'd item, optionally brainstorm, implement, push/merge, record the implementation. `--remote` to steer it from the Agents page. |
 | `devspec-remote` | Connect this session as a **DevSpec remote-control** target (private Agents-page channel). |
-| `devspec-done` | Log work you already finished — infers title, summary, testing notes, and commits from git history. |
-| `devspec-commit` | Generate a `[devspec:<id>]` deployment-tracked commit message and commit staged changes. |
-| `devspec-create` | Create an action item (bug/feature/improvement/task/query) from the terminal. |
-| `devspec-brainstorm` | Interactively refine an item's scope, edge cases, and approach, then save the summary. |
-| `devspec-link` | Link an existing commit (or `HEAD`) to an action item for traceability. |
-| `devspec-verify-connection` | Prove the setup connection loop: push a tagged `[devspec-verify:<id>]` commit to each tracked repo's primary branch and report per-repo via `report_connection_check`. |
+| `devspec-remote-stop` | Disconnect it again. |
 
-`devspec-work` bundles a `reference.md` (the full DevSpec MCP tool reference,
-shell-safety rules, local-storage schema, and worktree details) loaded on demand. The other
-skills are self-contained. To work several items in one go, pass their ids to `devspec-work` —
-it reserves the batch, then claims and works the members in order.
+**There used to be eight more, and they are gone on purpose.** A skill should be
+a script — something a model would improvise badly and that can be tested.
+Connecting is: resolve the project, pin the folder, register, arm the poller,
+write state. The others were a page of prose each, telling a model to call one
+DevSpec MCP tool it could already see.
+
+What they taught now lives in the MCP tool schemas themselves, server-side,
+written once and reaching every host the moment it changes — rather than copied
+into six repositories with no way to notice when one drifts out of date.
+
+**So ask for it instead.** With the DevSpec MCP server connected:
+
+```
+Work on DevSpec action item 4f2a
+Work these in order: 4f2a, 9c1b, 2e7d
+Log a DevSpec item for the login bug
+I just finished the caching fix — record it
+Write the commit message for 4f2a
+```
+
+DevSpec's web app emits exactly these lines from its copy buttons, so copying
+and typing produce the same thing. A sentence also works in a host with no
+plugin at all, which a skill name never could.
 
 ---
 
