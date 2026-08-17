@@ -67,7 +67,7 @@ Once published, you can simply tell Antigravity to install the plugin directly f
 
 | Skill | What it does |
 |---|---|
-| `devspec-work` | Pick up a named/ID'd item, optionally brainstorm, implement, push/merge, record the implementation. `--unattended` for fire-and-forget. |
+| `devspec-work` | Pick up a named/ID'd item, optionally brainstorm, implement, push/merge, record the implementation. `--remote` to steer it from the Agents page. |
 | `devspec-remote` | Connect this session as a **DevSpec remote-control** target (private Agents-page channel). |
 | `devspec-done` | Log work you already finished — infers title, summary, testing notes, and commits from git history. |
 | `devspec-commit` | Generate a `[devspec:<id>]` deployment-tracked commit message and commit staged changes. |
@@ -78,8 +78,8 @@ Once published, you can simply tell Antigravity to install the plugin directly f
 
 `devspec-work` bundles a `reference.md` (the full DevSpec MCP tool reference,
 shell-safety rules, local-storage schema, and worktree details) loaded on demand. The other
-skills are self-contained. To run a batch unattended, stage the items in DevSpec (**Stage for
-Autopilot**) — an idle `devspec-remote` connection of yours is handed the batch and works it.
+skills are self-contained. To work several items in one go, pass their ids to `devspec-work` —
+it reserves the batch, then claims and works the members in order.
 
 ---
 
@@ -121,8 +121,8 @@ server returns `remote_match.resolved_project_id`, which the skill threads as `p
 project-scoped call (`get_project_summary`, `send_heartbeat`,
 `get_action_items`, `search_memories`, `create_action_item`). Item-addressed calls (claim, record,
 fail, update, commit-reference, …) self-resolve their project from the item id and take no
-`project_id`. If a repo is tracked by more than one project, an unattended run fails with the
-candidate list rather than guessing; an interactive run asks which project to use.
+`project_id`. If a repo is tracked by more than one project, the skill lists the candidates and asks
+which project to use — it never guesses, and it never waits in silence.
 
 ## Notes
 

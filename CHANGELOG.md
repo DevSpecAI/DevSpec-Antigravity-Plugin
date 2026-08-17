@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.0 - 2026-08-17
+
+### `--unattended` is gone, and nothing replaced it
+
+`devspec-work` took a flag that installed a mode for the whole run: never ask, never wait, auto-select the highest-priority match when a name was ambiguous. It read as a safety feature and was really a licence to guess.
+
+Deleted: the flag, the `Mode:` line in the item header, every per-step "interactive mode / unattended mode" fork, and the two mode-specific contract resources — the served contract is now one document at `devspec://product/implementation-contract`. `devspec-remote`'s "batch mode overrides conversation mode" section goes too: working a batch never installed different rules, so resolving one clears nothing.
+
+Nothing takes its place — no timeout, no patience window, no ask-policy. **Ask only what is not yours to decide** (never a detail the item's intent and criteria already settle), and **do not assume someone is waiting to answer** (before a claim, say what you need and stop; after a claim, fail the item with a precise reason). Neither depends on knowing whether a human is watching, which is what the mode was pretending to know.
+
+Brainstorm no longer asks whether you want it: it runs when the invocation asked for it, and a plain work run skips it.
+
 ## 0.4.1 - 2026-08-14
 
 ### A quiet connection stays up while the host process is alive

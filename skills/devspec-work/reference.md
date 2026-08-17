@@ -461,7 +461,7 @@ Create a new action item in the project. Used by `/devspec:create` to let develo
 | `suggest_human_only` | Optional boolean. Pass `true` only for plainly off-platform work no agent could ever do (see below). It is a suggestion — a human confirms it in DevSpec. |
 | `assigned_to` | Optional user UUID. Omit for unassigned items. |
 | `parent_action_item_id` | Optional. Pass the UUID of a parent item to create this as a sub-task. Max depth 1 (no grandchildren). |
-| `session_id` | Optional. The DevSpec CHAT session this item originates from (e.g. a session handoff gave you one). The item becomes owned by that session — it appears in the session's transcript and "This session" panel. Omit in unattended/terminal flows with no live chat session; never pass the runner heartbeat `session_id` or a `source_session_id` you merely read intent from. |
+| `session_id` | Optional. The DevSpec CHAT session this item originates from (e.g. a session handoff gave you one). The item becomes owned by that session — it appears in the session's transcript and "This session" panel. Omit in terminal flows with no live chat session; never pass the runner heartbeat `session_id` or a `source_session_id` you merely read intent from. |
 
 **Response**: The created action item object. Includes `id` (UUID assigned by the server), plus the fields you passed and defaults applied server-side (`lifecycle: "open"`, etc.). Item payloads carry `human_only`, which becomes true only once a human confirms the suggestion in DevSpec.
 
