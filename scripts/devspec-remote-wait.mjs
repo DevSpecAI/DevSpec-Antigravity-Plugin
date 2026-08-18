@@ -120,13 +120,9 @@ function parseArgs(argv) {
 /**
  * Owner-pid resolution, deliberately SELF-CONTAINED.
  *
- * This file is the one script every plugin shares verbatim — Claude Code, Cursor,
- * Antigravity, Grok Build AND the Codex bridge, which owns its own poller/state layer
- * entirely. Importing `resolveOwnerPid` from `remote-control-state.mjs` quietly made
- * a UNIVERSAL file depend on a per-family one, so the sync could not actually carry it
- * anywhere: every downstream copy is missing that export, and syncing this file to
- * them would have crashed at import. Duplicating ~25 lines is the right trade against
- * a shared file that cannot be shared (found syncing item 27058153).
+ * This plugin owns this script independently. Keeping owner-pid resolution here
+ * avoids coupling the wait path to a different state layer; the small local helper
+ * is intentional and must not be replaced by cross-plugin copying or synchronization.
  *
  * On Windows the caller's `--owner-pid "$PPID"` is usually an MSYS-internal number
  * that maps to no real Win32 process, so an explicit value is validated before it is

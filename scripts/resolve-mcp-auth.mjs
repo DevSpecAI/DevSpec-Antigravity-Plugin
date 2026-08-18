@@ -106,8 +106,8 @@ function antigravityConfigAuth(cwd = process.cwd()) {
  * `resolveDevspecMcpAuth(cwd, { hostToken })` so the poller and the in-session MCP
  * stay on ONE token.
  *
- * Named `hostTokenFromEnv` because the SYNCED callers (poller, mirror, state) import
- * this symbol — Antigravity owns only the resolver, not those callers.
+ * Named `hostTokenFromEnv` because this plugin's poller, mirror, and state helpers
+ * import the symbol. Antigravity owns and tests every one of those callers locally.
  */
 export function hostTokenFromEnv(env = process.env) {
   const envTok = env.DEVSPEC_MCP_TOKEN || env.DEVSPEC_TOKEN
