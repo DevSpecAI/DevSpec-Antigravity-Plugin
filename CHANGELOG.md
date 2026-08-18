@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.0
+
+### MCP-served implementation contract is the runtime authority
+
+- Current public docs and remote work instructions point to
+  `devspec://product/implementation-contract` instead of restating mutable item
+  lifecycle rules.
+- The remote skill keeps only the required multi-item ordering: reserve once in
+  requested order, then claim each successfully reserved item in that order.
+- Antigravity's host limitation is explicit: there is no verified blocking
+  pre-tool hook, so `UserPromptSubmit` remains prompt-mirror/activity transport
+  and does not pretend to inject or enforce the contract before mutations.
+- Contract-surface tests reject stale lifecycle prose and protect the existing
+  mirror-turn hook plus reserve/claim ordering.
 
 ## 0.7.0
 

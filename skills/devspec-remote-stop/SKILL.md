@@ -5,7 +5,7 @@ description: "Disconnect DevSpec remote control for THIS conversation only — c
 
 # DevSpec Remote Control — Stop / Disconnect
 
-Cleanly disconnect **this** conversation's connection so the **Agents page** drops its live indicator immediately.
+Cleanly disconnect **this** conversation's connection so the **Agents page** drops its live indicator immediately. This skill governs connection teardown only; any tracked work performed while connected uses the MCP-served [`devspec://product/implementation-contract`](devspec://product/implementation-contract) as its runtime authority.
 
 ## Multi-connection safety (non-negotiable)
 

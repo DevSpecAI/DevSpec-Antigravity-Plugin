@@ -891,7 +891,7 @@ async function main() {
       content:
         d.kind === 'playbook_run'
           ? playbookRunCommandText(d)
-          : `📦 DevSpec dispatched \`${d.id}\` to this connection, and this plugin does not recognise its kind. Work assignments are no longer dispatched to anyone (item 1e455001) — an agent reserves what it was asked to work with reserve_work_items — so do NOT try get_assignment / acknowledge_assignment / resolve_assignment: those tools are gone. Read it with get_connection_dispatch and report what you see.`,
+          : `📦 DevSpec delivered \`${d.id}\` to this connection, but this plugin does not recognise its kind. Inspect it with get_connection_dispatch and report what you see. For tracked action-item work, devspec://product/implementation-contract is the MCP-served runtime authority.`,
       remote_control: { is_owner_instruction: true, is_advisory: false, role: 'owner_instruction' },
     }))
 

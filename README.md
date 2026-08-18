@@ -3,11 +3,10 @@
 Bring [DevSpec](https://devspec.ai) into [Antigravity](https://antigravity.google) — both the
 **CLI** (`agy`) and the **desktop app**. This plugin gives Antigravity two things:
 
-1. **A live connection to your DevSpec project** over MCP — action items, batches of work you hand an agent,
-   project intelligence, code search, memories, and commit/deployment tracking.
-2. **Skills** that turn that connection into one-shot workflows: pick up and implement an action
-   item, work a dispatched batch, log finished work, create items, commit with deployment
-   tracking, and more.
+1. **A live connection to your DevSpec project** over MCP — action items, project intelligence,
+   code search, memories, and commit/deployment tracking.
+2. **Remote-control skills** that connect or disconnect this Antigravity conversation from the
+   DevSpec Agents page.
 
 It is the Antigravity sibling of the DevSpec plugins for Claude Code, Codex CLI, and Gemini CLI.
 **All four talk to the same DevSpec MCP server** — only the per-client packaging differs.
@@ -24,10 +23,9 @@ It is the Antigravity sibling of the DevSpec plugins for Claude Code, Codex CLI,
   - **One token, everywhere:** it's account-wide, so use the *same* token in every tool and on
     every machine — don't mint one per machine. It's now **retrievable** too: reveal and copy it
     again any time at **You → Connections** (no more show-once).
-- `git` on your PATH for any repo work. **Node.js 18+** is only needed for the **work**
-  skills (git worktrees + small Node helpers for logging) and **DevSpec remote control**
-  (`devspec-remote`) — the latter runs a local poller so the agent can stay connected to the Agents
-  page without burning LLM tokens while waiting for instructions. The other skills work without it.
+- `git` on your PATH for repo work. **Node.js 18+** is needed for **DevSpec remote control**
+  (`devspec-remote`), whose local poller keeps the agent connected to the Agents page without
+  burning LLM tokens while waiting for instructions.
 
 ---
 
@@ -96,6 +94,17 @@ DevSpec's web app emits exactly these lines from its copy buttons, so copying
 and typing produce the same thing. A sentence also works in a host with no
 plugin at all, which a skill name never could.
 
+## Implementation contract
+
+[`devspec://product/implementation-contract`](devspec://product/implementation-contract) is the
+MCP-served runtime authority for tracked work. This package points to that contract instead of
+copying its lifecycle rules into host documentation.
+
+**Antigravity host limitation:** Antigravity exposes no verified blocking pre-tool hook, so this
+plugin cannot enforce the DevSpec mutation boundary immediately before a tool call. Connecting MCP
+alone is not a request to mutate DevSpec; explicitly ask for DevSpec work or another DevSpec write.
+On that request, use the MCP-served contract and live tool schemas as the runtime authority.
+
 ---
 
 ## How this fits with the other DevSpec plugins
@@ -130,14 +139,10 @@ The MCP config ships with a token *placeholder*, and `.gitignore` blocks any fil
 
 ## Project resolution (account-wide token)
 
-The MCP token is account-wide and does not pin a project. At startup each skill captures the repo's
-git remote (`git remote get-url origin`) and calls `list_projects({ git_remote: <url> })`; the
-server returns `remote_match.resolved_project_id`, which the skill threads as `project_id` on every
-project-scoped call (`get_project_summary`, `send_heartbeat`,
-`get_action_items`, `search_memories`, `create_action_item`). Item-addressed calls (claim, record,
-fail, update, commit-reference, …) self-resolve their project from the item id and take no
-`project_id`. If a repo is tracked by more than one project, the skill lists the candidates and asks
-which project to use — it never guesses, and it never waits in silence.
+The MCP token is account-wide and does not pin a project. The remote-control skill resolves the
+current project from the repository remote, with `.devspec/project.json` as the documented folder
+pin fallback. Project-scoped and item-addressed parameters remain defined by the live MCP tool
+schemas. If resolution is ambiguous, the skill asks rather than guessing.
 
 ## Notes
 
