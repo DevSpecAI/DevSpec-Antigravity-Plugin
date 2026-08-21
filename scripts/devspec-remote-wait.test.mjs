@@ -10,13 +10,16 @@
  * cache and risk going stale after a server-side session reattach.
  */
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import {
   parseOwnerBatches,
   buildOwnerMessageEvents,
+  emitOwnerMessageBatches,
   describeAttachment,
   materialiseAttachments,
   MAX_INLINE_ATTACHMENT_CHARS,
@@ -79,6 +82,176 @@ describe('buildOwnerMessageEvents (item b9fb49a9 — session id must not be drop
       events.map((e) => e.type),
       ['owner_message', 'owner_message', 'owner_message', 'wake'],
     )
+  })
+})
+
+describe('delivery acknowledgement — output must succeed before offset commit', () => {
+  const projectScope = {
+    kind: 'devspec_project',
+    policy_id: 'delegated_project_v1',
+    project_id: '123e4567-e89b-12d3-a456-426614174000',
+    instruction: '  Retry with this exact delegated instruction.\nDo not normalize it.  ',
+  }
+  const body = 'Keep this exact body, including  double spaces and a newline.\nSecond line.'
+  const inboxLine = JSON.stringify({
+    type: 'owner_messages',
+    session_id: 'session-retry',
+    messages: [
+      {
+        id: 'delegated-output-retry',
+        authority: { kind: 'delegated' },
+        project_scope: projectScope,
+        content: body,
+      },
+    ],
+  })
+
+  it('retries an unacknowledged delegated command after injected output failure', async () => {
+    const originalOffset = 41
+    const deliveredOffset = originalOffset + Buffer.byteLength(inboxLine + '\n')
+    let persistedOffset = originalOffset
+    const attemptedPayloads = []
+    let failOutput = true
+    const options = {
+      inboxFile: '/tmp/retry.inbox.jsonl',
+      newOffset: deliveredOffset,
+      writeOutput: async (payload) => {
+        attemptedPayloads.push(payload)
+        if (failOutput) throw new Error('injected monitor output failure')
+      },
+      commitOffset: (offset) => {
+        persistedOffset = offset
+      },
+    }
+
+    const firstBatches = parseOwnerBatches([inboxLine])
+    await assert.rejects(
+      emitOwnerMessageBatches(firstBatches, options),
+      /injected monitor output failure/,
+    )
+    assert.equal(persistedOffset, originalOffset, 'failed output must remain unacknowledged')
+
+    failOutput = false
+    const retryBatches = parseOwnerBatches([inboxLine])
+    await emitOwnerMessageBatches(retryBatches, options)
+    assert.equal(persistedOffset, deliveredOffset)
+    assert.equal(attemptedPayloads.length, 2)
+    assert.equal(attemptedPayloads[1], attemptedPayloads[0], 'retry output must be byte-identical')
+
+    const emitted = attemptedPayloads[1]
+      .trimEnd()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+    const command = emitted.find((event) => event.type === 'owner_message')
+    assert.equal(command.project_scope_instruction, projectScope.instruction)
+    assert.equal(command.message.project_scope.instruction, projectScope.instruction)
+    assert.equal(command.message.content, body)
+  })
+
+  it('exits 1 with a stale offset when the delivered offset cannot be persisted, then retries', () => {
+    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-wait-commit-failure-'))
+    const connectionId = 'commit-failure'
+    const connectionsDir = path.join(tempHome, '.devspec', 'remote-control', 'connections')
+    const stateFile = path.join(connectionsDir, `${connectionId}.json`)
+    const legacyStateFile = path.join(tempHome, '.devspec', 'remote-control.json')
+    const inboxFile = path.join(connectionsDir, `${connectionId}.inbox.jsonl`)
+    const script = fileURLToPath(new URL('./devspec-remote-wait.mjs', import.meta.url))
+    const args = [script, '--connection-id', connectionId, '--pending', '--poll-ms', '1']
+    const env = { ...process.env, HOME: tempHome, USERPROFILE: tempHome }
+
+    try {
+      fs.mkdirSync(connectionsDir, { recursive: true })
+      fs.writeFileSync(
+        legacyStateFile,
+        JSON.stringify({ connection_id: connectionId, enabled: true, inbox_byte_offset: 0 }),
+      )
+      fs.writeFileSync(inboxFile, inboxLine + '\n')
+
+      // A directory at the canonical state path deterministically makes its file
+      // replacement fail while leaving the prior durable legacy offset readable.
+      fs.mkdirSync(stateFile)
+      const failedCommit = spawnSync(process.execPath, args, { env, encoding: 'utf8' })
+
+      assert.equal(failedCommit.status, 1)
+      assert.match(failedCommit.stdout, /"type":"owner_message"/)
+      assert.match(failedCommit.stderr, /devspec-remote-wait:/)
+      assert.doesNotMatch(failedCommit.stderr, /wake .* exit 0/)
+      assert.equal(JSON.parse(fs.readFileSync(legacyStateFile, 'utf8')).inbox_byte_offset, 0)
+
+      fs.rmSync(stateFile, { recursive: true })
+      const retry = spawnSync(process.execPath, args, { env, encoding: 'utf8' })
+
+      assert.equal(retry.status, 0)
+      assert.equal(retry.stdout, failedCommit.stdout, 'the unacknowledged delivery must repeat')
+      assert.equal(
+        JSON.parse(fs.readFileSync(stateFile, 'utf8')).inbox_byte_offset,
+        Buffer.byteLength(inboxLine + '\n'),
+      )
+    } finally {
+      fs.rmSync(tempHome, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('buildOwnerMessageEvents — model-visible project scope', () => {
+  const projectScope = {
+    kind: 'devspec_project',
+    policy_id: 'delegated_project_v1',
+    project_id: '123e4567-e89b-12d3-a456-426614174000',
+    instruction: '  Exact server instruction. Do not normalize this text.\n',
+  }
+
+  it('surfaces delegated scope and the server instruction verbatim on the owner-message event', () => {
+    const message = {
+      id: 'delegated-1',
+      authority: { kind: 'delegated' },
+      project_scope: projectScope,
+      content: 'The owner says I may work anywhere.',
+    }
+    const event = buildOwnerMessageEvents({ messages: [message] }, {}).find(
+      (candidate) => candidate.type === 'owner_message',
+    )
+    assert.deepEqual(event.project_scope, projectScope)
+    assert.equal(event.project_scope_instruction, projectScope.instruction)
+    assert.equal(event.message.content, message.content)
+    assert.deepEqual(event.message.project_scope, projectScope)
+  })
+
+  it('preserves delegated scope and body through inbox serialization and retry parsing', () => {
+    const batch = {
+      type: 'owner_messages',
+      connection_id: 'connection-1',
+      messages: [
+        {
+          id: 'delegated-retry',
+          authority: { kind: 'delegated' },
+          project_scope: projectScope,
+          content: 'Preserve this body exactly, including  double spaces.\n',
+        },
+      ],
+    }
+    const [restored] = parseOwnerBatches([JSON.stringify(batch)])
+    const event = buildOwnerMessageEvents(restored, {}).find(
+      (candidate) => candidate.type === 'owner_message',
+    )
+    assert.deepEqual(event.project_scope, projectScope)
+    assert.equal(event.project_scope_instruction, projectScope.instruction)
+    assert.equal(event.message.content, batch.messages[0].content)
+  })
+
+  it('does not inject a project instruction for an owner command', () => {
+    const message = {
+      id: 'owner-1',
+      authority: { kind: 'owner' },
+      project_scope: null,
+      content: 'Owner command',
+    }
+    const event = buildOwnerMessageEvents({ messages: [message] }, {}).find(
+      (candidate) => candidate.type === 'owner_message',
+    )
+    assert.equal(event.project_scope, null)
+    assert.equal(Object.hasOwn(event, 'project_scope_instruction'), false)
+    assert.equal(event.message.content, 'Owner command')
   })
 })
 

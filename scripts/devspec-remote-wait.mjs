@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * devspec-remote-wait — wake the coding agent when a new OWNER COMMAND arrives
+ * devspec-remote-wait — wake the coding agent when a new OWNER OR DELEGATED
+ * COMMAND arrives
  * (CONNECTION-NATIVE, item fd51d80b).
  *
  * Complements continuous `devspec-remote-poll.mjs` (heartbeats + inbox writer).
@@ -10,7 +11,8 @@
  *   - Claude Code: run_in_background → process exit wakes the model
  *   - Grok Build:  monitor tool on this process stdout → chat notification
  *
- * It wakes ONLY on `owner_messages` (server-stamped owner commands / dispatches).
+ * It wakes ONLY on `owner_messages` (server-stamped owner/delegated commands and
+ * owner-authorized local dispatches).
  * `advisory_context` inbox entries (teammate / Dev / other-agent room context) are
  * DELIBERATELY ignored as a WAKE TRIGGER — advisory must never force a model wake or
  * an autonomous response.
@@ -28,6 +30,8 @@
  * After the agent acts, re-arm THIS wait process only (not the poller) — with
  * `--pending`, which resumes from the saved inbox offset AND leaves the working
  * indicator alone, because a re-arm happens mid-turn by design (see armEndsTurn).
+ * The offset acknowledges delivery, so it is committed only after the complete
+ * model-visible event payload has been written successfully.
  *
  * Usage:
  *   node devspec-remote-wait.mjs --connection-id <uuid> [--from-end|--pending] [--owner-pid <pid>]
@@ -67,8 +71,8 @@ export function clearTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
  *
  * Only a FIRST arm does (item 68f7b30c). Arming is not a turn end: `--pending`
  * exists precisely because the documented pattern is to re-arm the instant the
- * agent wakes, so owner mail arriving mid-turn is not dropped — so a re-arm
- * happens DURING most turns, seconds into them. Treating every arm as idle made
+ * agent wakes, so owner/delegated mail arriving mid-turn is not dropped — so a
+ * re-arm happens DURING most turns, seconds into them. Treating every arm as idle made
  * the poller clear the marker it had just written on delivery, drop busy, and
  * emit `report_complete` while the agent worked on for another five minutes with
  * the driver's UI showing nothing. **Turn end is owned by the Stop hook**
@@ -97,10 +101,10 @@ export function applyArmTurnSemantics(connectionId, args, dir = CONNECTIONS_DIR)
 }
 
 function parseArgs(argv) {
-  // Default: resume from saved inbox_byte_offset so owner commands that arrived
-  // while the agent was mid-turn are NOT skipped. --from-end is only for the
-  // first arm after connect (ignore historical inbox). Live bug 2026-07-24:
-  // re-arm with --from-end after a wake permanently dropped concurrent owner
+  // Default: resume from saved inbox_byte_offset so owner/delegated commands that
+  // arrived while the agent was mid-turn are NOT skipped. --from-end is only for
+  // the first arm after connect (ignore historical inbox). Live bug 2026-07-24:
+  // re-arm with --from-end after a wake permanently dropped concurrent command
   // mail that the poller had already written to the inbox.
   const out = { fromEnd: false, pending: false }
   for (let i = 0; i < argv.length; i++) {
@@ -201,37 +205,38 @@ function readState(connectionId) {
 }
 
 function writeStatePatch(connectionId, patch) {
+  const prev = readState(connectionId) || { connection_id: connectionId }
+  const next = {
+    ...prev,
+    ...patch,
+    connection_id: connectionId,
+    updated_at: new Date().toISOString(),
+  }
+  fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
+  // This canonical state write is the durable inbox acknowledgement. Let failure
+  // propagate so main's existing error path exits 1 instead of reporting a wake
+  // with a stale offset and exit 0.
+  fs.writeFileSync(statePath(connectionId), JSON.stringify(next, null, 2) + '\n', { mode: 0o600 })
+
+  // The connection-native state is canonical. Keep the compatibility mirror
+  // best-effort so a stale or malformed legacy file cannot invalidate its commit.
   try {
-    const prev = readState(connectionId) || { connection_id: connectionId }
-    const next = {
-      ...prev,
-      ...patch,
-      connection_id: connectionId,
-      updated_at: new Date().toISOString(),
-    }
-    fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
-    fs.writeFileSync(statePath(connectionId), JSON.stringify(next, null, 2) + '\n', { mode: 0o600 })
-    // Mirror offset into legacy only if it points at this connection.
-    try {
-      if (fs.existsSync(LEGACY_STATE_PATH)) {
-        const leg = JSON.parse(fs.readFileSync(LEGACY_STATE_PATH, 'utf8'))
-        if (!leg.connection_id || leg.connection_id === connectionId) {
-          fs.writeFileSync(
-            LEGACY_STATE_PATH,
-            JSON.stringify(
-              { ...leg, ...patch, connection_id: connectionId, updated_at: next.updated_at },
-              null,
-              2,
-            ) + '\n',
-            { mode: 0o600 },
-          )
-        }
+    if (fs.existsSync(LEGACY_STATE_PATH)) {
+      const leg = JSON.parse(fs.readFileSync(LEGACY_STATE_PATH, 'utf8'))
+      if (!leg.connection_id || leg.connection_id === connectionId) {
+        fs.writeFileSync(
+          LEGACY_STATE_PATH,
+          JSON.stringify(
+            { ...leg, ...patch, connection_id: connectionId, updated_at: next.updated_at },
+            null,
+            2,
+          ) + '\n',
+          { mode: 0o600 },
+        )
       }
-    } catch {
-      /* ignore legacy */
     }
-  } catch (e) {
-    process.stderr.write(`devspec-remote-wait: state write failed: ${e.message}\n`)
+  } catch {
+    /* ignore legacy */
   }
 }
 
@@ -272,8 +277,8 @@ function readNewLines(file, offset) {
 }
 
 /**
- * Owner-command batches ONLY. `advisory_context` entries are intentionally excluded
- * so room awareness never wakes the model or triggers an autonomous response.
+ * Owner/delegated-command batches ONLY. `advisory_context` entries are intentionally
+ * excluded so room awareness never wakes the model or triggers an autonomous response.
  */
 export function parseOwnerBatches(lines) {
   const batches = []
@@ -397,7 +402,7 @@ export function materialiseAttachments(message, opts = {}) {
 }
 
 /**
- * Build the stdout events for one owner-command batch:
+ * Build the stdout events for one owner/delegated-command batch:
  *   1. an optional `room_context` event — the room the command arrived into,
  *   2. one `owner_message` per command,
  *   3. a trailing `wake` summary.
@@ -411,6 +416,10 @@ export function materialiseAttachments(message, opts = {}) {
  * on each inbox line, but it used to get dropped here, so the agent consuming the
  * stream had no live signal for which session a command belonged to and fell back to a
  * value cached at attach time — stale after a server-side reattach.
+ *
+ * The command-message event also promotes the validated root `project_scope` and its
+ * exact server-owned instruction to model-visible fields. The instruction is copied
+ * verbatim; this host does not recreate mutable project-delegation policy text.
  */
 export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, writeFile } = {}) {
   const sessionId = batch?.session_id ?? null
@@ -442,9 +451,12 @@ export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, write
   for (const m of messages) {
     // Attachments become on-disk files + descriptors. Emitting the server's base64
     // verbatim used to blow the turn up ~2.7x the source image (item 99165e12).
+    const projectScope = m?.project_scope ?? null
     events.push({
       type: 'owner_message',
       session_id: sessionId,
+      project_scope: projectScope,
+      ...(projectScope ? { project_scope_instruction: projectScope.instruction } : {}),
       message: materialiseAttachments(m, { dir: attachmentDir, writeFile }),
     })
   }
@@ -461,6 +473,45 @@ export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, write
     rearm: 'devspec-remote-wait',
   })
   return events
+}
+
+/**
+ * Write a complete monitor payload and resolve only once the stream confirms it.
+ * Keeping this promise boundary injectable makes acknowledgement ordering testable.
+ */
+export function writeMonitorOutput(payload, stream = process.stdout) {
+  return new Promise((resolve, reject) => {
+    try {
+      stream.write(payload, (error) => (error ? reject(error) : resolve()))
+    } catch (error) {
+      reject(error)
+    }
+  })
+}
+
+/**
+ * Generate and write every model-visible event before acknowledging the inbox bytes.
+ * Any generation/output/commit error rejects; in particular, output failure leaves the
+ * caller's durable offset unchanged so the same command is retryable on the next arm.
+ */
+export async function emitOwnerMessageBatches(
+  batches,
+  {
+    inboxFile,
+    attachmentDir,
+    writeFile,
+    newOffset,
+    writeOutput = writeMonitorOutput,
+    commitOffset,
+  } = {},
+) {
+  const events = []
+  for (const batch of batches) {
+    events.push(...buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, writeFile }))
+  }
+  const payload = events.map((event) => JSON.stringify(event)).join('\n') + '\n'
+  await writeOutput(payload)
+  if (typeof commitOffset === 'function') await commitOffset(newOffset)
 }
 
 async function main() {
@@ -536,28 +587,30 @@ async function main() {
     const { lines, newOffset } = readNewLines(file, offset)
     if (lines.length > 0) {
       const batches = parseOwnerBatches(lines)
-      offset = newOffset
-      writeStatePatch(connectionId, { inbox_byte_offset: offset })
 
       if (batches.length > 0) {
         const attachmentDir = path.join(CONNECTIONS_DIR, `${connectionId}.attachments`)
-        for (const batch of batches) {
-          for (const event of buildOwnerMessageEvents(batch, {
-            inboxFile: file,
-            attachmentDir,
-            writeFile: (target, buf) => {
-              fs.mkdirSync(path.dirname(target), { recursive: true })
-              fs.writeFileSync(target, buf, { mode: 0o600 })
-            },
-          })) {
-            process.stdout.write(JSON.stringify(event) + '\n')
-          }
-        }
+        await emitOwnerMessageBatches(batches, {
+          inboxFile: file,
+          attachmentDir,
+          newOffset,
+          writeFile: (target, buf) => {
+            fs.mkdirSync(path.dirname(target), { recursive: true })
+            fs.writeFileSync(target, buf, { mode: 0o600 })
+          },
+          commitOffset: (committedOffset) =>
+            writeStatePatch(connectionId, { inbox_byte_offset: committedOffset }),
+        })
+        offset = newOffset
         process.stderr.write(
           `devspec-remote-wait: wake (${batches.reduce((n, b) => n + b.messages.length, 0)} msg) — exit 0\n`,
         )
         process.exit(0)
       }
+
+      // Non-command lines have no model-visible delivery to acknowledge.
+      offset = newOffset
+      writeStatePatch(connectionId, { inbox_byte_offset: offset })
     }
 
     await sleep(pollMs)
