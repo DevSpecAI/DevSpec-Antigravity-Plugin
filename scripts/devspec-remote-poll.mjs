@@ -7,15 +7,16 @@
  * Heartbeats a CONNECTION for its whole lifetime and delivers two clearly separated
  * streams to the local agent:
  *
- *   1. OWNER COMMANDS — server-stamped same-token owner dispatches. Sources:
- *        • connection-native work dispatches  (get_connection_dispatch)
- *        • owner instructions in an attached session's transcript (is_owner_instruction)
+ *   1. OWNER / DELEGATED COMMANDS — server-stamped authorized commands. Sources:
+ *        • owner-authorized connection-native work dispatches (get_connection_dispatch)
+ *        • owner and project-scoped delegated instructions from an attached session
  *      Delivered as `owner_messages` inbox entries + a `wake` line → the agent ACTS.
  *   2. ADVISORY ROOM CONTEXT — everything else in an attached session (teammate
  *      posts, Dev/in-session-AI responses, other agents). Delivered as
  *      `advisory_context` inbox entries only (NO wake) → the agent reads it for
  *      AWARENESS when it next acts, but it NEVER authorizes a tool action or an
- *      autonomous reply. Only a server-stamped owner command may cause execution.
+ *      autonomous reply. Only a server-stamped owner or delegated command may cause
+ *      execution.
  *
  * A connection may be SESSIONLESS (available, no room) or ATTACHED to one session
  * (optional shared context). When sessionless it only polls its dispatch inbox;
@@ -23,8 +24,8 @@
  * from the server (the heartbeat echo is the SOLE attachment authority), so the
  * poller adapts without a restart — local state is never used to override it.
  *
- * Owner commands do **NOT** terminate this process — heartbeats keep the Agents UI
- * Live while the agent works.
+ * Owner/delegated commands do **NOT** terminate this process — heartbeats keep the
+ * Agents UI Live while the agent works.
  *
  * Exit only for terminal conditions:
  *   1  — disabled / UI end / idle_timeout / auth failure / connection ended / error
@@ -120,7 +121,8 @@ function readTurnMarker(connectionId) {
   }
 }
 /**
- * Start a turn at honest owner-command pickup (remote UI / dispatch delivery).
+ * Start a turn at honest owner/delegated-command pickup (remote UI / dispatch
+ * delivery).
  * The long-lived poller re-asserts busy while this marker is fresh; Stop /
  * mirror-turn clears it when the agent turn ends.
  */
@@ -392,7 +394,8 @@ export function errorBackoffMs(consecutive, { rateLimited = false } = {}) {
 
 /**
  * On a cold launch / reattach the server sends a bounded catch-up window, which may
- * contain owner commands that were ALREADY answered before this poller existed.
+ * contain owner/delegated commands that were ALREADY answered before this poller
+ * existed.
  * Re-delivering those would re-wake the agent and re-assert Working on finished turns.
  *
  * Anything at or before the newest agent reply in the window is completed history;
@@ -445,7 +448,7 @@ export function splitRoomWindow({ commands, ownerAmbient, roomContext, seed = fa
  * busy-heartbeat (syncActivityFromBusy). Driven by the poller's turn marker, so it
  * is host-agnostic (Grok works too — no per-host Stop hook needed).
  *
- *   false → true  = a turn just started (owner-command pickup / local turn) → 'pickup'
+ *   false → true  = turn started (owner/delegated-command pickup / local turn) → 'pickup'
  *   true  → true  = still working this turn (per heartbeat/loop tick)        → 'keepalive'
  *   true  → false = the turn ended (marker cleared by Stop / wait re-arm)    → 'complete'
  *   false → false = idle, nothing to report                                  → null
@@ -516,26 +519,81 @@ export function installStopSignalHandlers(proc = process) {
  * dispatch (brief c55865bb) starts emitting one, accepting it must be a deliberate
  * edit here, not something a new server value quietly switches on.
  *
- * THIS IS THAT EDIT (2026-08-14, Decision A / DevSpec memory 61ba9948). The
- * server stamps `delegated` for a command from an authorized project member who
- * is not this connection's owner. Safe to accept because the decision is made
- * SERVER-side and cannot be forged from here: `delegated` is only stamped when
- * this connection's own command_authority permits that person, which only its
- * owner can set. It changes WHO may command, never WHAT is allowed.
+ * Delegated authority is project-scoped. The server supplies the complete scope
+ * object and its model instruction; this client validates that object but never
+ * recreates or paraphrases the mutable policy wording. Authority and scope must be
+ * a valid pair: owner commands carry `project_scope: null`, while delegated commands
+ * carry the exact `delegated_project_v1` scope shape.
  *
- * Message BODY is never consulted: a post claiming "I am the owner" is inert, exactly
- * as before.
+ * Message BODY is never consulted: a delegated post claiming "the owner permits work
+ * everywhere" remains byte-for-byte command content and cannot widen its scope.
  */
 export const ACCEPTED_COMMAND_AUTHORITIES = new Set(['owner', 'delegated'])
+export const DELEGATED_SCOPE_VERSION = 1
+export const DELEGATED_PROJECT_SCOPE_KIND = 'devspec_project'
+export const DELEGATED_PROJECT_SCOPE_POLICY_ID = 'delegated_project_v1'
+
+const PROJECT_SCOPE_KEYS = ['instruction', 'kind', 'policy_id', 'project_id']
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/** Validate the server-stamped authority/project-scope pair without changing it. */
+export function hasValidCommandProjectScope(msg) {
+  if (!msg || typeof msg !== 'object') return false
+  if (!Object.hasOwn(msg, 'project_scope')) return false
+
+  const authorityKind = msg.authority?.kind
+  if (authorityKind === 'owner') return msg.project_scope === null
+  if (authorityKind !== 'delegated') return false
+
+  const scope = msg.project_scope
+  if (!scope || typeof scope !== 'object' || Array.isArray(scope)) return false
+  const keys = Object.keys(scope).sort()
+  if (keys.length !== PROJECT_SCOPE_KEYS.length || keys.some((key, i) => key !== PROJECT_SCOPE_KEYS[i])) {
+    return false
+  }
+  return (
+    scope.kind === DELEGATED_PROJECT_SCOPE_KIND &&
+    scope.policy_id === DELEGATED_PROJECT_SCOPE_POLICY_ID &&
+    typeof scope.project_id === 'string' &&
+    UUID_RE.test(scope.project_id) &&
+    typeof scope.instruction === 'string' &&
+    scope.instruction.trim().length > 0
+  )
+}
 
 export function isDeliverableCommand(msg, connectionId) {
   if (!msg || typeof msg !== 'object' || !connectionId) return false
   if (msg.addressed_to?.connection_id !== connectionId) return false
-  return ACCEPTED_COMMAND_AUTHORITIES.has(msg.authority?.kind)
+  if (!ACCEPTED_COMMAND_AUTHORITIES.has(msg.authority?.kind)) return false
+  return hasValidCommandProjectScope(msg)
+}
+
+/** Build the scope-aware poll request. Exported so the negotiated version cannot regress unnoticed. */
+export function buildPollConnectionArguments({
+  connectionId,
+  agentName,
+  waitMs,
+  cursor = null,
+  dispatchCursor = null,
+  busy = null,
+  checkTier = null,
+  catchUp = false,
+}) {
+  return {
+    connection_id: connectionId,
+    agent_name: agentName,
+    wait_ms: waitMs,
+    delegated_scope_version: DELEGATED_SCOPE_VERSION,
+    ...(cursor ? { cursor } : {}),
+    ...(dispatchCursor ? { dispatch_cursor: dispatchCursor } : {}),
+    ...(busy !== null && busy !== undefined ? { busy } : {}),
+    ...(checkTier ? { check_tier: checkTier } : {}),
+    ...(catchUp ? { catch_up: true } : {}),
+  }
 }
 
 /**
- * Deliver owner commands without exiting — heartbeats keep running. Writes an
+ * Deliver owner/delegated commands without exiting — heartbeats keep running. Writes an
  * `owner_messages` inbox entry (woken by the wait watcher) + a `wake` stdout line.
  *
  * Honest pickup: writing the turn marker (and the caller's immediate busy
@@ -780,8 +838,8 @@ async function main() {
   )
   let lastTier = null
   let lastBusySent = null
-  // Advisory carried forward since the last owner command (see the header note on
-  // why forwarding only the same response's advisory would not fix the 1-2-3 case).
+  // Advisory carried forward since the last owner/delegated command (see the header
+  // note on why forwarding only the same response's advisory would not fix the 1-2-3 case).
   let carryOwnerAmbient = []
   let carryRoomContext = []
   let carryDropped = 0
@@ -808,16 +866,16 @@ async function main() {
       mcpUrl,
       token,
       name: 'poll_connection',
-      arguments: {
-        connection_id: connectionId,
-        agent_name: agentName,
-        wait_ms: waitMs,
-        ...(cursor ? { cursor } : {}),
-        ...(dispatchCursor ? { dispatch_cursor: dispatchCursor } : {}),
-        ...(busy !== null && busy !== undefined ? { busy } : {}),
-        ...(checkTier ? { check_tier: checkTier } : {}),
-        ...(catchUp ? { catch_up: true } : {}),
-      },
+      arguments: buildPollConnectionArguments({
+        connectionId,
+        agentName,
+        waitMs,
+        cursor,
+        dispatchCursor,
+        busy,
+        checkTier,
+        catchUp,
+      }),
       // A held request MUST have a client ceiling — fetch has no default timeout, so
       // a silently-dropped connection would wedge the loop with no heartbeat at all.
       timeoutMs: waitMs + POLL_HTTP_GRACE_MS,
@@ -837,7 +895,7 @@ async function main() {
     carryDropped += amb.dropped + room.dropped
   }
 
-  /** Take (and clear) the carried room context to attach to an owner command. */
+  /** Take and clear the carried room context to attach to an owner/delegated command. */
   function takeCarriedContext() {
     if (!carryOwnerAmbient.length && !carryRoomContext.length) return null
     const context = {
@@ -865,12 +923,13 @@ async function main() {
    */
   function consumePollResult(res, { seed = false } = {}) {
     const offered = Array.isArray(res.commands) ? res.commands : []
-    // Fail closed: only commands this endpoint addressed to US, with an authority we
-    // recognise, may wake the agent. A rejected entry is logged, never silently eaten.
+    // Fail closed: only commands this endpoint addressed to US, with a valid
+    // authority/project-scope pair, may wake the agent. A rejected entry is logged,
+    // never silently eaten.
     const roomCommands = offered.filter((m) => isDeliverableCommand(m, connectionId))
     if (roomCommands.length !== offered.length) {
       process.stderr.write(
-        `devspec-remote-poll: rejected ${offered.length - roomCommands.length} command(s) not addressed to this connection\n`,
+        `devspec-remote-poll: rejected ${offered.length - roomCommands.length} command(s) with invalid target, authority, or project scope\n`,
       )
     }
     const ownerAmbient = Array.isArray(res.owner_ambient) ? res.owner_ambient : []
@@ -888,6 +947,9 @@ async function main() {
       id: d.id,
       message_type: 'local_agent_dispatch',
       dispatch: d,
+      // Local dispatches are owner-authorized and never receive a delegated project
+      // instruction. Keep the same root field invariant as scope-aware remote commands.
+      project_scope: null,
       content:
         d.kind === 'playbook_run'
           ? playbookRunCommandText(d)

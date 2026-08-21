@@ -10,8 +10,8 @@ Tracked work uses the MCP-served [`devspec://product/implementation-contract`](d
 
 Same transport shape as other local-poller hosts:
 
-1. Owner dispatch → `poll_connection` → connection inbox.
-2. Wait (or host-equivalent) wakes the model with owner command text.
+1. Authorized owner/delegated dispatch → scope-aware `poll_connection` → connection inbox, preserving the root `project_scope`.
+2. Wait wakes the model with the command plus delegated-only server instruction; owner commands receive no project instruction.
 3. Model acts; when attached, model `post_session_message({ connection_id })`.
 4. Hooks keep busy/heartbeat honest — they do not own the product reply.
 
@@ -28,7 +28,7 @@ Antigravity is **not** OpenCode-native inject and **not** the Codex app-server b
 
 ## Host limitation
 
-Antigravity exposes no verified blocking pre-tool hook. The plugin therefore cannot enforce the DevSpec mutation boundary immediately before a tool call: connecting alone is not a request to mutate DevSpec, and the user must explicitly request tracked work or another DevSpec write. The existing `UserPromptSubmit` hook remains prompt-mirror/activity transport; it does not inject the contract. The MCP-served contract and live tool schemas remain authoritative when work is requested.
+Antigravity exposes no verified blocking pre-tool hook. The plugin therefore cannot enforce the DevSpec mutation boundary immediately before a tool call: connecting alone is not a request to mutate DevSpec, and the user must explicitly request tracked work or another DevSpec write. The existing `UserPromptSubmit` hook remains prompt-mirror/activity transport; it does not inject the contract. For delegated remote commands, the monitor makes the server-owned project instruction model-visible; this is guidance at the host seam, not a blocking filesystem hook. The MCP-served contracts and live tool schemas remain authoritative when work is requested, including [`devspec://product/remote-ingress-contract`](devspec://product/remote-ingress-contract) for mutable remote-ingress policy.
 
 ## What not to change lightly
 
