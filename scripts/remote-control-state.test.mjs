@@ -10,6 +10,7 @@ import {
   ensurePollerForConnection,
   isRecoverableEndReason,
   mintLocalId,
+  negotiateConnectionCapability,
   ownerAlive,
   reapDeadPollers,
   resolveLocalAction,
@@ -158,6 +159,8 @@ describe('resolveLocalAction (connection-native)', () => {
     assert.equal(r.connection_id, connectionId)
     assert.equal(r.session_id, sessionId)
     assert.equal(r.session_codename, 'Colorful Possum')
+    assert.equal(r.requires_state_write, true)
+    assert.match(r.note, /state write.*rotate capability.*before re-arming/i)
   })
 
   it('already_live for a SESSIONLESS connection (no session attached)', () => {
@@ -183,6 +186,7 @@ describe('resolveLocalAction (connection-native)', () => {
     assert.equal(r.action, 'already_live')
     assert.equal(r.connection_id, connectionId)
     assert.equal(r.session_id, null)
+    assert.equal(r.requires_state_write, true)
   })
 
   it('reconnect after recent local_stop for THIS conversation only', () => {
@@ -321,6 +325,50 @@ describe('resolveLocalAction (connection-native)', () => {
   })
 })
 
+describe('negotiateConnectionCapability', () => {
+  const input = {
+    mcpUrl: 'https://example.test/mcp',
+    token: 'dvs_test',
+    projectId: '11111111-1111-4111-8111-111111111111',
+    localId: 'local-conversation',
+    connectionId: '22222222-2222-4222-8222-222222222222',
+    agentName: 'Antigravity',
+    cwd: '/repo',
+  }
+
+  it('requests version 1 and extracts the secret only from result _meta', async () => {
+    const calls = []
+    const result = await negotiateConnectionCapability({
+      ...input,
+      call: async (request) => {
+        calls.push(request)
+        return {
+          data: { connection_id: input.connectionId, connection_capability_version: 1 },
+          meta: { devspec: { connection_capability: { version: 1, value: 'dvsc_secret' } } },
+        }
+      },
+    })
+    assert.deepEqual(result, { ok: true, version: 1, value: 'dvsc_secret' })
+    assert.equal(calls[0].arguments.connection_capability_version, 1)
+    assert.equal(calls[0].includeMeta, true)
+  })
+
+  it('fails closed on a different bond or missing hidden capability', async () => {
+    const mismatch = await negotiateConnectionCapability({
+      ...input,
+      call: async () => ({ data: { connection_id: '33333333-3333-4333-8333-333333333333' }, meta: null }),
+    })
+    assert.equal(mismatch.ok, false)
+    assert.match(mismatch.error, /different connection bond/)
+    const missing = await negotiateConnectionCapability({
+      ...input,
+      call: async () => ({ data: { connection_id: input.connectionId }, meta: null }),
+    })
+    assert.equal(missing.ok, false)
+    assert.match(missing.error, /result _meta/)
+  })
+})
+
 describe('ownerAlive', () => {
   it('this process is alive; pid 1 / bad input are not adopted', () => {
     assert.equal(ownerAlive(process.pid), true)
@@ -341,27 +389,30 @@ describe('reapDeadPollers (connection-native)', () => {
 
   function run(states, opts = {}) {
     const killed = []
+    const cleared = []
     const reaped = reapDeadPollers({
       agent,
       listStates: () => states,
       findPids: opts.findPids || findPidsAll,
       isOwnerAlive: opts.isOwnerAlive || allAlive,
+      clearCapability: (connectionId) => cleared.push(connectionId),
       kill: (pid) => {
         killed.push(pid)
         return true
       },
       ...opts.args,
     })
-    return { reaped, killed }
+    return { reaped, killed, cleared }
   }
 
-  it('reaps a disabled connection', () => {
-    const { reaped, killed } = run([
+  it('reaps a disabled connection and clears its capability', () => {
+    const { reaped, killed, cleared } = run([
       { connection_id: 'c-disabled', agent_name: agent, enabled: false },
     ])
     assert.equal(reaped.length, 1)
     assert.equal(reaped[0].reason, 'disabled')
     assert.deepEqual(killed, ['pid-c-disabled'])
+    assert.deepEqual(cleared, ['c-disabled'])
   })
 
   it('reaps an owner-gone connection (owner_pid recorded but dead)', () => {
@@ -445,11 +496,12 @@ describe('reapDeadPollers (connection-native)', () => {
     )
   })
 
-  it('skips connections with no running poller', () => {
-    const { reaped } = run([{ connection_id: 'c-nopoller', agent_name: agent, enabled: false }], {
+  it('clears capability for dead state even when no poller remains to reap', () => {
+    const { reaped, cleared } = run([{ connection_id: 'c-nopoller', agent_name: agent, enabled: false }], {
       findPids: () => [],
     })
     assert.equal(reaped.length, 0)
+    assert.deepEqual(cleared, ['c-nopoller'])
   })
 })
 

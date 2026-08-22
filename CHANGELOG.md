@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.9.0
+
+### Shared session plans without widening Antigravity's hot surface
+
+- Work-entry, tracking, and plan-threshold authority remains at
+  `devspec://product/implementation-contract`; routine investigation stays plan-free.
+- Attached connections negotiate a hidden capability for an on-demand,
+  schema-complete `manage_plan` bridge with revisioned atomic advance, resume,
+  complete/abandon, and explicit authorized adoption mechanics. Already-live
+  re-arms rotate first; stale/pre-capability state fails closed, and `--schema`
+  emits exact discriminated per-action objects.
+- Remote polling now requests ingress, delegated scope, and active-plan projection
+  v1, strictly validates canonical 1.3 plan inventories, and retains strict 1.2
+  compatibility. All-room plans are advisory read-awareness only.
+- Tests cover routine no-plan discovery, plan mechanics, capability negotiation,
+  reconnect revisions, orphan adoption inputs, cross-owner reads, and strict wire
+  negotiation. The existing two-skill, host-native workflow remains bounded.
+
 ## 0.8.0
 
 ### MCP-served implementation contract is the runtime authority

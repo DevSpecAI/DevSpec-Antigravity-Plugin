@@ -14,6 +14,7 @@ const CURRENT_SURFACES = [
   'skills/devspec-remote/SKILL.md',
   'skills/devspec-remote-stop/SKILL.md',
   'scripts/devspec-remote-poll.mjs',
+  'scripts/devspec-plan.mjs',
 ]
 
 function read(relativePath) {
@@ -105,9 +106,9 @@ describe('MCP-served implementation contract', () => {
   it('keeps package metadata and the current changelog release aligned', () => {
     const pkg = JSON.parse(read('package.json'))
     const firstRelease = read('CHANGELOG.md').match(/^## (\d+\.\d+\.\d+)$/m)?.[1]
-    assert.equal(pkg.version, '0.8.0')
+    assert.equal(pkg.version, '0.9.0')
     assert.equal(firstRelease, pkg.version)
-    const currentEntry = read('CHANGELOG.md').split(/^## 0\.7\.0$/m)[0]
+    const currentEntry = read('CHANGELOG.md').split(/^## 0\.8\.0$/m)[0]
     assert.ok(currentEntry.includes(CONTRACT))
   })
 })

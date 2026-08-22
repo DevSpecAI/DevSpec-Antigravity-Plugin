@@ -72,6 +72,8 @@ import { fileURLToPath } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
+import { stripConnectionCapability } from './connection-capability-state.mjs'
+import { normalizeRemoteIngressV1 } from './remote-ingress-v1.mjs'
 
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
@@ -244,23 +246,26 @@ function appendInbox(
   }
 }
 
+/** Pure terminal-state projection: every end revokes the local capability. */
+export function disabledLocalConnectionState(prev, { connectionId, reason, now = new Date().toISOString() }) {
+  return {
+    ...stripConnectionCapability(prev),
+    enabled: false,
+    connection_id: connectionId || prev?.connection_id,
+    // The server's real word for an Agents-page End is 'ui'; 'ended_from_ui' is
+    // this poller's own legacy label. Both must set the flag.
+    ended_from_ui: reason === 'ui' || reason === 'ended_from_ui',
+    end_reason: reason,
+    updated_at: now,
+  }
+}
+
 /** Disable THIS connection only — never other remotes on the machine. */
 function disableLocalState({ connectionId, reason }) {
   try {
     const prev = readState(connectionId) || {}
     writeState(
-      {
-        ...prev,
-        enabled: false,
-        connection_id: connectionId || prev.connection_id,
-        // The server's real word for an Agents-page End is 'ui'; 'ended_from_ui' is
-        // this poller's own legacy label. Both must set the flag, or a genuine UI
-        // End would stop stamping it the moment the server started telling the
-        // truth (brief e691c68a) — and devspec-remote-wait.mjs:533 reads this flag.
-        ended_from_ui: reason === 'ui' || reason === 'ended_from_ui',
-        end_reason: reason,
-        updated_at: new Date().toISOString(),
-      },
+      disabledLocalConnectionState(prev, { connectionId, reason }),
       connectionId,
     )
   } catch (e) {
@@ -529,7 +534,9 @@ export function installStopSignalHandlers(proc = process) {
  * everywhere" remains byte-for-byte command content and cannot widen its scope.
  */
 export const ACCEPTED_COMMAND_AUTHORITIES = new Set(['owner', 'delegated'])
+export const REMOTE_INGRESS_VERSION = 1
 export const DELEGATED_SCOPE_VERSION = 1
+export const ACTIVE_PLAN_PROJECTION_VERSION = 1
 export const DELEGATED_PROJECT_SCOPE_KIND = 'devspec_project'
 export const DELEGATED_PROJECT_SCOPE_POLICY_ID = 'delegated_project_v1'
 
@@ -568,12 +575,37 @@ export function isDeliverableCommand(msg, connectionId) {
   return hasValidCommandProjectScope(msg)
 }
 
-/** Build the scope-aware poll request. Exported so the negotiated version cannot regress unnoticed. */
+/**
+ * Normalize negotiated canonical delivery into the existing Antigravity inbox lanes.
+ * Legacy top-level arrays are never command sources after negotiation. Strict 1.3
+ * projections remain advisory; preserved strict 1.2 envelopes remain readable.
+ */
+export function normalizePollDelivery(res, connectionId) {
+  if (!res || typeof res !== 'object') return { ok: false, error: 'malformed poll response' }
+  if (res.changed !== true) {
+    return { ok: true, changed: false, commands: [], context: [], activeSessionPlans: null }
+  }
+  const parsed = normalizeRemoteIngressV1(res, connectionId)
+  if (!parsed.ok) return parsed
+  const envelope = parsed.envelope
+  const commands = parsed.wake ? envelope.commands : []
+  return {
+    ok: true,
+    changed: true,
+    envelope,
+    commands,
+    context: Object.values(envelope.context).flat().sort((a, b) => a.order.sequence - b.order.sequence),
+    activeSessionPlans: envelope.active_session_plans ?? null,
+  }
+}
+
+/** Build the negotiated poll request. Exported so every version remains explicit. */
 export function buildPollConnectionArguments({
   connectionId,
   agentName,
   waitMs,
   cursor = null,
+  cursorV2 = null,
   dispatchCursor = null,
   busy = null,
   checkTier = null,
@@ -583,8 +615,10 @@ export function buildPollConnectionArguments({
     connection_id: connectionId,
     agent_name: agentName,
     wait_ms: waitMs,
+    ingress_version: REMOTE_INGRESS_VERSION,
     delegated_scope_version: DELEGATED_SCOPE_VERSION,
-    ...(cursor ? { cursor } : {}),
+    active_plan_projection_version: ACTIVE_PLAN_PROJECTION_VERSION,
+    ...(cursorV2 ? { cursor_v2: cursorV2 } : cursor ? { cursor } : {}),
     ...(dispatchCursor ? { dispatch_cursor: dispatchCursor } : {}),
     ...(busy !== null && busy !== undefined ? { busy } : {}),
     ...(checkTier ? { check_tier: checkTier } : {}),
@@ -661,7 +695,8 @@ function deliverAdvisory(connectionId, advisoryMsgs, sessionId) {
  *
  * A playbook is not an action item — it is a job the owner saved to run again and
  * again, and it never completes. So this deliberately does NOT send the agent down
- * the assignment protocol; it sends it to the playbook run tools instead.
+ * an action-item path; it sends it to the playbook run tools instead. Requested
+ * tracked work remains governed by devspec://product/implementation-contract.
  *
  * The permission line matters: a look-only playbook must not be "helpfully" fixed
  * while the agent is in there.
@@ -827,6 +862,7 @@ async function main() {
   installStopSignalHandlers()
 
   let cursor = args.cursor || state?.cursor_after_message_id || null
+  let cursorV2 = state?.ingress_cursor_v2 || null
   // Second, independent cursor for the DISPATCH clock. Live assignments stay live
   // while the agent works them, so the server's dispatch marker cannot be compared
   // against the message cursor without pinning the hold permanently open — echoing
@@ -843,6 +879,7 @@ async function main() {
   let carryOwnerAmbient = []
   let carryRoomContext = []
   let carryDropped = 0
+  let latestActiveSessionPlans = state?.active_session_plans ?? null
 
   /** Persist a state patch without clobbering concurrent fields. Best-effort. */
   function patchState(patch) {
@@ -871,6 +908,7 @@ async function main() {
         agentName,
         waitMs,
         cursor,
+        cursorV2,
         dispatchCursor,
         busy,
         checkTier,
@@ -897,11 +935,12 @@ async function main() {
 
   /** Take and clear the carried room context to attach to an owner/delegated command. */
   function takeCarriedContext() {
-    if (!carryOwnerAmbient.length && !carryRoomContext.length) return null
+    if (!carryOwnerAmbient.length && !carryRoomContext.length && !latestActiveSessionPlans) return null
     const context = {
       owner_ambient: carryOwnerAmbient,
       room_context: carryRoomContext,
       dropped: carryDropped,
+      ...(latestActiveSessionPlans ? { active_session_plans: latestActiveSessionPlans } : {}),
       note:
         'Room context delivered WITH the command above. `owner_ambient` is your owner ' +
         'speaking in the room but NOT to you; `room_context` is everyone else. Read both ' +
@@ -922,6 +961,75 @@ async function main() {
    * tail is delivered (advisory is never filtered — that IS the orientation).
    */
   function consumePollResult(res, { seed = false } = {}) {
+    const canonical = normalizePollDelivery(res, connectionId)
+    if (!canonical.ok) {
+      process.stderr.write(`devspec-remote-poll: rejected negotiated ingress: ${canonical.error}\n`)
+      return false
+    }
+    if (canonical.changed) {
+      // The server's canonical delivery state owns replay/reseed behavior; `seed`
+      // never reclassifies a canonical command locally.
+      void seed
+      const dispatches = Array.isArray(res.dispatches) ? res.dispatches : []
+      if (dispatches.some((d) => d?.kind !== 'playbook_run')) {
+        process.stderr.write('devspec-remote-poll: rejected non-playbook dispatch from negotiated poll\n')
+        return false
+      }
+      const freshDispatches = dispatches.filter((d) => d?.id && !deliveredDispatchIds.has(d.id))
+      for (const d of freshDispatches) deliveredDispatchIds.add(d.id)
+      const dispatchCommands = freshDispatches.map((d) => ({
+        id: d.id,
+        message_type: 'local_agent_dispatch',
+        dispatch: d,
+        project_scope: null,
+        content: playbookRunCommandText(d),
+        remote_control: { is_owner_instruction: true, is_advisory: false, role: 'owner_instruction' },
+      }))
+
+      cursor = typeof res.cursor === 'string' && res.cursor ? res.cursor : cursor
+      cursorV2 = typeof res.cursor_v2 === 'string' && res.cursor_v2 ? res.cursor_v2 : cursorV2
+      dispatchCursor = typeof res.dispatch_cursor === 'string' ? res.dispatch_cursor : dispatchCursor
+      latestActiveSessionPlans = canonical.activeSessionPlans
+
+      const advisory = canonical.context
+      if (advisory.length > 0) {
+        deliverAdvisory(connectionId, advisory, sessionId)
+        carryAdvisory([], advisory)
+      }
+      if (latestActiveSessionPlans) {
+        const planAwareness = [{
+          message_type: 'active_session_plans',
+          advisory: true,
+          content: latestActiveSessionPlans.authority_note,
+          active_session_plans: latestActiveSessionPlans,
+        }]
+        deliverAdvisory(connectionId, planAwareness, sessionId)
+      }
+
+      const commands = [...dispatchCommands, ...canonical.commands]
+      if (commands.length > 0) {
+        deliverOwnerMessages(
+          connectionId,
+          commands,
+          cursorV2 || cursor,
+          canonical.commands[0]?.requester?.user_id || ownerUserId,
+          sessionId,
+          takeCarriedContext(),
+        )
+      }
+      const delivered = commands.length > 0 || advisory.length > 0 || Boolean(latestActiveSessionPlans)
+      patchState({
+        ingress_version: REMOTE_INGRESS_VERSION,
+        ingress_contract_version: canonical.envelope.contract_version,
+        ingress_cursor_v2: cursorV2,
+        cursor_after_message_id: cursor,
+        dispatch_cursor: dispatchCursor,
+        active_session_plans: latestActiveSessionPlans,
+        delivered_dispatch_ids: [...deliveredDispatchIds].slice(-200),
+      })
+      return delivered
+    }
+
     const offered = Array.isArray(res.commands) ? res.commands : []
     // Fail closed: only commands this endpoint addressed to US, with a valid
     // authority/project-scope pair, may wake the agent. A rejected entry is logged,
@@ -941,7 +1049,9 @@ async function main() {
       typeof res.dispatch_cursor === 'string' ? res.dispatch_cursor : dispatchCursor
 
     // Dispatched work → owner commands (the assignment reference wakes the agent).
-    const freshDispatches = dispatches.filter((d) => d?.id && !deliveredDispatchIds.has(d.id))
+    const freshDispatches = dispatches.filter(
+      (d) => d?.kind === 'playbook_run' && d?.id && !deliveredDispatchIds.has(d.id),
+    )
     for (const d of freshDispatches) deliveredDispatchIds.add(d.id)
     const dispatchCommands = freshDispatches.map((d) => ({
       id: d.id,
@@ -950,10 +1060,7 @@ async function main() {
       // Local dispatches are owner-authorized and never receive a delegated project
       // instruction. Keep the same root field invariant as scope-aware remote commands.
       project_scope: null,
-      content:
-        d.kind === 'playbook_run'
-          ? playbookRunCommandText(d)
-          : `📦 DevSpec delivered \`${d.id}\` to this connection, but this plugin does not recognise its kind. Inspect it with get_connection_dispatch and report what you see. For tracked action-item work, devspec://product/implementation-contract is the MCP-served runtime authority.`,
+      content: playbookRunCommandText(d),
       remote_control: { is_owner_instruction: true, is_advisory: false, role: 'owner_instruction' },
     }))
 
@@ -1167,11 +1274,13 @@ async function main() {
       )
       sessionId = adopt.sessionId
       cursor = null // fresh room → reseed (the ONE reseed path)
+      cursorV2 = null
+      latestActiveSessionPlans = null
       needsSeed = true // and treat the next window as history, not as new commands
       carryOwnerAmbient = []
       carryRoomContext = []
       carryDropped = 0
-      patchState({ session_id: sessionId, cursor_after_message_id: null })
+      patchState({ session_id: sessionId, cursor_after_message_id: null, ingress_cursor_v2: null, active_session_plans: null })
       continue
     }
 

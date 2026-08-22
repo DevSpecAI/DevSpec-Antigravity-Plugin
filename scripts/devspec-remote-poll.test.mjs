@@ -7,12 +7,17 @@
  */
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
+import { FIXTURE_ID, fixtureEnvelope, fixturePollResponse } from './remote-ingress-test-fixtures.mjs'
 import {
   isDeliverableCommand,
   hasValidCommandProjectScope,
   buildPollConnectionArguments,
+  normalizePollDelivery,
+  REMOTE_INGRESS_VERSION,
   DELEGATED_SCOPE_VERSION,
+  ACTIVE_PLAN_PROJECTION_VERSION,
   cadenceFor,
+  disabledLocalConnectionState,
   installStopSignalHandlers,
   resolveServerAttachment,
   verbForTurnTransition,
@@ -166,18 +171,45 @@ describe('buildPollConnectionArguments (delegated scope negotiation)', () => {
       checkTier: 'responsive',
       catchUp: true,
     })
+    assert.equal(REMOTE_INGRESS_VERSION, 1)
     assert.equal(DELEGATED_SCOPE_VERSION, 1)
+    assert.equal(ACTIVE_PLAN_PROJECTION_VERSION, 1)
     assert.deepEqual(args, {
       connection_id: ME,
       agent_name: 'Antigravity',
       wait_ms: 25_000,
+      ingress_version: 1,
       delegated_scope_version: 1,
+      active_plan_projection_version: 1,
       cursor: 'message-cursor',
       dispatch_cursor: 'dispatch-cursor',
       busy: false,
       check_tier: 'responsive',
       catch_up: true,
     })
+  })
+})
+
+describe('normalizePollDelivery (strict 1.3 active-plan delivery)', () => {
+  it('accepts the current revision and exposes all-room plans as advisory only', () => {
+    const accepted = normalizePollDelivery(fixturePollResponse(), FIXTURE_ID.connection)
+    assert.equal(accepted.ok, true)
+    assert.equal(accepted.commands.length, 1)
+    assert.equal(accepted.activeSessionPlans.advisory, true)
+    assert.equal(accepted.activeSessionPlans.plans[0].revision, 7)
+  })
+
+  it('keeps replay/read awareness inert', () => {
+    const envelope = fixtureEnvelope({ wakeKind: 'history_reseed', deliveryState: 'reseed' })
+    const accepted = normalizePollDelivery(fixturePollResponse({ envelope }), FIXTURE_ID.connection)
+    assert.equal(accepted.ok, true)
+    assert.deepEqual(accepted.commands, [])
+    assert.ok(accepted.activeSessionPlans)
+  })
+
+  it('fails closed instead of consulting top-level legacy command arrays', () => {
+    const accepted = normalizePollDelivery({ changed: true, commands: [command()] }, FIXTURE_ID.connection)
+    assert.equal(accepted.ok, false)
   })
 })
 
@@ -289,6 +321,22 @@ describe('trimAdvisoryCarry', () => {
  * The rule: only a deliberate human act is permanent. Absence of a reason means we
  * do not know, and "we do not know" is recoverable.
  */
+describe('terminal local state capability cleanup', () => {
+  it('removes capability fields on every poller end reason', () => {
+    for (const reason of ['ui', 'local_stop', 'owner_gone', 'server_ended', 'auth']) {
+      const next = disabledLocalConnectionState({
+        connection_id: ME,
+        connection_capability: 'dvsc_secret',
+        connection_capability_version: 1,
+      }, { connectionId: ME, reason, now: '2026-08-22T00:00:00.000Z' })
+      assert.equal(next.enabled, false)
+      assert.equal(next.end_reason, reason)
+      assert.equal(Object.hasOwn(next, 'connection_capability'), false)
+      assert.equal(Object.hasOwn(next, 'connection_capability_version'), false)
+    }
+  })
+})
+
 describe('pollTerminalReason', () => {
   it('treats a reasonless not_found as RECOVERABLE, not as a UI end', () => {
     // THE regression. This used to return the string 'ended_from_ui'.

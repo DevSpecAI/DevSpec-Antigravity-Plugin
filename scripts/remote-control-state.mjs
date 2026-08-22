@@ -32,7 +32,7 @@
  *
  * Usage:
  *   node remote-control-state.mjs write --connection-id <uuid> [--session <uuid>]
- *       [--agent "Antigravity"] [--cwd <path>] [--codename "Colorful Possum"]
+ *       [--agent "Antigravity"] [--project-id <uuid>] [--cwd <path>] [--codename "Colorful Possum"]
  *       [--title "…"] [--local-id <id>] [--owner-pid <pid>] [--host-token <bearer>] [--no-poller]
  *   node remote-control-state.mjs ensure-poller --connection-id <uuid> [--session <uuid>] [--owner-pid <pid>]
  *   node remote-control-state.mjs disable --connection-id <uuid>
@@ -57,6 +57,11 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
+import { mcpToolsCall } from './mcp-call.mjs'
+import {
+  applyConnectionCapabilityRotation,
+  stripConnectionCapability,
+} from './connection-capability-state.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 
 const DEVSPEC_DIR = path.join(os.homedir(), '.devspec')
@@ -103,6 +108,7 @@ function parseArgs(argv) {
     else if (a === '--connection-id' || a === '--connection_id' || a === '--connection') {
       out['connection-id'] = argv[++i]
     } else if (a === '--agent' || a === '--agent_name') out.agent = argv[++i]
+    else if (a === '--project-id' || a === '--project_id') out['project-id'] = argv[++i]
     else if (a === '--cwd') out.cwd = argv[++i]
     else if (a === '--url') out.url = argv[++i]
     else if (a === '--codename' || a === '--session_codename') out.codename = argv[++i]
@@ -384,7 +390,7 @@ function disableConnectionState(connectionId, { agent = null, localId = null } =
   const perPath = connectionPath(connectionId)
   const prev = readJson(perPath) || readJson(LEGACY_PATH) || {}
   const next = {
-    ...prev,
+    ...stripConnectionCapability(prev),
     connection_id: connectionId,
     enabled: false,
     end_reason: prev.end_reason || 'local_stop',
@@ -457,6 +463,17 @@ function scanConnectionStates() {
  */
 const STALE_NO_OWNER_REAP_MS = 60 * 60 * 1000 // 1h
 
+/** Clear a dead connection's local capability from both state pointers. */
+function clearStoredConnectionCapability(connectionId) {
+  const perPath = connectionPath(connectionId)
+  const perState = readJson(perPath)
+  if (perState) writeJson(perPath, stripConnectionCapability(perState))
+  const legacy = readJson(LEGACY_PATH)
+  if (legacy?.connection_id === connectionId) {
+    writeJson(LEGACY_PATH, stripConnectionCapability(legacy))
+  }
+}
+
 /**
  * Reap PROVABLY-DEAD pollers — the connect-time / SessionStart backstop for the
  * self-terminating poller. A poller is reaped when its connection is provably dead
@@ -474,6 +491,7 @@ export function reapDeadPollers({
   listStates = scanConnectionStates,
   findPids = findPollerPidsForConnection,
   isOwnerAlive = ownerAlive,
+  clearCapability = clearStoredConnectionCapability,
   kill = (pid) => {
     try {
       process.kill(pid, 'SIGTERM')
@@ -490,8 +508,6 @@ export function reapDeadPollers({
     if (agent && s.agent_name && String(s.agent_name).toLowerCase() !== String(agent).toLowerCase()) {
       continue
     }
-    const pids = findPids(s.connection_id)
-    if (!pids.length) continue
     const ownerPid = Number.isInteger(s.owner_pid) && s.owner_pid > 1 ? s.owner_pid : null
     const ownerGone = ownerPid !== null && !isOwnerAlive(ownerPid)
     const provablyDead = s.enabled === false || s.ended_from_ui === true || ownerGone
@@ -507,6 +523,9 @@ export function reapDeadPollers({
     }
 
     if (!provablyDead && !staleNoOwner) continue
+    clearCapability(s.connection_id)
+    const pids = findPids(s.connection_id)
+    if (!pids.length) continue
     const killed = pids.filter((pid) => kill(pid))
     reaped.push({
       connection_id: s.connection_id,
@@ -761,7 +780,8 @@ export function resolveLocalAction({
     return {
       ...base,
       action: 'already_live',
-      note: `This conversation is already connected as "${base.session_codename || bond.connection_id.slice(0, 8)}". Re-arm wait/poller; do not re-register.`,
+      requires_state_write: true,
+      note: `This conversation is already connected as "${base.session_codename || bond.connection_id.slice(0, 8)}". Run state write to mechanically re-register this bond and rotate capability before re-arming the wait; do not create a new connection.`,
     }
   }
 
@@ -793,6 +813,52 @@ export function resolveLocalAction({
       : ageMs != null && ageMs > maxAgeMs
         ? `Prior bond is older than ${base.max_age_minutes}m — register a fresh connection.`
         : 'Prior bond is not recoverable — register a fresh connection.',
+  }
+}
+
+/**
+ * Re-register the stable token/local-id bond to rotate a version-1 plan capability.
+ * The secret is read only from MCP result _meta, compared to the expected connection,
+ * and persisted by the caller in a mode-0600 connection state file.
+ */
+export async function negotiateConnectionCapability({
+  mcpUrl,
+  token,
+  projectId,
+  localId,
+  connectionId,
+  agentName = AGENT_NAME,
+  cwd = process.cwd(),
+  call = mcpToolsCall,
+} = {}) {
+  if (!mcpUrl || !token || !projectId || !localId || !connectionId) {
+    return { ok: false, error: 'capability negotiation requires MCP auth, project-id, local-id, and connection-id' }
+  }
+  try {
+    const result = await call({
+      mcpUrl,
+      token,
+      name: 'register_connection',
+      arguments: {
+        project_id: projectId,
+        local_id: localId,
+        agent_name: agentName,
+        cwd,
+        connection_capability_version: 1,
+      },
+      includeMeta: true,
+      timeoutMs: 15_000,
+    })
+    if (result?.data?.connection_id !== connectionId) {
+      return { ok: false, error: 'capability negotiation returned a different connection bond' }
+    }
+    const capability = result?.meta?.devspec?.connection_capability
+    if (capability?.version !== 1 || typeof capability.value !== 'string' || !capability.value.startsWith('dvsc_')) {
+      return { ok: false, error: 'server did not return connection capability version 1 in MCP result _meta' }
+    }
+    return { ok: true, version: 1, value: capability.value }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
   }
 }
 
@@ -1050,7 +1116,14 @@ if (isMain) {
         s = null
       }
     }
-    process.stdout.write(JSON.stringify(s, null, 2) + '\n')
+    const printable = s
+      ? {
+          ...s,
+          connection_capability_present: typeof s.connection_capability === 'string',
+          connection_capability: undefined,
+        }
+      : null
+    process.stdout.write(JSON.stringify(printable, null, 2) + '\n')
     process.exit(s ? 0 : 1)
   }
 
@@ -1168,14 +1241,27 @@ if (isMain) {
     // Owner-process anchor for self-termination (see devspec-remote-poll.mjs and
     // resolveOwnerPid / resolveOwnerPidAutoWindows above for the win32 self-resolve path).
     const ownerPid = resolveOwnerPid(args['owner-pid'], prev.owner_pid)
+    const projectId = args['project-id'] || prev.project_id || null
+    const capability = auth.ok
+      ? await negotiateConnectionCapability({
+          mcpUrl: args.url || auth.mcp_url || prev.mcp_url,
+          token: auth.token || prev.token,
+          projectId,
+          localId,
+          connectionId,
+          agentName,
+          cwd,
+        })
+      : { ok: false, error: auth.error || 'MCP auth unavailable' }
     const state = {
-      ...prev,
+      ...applyConnectionCapabilityRotation(prev, capability),
       enabled: true,
       connection_id: connectionId,
       session_id: sessionId,
       agent_name: agentName,
       local_id: localId ?? prev.local_id ?? null,
       owner_pid: ownerPid,
+      project_id: projectId,
       mcp_url: args.url || auth.mcp_url || prev.mcp_url || 'https://devspec.ai/api/mcp',
       token: auth.token || prev.token || undefined,
       auth_source: auth.source || auth.error || prev.auth_source || null,
@@ -1221,6 +1307,12 @@ if (isMain) {
       token_present: !!state.token,
       local_id: localId,
       bond_path: bond ? localBondPath(agentName, localId) : null,
+      project_id: projectId,
+      plan_capability: {
+        ok: capability.ok,
+        version: capability.ok ? capability.version : null,
+        error: capability.ok ? null : capability.error,
+      },
     }
     if (!state.auth_ok) {
       result.warning = auth.error
@@ -1228,6 +1320,10 @@ if (isMain) {
     if (!localId) {
       result.warning_local =
         'No --local-id / conversation env; soft-reconnect and already_live will not work until write is called with a local id.'
+    }
+    if (!capability.ok) {
+      result.warning_plan =
+        `Shared plans unavailable until capability negotiation succeeds: ${capability.error}`
     }
 
     // Default: start the continuous heartbeat poller after a successful write.

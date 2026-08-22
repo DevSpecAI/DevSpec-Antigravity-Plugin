@@ -97,13 +97,18 @@ plugin at all, which a skill name never could.
 ## Implementation contract
 
 [`devspec://product/implementation-contract`](devspec://product/implementation-contract) is the
-MCP-served runtime authority for tracked work. This package points to that contract instead of
-copying its lifecycle rules into host documentation.
+MCP-served runtime authority for work entry, tracking, claiming, and the high semantic threshold
+for shared session plans. This package points to that contract instead of copying its lifecycle
+rules into host documentation. Routine investigation remains host-native and plan-free; when the
+contract selects a plan, the remote skill exposes the complete `manage_plan` schema on demand
+through `scripts/devspec-plan.mjs --schema` rather than adding another hot skill.
 
 **Antigravity host limitation:** Antigravity exposes no verified blocking pre-tool hook, so this
 plugin cannot enforce the DevSpec mutation boundary immediately before a tool call. Connecting MCP
 alone is not a request to mutate DevSpec; explicitly ask for DevSpec work or another DevSpec write.
 On that request, use the MCP-served contract and live tool schemas as the runtime authority.
+Attached remote connections negotiate capability-backed plan access; all active room plans arrive
+as advisory read-awareness, never implicit mutation authority.
 
 ---
 

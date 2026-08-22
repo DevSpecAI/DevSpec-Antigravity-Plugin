@@ -6,12 +6,12 @@
 
 ## How a message reaches Antigravity
 
-Tracked work uses the MCP-served [`devspec://product/implementation-contract`](devspec://product/implementation-contract) as its runtime authority; this primer covers remote transport only.
+Work entry, tracking, claiming, and the high session-plan threshold use the MCP-served [`devspec://product/implementation-contract`](devspec://product/implementation-contract) as runtime authority; this primer covers Antigravity operations only.
 
 Same transport shape as other local-poller hosts:
 
-1. Authorized owner/delegated dispatch → scope-aware `poll_connection` → connection inbox, preserving the root `project_scope`.
-2. Wait wakes the model with the command plus delegated-only server instruction; owner commands receive no project instruction.
+1. `poll_connection` negotiates ingress, delegated scope, and active-plan projection v1; strict canonical 1.3 reaches the connection inbox.
+2. Wait wakes only for complete authorized commands. Typed room context and all active plans remain read-only awareness.
 3. Model acts; when attached, model `post_session_message({ connection_id })`.
 4. Hooks keep busy/heartbeat honest — they do not own the product reply.
 
@@ -25,6 +25,7 @@ Antigravity is **not** OpenCode-native inject and **not** the Codex app-server b
 | Bond id | Host conversation / session env — never invent an id that won’t survive the next turn |
 | Agent name | `Antigravity` via `agent-identity` (no silent fallback to another host’s name) |
 | Scripts | Owned and tested in this plugin; never copied from or synchronized with another host plugin |
+| Plans | Capability-backed `scripts/devspec-plan.mjs` is discovered on demand; no extra hot skill or broad allowlist |
 
 ## Host limitation
 
@@ -36,6 +37,7 @@ Antigravity exposes no verified blocking pre-tool hook. The plugin therefore can
 - Copying another plugin’s scripts or adding cross-repo synchronization.
 - Copying OpenCode `promptAsync` injection without a verified Antigravity host capability.
 - Hardcoding MCP URLs or agent display names.
+- Treating projected cross-owner plans as executable, or adopting without explicit `plan_id` and revision.
 
 ## Failure modes
 

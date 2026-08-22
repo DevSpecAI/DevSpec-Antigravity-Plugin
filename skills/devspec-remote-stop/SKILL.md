@@ -46,6 +46,6 @@ Multiple remotes may run on one machine (several Antigravity terminals).
 ## Rules
 
 - Always offline **this** connection.
-- Do not delete the DevSpec session — history remains.
+- Do not delete the DevSpec session — history remains. Disconnecting does not complete or abandon an active session plan; it remains visible and may become eligible for authorized same-owner adoption.
 - Soft-reconnect is bond-scoped (same conversation `local_id`), never by cwd/repo: `end_reason: local_stop` is recoverable only soon after (~30m), so remote → stop → remote again in the same conversation resumes the connection. A new agent chat later must not rejoin just because files remain under `~/.devspec`.
 - This is DevSpec remote control — distinct from any built-in remote-control feature of your host app.

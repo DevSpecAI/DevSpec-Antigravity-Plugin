@@ -22,6 +22,8 @@ export async function mcpToolsCall({
   timeoutMs = 0,
   isAlive = null,
   aliveCheckMs = 2_000,
+  connectionCapability = null,
+  includeMeta = false,
 }) {
   const body = {
     jsonrpc: '2.0',
@@ -65,6 +67,9 @@ export async function mcpToolsCall({
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
         Accept: 'application/json, text/event-stream',
+        ...(connectionCapability
+          ? { 'x-devspec-connection-capability': connectionCapability }
+          : {}),
       },
       body: JSON.stringify(body),
       signal: controller.signal,
@@ -122,11 +127,14 @@ export async function mcpToolsCall({
     if (payload.result?.isError) {
       throw new Error(joined || 'MCP tool error')
     }
+    let data
     try {
-      return JSON.parse(joined)
+      data = JSON.parse(joined)
     } catch {
-      return { raw: joined, result: payload.result }
+      data = { raw: joined, result: payload.result }
     }
+    return includeMeta ? { data, meta: payload.result?._meta ?? null } : data
   }
-  return payload.result ?? payload
+  const data = payload.result ?? payload
+  return includeMeta ? { data, meta: payload.result?._meta ?? null } : data
 }
