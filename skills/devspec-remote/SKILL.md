@@ -153,7 +153,7 @@ node "<plugin>/hooks/scripts/remote-control-state.mjs" write \
   [--codename '<session_codename if any>']
 ```
 
-This resolves the MCP token, mechanically re-registers the same token/local-id bond with `connection_capability_version: 1`, stores the returned `_meta` secret only in the mode-0600 connection state, and **auto-starts the continuous poller**. This is mandatory for `already_live` too and must finish before step 7; a pre-capability state or failed/stale rotation leaves plan access unavailable rather than reusing an old secret. It also reaps provably-dead pollers for this agent. Confirm `plan_capability.ok` and `poller.ok` / `poller.pid`; never print or place the capability in a prompt. Opt out with `--no-poller` (tests only).
+This resolves the MCP token (env → `~/.gemini/antigravity-cli/mcp_config.json` then cwd `.gemini/antigravity-cli/mcp_config.json` → project `.mcp.json` last — never `~/.claude.json`), mechanically re-registers the same token/local-id bond with `connection_capability_version: 1`, stores the returned `_meta` secret only in the mode-0600 connection state, and **auto-starts the continuous poller**. This is mandatory for `already_live` too and must finish before step 7; a pre-capability state or failed/stale rotation leaves plan access unavailable rather than reusing an old secret. It also reaps provably-dead pollers for this agent. Confirm `plan_capability.ok` and `poller.ok` / `poller.pid`; never print or place the capability in a prompt. Opt out with `--no-poller` (tests only).
 
 If `auth_ok: false`, print the `warning` and tell the user to fix MCP auth. If `poller.ok` is false, show `warning_poller`.
 

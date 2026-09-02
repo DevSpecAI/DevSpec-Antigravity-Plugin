@@ -18,8 +18,8 @@
  * Lookup order:
  * 1. DEVSPEC_MCP_TOKEN / DEVSPEC_TOKEN (+ DEVSPEC_MCP_URL) — explicit override.
  * 2. opts.hostToken — an explicitly supplied host bearer.
- * 3. Antigravity MCP config — `<cwd>/.gemini/antigravity-cli/mcp_config.json` then
- *    `~/.gemini/antigravity-cli/mcp_config.json`.
+ * 3. Antigravity MCP config — `~/.gemini/antigravity-cli/mcp_config.json` then
+ *    `<cwd>/.gemini/antigravity-cli/mcp_config.json`.
  * 4. Project `.mcp.json` (cwd and parents) — fallback for non-standard setups.
  *
  * Prints JSON: { ok, token?, mcp_url?, source?, error? }
@@ -80,15 +80,15 @@ function walkMcpJson(startDir) {
 }
 
 /**
- * Antigravity's own MCP config — where its CLI keeps the token: a project
- * `<cwd>/.gemini/antigravity-cli/mcp_config.json` (more specific) then
- * `~/.gemini/antigravity-cli/mcp_config.json`. First one carrying a token wins.
+ * Antigravity's own MCP config — user-home first so every folder sees the same
+ * token, then an optional project `<cwd>/.gemini/antigravity-cli/mcp_config.json`.
+ * First one carrying a token wins. Never `~/.claude.json`.
  */
 function antigravityConfigAuth(cwd = process.cwd()) {
   const rel = ['.gemini', 'antigravity-cli', 'mcp_config.json']
   const candidates = [
-    path.join(path.resolve(cwd || process.cwd()), ...rel),
     path.join(os.homedir(), ...rel),
+    path.join(path.resolve(cwd || process.cwd()), ...rel),
   ]
   let urlOnly = null
   for (const file of candidates) {

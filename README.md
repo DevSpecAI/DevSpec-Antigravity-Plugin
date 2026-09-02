@@ -31,33 +31,57 @@ It is the Antigravity sibling of the DevSpec plugins for Claude Code, Codex CLI,
 
 ## Install
 
-This extension is built as a unified **Antigravity Plugin**, containing the skills, MCP configuration, and hooks. 
+Install once at **user home**, not inside a project folder. The MCP token is account-wide; which DevSpec project a run belongs to comes from `git remote get-url origin` in the folder you open (or from `.devspec/project.json` when there is no resolving remote). Opening Cold Trace and DevSpecV2 with the same user-level config is supposed to just work.
 
-### 1. Configure your MCP token
-Before installing the plugin, edit the `mcp_config.json` file at the root of this plugin directory and insert your DevSpec MCP token. 
-Replace `dvs_YOUR_DEVSPEC_MCP_TOKEN` with your **account-wide** token from DevSpec → **You → Connections** → **Connect a tool** (pick **Read & write**). 
-One token covers every project in your account.
+This package is a unified Antigravity plugin (skills, hooks, and MCP wiring).
 
-### 2. Add the plugin to Antigravity
-To install the plugin, simply move or copy this entire repository directory into one of Antigravity's plugin directories. Antigravity will automatically load the skills, MCP connection, and hooks.
+### 1. Add the DevSpec MCP server (user home)
 
-**Workspace level (recommended)**:
-Place this folder inside `.agents/plugins/` at the root of your workspace:
-```bash
-# E.g.
-mkdir -p .agents/plugins
-cp -R path/to/antigravity-devspec-autopilot-extension .agents/plugins/
+Put the token in Antigravity's **user-level** MCP file — not in a `mcp_config.json` next to this repo, and not in a per-project `.mcp.json`.
+
+**CLI:** merge this into `~/.gemini/antigravity-cli/mcp_config.json` (Windows: `%USERPROFILE%\.gemini\antigravity-cli\mcp_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "devspec": {
+      "type": "http",
+      "serverUrl": "https://devspec.ai/api/mcp",
+      "headers": {
+        "Authorization": "Bearer dvs_YOUR_DEVSPEC_MCP_TOKEN"
+      }
+    }
+  }
+}
 ```
 
-**Global level (available in all repos)**:
-Place this folder inside `~/.gemini/config/plugins/` (or your OS equivalent):
+**Desktop:** Settings → MCP → Add server (HTTP). Same URL and Authorization header.
+
+Replace `dvs_YOUR_DEVSPEC_MCP_TOKEN` with your **account-wide** token from DevSpec → **You → Connections** → **Connect a tool** (pick **Read & write**). One token covers every project in your account. Reveal it again any time on that page.
+
+A leftover project `.mcp.json` from Claude or Cursor can stay — it is not required, and it is not the default.
+
+### 2. Install the plugin globally
+
+Clone this repository into Antigravity's **user-level** plugin directory so every repo sees it:
+
 ```bash
-mkdir -p ~/.gemini/config/plugins
-cp -R path/to/antigravity-devspec-autopilot-extension ~/.gemini/config/plugins/
+mkdir -p ~/.gemini/antigravity-cli/plugins
+git clone https://github.com/DevSpecAI/DevSpec-Antigravity-Plugin.git ~/.gemini/antigravity-cli/plugins/devspec
 ```
 
-**Marketplace / Agent install**: 
-Once published, you can simply tell Antigravity to install the plugin directly from the repository URL. Antigravity will handle placing it in the correct directory.
+Windows:
+
+```text
+mkdir %USERPROFILE%\.gemini\antigravity-cli\plugins
+git clone https://github.com/DevSpecAI/DevSpec-Antigravity-Plugin.git %USERPROFILE%\.gemini\antigravity-cli\plugins\devspec
+```
+
+Alternate global path some Antigravity builds also load: `~/.gemini/config/plugins/` (same idea — home, not the repo).
+
+**Marketplace / Agent install:** once published, tell Antigravity to install from the repository URL; it should land in the same user-level directory.
+
+**Optional — this workspace only:** copy the folder into `.agents/plugins/` at the root of one repo if you need a one-off override. That does **not** connect other folders. Do not treat it as the default.
 
 ---
 
@@ -121,7 +145,7 @@ DevSpec exposes one MCP server. Each editor/agent gets a thin, native wrapper:
 | Claude Code | `.mcp.json` | `url` | skills / slash commands |
 | Codex CLI | `~/.codex/config.toml` | `url` (`http_headers`) | prompt commands |
 | Gemini CLI | `gemini-extension.json` | `httpUrl` | `.toml` commands |
-| **Antigravity** | `mcp_config.json` | `serverUrl` | **`SKILL.md` skills** |
+| **Antigravity** | `~/.gemini/antigravity-cli/mcp_config.json` | `serverUrl` | **`SKILL.md` skills** |
 
 The intelligence lives server-side in DevSpec; each client is just native packaging around the
 same tools.
@@ -133,12 +157,11 @@ same tools.
 This repo is the distributable artifact. Three channels:
 
 1. **Antigravity skill marketplace** — publish so users install with one click (CLI and desktop).
-2. **Public GitHub repo** — users `git clone` this repo into `.agents/plugins/`, or ask the agent to
-   install the plugin directly from the URL.
-3. **Bundled** — drop this entire folder into a project's `.agents/plugins/` and commit it.
+2. **Public GitHub repo** — `git clone` into `~/.gemini/antigravity-cli/plugins/devspec` (see Install).
+3. **Optional workspace copy** — `.agents/plugins/` in one repo only, if you need a local override.
 
-The MCP config ships with a token *placeholder*, and `.gitignore` blocks any filled-in
-`mcp_config.json` from being committed.
+The MCP token belongs in **user-home** `~/.gemini/antigravity-cli/mcp_config.json`, not in a filled-in
+file inside this repository. `.gitignore` still blocks a filled-in `mcp_config.json` if one appears.
 
 ---
 
@@ -153,8 +176,7 @@ schemas. If resolution is ambiguous, the skill asks rather than guessing.
 
 - **Provider attribution.** The skills report completed work with `provider: "antigravity"` so
   Antigravity runs show up distinctly in the dashboard. This requires a current DevSpec server.
-- **Token in config.** Use a literal token in `mcp_config.json` — the template ships a literal
-  placeholder to replace. Avoid env-var interpolation like `${TOKEN}`.
+- **Token in config.** Use a literal token in `~/.gemini/antigravity-cli/mcp_config.json`. Avoid env-var interpolation like `${TOKEN}`.
 
 ---
 

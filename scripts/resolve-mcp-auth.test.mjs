@@ -30,6 +30,11 @@ beforeEach(() => {
   delete process.env.DEVSPEC_MCP_TOKEN
   delete process.env.DEVSPEC_TOKEN
   delete process.env.DEVSPEC_MCP_URL
+  // Stop walkMcpJson before it climbs into the real user home (which may have ~/.mcp.json).
+  fs.writeFileSync(
+    path.join(root, '.mcp.json'),
+    JSON.stringify({ mcpServers: { devspec: { url: 'https://devspec.ai/api/mcp' } } }),
+  )
 })
 
 afterEach(() => {
@@ -60,7 +65,7 @@ function mcpJson(dir, token) {
   )
 }
 
-describe('resolveDevspecMcpAuth (Antigravity)', () => {
+describe('resolveDevspecMcpAuth (Antigravity)', { concurrency: false }, () => {
   it('prefers mcp_config.json over a generic project .mcp.json (the fix)', () => {
     const d = proj('both')
     mcpJson(d, 'dvs_from_mcpjson')
@@ -77,6 +82,15 @@ describe('resolveDevspecMcpAuth (Antigravity)', () => {
     const auth = resolveDevspecMcpAuth(d)
     assert.equal(auth.token, 'dvs_home_ag')
     assert.equal(hostTokenFromEnv(process.env), 'dvs_home_ag')
+  })
+
+  it('prefers user-home Antigravity MCP over a per-project mcp_config.json', () => {
+    const d = proj('homewins')
+    agConfig(d, 'dvs_project_ag')
+    agConfig(fakeHome, 'dvs_home_ag')
+    const auth = resolveDevspecMcpAuth(d)
+    assert.equal(auth.ok, true)
+    assert.equal(auth.token, 'dvs_home_ag')
   })
 
   it('parses the serverUrl key (Antigravity shape), not just url', () => {
