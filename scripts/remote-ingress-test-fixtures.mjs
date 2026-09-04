@@ -7,8 +7,8 @@ export const FIXTURE_ID = {
   turn: '77777777-7777-4777-8777-777777777777',
   resource: '88888888-8888-4888-8888-888888888888',
   control: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
-  playbookRun: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
-  playbook: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+  automationRun: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+  automation: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
   plan: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
   step: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
 }
@@ -148,13 +148,13 @@ export function fixtureControl(verb = 'compact', args) {
     ...(args ? { args } : {}),
   }
 }
-export function fixturePlaybookDispatch(over = {}) {
+export function fixtureAutomationDispatch(over = {}) {
   return {
-    id: FIXTURE_ID.playbookRun,
-    kind: 'playbook_run',
-    run_id: FIXTURE_ID.playbookRun,
-    playbook_id: FIXTURE_ID.playbook,
-    playbook_name: 'Review health',
+    id: FIXTURE_ID.automationRun,
+    kind: 'automation_run',
+    run_id: FIXTURE_ID.automationRun,
+    automation_id: FIXTURE_ID.automation,
+    automation_name: 'Review health',
     instruction: 'Inspect and report.',
     permission: 'look_only',
     requester: { user_id: FIXTURE_ID.requester },

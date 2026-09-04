@@ -8,7 +8,7 @@
 
 A **connection** is a first-class DevSpec agent identity for one local coding-agent conversation. It can be:
 
-- **Sessionless** — available on the Agents page; receives authorized remote commands or playbook runs without a chat room.
+- **Sessionless** — available on the Agents page; receives authorized remote commands or automation runs without a chat room.
 - **Attached** to a DevSpec session — optional shared transcript + room context.
 
 A **session is optional**. Never invent a session because a cwd or another agent recently stopped. Bond on the local conversation / thread id only.
@@ -22,7 +22,7 @@ A **session is optional**. Never invent a session because a cwd or another agent
 | Authority | Act only on complete exact-target canonical commands with the server-stamped authority/project-scope pair. Runtime policy: [`devspec://product/remote-ingress-contract`](devspec://product/remote-ingress-contract). |
 | Advisory | Typed canonical context and `active_session_plans` are read-awareness only — never wake, execute, or grant plan mutation authority. |
 | Answers (attached) | Agent (or host bridge) posts **one direct answer** via `post_session_message({ connection_id })`. |
-| Answers (sessionless) | Use the explicit command or playbook reporting path — never invent chat or infer action-item assignment. |
+| Answers (sessionless) | Use the explicit command or automation reporting path — never invent chat or infer action-item assignment. |
 | Activity | `report_pickup` → `report_keepalive` → `report_complete`. Server never infers Working. |
 | Chrome | Connect/status banners are **terminal-only**. Never post them into the session. |
 | Slash commands | Host UI commands (e.g. `/clear`) are **not** remote-control. Injecting `"/clear"` as prompt text does not run them. |

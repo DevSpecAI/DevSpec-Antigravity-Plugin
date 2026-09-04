@@ -691,34 +691,34 @@ function deliverAdvisory(connectionId, advisoryMsgs, sessionId) {
 }
 
 /**
- * Wake text for a dispatched PLAYBOOK RUN (DevSpecV2 child ae168718).
+ * Wake text for a dispatched AUTOMATION RUN (DevSpecV2 child ae168718).
  *
- * A playbook is not an action item — it is a job the owner saved to run again and
+ * An automation is not an action item — it is a job the owner saved to run again and
  * again, and it never completes. So this deliberately does NOT send the agent down
- * an action-item path; it sends it to the playbook run tools instead. Requested
+ * an action-item path; it sends it to the automation run tools instead. Requested
  * tracked work remains governed by devspec://product/implementation-contract.
  *
- * The permission line matters: a look-only playbook must not be "helpfully" fixed
+ * The permission line matters: a look-only automation must not be "helpfully" fixed
  * while the agent is in there.
  *
  * Always pass provider on claim (hard match against preferred_provider). Omitting
  * it fails even when this agent is the named one — same habit as claim_work_item.
  */
-function playbookRunCommandText(d) {
+function automationRunCommandText(d) {
   const permission =
     d.permission === 'can_push'
       ? 'You MAY edit, commit and push.'
       : d.permission === 'can_commit'
         ? 'You MAY edit and commit locally, but MUST NOT push.'
-        : 'This playbook is LOOK ONLY — investigate and report, do not edit, commit or push anything.'
+        : 'This automation is LOOK ONLY — investigate and report, do not edit, commit or push anything.'
 
   return [
-    `▶️ Playbook run dispatched to this connection: "${d.playbook_name}" (run ${d.run_id}).`,
+    `▶️ Automation run dispatched to this connection: "${d.automation_name}" (run ${d.run_id}).`,
     '',
     'What to do:',
-    `1. claim_playbook_run({ run_id: "${d.run_id}", provider: "antigravity" }) — always pass provider (and model if the playbook names one). If claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
+    `1. claim_automation_run({ run_id: "${d.run_id}", provider: "antigravity" }) — always pass provider (and model if the automation names one). If claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
     '2. Do the work described below, in this repo.',
-    '3. record_playbook_run — report status, a verdict for EACH acceptance criterion WITH evidence, and whatever the run produced as artifacts.',
+    '3. record_automation_run — report status, a verdict for EACH acceptance criterion WITH evidence, and whatever the run produced as artifacts.',
     '',
     `Permission: ${permission}`,
     '',
@@ -971,8 +971,8 @@ async function main() {
       // never reclassifies a canonical command locally.
       void seed
       const dispatches = Array.isArray(res.dispatches) ? res.dispatches : []
-      if (dispatches.some((d) => d?.kind !== 'playbook_run')) {
-        process.stderr.write('devspec-remote-poll: rejected non-playbook dispatch from negotiated poll\n')
+      if (dispatches.some((d) => d?.kind !== 'automation_run')) {
+        process.stderr.write('devspec-remote-poll: rejected non-automation dispatch from negotiated poll\n')
         return false
       }
       const freshDispatches = dispatches.filter((d) => d?.id && !deliveredDispatchIds.has(d.id))
@@ -982,7 +982,7 @@ async function main() {
         message_type: 'local_agent_dispatch',
         dispatch: d,
         project_scope: null,
-        content: playbookRunCommandText(d),
+        content: automationRunCommandText(d),
         remote_control: { is_owner_instruction: true, is_advisory: false, role: 'owner_instruction' },
       }))
 
@@ -1050,7 +1050,7 @@ async function main() {
 
     // Dispatched work → owner commands (the assignment reference wakes the agent).
     const freshDispatches = dispatches.filter(
-      (d) => d?.kind === 'playbook_run' && d?.id && !deliveredDispatchIds.has(d.id),
+      (d) => d?.kind === 'automation_run' && d?.id && !deliveredDispatchIds.has(d.id),
     )
     for (const d of freshDispatches) deliveredDispatchIds.add(d.id)
     const dispatchCommands = freshDispatches.map((d) => ({
@@ -1060,7 +1060,7 @@ async function main() {
       // Local dispatches are owner-authorized and never receive a delegated project
       // instruction. Keep the same root field invariant as scope-aware remote commands.
       project_scope: null,
-      content: playbookRunCommandText(d),
+      content: automationRunCommandText(d),
       remote_control: { is_owner_instruction: true, is_advisory: false, role: 'owner_instruction' },
     }))
 
