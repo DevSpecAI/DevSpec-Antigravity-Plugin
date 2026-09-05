@@ -48,12 +48,13 @@ Remote control has **no in-session Dev** offering memories each turn. **You** ar
 
 When the conversation produces a durable decision, convention, architecture choice, accepted risk, or short plan/ADR-worthy write-up:
 
-1. **Memories (primary)** — interactive, human-in-the-loop (do **not** pass `runner_session_id`; absence = interactive authority):
+1. **Memories (primary)** — human-in-the-loop: do **not** pass `runner_session_id` (that stamp marks an unattended run). Whether a write commits, is queued as a proposal, or is refused is the served contract's decision (`devspec://product/implementation-contract` → `authority_contract`), judged from the verb, the owner's project role and whether the run is unattended — never predict it, read the `outcome`:
    - Prefer: ask the owner *"Should I record this as a decided memory/convention?"* then `record_memory` (or `supersede_memory` if updating).
    - If the owner already clearly decided, propose the memory text in your reply and record after a clear yes.
    - Always `search_memories` first; never duplicate — `supersede_memory` the closest match. `search_memories` returns a CARD (title, one-line summary, id) — `get_memory` the closest match and read it in full before superseding it, because a card is enough to choose WHICH memory you mean and not enough to justify replacing it. 
    - Types: `decision`, `convention`, `architecture`, `risk`, `insight`.
-2. **Artifacts** — short plans/ADRs/runbooks via `create_resource` / `update_resource` / `supersede_resource`.
+   - **Read the `outcome` and report what it says.** `committed` = recorded now. `queued_for_review` = **not in effect**: relay the `proposal_id` and the reason the server gave, and say a maintainer has to accept it on the project's Review tab before it applies. Never tell the owner a change landed when it was only proposed.
+2. **Artifacts** — short plans/ADRs/runbooks via `create_resource` / `update_resource` / `supersede_resource` (same `outcome` rule).
 3. **Do not** rely on post-session extraction for this channel.
 4. Mirror the offer + capture confirmation into `post_session_message` (when attached) so the phone transcript shows knowledge landing.
 

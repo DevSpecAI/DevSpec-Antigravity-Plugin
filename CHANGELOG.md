@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.11.0
+
+### Authority is the served contract's, not this plugin's
+
+The remote skill no longer says a write without a runner stamp carries "interactive
+authority". Whether a memory, artifact or rule change commits, is queued as a proposal, or
+is refused is decided by DevSpec and served at `devspec://product/implementation-contract`
+→ `authority_contract`; the skill points there and keeps its own step: read each write's
+`outcome`, and on `queued_for_review` relay the `proposal_id` and the reason, saying a
+maintainer has to accept it before it applies.
+
 ## 0.10.0
 
 ### Playbooks are now Automations
