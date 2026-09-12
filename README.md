@@ -55,8 +55,6 @@ Put the token in Antigravity's **user-level** MCP file — not in a `mcp_config.
 }
 ```
 
-For DevSpec **staging**, the `serverUrl` is `https://api.devspecstaging.com/api/mcp` instead.
-
 **Desktop:** Settings → MCP → Add server (HTTP). Same URL and Authorization header.
 
 Replace `dvs_YOUR_DEVSPEC_MCP_TOKEN` with your **account-wide** token from DevSpec → **You → Connections** → **Connect a tool** (pick **Read & write**). One token covers every project in your account. Reveal it again any time on that page.
