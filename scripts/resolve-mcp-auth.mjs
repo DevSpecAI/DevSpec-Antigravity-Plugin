@@ -30,7 +30,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-const DEFAULT_PROD_URL = 'https://devspec.ai/api/mcp'
+const DEFAULT_PROD_URL = 'https://api.devspec.ai/api/mcp'
 
 function readJson(file) {
   try {

@@ -762,7 +762,7 @@ async function main() {
     )
     process.exit(1)
   }
-  mcpUrl = mcpUrl || 'https://devspec.ai/api/mcp'
+  mcpUrl = mcpUrl || 'https://api.devspec.ai/api/mcp'
   // Identity is a fixed property of THIS plugin — never trust state/args for it.
   const agentName = AGENT_NAME
   // Bond key for the attached-session heartbeat's connection dual-write.

@@ -33,7 +33,7 @@ beforeEach(() => {
   // Stop walkMcpJson before it climbs into the real user home (which may have ~/.mcp.json).
   fs.writeFileSync(
     path.join(root, '.mcp.json'),
-    JSON.stringify({ mcpServers: { devspec: { url: 'https://devspec.ai/api/mcp' } } }),
+    JSON.stringify({ mcpServers: { devspec: { url: 'https://api.devspec.ai/api/mcp' } } }),
   )
 })
 
@@ -50,7 +50,7 @@ function proj(name) {
   fs.mkdirSync(d, { recursive: true })
   return d
 }
-function agConfig(dir, token, url = 'https://devspec.ai/api/mcp') {
+function agConfig(dir, token, url = 'https://api.devspec.ai/api/mcp') {
   const c = path.join(dir, '.gemini', 'antigravity-cli')
   fs.mkdirSync(c, { recursive: true })
   fs.writeFileSync(
@@ -61,7 +61,7 @@ function agConfig(dir, token, url = 'https://devspec.ai/api/mcp') {
 function mcpJson(dir, token) {
   fs.writeFileSync(
     path.join(dir, '.mcp.json'),
-    JSON.stringify({ mcpServers: { devspec: { url: 'https://devspec.ai/api/mcp', headers: { Authorization: `Bearer ${token}` } } } }),
+    JSON.stringify({ mcpServers: { devspec: { url: 'https://api.devspec.ai/api/mcp', headers: { Authorization: `Bearer ${token}` } } } }),
   )
 }
 
@@ -130,9 +130,38 @@ describe('resolveDevspecMcpAuth (Antigravity)', { concurrency: false }, () => {
     const d = proj('urlonly')
     const c = path.join(d, '.gemini', 'antigravity-cli')
     fs.mkdirSync(c, { recursive: true })
-    fs.writeFileSync(path.join(c, 'mcp_config.json'), JSON.stringify({ mcpServers: { devspec: { serverUrl: 'https://devspec.ai/api/mcp' } } }))
+    fs.writeFileSync(path.join(c, 'mcp_config.json'), JSON.stringify({ mcpServers: { devspec: { serverUrl: 'https://api.devspec.ai/api/mcp' } } }))
     const auth = resolveDevspecMcpAuth(d)
     assert.equal(auth.ok, false)
     assert.match(auth.error, /antigravity-cli[\\/]mcp_config\.json/)
+  })
+
+  it('defaults to the production API host when only an env token is known', () => {
+    const d = proj('envdefault')
+    process.env.DEVSPEC_MCP_TOKEN = 'dvs_env_only'
+    const auth = resolveDevspecMcpAuth(d)
+    assert.equal(auth.ok, true)
+    assert.equal(auth.mcp_url, 'https://api.devspec.ai/api/mcp')
+  })
+
+  it('defaults to the production API host when the config entry has a token but no URL', () => {
+    const d = proj('tokenonly')
+    const c = path.join(d, '.gemini', 'antigravity-cli')
+    fs.mkdirSync(c, { recursive: true })
+    fs.writeFileSync(
+      path.join(c, 'mcp_config.json'),
+      JSON.stringify({ mcpServers: { devspec: { headers: { Authorization: 'Bearer dvs_no_url' } } } }),
+    )
+    const auth = resolveDevspecMcpAuth(d)
+    assert.equal(auth.token, 'dvs_no_url')
+    assert.equal(auth.mcp_url, 'https://api.devspec.ai/api/mcp')
+  })
+
+  it('honours a staging serverUrl override rather than falling back to production', () => {
+    const d = proj('stagingurl')
+    agConfig(d, 'dvs_staging', 'https://api.devspecstaging.com/api/mcp')
+    const auth = resolveDevspecMcpAuth(d)
+    assert.equal(auth.token, 'dvs_staging')
+    assert.equal(auth.mcp_url, 'https://api.devspecstaging.com/api/mcp')
   })
 })

@@ -303,7 +303,7 @@ async function main() {
   }
   if (!token) process.exit(0) // silent — skill still posts instructionally
 
-  mcpUrl = mcpUrl || 'https://devspec.ai/api/mcp'
+  mcpUrl = mcpUrl || 'https://api.devspec.ai/api/mcp'
   // Identity is a fixed property of THIS plugin — never trust state/args for it.
   const agentName = AGENT_NAME
   const connectionId = state.connection_id

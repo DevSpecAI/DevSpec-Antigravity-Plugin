@@ -46,7 +46,7 @@ Put the token in Antigravity's **user-level** MCP file — not in a `mcp_config.
   "mcpServers": {
     "devspec": {
       "type": "http",
-      "serverUrl": "https://devspec.ai/api/mcp",
+      "serverUrl": "https://api.devspec.ai/api/mcp",
       "headers": {
         "Authorization": "Bearer dvs_YOUR_DEVSPEC_MCP_TOKEN"
       }
@@ -54,6 +54,8 @@ Put the token in Antigravity's **user-level** MCP file — not in a `mcp_config.
   }
 }
 ```
+
+For DevSpec **staging**, the `serverUrl` is `https://api.devspecstaging.com/api/mcp` instead.
 
 **Desktop:** Settings → MCP → Add server (HTTP). Same URL and Authorization header.
 

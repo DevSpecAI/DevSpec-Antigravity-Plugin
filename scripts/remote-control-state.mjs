@@ -1262,7 +1262,7 @@ if (isMain) {
       local_id: localId ?? prev.local_id ?? null,
       owner_pid: ownerPid,
       project_id: projectId,
-      mcp_url: args.url || auth.mcp_url || prev.mcp_url || 'https://devspec.ai/api/mcp',
+      mcp_url: args.url || auth.mcp_url || prev.mcp_url || 'https://api.devspec.ai/api/mcp',
       token: auth.token || prev.token || undefined,
       auth_source: auth.source || auth.error || prev.auth_source || null,
       auth_ok: !!auth.ok || !!prev.auth_ok,
