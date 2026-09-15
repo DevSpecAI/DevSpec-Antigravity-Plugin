@@ -155,13 +155,12 @@ export function fixtureAutomationDispatch(over = {}) {
     run_id: FIXTURE_ID.automationRun,
     automation_id: FIXTURE_ID.automation,
     automation_name: 'Review health',
-    instruction: 'Inspect and report.',
+    trigger_kind: 'pressed',
+    owner: { user_id: FIXTURE_ID.requester, display_name: 'Ali Price' },
     permission: 'look_only',
-    requester: { user_id: FIXTURE_ID.requester },
-    original_target_connection_id: null,
-    delivery_connection_id: FIXTURE_ID.connection,
     queued_at: '2026-08-19T12:00:00.000Z',
-    state: 'queued',
+    delivery_connection_id: FIXTURE_ID.connection,
+    requester: { user_id: FIXTURE_ID.requester },
     ...over,
   }
 }

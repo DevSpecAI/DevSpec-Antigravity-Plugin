@@ -543,6 +543,38 @@ export const DELEGATED_PROJECT_SCOPE_POLICY_ID = 'delegated_project_v1'
 const PROJECT_SCOPE_KEYS = ['instruction', 'kind', 'policy_id', 'project_id']
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
+function exactKeys(value, keys) {
+  return value && typeof value === 'object' && !Array.isArray(value) &&
+    Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key))
+}
+
+export function validateAutomationRunDispatch(dispatch, connectionId) {
+  const keys = [
+    'id', 'kind', 'run_id', 'automation_id', 'automation_name', 'trigger_kind', 'owner',
+    'permission', 'queued_at', 'delivery_connection_id', 'requester',
+  ]
+  if (!exactKeys(dispatch, keys)) return { ok: false, error: 'dispatch does not exactly match automation_run' }
+  const pressed = dispatch.trigger_kind === 'pressed'
+  const requesterOk = pressed
+    ? exactKeys(dispatch.requester, ['user_id']) && UUID_RE.test(dispatch.requester.user_id)
+    : dispatch.requester === null
+  const valid =
+    dispatch.kind === 'automation_run' &&
+    typeof dispatch.id === 'string' && UUID_RE.test(dispatch.id) &&
+    dispatch.run_id === dispatch.id &&
+    typeof dispatch.automation_id === 'string' && UUID_RE.test(dispatch.automation_id) &&
+    typeof dispatch.automation_name === 'string' && dispatch.automation_name.length > 0 &&
+    ['scheduled', 'event', 'pressed'].includes(dispatch.trigger_kind) &&
+    exactKeys(dispatch.owner, ['user_id', 'display_name']) && UUID_RE.test(dispatch.owner.user_id) &&
+    typeof dispatch.owner.display_name === 'string' && dispatch.owner.display_name.length > 0 &&
+    ['look_only', 'can_commit', 'can_push'].includes(dispatch.permission) &&
+    dispatch.delivery_connection_id === connectionId &&
+    typeof dispatch.queued_at === 'string' && !Number.isNaN(Date.parse(dispatch.queued_at)) &&
+    requesterOk
+  return valid ? { ok: true, dispatch } : { ok: false, error: 'invalid or misaddressed automation_run dispatch' }
+}
+
+
 /** Validate the server-stamped authority/project-scope pair without changing it. */
 export function hasValidCommandProjectScope(msg) {
   if (!msg || typeof msg !== 'object') return false
@@ -714,16 +746,15 @@ function automationRunCommandText(d) {
 
   return [
     `▶️ Automation run dispatched to this connection: "${d.automation_name}" (run ${d.run_id}).`,
+    d.trigger_kind === 'pressed' ? 'Someone pressed Run.' : d.trigger_kind === 'scheduled' ? 'This run started on a schedule.' : 'This run started because of an event.',
+    `Owner: ${d.owner?.display_name || 'the owner'}`,
     '',
     'What to do:',
     `1. claim_automation_run({ run_id: "${d.run_id}", provider: "antigravity" }) — always pass provider (and model if the automation names one). If claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
-    '2. Do the work described below, in this repo.',
+    '2. Follow the instruction returned by that claim, in this repo.',
     '3. record_automation_run — report status, a verdict for EACH acceptance criterion WITH evidence, and whatever the run produced as artifacts.',
     '',
     `Permission: ${permission}`,
-    '',
-    'The instruction:',
-    d.instruction || '(claim the run to read it)',
   ].join('\n')
 }
 
@@ -971,7 +1002,7 @@ async function main() {
       // never reclassifies a canonical command locally.
       void seed
       const dispatches = Array.isArray(res.dispatches) ? res.dispatches : []
-      if (dispatches.some((d) => d?.kind !== 'automation_run')) {
+      if (dispatches.some((d) => !validateAutomationRunDispatch(d, connectionId).ok)) {
         process.stderr.write('devspec-remote-poll: rejected non-automation dispatch from negotiated poll\n')
         return false
       }
@@ -979,11 +1010,11 @@ async function main() {
       for (const d of freshDispatches) deliveredDispatchIds.add(d.id)
       const dispatchCommands = freshDispatches.map((d) => ({
         id: d.id,
-        message_type: 'local_agent_dispatch',
+        message_type: 'automation_run',
         dispatch: d,
         project_scope: null,
         content: automationRunCommandText(d),
-        remote_control: { is_owner_instruction: true, is_advisory: false, role: 'owner_instruction' },
+        remote_control: { is_owner_instruction: false, is_advisory: false, role: 'automation_run' },
       }))
 
       cursor = typeof res.cursor === 'string' && res.cursor ? res.cursor : cursor
@@ -1050,18 +1081,18 @@ async function main() {
 
     // Dispatched work → owner commands (the assignment reference wakes the agent).
     const freshDispatches = dispatches.filter(
-      (d) => d?.kind === 'automation_run' && d?.id && !deliveredDispatchIds.has(d.id),
+      (d) => validateAutomationRunDispatch(d, connectionId).ok && d?.id && !deliveredDispatchIds.has(d.id),
     )
     for (const d of freshDispatches) deliveredDispatchIds.add(d.id)
     const dispatchCommands = freshDispatches.map((d) => ({
       id: d.id,
-      message_type: 'local_agent_dispatch',
+      message_type: 'automation_run',
       dispatch: d,
       // Local dispatches are owner-authorized and never receive a delegated project
       // instruction. Keep the same root field invariant as scope-aware remote commands.
       project_scope: null,
       content: automationRunCommandText(d),
-      remote_control: { is_owner_instruction: true, is_advisory: false, role: 'owner_instruction' },
+      remote_control: { is_owner_instruction: false, is_advisory: false, role: 'automation_run' },
     }))
 
     // seed filters the COMMAND half only — advisory always survives (item 55655986).
