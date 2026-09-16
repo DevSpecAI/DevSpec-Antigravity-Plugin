@@ -46,7 +46,7 @@ Never rejoin/attach a session because it shared a repo/cwd or another agent stop
 
 Remote control has **no in-session Dev** offering memories each turn. **You** are the capture agent. Action items alone are not enough — decisions evaporate if they only live in the control transcript.
 
-When the conversation produces a durable decision, convention, architecture choice, accepted risk, or short plan/ADR-worthy write-up:
+When the conversation produces a durable decision, convention, architecture choice, accepted risk, or short plan/ADR-worthy write-up — something a future agent needs to know forever. If instead it is the state of work in flight (approved-but-unbuilt, awaiting a pick, blocked on someone), it belongs on an action item, not in memory; left in memory it decays into a phantom standing rule:
 
 1. **Memories (primary)** — human-in-the-loop: do **not** pass `runner_session_id` (that stamp marks an unattended run). Whether a write commits, is queued as a proposal, or is refused is the served contract's decision (`devspec://product/implementation-contract` → `authority_contract`), judged from the verb, the owner's project role and whether the run is unattended — never predict it, read the `outcome`:
    - Prefer: ask the owner *"Should I record this as a decided memory/convention?"* then `record_memory` (or `supersede_memory` if updating).
