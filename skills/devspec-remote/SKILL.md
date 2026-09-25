@@ -53,7 +53,7 @@ When the conversation produces a durable decision, convention, architecture choi
    - If the owner already clearly decided, propose the memory text in your reply and record after a clear yes.
    - Always `search_memories` first; never duplicate — `supersede_memory` the closest match. `search_memories` returns a CARD (title, one-line summary, id) — `get_memory` the closest match and read it in full before superseding it, because a card is enough to choose WHICH memory you mean and not enough to justify replacing it. 
    - Types: `decision`, `convention`, `architecture`, `risk`, `insight`.
-   - **Read the `outcome` and report what it says.** `committed` = recorded now. `queued_for_review` = **not in effect**: relay the `proposal_id` and the reason the server gave, and say a maintainer has to accept it on the project's Review tab before it applies. Never tell the owner a change landed when it was only proposed.
+   - **Read the `outcome` and report what it says.** `committed` = recorded now. `queued_for_review` = **not in effect**: relay the `proposal_id` and the reason the server gave, and say a maintainer has to accept it on the project's Review page, under Proposed changes, before it applies. Never tell the owner a change landed when it was only proposed.
 2. **Artifacts** — short plans/ADRs/runbooks via `create_resource` / `update_resource` / `supersede_resource` (same `outcome` rule).
 3. **Do not** rely on post-session extraction for this channel.
 4. Mirror the offer + capture confirmation into `post_session_message` (when attached) so the phone transcript shows knowledge landing.

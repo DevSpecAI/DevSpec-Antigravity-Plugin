@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.1
+
+### A proposed change is accepted on the Review page
+
+When a write comes back `queued_for_review`, the skill now says a maintainer accepts it on the project's Review page, under Proposed changes. It used to send people to a "Review tab", which no longer exists.
+
 ## 0.11.0
 
 ### Authority is the served contract's, not this plugin's
