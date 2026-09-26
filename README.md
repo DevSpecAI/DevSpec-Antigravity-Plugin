@@ -17,12 +17,12 @@ It is the Antigravity sibling of the DevSpec plugins for Claude Code, Codex CLI,
 
 - Antigravity CLI (`agy`) **or** the Antigravity desktop app.
 - A DevSpec account, with an **account-wide MCP token**. Create one in DevSpec under
-  **You → Connections** → **Connect a tool** (pick **Read & write**); it starts with `dvs_`. The
+  **You → Coding agents** → **Create your token** (pick **Read & write**); it starts with `dvs_`. The
   skills resolve which project a run is for from the repo's git remote (`git remote get-url origin`),
   so one token works across every project in your account.
   - **One token, everywhere:** it's account-wide, so use the *same* token in every tool and on
     every machine — don't mint one per machine. It's now **retrievable** too: reveal and copy it
-    again any time at **You → Connections** (no more show-once).
+    again any time at **You → Coding agents** (no more show-once).
 - `git` on your PATH for repo work. **Node.js 18+** is needed for **DevSpec remote control**
   (`devspec-remote`), whose local poller keeps the agent connected to the Agents page without
   burning LLM tokens while waiting for instructions.
@@ -57,7 +57,7 @@ Put the token in Antigravity's **user-level** MCP file — not in a `mcp_config.
 
 **Desktop:** Settings → MCP → Add server (HTTP). Same URL and Authorization header.
 
-Replace `dvs_YOUR_DEVSPEC_MCP_TOKEN` with your **account-wide** token from DevSpec → **You → Connections** → **Connect a tool** (pick **Read & write**). One token covers every project in your account. Reveal it again any time on that page.
+Replace `dvs_YOUR_DEVSPEC_MCP_TOKEN` with your **account-wide** token from DevSpec → **You → Coding agents** → **Create your token** (pick **Read & write**). One token covers every project in your account. Reveal it again any time on that page.
 
 A leftover project `.mcp.json` from Claude or Cursor can stay — it is not required, and it is not the default.
 

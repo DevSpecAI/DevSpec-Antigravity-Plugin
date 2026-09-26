@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.4
+
+### DevSpec's renamed settings pages
+
+The README now sends you to **You → Coding agents** → **Create your token** for your DevSpec token; the page used to be called You → Connections. The remote skill's "Account + project instructions" section is now "Personal + project instructions", and it no longer calls the owner's response style by its old name, Chat Response Style. Nothing about how the plugin behaves has changed.
+
 ## 0.11.3
 
 ### A test catches a DevSpec tool name the server no longer has
