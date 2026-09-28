@@ -13,7 +13,7 @@ This is **DevSpec** remote control — distinct from any built-in remote-control
 
 ## DevSpec work contract
 
-[`devspec://product/implementation-contract`](devspec://product/implementation-contract) is the MCP-served runtime authority for work entry, tracking, claiming, and session-plan thresholds. Do not restate its lifecycle here. Routine search/inspect/answer investigation does not merit a plan merely because it branches or uses several tools. Only when the served `work_entry_contract` selects a session plan, discover the complete mechanics on demand with `node "<plugin>/hooks/scripts/devspec-plan.mjs" --schema`; do not keep a local plan skill or broad static MCP allowlist hot.
+[`devspec://product/implementation-contract`](devspec://product/implementation-contract) is the MCP-served runtime authority for work entry, tracking, claiming, and session-plan thresholds. Do not restate its lifecycle here. Routine search/inspect/answer investigation does not merit a plan merely because it branches or uses several tools. Only when the served `work_entry_contract` selects a session plan, discover the complete mechanics on demand with `node "<plugin>/scripts/devspec-plan.mjs" --schema`; do not keep a local plan skill or broad static MCP allowlist hot.
 
 **Antigravity host limitation:** there is no verified blocking pre-tool hook, so this plugin cannot inject the contract or enforce the DevSpec mutation boundary immediately before a tool call. Connecting or receiving advisory context is not a work request; begin tracked work only from an explicit local request or an authorized remote command that explicitly requests it, then use the served contract and live tool schemas as the runtime authority. The existing `UserPromptSubmit` hook remains prompt-mirror/activity transport, not a mutation gate.
 
@@ -61,7 +61,7 @@ When the conversation produces a durable decision, convention, architecture choi
 
 ## Plugin root
 
-Scripts live at `<plugin>/hooks/scripts/`, where `<plugin>` is this plugin's installed root (the same directory the `Stop` / `UserPromptSubmit` hooks run from). Resolve it from the installed plugin path; every script path below is relative to it.
+Scripts live at `<plugin>/scripts/`, where `<plugin>` is this plugin's installed root (the same directory the `Stop` / `UserPromptSubmit` hooks run from). Resolve it from the installed plugin path; every script path below is relative to it.
 
 ---
 
@@ -88,7 +88,7 @@ Use `remote_match.resolved_project_id` as `project_id`. If no match — or no re
 ### 3. Resolve local conversation id (bond key)
 
 ```bash
-node "<plugin>/hooks/scripts/remote-control-state.mjs" resolve-local-id --agent "Antigravity"
+node "<plugin>/scripts/remote-control-state.mjs" resolve-local-id --agent "Antigravity"
 ```
 
 The script prefers a conversation id from the environment and mints one if none is present. Keep the returned `local_id` in working memory; pass `--local-id` on every subsequent call.
@@ -98,29 +98,31 @@ The script prefers a conversation id from the environment and mints one if none 
 First check whether THIS conversation already has a connection:
 
 ```bash
-node "<plugin>/hooks/scripts/remote-control-state.mjs" resolve-local \
+node "<plugin>/scripts/remote-control-state.mjs" resolve-local \
   --agent "Antigravity" --local-id "<local_id>" [--force-new if --new]
 ```
 
 | `action` | Meaning |
 |---|---|
-| `already_live` | This conversation already owns a live connection (`connection_id` in the result). Keep that id; skip the model-issued register call, but **still run state write (step 5)** so it mechanically re-registers the same bond and rotates capability before any wait is armed. If args change attachment, attach first. |
+| `already_live` | This conversation already owns a live connection (`connection_id` in the result). Keep that id; skip the initial registration helper, but **still run state write (step 5)** so it mechanically re-registers the same bond and rotates capability before any wait is armed. If args change attachment, attach first. |
 | `reconnect` | Recent recoverable stop of this conversation's connection — resume it (re-register the same conversation; reattach its prior session only if it had one). |
 | `register` | Register a fresh **sessionless** connection. |
 | `create_and_attach` | `--new`: create a session, then attach. |
 
-For `register`, `reconnect`, and `create_and_attach`, **register the connection** (idempotent on the conversation bond). For `already_live`, retain its returned connection id and skip only this model-issued call; step 5 remains mandatory:
+For `register`, `reconnect`, and `create_and_attach`, **register the connection** (idempotent on the conversation bond). For `already_live`, retain its returned connection id and skip only this initial registration call; step 5 remains mandatory:
 
 ```
-register_connection({ project_id, local_id: "<local_id>", agent_name: "Antigravity", machine_hostname?, cwd?, name?: "<--name value, only if the user passed one>" })
+node "<plugin>/scripts/connection-call.mjs" register_connection --project-id "<project_id>" --local-id "<local_id>" --cwd "<cwd>" [--name "<user-chosen name>"]
 ```
 
 Store the returned **`connection_id`** (full UUID) **and the returned `codename`** — this agent's own adjective-animal identity (e.g. `Brave Otter`), auto-minted server-side so two of your Antigravity agents are never confused. If `--name "…"` was passed, that becomes the codename instead. **Tell the user which agent this terminal is** (see the status block), so a phone/web driver can pick the right one.
 
 Now handle the session attachment by invocation:
 - **bare** → nothing more; the connection is available and sessionless.
-- **`--session <uuid>`** → `attach_connection({ connection_id, session_id: <uuid> })`.
-- **`--new`** → mint a channel name (`mint-codename`), then `create_session({ session_type: "agent_remote_control", access: "private", agent_name: "Antigravity", project_id, session_codename?, machine_hostname?, cwd?, title?, initial_message? })`, then `attach_connection({ connection_id, session_id })`.
+- **`--session <uuid>`** → run `node "<plugin>/scripts/connection-call.mjs" attach_connection --connection-id "<connection_id>" --session "<uuid>" --cwd "<cwd>"`.
+- **`--new`** → mint a channel name (`mint-codename`), then `create_session({ session_type: "agent_remote_control", access: "private", agent_name: "Antigravity", project_id, session_codename?, machine_hostname?, cwd?, title?, initial_message? })`, then run the same attachment helper with the returned session id.
+
+Use the mechanical helper for registration and attachment, not a raw model-issued MCP call. It uses the existing auth resolver and adds the executing plugin version itself. Host version stays unknown when unavailable; do not guess it. Treat its public JSON response as the normal MCP result. Capability negotiation/storage still happens in step 5.
 
 Never scan by cwd. Other agents' files under `~/.devspec` are irrelevant.
 
@@ -144,7 +146,7 @@ Stop with:  /devspec-remote-stop
 Run **exactly** (never hand-write JSON with a hardcoded prod URL). Pass `--session` only when attached:
 
 ```bash
-node "<plugin>/hooks/scripts/remote-control-state.mjs" write \
+node "<plugin>/scripts/remote-control-state.mjs" write \
   --connection-id '<connection_id>' \
   [--session '<session_id>' when attached] \
   --agent 'Antigravity' \
@@ -178,7 +180,7 @@ Also apply the four instruction fields when present on the seed / create_session
 Step 5's `write` already started the continuous poller. Do **NOT** launch a second one. To (re)start by hand:
 
 ```bash
-node "<plugin>/hooks/scripts/remote-control-state.mjs" \
+node "<plugin>/scripts/remote-control-state.mjs" \
   ensure-poller --connection-id "$CONNECTION_ID" [--session "$SESSION"] --owner-pid "$PPID"
 ```
 
@@ -195,13 +197,13 @@ The poller (no LLM tokens while idle) runs **one long-poll** (`poll_connection`)
 
 ```bash
 # FIRST arm only (just connected) — skip historical inbox:
-node "<plugin>/hooks/scripts/devspec-remote-wait.mjs" --connection-id "$CONNECTION_ID" --owner-pid "$PPID" --from-end
+node "<plugin>/scripts/devspec-remote-wait.mjs" --connection-id "$CONNECTION_ID" --owner-pid "$PPID" --from-end
 
 # EVERY re-arm after a wake — MUST use --pending (or omit --from-end) so owner
 # commands that arrived while you were mid-turn are not skipped. Live bug:
 # --from-end on re-arm jumps the byte offset to EOF and permanently drops mail
 # the poller already wrote to the inbox.
-node "<plugin>/hooks/scripts/devspec-remote-wait.mjs" --connection-id "$CONNECTION_ID" --owner-pid "$PPID" --pending
+node "<plugin>/scripts/devspec-remote-wait.mjs" --connection-id "$CONNECTION_ID" --owner-pid "$PPID" --pending
 ```
 
 Run it under the Antigravity **`monitor`** tool so each stdout line notifies the chat. When you see a `type":"wake"` / `owner_message` line → act → **re-arm only this wait** with `monitor` again using **`--pending`**. Exit **1** → connection ended/disabled/owner gone — stop. Never re-arm with `--from-end`.
@@ -261,7 +263,7 @@ Follow the served contract for everything after work entry.
 
 ### 8b. Shared session plans (only when the served contract selects one)
 
-Use the on-demand bridge with one JSON object: `node "<plugin>/hooks/scripts/devspec-plan.mjs" [--connection-id <uuid>] '{"action":"..."}'`. Create once; use `advance` for one atomic current-complete / optional-amend / next-start transition at meaningful phase boundaries. On reconnect, read the authoritative current plan/revision before mutation. Every existing-plan mutation carries `expected_revision`; cross-plan work carries explicit `plan_id`. Another owner's plan is read-only awareness. Adopt only an orphaned same-owner plan with explicit `plan_id` + revision; server capability authorization decides, never projection presence. Complete when outcome and steps are achieved; otherwise continue, explicitly hand off/adopt, or abandon. Closing a plan does not end remote control.
+Use the on-demand bridge with one JSON object: `node "<plugin>/scripts/devspec-plan.mjs" [--connection-id <uuid>] '{"action":"..."}'`. Create once; use `advance` for one atomic current-complete / optional-amend / next-start transition at meaningful phase boundaries. On reconnect, read the authoritative current plan/revision before mutation. Every existing-plan mutation carries `expected_revision`; cross-plan work carries explicit `plan_id`. Another owner's plan is read-only awareness. Adopt only an orphaned same-owner plan with explicit `plan_id` + revision; server capability authorization decides, never projection presence. Complete when outcome and steps are achieved; otherwise continue, explicitly hand off/adopt, or abandon. Closing a plan does not end remote control.
 
 ### 9. Stopping
 
@@ -271,7 +273,7 @@ Prefer **`/devspec-remote-stop`** — it detaches + marks the connection offline
 
 ## Fallback only (if poller script missing)
 
-If `<plugin>/hooks/scripts/devspec-remote-poll.mjs` does not exist, use this **exact** fallback (do not invent another):
+If `<plugin>/scripts/devspec-remote-poll.mjs` does not exist, use this **exact** fallback (do not invent another):
 
 1. Keep-alive: `heartbeat_connection(connection_id, status: "live", agent_name: "Antigravity")` — one path, attached or sessionless. If a result flags `status: "not_found"` (the connection was ended), stop.
 2. Poll `poll_connection({ connection_id, ingress_version: 1, delegated_scope_version: 1, active_plan_projection_version: 1 })`; validate the strict canonical envelope. Never recover command bodies from legacy previews or transcript calls after negotiation.

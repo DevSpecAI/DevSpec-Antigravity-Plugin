@@ -14,6 +14,8 @@
  * deliberate abort from a network failure. Omitting them keeps the original behaviour.
  */
 
+import { versionedConnectionArguments } from './connection-version.mjs'
+
 export async function mcpToolsCall({
   mcpUrl,
   token,
@@ -29,7 +31,7 @@ export async function mcpToolsCall({
     jsonrpc: '2.0',
     id: Date.now(),
     method: 'tools/call',
-    params: { name, arguments: toolArgs || {} },
+    params: { name, arguments: versionedConnectionArguments(name, toolArgs || {}) },
   }
 
   const controller = new AbortController()
