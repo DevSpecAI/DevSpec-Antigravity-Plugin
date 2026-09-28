@@ -1,5 +1,9 @@
 # DevSpec for Antigravity
 
+**Build on your team’s best thinking.**
+
+DevSpec helps your team and AI agents turn ideas and experience into better software.
+
 Bring [DevSpec](https://devspec.ai) into [Antigravity](https://antigravity.google) — both the
 **CLI** (`agy`) and the **desktop app**. This plugin gives Antigravity two things:
 
