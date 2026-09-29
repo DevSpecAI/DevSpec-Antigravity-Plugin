@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.7
+
+The mechanical Connect helper starts optional setup of a generated shared-launcher payload. This runs on first Connect, not an assumed plugin-activation hook, and does not alter credentials or connection responses. Clone/install the complete plugin including `launcher/`; copying only skills is insufficient. Carrying the installer does not add an Antigravity launch target.
+
 ## 0.11.6
 
 The Connect skill now uses a narrow mechanical registration/attachment helper that reports the executing plugin version and keeps credentials/private capability metadata out of its output. Internal re-registration also reports the version. No unsupported pre-tool hook was invented; unavailable host versions stay unknown. The Connect skill's script paths now match this package's actual `scripts/` layout.
