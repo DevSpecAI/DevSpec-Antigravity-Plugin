@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.10
+
+- Remove the shared launcher payload and installation/pairing side effect from Connect. The mechanical Antigravity connection helper still owns normal authentication and registration.
+- Explain that the standalone launcher is optional and independently installed.
+
 ## 0.11.8
 
 Bundle launcher 0.3.1 to find npm-installed Pi from desktop services and avoid duplicate loopback error tabs. Update the plugin and run Connect to run its shared update check.

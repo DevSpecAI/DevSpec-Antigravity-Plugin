@@ -8,7 +8,6 @@ import { AGENT_NAME } from './agent-identity.mjs'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { versionedConnectionArguments } from './connection-version.mjs'
-import { setupAntigravityLauncher } from './setup-launcher.mjs'
 
 const fields = new Map([['--project-id', 'project_id'], ['--local-id', 'local_id'], ['--connection-id', 'connection_id'], ['--session', 'session_id'], ['--cwd', 'cwd'], ['--name', 'name'], ['--git-remote', 'git_remote'], ['--pinned-project-id', 'pinned_project_id']])
 export function parseConnectionCall(argv) {
@@ -50,9 +49,6 @@ export async function runConnectionCall(name, args, { resolveAuth = resolveDevsp
 let main = false
 try { main = !!process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)) } catch {}
 if (main) {
-  // This mechanical Connect entry exists on the supported host. Do not invent
-  // a SessionStart event: installation occurs on first Connect, not plugin load.
-  void setupAntigravityLauncher().catch(() => {})
   try {
     const { name, args } = parseConnectionCall(process.argv.slice(2))
     process.stdout.write(JSON.stringify(await runConnectionCall(name, args)) + '\n')

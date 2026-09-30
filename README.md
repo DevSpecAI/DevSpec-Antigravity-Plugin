@@ -1,5 +1,7 @@
 # DevSpec for Antigravity
 
+**No DevSpec Launcher is installed by this plugin.** Use Antigravity and its DevSpec connection commands normally. The launcher is a separate, optional browser-launch convenience with its own setup; this plugin does not bundle it, register its URL handler or start its service. Check Coding agents settings in DevSpec for supported standalone launch targets and release availability.
+
 **Build on your team’s best thinking.**
 
 DevSpec helps your team and AI agents turn ideas and experience into better software.
