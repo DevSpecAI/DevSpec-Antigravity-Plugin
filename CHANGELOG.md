@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.8
+
+Bundle launcher 0.3.1 to find npm-installed Pi from desktop services and avoid duplicate loopback error tabs. Update the plugin and run Connect to run its shared update check.
+
 ## 0.11.7
 
 The mechanical Connect helper starts optional setup of a generated shared-launcher payload. This runs on first Connect, not an assumed plugin-activation hook, and does not alter credentials or connection responses. Clone/install the complete plugin including `launcher/`; copying only skills is insufficient. Carrying the installer does not add an Antigravity launch target.
