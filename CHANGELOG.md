@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.11
+
+### Links to DevSpec's Agents settings page
+
+DevSpec's Coding agents settings page is now called Agents, at `/settings/agents`. The README no longer gives directions like You → Coding agents: wherever it sends you to create or reveal your DevSpec token, or to check standalone launch targets, it links straight to [your Agents settings page](https://app.devspec.ai/settings/agents). Nothing about how the plugin behaves has changed.
+
 ## 0.11.10
 
 - Remove the shared launcher payload and installation/pairing side effect from Connect. The mechanical Antigravity connection helper still owns normal authentication and registration.
