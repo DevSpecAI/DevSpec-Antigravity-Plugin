@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.12.2
+
+### DevSpec decides when work was unattended
+
+DevSpec now works out for itself whether an agent's work was unattended, so the remote-control guidance no longer tells Antigravity to leave out a setting that no longer exists. Update the extension to pick this up.
+
 ## 0.12.1
 
 ### An @mention reaches a person
