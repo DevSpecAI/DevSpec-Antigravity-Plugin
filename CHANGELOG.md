@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.12.0
+
+### DevSpec lists Antigravity's model tools only
+
+DevSpec now shows a model only the DevSpec tools it should call. The connection plumbing (registering, polling, keep-alives, pickup and completion reports) no longer appears in Antigravity's tool list, and Antigravity's model no longer needs any of it: `/devspec-remote-stop` now marks the connection offline and detaches through `scripts/connection-call.mjs`, the same mechanical caller Connect already uses for registering and attaching. The stop skill's script paths now point at `scripts/`, where they actually are. The remote-control skill drops its in-chat keep-alive and poll fallback for a missing poller, which ships with the plugin. Your MCP config does not change. Update the plugin to load this version.
+
 ## 0.11.11
 
 ### Links to DevSpec's Agents settings page

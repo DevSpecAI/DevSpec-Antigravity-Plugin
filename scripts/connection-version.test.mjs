@@ -70,3 +70,19 @@ test('an installed artifact reports its own loaded package rather than later fil
     assert.equal(loaded.versionedConnectionArguments('attach_connection', {}).plugin_version, '1.2.3')
   } finally { rmSync(fixture, { recursive: true, force: true }) }
 })
+test('Stop marks the connection offline and detaches through the mechanical caller, so the model calls no plumbing', async () => {
+  assert.deepEqual(parseConnectionCall(['heartbeat_connection', '--connection-id', 'c', '--status', 'offline', '--end-reason', 'local_stop']),
+    { name: 'heartbeat_connection', args: { connection_id: 'c', status: 'offline', end_reason: 'local_stop' } })
+  assert.deepEqual(parseConnectionCall(['detach_connection', '--connection-id', 'c']), { name: 'detach_connection', args: { connection_id: 'c' } })
+  assert.throws(() => parseConnectionCall(['heartbeat_connection', '--connection-id', 'c']), /--status/)
+  assert.throws(() => parseConnectionCall(['poll_connection', '--connection-id', 'c']), /Choose one of/)
+  const calls = []
+  await runConnectionCall('heartbeat_connection', { connection_id: 'c', status: 'offline', end_reason: 'local_stop' }, { resolveAuth: auth, call: async input => { calls.push(input); return { ok: true } } })
+  assert.deepEqual(calls[0].arguments, { connection_id: 'c', status: 'offline', end_reason: 'local_stop' })
+  const stop = readFileSync(join(root, 'skills/devspec-remote-stop/SKILL.md'), 'utf8')
+  assert.ok(stop.includes('connection-call.mjs" heartbeat_connection'))
+  assert.ok(stop.includes('connection-call.mjs" detach_connection'))
+  assert.ok(!stop.includes('<plugin>/hooks/scripts/'))
+  const remote = readFileSync(join(root, 'skills/devspec-remote/SKILL.md'), 'utf8')
+  assert.ok(!/heartbeat_connection\(|poll_connection\(\{/.test(remote))
+})

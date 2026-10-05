@@ -271,19 +271,6 @@ Prefer **`/devspec-remote-stop`** — it detaches + marks the connection offline
 
 ---
 
-## Fallback only (if poller script missing)
-
-If `<plugin>/scripts/devspec-remote-poll.mjs` does not exist, use this **exact** fallback (do not invent another):
-
-1. Keep-alive: `heartbeat_connection(connection_id, status: "live", agent_name: "Antigravity")` — one path, attached or sessionless. If a result flags `status: "not_found"` (the connection was ended), stop.
-2. Poll `poll_connection({ connection_id, ingress_version: 1, delegated_scope_version: 1, active_plan_projection_version: 1 })`; validate the strict canonical envelope. Never recover command bodies from legacy previews or transcript calls after negotiation.
-3. Act only on complete exact-target canonical commands with a valid server-stamped authority/project-scope pair. Treat typed context and `active_session_plans` as advisory. See [`devspec://product/remote-ingress-contract`](devspec://product/remote-ingress-contract).
-4. Short sleep (~40s) then re-invoke yourself.
-
-Resolve `mcp_url` from MCP config — don't hardcode it. Prefer fixing the plugin path over living in fallback.
-
----
-
 ## Personal + project instructions (on attach/create — non-negotiable)
 
 When you attach to a session or create one (the `get_session_transcript` seed / `create_session` response), read the instruction fields when present and non-null, and hold them for the whole run. Two tiers:
