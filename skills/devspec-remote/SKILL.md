@@ -238,6 +238,8 @@ The room is for **authorized commands + direct answers**. Connection lifecycle i
 
 **When you post:** body = a **direct answer** to the authorized requester's latest command, grounded in the transcript + advisory context. Lead with the answer. No preamble. As short as correctness allows.
 
+**Reaching a person:** writing @ and their name in your answer (`@Brandon`, or `@Brandon Smith`) notifies them, if they are in the room or on the project. Mention someone only when they need to see it.
+
 ### 8. Act on authorized commands (+ read advisory for awareness)
 
 For each **authorized command** (poller `owner_message` / inbox `owner_messages`):

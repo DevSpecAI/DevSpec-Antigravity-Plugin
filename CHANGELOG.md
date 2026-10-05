@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.12.1
+
+### An @mention reaches a person
+
+The remote-control skill now tells Antigravity that writing @ and a person's name in an answer in a DevSpec room notifies that person, if they are in the room or on the project. Update the plugin to load this version.
+
 ## 0.12.0
 
 ### DevSpec lists Antigravity's model tools only
