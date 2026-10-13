@@ -359,6 +359,9 @@ export function resolveHookConversationId(hookInput, env = process.env) {
     if (typeof parsed.conversationId === 'string' && parsed.conversationId.trim()) {
       return parsed.conversationId.trim()
     }
+    if (typeof parsed.conversation_id === 'string' && parsed.conversation_id.trim()) {
+      return parsed.conversation_id.trim()
+    }
     if (typeof parsed.session_id === 'string' && parsed.session_id.trim()) {
       return parsed.session_id.trim()
     }

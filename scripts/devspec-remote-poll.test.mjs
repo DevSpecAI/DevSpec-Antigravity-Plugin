@@ -8,6 +8,9 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { FIXTURE_ID, fixtureEnvelope, fixturePollResponse } from './remote-ingress-test-fixtures.mjs'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import {
   isDeliverableCommand,
   hasValidCommandProjectScope,
@@ -27,7 +30,18 @@ import {
   errorBackoffMs,
   unansweredCommands,
   splitRoomWindow,
+  automationRunCommandText,
+  PUSH_HEALTHY_MS,
+  nextPushReconnectDelayMs,
+  pushChannelUrl,
+  parseSseFrame,
+  openPushChannel,
+  extractAntigravityTrailFromTranscript,
+  streamTurnTrailIfChanged,
 } from './devspec-remote-poll.mjs'
+import { storeTiers, takeTiersFor } from './instruction-tiers.mjs'
+import { connectAtStartupEnabled, runSessionStart } from './session-start.mjs'
+import { buildWakeDeliveryMessage, deliverWakeViaAgentApi } from './devspec-remote-listen.mjs'
 
 const ME = 'conn-mine-1111'
 const OTHER_CONN = 'conn-theirs-2222'
@@ -635,3 +649,284 @@ describe('installStopSignalHandlers (item b9e02835)', () => {
     assert.equal(typeof proc.handlers.SIGINT, 'function')
   })
 })
+
+describe('automationRunCommandText (explicit connection_id on claim & record)', () => {
+  it('includes explicit connection_id in both claim_automation_run and record_automation_run', () => {
+    const text = automationRunCommandText(
+      {
+        run_id: 'run-9999',
+        automation_name: 'Nightly Security Audit',
+        trigger_kind: 'scheduled',
+        permission: 'look_only',
+        owner: { display_name: 'N3O' },
+      },
+      ME,
+    )
+    assert.match(
+      text,
+      /claim_automation_run\(\{ run_id: "run-9999", connection_id: "conn-mine-1111", provider: "antigravity" \}\)/,
+    )
+    assert.match(
+      text,
+      /record_automation_run\(\{ run_id: "run-9999", connection_id: "conn-mine-1111", \.\.\. \}\)/,
+    )
+  })
+})
+
+describe('SSE push channel (parseSseFrame, pushChannelUrl, nextPushReconnectDelayMs, openPushChannel)', () => {
+  it('builds /connection-stream URL with version query parameters', () => {
+    const url = pushChannelUrl('https://api.devspec.ai/api/mcp/', ME)
+    assert.equal(
+      url,
+      'https://api.devspec.ai/api/mcp/connection-stream?connection_id=conn-mine-1111&system_notice_version=1&interaction_event_version=1&question_dismissal_event_version=1',
+    )
+  })
+
+  it('parses comment, hello, wake, ended, and system_notice frames', () => {
+    assert.deepEqual(parseSseFrame(': keepalive'), { kind: 'comment' })
+    assert.deepEqual(parseSseFrame('event: hello\ndata: {}'), { kind: 'hello' })
+    assert.deepEqual(parseSseFrame('event: wake\ndata: {"reason":"message"}'), { kind: 'wake' })
+    assert.deepEqual(parseSseFrame('event: ended\ndata: {"end_reason":"ui"}'), {
+      kind: 'ended',
+      endReason: 'ui',
+    })
+    assert.deepEqual(
+      parseSseFrame('event: system_notice\ndata: {"notice_id":"n1","text":"hi"}'),
+      { kind: 'system_notice', notice: { notice_id: 'n1', text: 'hi' } },
+    )
+  })
+
+  it('backs off reconnect attempts and resets after a healthy stream', () => {
+    assert.deepEqual(nextPushReconnectDelayMs({ attempt: 0, openedAtMs: null }), {
+      delayMs: 1_000,
+      nextAttempt: 1,
+    })
+    assert.deepEqual(nextPushReconnectDelayMs({ attempt: 3, openedAtMs: null }), {
+      delayMs: null,
+      nextAttempt: 4,
+    })
+    // Healthy stream resets attempt to 0 -> 1_000ms
+    assert.deepEqual(
+      nextPushReconnectDelayMs({
+        attempt: 3,
+        openedAtMs: 1_000,
+        nowMs: 1_000 + PUSH_HEALTHY_MS + 50,
+      }),
+      { delayMs: 1_000, nextAttempt: 1 },
+    )
+  })
+
+  it('falls back cleanly to poll_connection when SSE endpoint returns non-200', async () => {
+    let fallbackReason = null
+    const handle = openPushChannel({
+      mcpUrl: 'https://api.devspec.ai/api/mcp',
+      token: 'tok',
+      connectionId: ME,
+      fetchImpl: async () => ({
+        ok: false,
+        status: 404,
+        headers: new Map([['content-type', 'application/json']]),
+      }),
+      onFallback: (reason) => {
+        fallbackReason = reason
+      },
+    })
+    await new Promise((r) => setTimeout(r, 20))
+    handle.close()
+    assert.equal(fallbackReason, 'push_http_404')
+  })
+})
+
+describe('extractAntigravityTrailFromTranscript & streamTurnTrailIfChanged', () => {
+  const sampleTranscript = [
+    JSON.stringify({
+      step_index: 1,
+      type: 'USER_INPUT',
+      created_at: '2026-10-13T22:00:00.000Z',
+      content: 'Investigate the remote poller',
+    }),
+    JSON.stringify({
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-10-13T22:00:05.000Z',
+      thinking: 'Let us inspect the remote poller script and check SSE push handling.\n\nSecond paragraph ignored.',
+      tool_calls: [
+        {
+          tool_name: 'view_file',
+          args: {
+            AbsolutePath: '/tmp/foo.mjs',
+            toolAction: 'Viewing devspec-remote-poll.mjs',
+            toolSummary: 'View devspec-remote-poll.mjs',
+          },
+        },
+        {
+          tool_name: 'invoke_subagent',
+          args: {
+            toolAction: 'Spawning codebase researcher',
+            Subagents: [
+              {
+                TypeName: 'research',
+                Role: 'Plugin Architecture Researcher',
+                Prompt: 'Explore the plugin',
+              },
+            ],
+          },
+        },
+      ],
+    }),
+  ].join('\n')
+
+  it('extracts thinking summaries, toolAction/toolSummary, and subagent invocations', () => {
+    const { events, markdown } = extractAntigravityTrailFromTranscript(sampleTranscript, {
+      sinceIso: '2026-10-13T22:00:01.000Z',
+    })
+    assert.equal(events.length, 3)
+    assert.equal(events[0].kind, 'thinking')
+    assert.match(events[0].label, /inspect the remote poller script/)
+    assert.equal(events[1].kind, 'tool')
+    assert.equal(events[1].action, 'Viewing devspec-remote-poll.mjs')
+    assert.equal(events[2].kind, 'subagent')
+    assert.equal(events[2].role, 'Plugin Architecture Researcher')
+    assert.match(markdown, /💭 \*Let us inspect the remote poller script/)
+    assert.match(markdown, /🔧 Viewing devspec-remote-poll\.mjs/)
+    assert.match(markdown, /🤖 \*\*Subagent \(Plugin Architecture Researcher\)\*\*/)
+  })
+
+  it('posts debounced phase: trail updates via post_session_message only when changed', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-trail-test-'))
+    const transcriptPath = path.join(tmpDir, 'transcript.jsonl')
+    fs.writeFileSync(transcriptPath, sampleTranscript, 'utf8')
+    const calls = []
+    const first = await streamTurnTrailIfChanged({
+      transcriptPath,
+      sinceMs: Date.parse('2026-10-13T22:00:01.000Z'),
+      sessionId: 'sess-12345678',
+      connectionId: ME,
+      mcpUrl: 'https://api.devspec.ai/api/mcp',
+      token: 'tok',
+      prevSignature: '',
+      callMcp: async (req) => {
+        calls.push(req)
+        return {}
+      },
+    })
+    assert.equal(first.posted, true)
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].name, 'post_session_message')
+    assert.equal(calls[0].arguments.phase, 'trail')
+    assert.equal(calls[0].arguments.connection_id, ME)
+    assert.equal(calls[0].arguments.trail_events.length, 3)
+
+    // Calling again with the same signature does not re-post
+    const second = await streamTurnTrailIfChanged({
+      transcriptPath,
+      sinceMs: Date.parse('2026-10-13T22:00:01.000Z'),
+      sessionId: 'sess-12345678',
+      connectionId: ME,
+      mcpUrl: 'https://api.devspec.ai/api/mcp',
+      token: 'tok',
+      prevSignature: first.signature,
+      callMcp: async (req) => {
+        calls.push(req)
+        return {}
+      },
+    })
+    assert.equal(second.posted, false)
+    assert.equal(calls.length, 1)
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  })
+})
+
+describe('session-start auto-connect, cached instruction tiers, and sidecar wake delivery', () => {
+  it('stores and consumes cached instruction tiers once for startup orientation', () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-tiers-'))
+    assert.equal(
+      storeTiers('conn-tier-test', { tier_0: 'Tier0 rules', tier_1: 'Tier1 project' }, { home: tmpHome }),
+      true,
+    )
+    const taken = takeTiersFor('conn-tier-test', { home: tmpHome, consume: true })
+    assert.deepEqual(taken, { tier_0: 'Tier0 rules', tier_1: 'Tier1 project', tier_2: '' })
+    assert.equal(takeTiersFor('conn-tier-test', { home: tmpHome }), null)
+    fs.rmSync(tmpHome, { recursive: true, force: true })
+  })
+
+  it('detects connectAtStartupEnabled from env or .devspec/project.json', () => {
+    assert.equal(connectAtStartupEnabled({ DEVSPEC_CONNECT_AT_STARTUP: '1' }), true)
+    assert.equal(connectAtStartupEnabled({ DEVSPEC_CONNECT_AT_STARTUP: '0' }), false)
+  })
+
+  it('auto-connects on SessionStart when DEVSPEC_CONNECT_AT_STARTUP=1 and injects cached tiers', async () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-sess-start-'))
+    const writtenStates = new Map()
+    const writtenBonds = new Map()
+    const ensuredPollers = []
+    try {
+      const out = await runSessionStart(
+        JSON.stringify({
+          conversation_id: 'conv-auto-12345678',
+          transcript_path: '/tmp/transcript.jsonl',
+        }),
+        {
+          env: {
+            HOME: tmpHome,
+            DEVSPEC_CONNECT_AT_STARTUP: '1',
+            DEVSPEC_MCP_TOKEN: 'tok-auto-123',
+          },
+          cwd: tmpHome,
+          home: tmpHome,
+          loadStateFn: () => null,
+          writeStateFn: (id, payload) => writtenStates.set(id, payload),
+          writeBondFn: (agent, localId, bond) => writtenBonds.set(`${agent}:${localId}`, bond),
+          ensurePollerFn: (id, opts) => ensuredPollers.push({ id, opts }),
+          reapPollersFn: () => {},
+          callMcp: async ({ name }) => {
+            assert.equal(name, 'register_connection')
+            return {
+              connection_id: 'conn-auto-99999999',
+              codename: 'Swift Falcon',
+              instructions: { tier_0: 'Always ground with DevSpec first.' },
+            }
+          },
+        },
+      )
+      assert.ok(out?.hookSpecificOutput?.additionalContext)
+      assert.match(out.hookSpecificOutput.additionalContext, /Swift Falcon/)
+      assert.match(out.hookSpecificOutput.additionalContext, /Always ground with DevSpec first\./)
+      assert.ok(writtenStates.has('conn-auto-99999999'))
+      assert.ok(writtenBonds.has('Antigravity:conv-auto-12345678'))
+      assert.ok(ensuredPollers.length >= 1)
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
+    }
+  })
+
+  it('formats wake delivery messages and invokes agentapi send-message', async () => {
+    const msg = buildWakeDeliveryMessage({
+      type: 'owner_messages',
+      session_id: 'sess-abc',
+      messages: [
+        {
+          author: { display_name: 'N3O' },
+          content: 'Please run the test suite and report back.',
+        },
+      ],
+    })
+    assert.match(msg, /\[DevSpec Remote Wake\]/)
+    assert.match(msg, /N3O: Please run the test suite and report back\./)
+
+    const seen = []
+    const res = await deliverWakeViaAgentApi({
+      conversationId: 'conv-123',
+      message: msg,
+      execFileImpl: (cmd, args, _opts, cb) => {
+        seen.push({ cmd, args })
+        cb(null, 'sent', '')
+      },
+    })
+    assert.equal(res.ok, true)
+    assert.equal(seen.length, 1)
+    assert.equal(seen[0].cmd, 'agentapi')
+    assert.deepEqual(seen[0].args, ['send-message', 'conv-123', msg])
+  })
+})
+

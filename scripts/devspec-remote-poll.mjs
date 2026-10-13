@@ -736,7 +736,8 @@ function deliverAdvisory(connectionId, advisoryMsgs, sessionId) {
  * Always pass provider on claim (hard match against preferred_provider). Omitting
  * it fails even when this agent is the named one — same habit as claim_work_item.
  */
-function automationRunCommandText(d) {
+export function automationRunCommandText(d, connectionId = null) {
+  const connId = d?.delivery_connection_id || connectionId || ''
   const permission =
     d.permission === 'can_push'
       ? 'You MAY edit, commit and push.'
@@ -750,12 +751,371 @@ function automationRunCommandText(d) {
     `Owner: ${d.owner?.display_name || 'the owner'}`,
     '',
     'What to do:',
-    `1. claim_automation_run({ run_id: "${d.run_id}", provider: "antigravity" }) — always pass provider (and model if the automation names one). If claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
+    `1. claim_automation_run({ run_id: "${d.run_id}", connection_id: "${connId}", provider: "antigravity" }) — always pass connection_id and provider (and model if the automation names one). If claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
     '2. Follow the instruction returned by that claim, in this repo.',
-    '3. record_automation_run — report status, a verdict for EACH acceptance criterion WITH evidence, and whatever the run produced as artifacts.',
+    `3. record_automation_run({ run_id: "${d.run_id}", connection_id: "${connId}", ... }) — report status, a verdict for EACH acceptance criterion WITH evidence, and whatever the run produced as artifacts.`,
     '',
     `Permission: ${permission}`,
   ].join('\n')
+}
+
+// ---------------------------------------------------------------------------
+// SSE Push Channel (parity with Pi push-channel.ts, falls back to poll_connection)
+// ---------------------------------------------------------------------------
+
+export const PUSH_RECONNECT_BACKOFF_MS = [1_000, 4_000, 10_000]
+export const PUSH_HEALTHY_MS = 30_000
+
+export function nextPushReconnectDelayMs({ attempt, openedAtMs, nowMs = Date.now() }) {
+  const effectiveAttempt =
+    openedAtMs !== null && openedAtMs !== undefined && nowMs - openedAtMs >= PUSH_HEALTHY_MS
+      ? 0
+      : attempt
+  if (effectiveAttempt >= PUSH_RECONNECT_BACKOFF_MS.length) {
+    return { delayMs: null, nextAttempt: effectiveAttempt + 1 }
+  }
+  return {
+    delayMs: PUSH_RECONNECT_BACKOFF_MS[effectiveAttempt],
+    nextAttempt: effectiveAttempt + 1,
+  }
+}
+
+export function pushChannelUrl(mcpUrl, connectionId, options = {}) {
+  const base = String(mcpUrl || '').replace(/\/$/, '')
+  const params = new URLSearchParams({
+    connection_id: String(connectionId || ''),
+    system_notice_version: String(options.systemNoticeVersion ?? 1),
+    interaction_event_version: String(options.interactionEventVersion ?? 1),
+    question_dismissal_event_version: String(options.questionDismissalEventVersion ?? 1),
+  })
+  return `${base}/connection-stream?${params.toString()}`
+}
+
+export function parseSseFrame(block) {
+  let eventName = 'message'
+  const dataLines = []
+  let sawComment = false
+
+  for (const rawLine of String(block || '').split(/\r?\n/)) {
+    if (!rawLine) continue
+    if (rawLine.startsWith(':')) {
+      sawComment = true
+      continue
+    }
+    const colon = rawLine.indexOf(':')
+    const field = colon === -1 ? rawLine : rawLine.slice(0, colon)
+    let value = colon === -1 ? '' : rawLine.slice(colon + 1)
+    if (value.startsWith(' ')) value = value.slice(1)
+    if (field === 'event') eventName = value
+    else if (field === 'data') dataLines.push(value)
+  }
+
+  if (dataLines.length === 0 && sawComment) {
+    return { kind: 'comment' }
+  }
+  const data = dataLines.join('\n')
+  if (eventName === 'hello') return { kind: 'hello' }
+  if (eventName === 'wake') return { kind: 'wake' }
+  if (eventName === 'ended') {
+    try {
+      const parsed = data ? JSON.parse(data) : {}
+      return {
+        kind: 'ended',
+        endReason: typeof parsed.end_reason === 'string' ? parsed.end_reason : null,
+      }
+    } catch {
+      return { kind: 'ended', endReason: null }
+    }
+  }
+  if (eventName === 'system_notice') {
+    try {
+      const parsed = data ? JSON.parse(data) : null
+      return parsed && typeof parsed === 'object' ? { kind: 'system_notice', notice: parsed } : null
+    } catch {
+      return null
+    }
+  }
+  if (eventName === 'interaction_event') {
+    try {
+      const parsed = data ? JSON.parse(data) : null
+      return parsed && typeof parsed === 'object' ? { kind: 'interaction_event', event: parsed } : null
+    } catch {
+      return null
+    }
+  }
+  if (eventName === 'question_dismissal_event') {
+    try {
+      const parsed = data ? JSON.parse(data) : null
+      return parsed && typeof parsed === 'object'
+        ? { kind: 'question_dismissal_event', event: parsed }
+        : null
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
+export function openPushChannel({
+  mcpUrl,
+  token,
+  connectionId,
+  connectionCapability = null,
+  onEvent,
+  onFallback,
+  fetchImpl = fetch,
+}) {
+  let closed = false
+  let controller = null
+  let reconnectTimer = null
+  let attempt = 0
+
+  const stop = () => {
+    closed = true
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+    if (controller) {
+      controller.abort()
+      controller = null
+    }
+  }
+
+  const scheduleReconnect = (openedAtMs, reason) => {
+    if (closed) return
+    const { delayMs, nextAttempt } = nextPushReconnectDelayMs({ attempt, openedAtMs })
+    attempt = nextAttempt
+    if (delayMs === null) {
+      onFallback?.(`push_reconnect_exhausted:${reason}`)
+      return
+    }
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null
+      void connect()
+    }, delayMs)
+  }
+
+  const connect = async () => {
+    if (closed) return
+    controller = new AbortController()
+    let openedAtMs = null
+    try {
+      const res = await fetchImpl(pushChannelUrl(mcpUrl, connectionId), {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'text/event-stream',
+          ...(connectionCapability ? { 'x-devspec-connection-capability': connectionCapability } : {}),
+        },
+        signal: controller.signal,
+      })
+      const contentType = res.headers?.get?.('content-type') || ''
+      if (!res.ok || !contentType.includes('text/event-stream') || !res.body) {
+        onFallback?.(`push_http_${res.status}`)
+        return
+      }
+      openedAtMs = Date.now()
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      while (!closed) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        let sep = buffer.indexOf('\n\n')
+        while (sep !== -1) {
+          const rawFrame = buffer.slice(0, sep)
+          buffer = buffer.slice(sep + 2)
+          const parsed = parseSseFrame(rawFrame)
+          if (parsed && parsed.kind !== 'comment') {
+            onEvent?.(parsed)
+            if (parsed.kind === 'ended') {
+              stop()
+              return
+            }
+          }
+          sep = buffer.indexOf('\n\n')
+        }
+      }
+      if (!closed) {
+        scheduleReconnect(openedAtMs, 'eof')
+      }
+    } catch (err) {
+      if (closed) return
+      const msg = err instanceof Error ? err.message : String(err)
+      scheduleReconnect(openedAtMs, msg)
+    }
+  }
+
+  void connect()
+  return { close: stop }
+}
+
+// ---------------------------------------------------------------------------
+// Live Antigravity transcript.jsonl Trail Streaming (`phase: 'trail'`)
+// ---------------------------------------------------------------------------
+
+export function summarizeThinkingText(text, maxLen = 140) {
+  if (typeof text !== 'string') return ''
+  const firstParagraph = text
+    .trim()
+    .split(/\r?\n\r?\n/)[0]
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!firstParagraph) return ''
+  return firstParagraph.length > maxLen
+    ? `${firstParagraph.slice(0, maxLen - 1).trimEnd()}…`
+    : firstParagraph
+}
+
+/**
+ * Extract structured trail events and cumulative Markdown from an Antigravity
+ * `transcript.jsonl` raw string for the active turn.
+ */
+export function extractAntigravityTrailFromTranscript(
+  rawText,
+  { sinceIso = null, sinceMs = null } = {},
+) {
+  const cutoffMs =
+    typeof sinceMs === 'number' && Number.isFinite(sinceMs)
+      ? sinceMs
+      : sinceIso
+        ? Date.parse(sinceIso)
+        : null
+
+  const events = []
+  const bullets = []
+  let seq = 0
+
+  for (const rawLine of String(rawText || '').split(/\r?\n/)) {
+    const trimmed = rawLine.trim()
+    if (!trimmed) continue
+    let step
+    try {
+      step = JSON.parse(trimmed)
+    } catch {
+      continue
+    }
+    if (!step || step.type !== 'PLANNER_RESPONSE') continue
+
+    if (cutoffMs !== null && Number.isFinite(cutoffMs) && step.created_at) {
+      const stepMs = Date.parse(step.created_at)
+      if (Number.isFinite(stepMs) && stepMs < cutoffMs) continue
+    }
+
+    if (typeof step.thinking === 'string' && step.thinking.trim()) {
+      const summary = summarizeThinkingText(step.thinking)
+      if (summary) {
+        seq++
+        events.push({
+          seq,
+          kind: 'thinking',
+          label: summary,
+          step_index: step.step_index ?? null,
+        })
+        bullets.push(`- 💭 *${summary}*`)
+      }
+    }
+
+    const toolCalls = Array.isArray(step.tool_calls) ? step.tool_calls : []
+    for (const tc of toolCalls) {
+      const toolName = tc?.name || tc?.tool_name || tc?.function?.name || 'tool'
+      let args = tc?.arguments ?? tc?.args ?? tc?.input ?? tc?.function?.arguments ?? {}
+      if (typeof args === 'string') {
+        try {
+          args = JSON.parse(args)
+        } catch {
+          args = {}
+        }
+      }
+
+      if (toolName === 'invoke_subagent' && Array.isArray(args?.Subagents)) {
+        for (const sub of args.Subagents) {
+          const role = sub?.Role || sub?.TypeName || 'subagent'
+          const typeName = sub?.TypeName || 'self'
+          const summary = args?.toolAction || args?.toolSummary || role
+          seq++
+          events.push({
+            seq,
+            kind: 'subagent',
+            role,
+            type_name: typeName,
+            action: summary,
+            step_index: step.step_index ?? null,
+          })
+          bullets.push(`- 🤖 **Subagent (${role})**: ${summary}`)
+        }
+        continue
+      }
+
+      const action =
+        (typeof args?.toolAction === 'string' && args.toolAction.trim()) ||
+        (typeof args?.toolSummary === 'string' && args.toolSummary.trim()) ||
+        toolName
+      const summary =
+        (typeof args?.toolSummary === 'string' && args.toolSummary.trim()) || action
+      seq++
+      events.push({
+        seq,
+        kind: 'tool',
+        tool_name: toolName,
+        action,
+        summary,
+        step_index: step.step_index ?? null,
+      })
+      bullets.push(`- 🔧 ${action}`)
+    }
+  }
+
+  const markdown = bullets.join('\n')
+  const signature = JSON.stringify(events.map((e) => [e.kind, e.label || e.action || e.role]))
+  return { events, markdown, signature }
+}
+
+/**
+ * Tail `transcriptPath` (`transcript.jsonl`) and post a debounced `phase: 'trail'`
+ * session message when the turn trail has changed.
+ */
+export async function streamTurnTrailIfChanged({
+  transcriptPath,
+  sinceMs = null,
+  sessionId,
+  connectionId,
+  mcpUrl,
+  token,
+  prevSignature = '',
+  callMcp = mcpToolsCall,
+} = {}) {
+  if (!transcriptPath || !sessionId || !connectionId || !fs.existsSync(transcriptPath)) {
+    return { posted: false, signature: prevSignature, events: [], markdown: '' }
+  }
+  let raw = ''
+  try {
+    raw = fs.readFileSync(transcriptPath, 'utf8')
+  } catch {
+    return { posted: false, signature: prevSignature, events: [], markdown: '' }
+  }
+  const { events, markdown, signature } = extractAntigravityTrailFromTranscript(raw, {
+    sinceMs,
+  })
+  if (events.length === 0 || !markdown || signature === prevSignature) {
+    return { posted: false, signature: prevSignature, events, markdown }
+  }
+  await callMcp({
+    mcpUrl,
+    token,
+    name: 'post_session_message',
+    arguments: {
+      session_id: sessionId,
+      connection_id: connectionId,
+      phase: 'trail',
+      message: markdown,
+      trail_events: events,
+    },
+    timeoutMs: 10_000,
+  })
+  return { posted: true, signature, events, markdown }
 }
 
 async function main() {
@@ -1013,7 +1373,7 @@ async function main() {
         message_type: 'automation_run',
         dispatch: d,
         project_scope: null,
-        content: automationRunCommandText(d),
+        content: automationRunCommandText(d, connectionId),
         remote_control: { is_owner_instruction: false, is_advisory: false, role: 'automation_run' },
       }))
 
@@ -1091,7 +1451,7 @@ async function main() {
       // Local dispatches are owner-authorized and never receive a delegated project
       // instruction. Keep the same root field invariant as scope-aware remote commands.
       project_scope: null,
-      content: automationRunCommandText(d),
+      content: automationRunCommandText(d, connectionId),
       remote_control: { is_owner_instruction: false, is_advisory: false, role: 'automation_run' },
     }))
 
@@ -1139,6 +1499,25 @@ async function main() {
   // TRANSITION (see verbForTurnTransition): pickup on start, keepalive each tick
   // while active, complete on end. Starts false (no turn at boot).
   let prevTurnActive = false
+  let lastTrailSignature = ''
+  let lastTrailPostAt = 0
+  let sseWakePending = false
+  if (process.env.DEVSPEC_DISABLE_SSE !== '1') {
+    openPushChannel({
+      mcpUrl,
+      token,
+      connectionId,
+      connectionCapability: state?.connection_capability || null,
+      onEvent: (evt) => {
+        if (evt.kind === 'wake') {
+          sseWakePending = true
+        }
+      },
+      onFallback: (reason) => {
+        process.stderr.write(`devspec-remote-poll: SSE push unavailable (${reason}) — using poll_connection\n`)
+      },
+    })
+  }
   // First tick is a SEED: ask for the catch-up window and filter already-answered
   // history out of the commands. Re-armed on a server-side reattach, which lands us
   // in a room we have never read.
@@ -1190,6 +1569,30 @@ async function main() {
     await emitActivityVerb(verbForTurnTransition(prevTurnActive, turnActive))
     prevTurnActive = turnActive
 
+    if (turnActive && sessionId && liveState?.transcript_path) {
+      if (Date.now() - lastTrailPostAt >= 2_000) {
+        try {
+          const trailRes = await streamTurnTrailIfChanged({
+            transcriptPath: liveState.transcript_path,
+            sinceMs: marker?.startedAt || null,
+            sessionId,
+            connectionId,
+            mcpUrl,
+            token,
+            prevSignature: lastTrailSignature,
+          })
+          if (trailRes.posted) {
+            lastTrailSignature = trailRes.signature
+            lastTrailPostAt = Date.now()
+          }
+        } catch {
+          /* non-fatal */
+        }
+      }
+    } else if (!turnActive) {
+      lastTrailSignature = ''
+    }
+
     // Cadence from connection STATE — with long-poll this picks the HOLD LENGTH,
     // not a gap. Both tiers deliver instantly; check_tier is 'responsive' either way
     // because the UI's latency copy would now be lying if it said otherwise.
@@ -1203,8 +1606,10 @@ async function main() {
     // --- ONE held call: heartbeat + dispatches + room, in one response ---------
     let res = null
     try {
+      const effectiveWaitMs = sseWakePending ? 0 : tier.waitMs
+      sseWakePending = false
       res = await pollOnce({
-        waitMs: tier.waitMs,
+        waitMs: effectiveWaitMs,
         busy: busyArg,
         checkTier: tier.checkTier,
         catchUp: needsSeed,
