@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.13.0
+
+### Antigravity parity with Claude Code and Pi plugins
+
+- **SSE push channel and live trail streaming:** `scripts/devspec-remote-poll.mjs` now opens `scripts/remote-push-client.mjs` (`/api/mcp/remote-events`) for sub-second wake notifications with graceful fallback to held `poll_connection`, and streams live turn activity trails (`scripts/turn-trail.mjs`) while a turn is active.
+- **Session lifecycle, compaction, and room awareness hooks:** Added `scripts/session-start-context.mjs`, `scripts/pre-compact.mjs`, `scripts/room-unread.mjs`, and `scripts/post-tool-dispatch.mjs` to surface remote session continuity, unread room messages, and background launch correlation (`scripts/requests.mjs`).
+- **Commit provenance, observation, and session coordination bridges:** Added `scripts/commit-provenance.mjs`, `scripts/commit-observation.mjs`, `scripts/devspec-scope.mjs`, `scripts/pin-check.mjs`, `scripts/repo-link-nudge.mjs`, `scripts/statusline.mjs`, `scripts/devspec-poll.mjs` (`manage_poll`), `scripts/devspec-question.mjs` (`manage_directed_question`), `scripts/interaction-events.mjs`, and `scripts/question-dismissal-events.mjs`, governed by `devspec://product/implementation-contract`.
+
 ## 0.12.2
 
 ### DevSpec decides when work was unattended

@@ -74,6 +74,7 @@ import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { stripConnectionCapability } from './connection-capability-state.mjs'
 import { normalizeRemoteIngressV1 } from './remote-ingress-v1.mjs'
+import { readConnectionTelemetry } from './statusline.mjs'
 
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
@@ -1192,7 +1193,8 @@ async function main() {
   // hold, so there is no separate keep-alive timer any more. This path survives for
   // the one thing the poll cannot express: the deliberate `offline` stamp with an
   // end_reason, which flips the Agents UI to Disconnected immediately on teardown.
-  async function sendHeartbeat({ status, checkTier = null, busy = null, endReason = null }) {
+  async function sendHeartbeat({ status, checkTier = null, busy = null, endReason = null, agentStats = undefined }) {
+    const telemetry = agentStats !== undefined ? agentStats : readConnectionTelemetry(connectionId)
     return mcpToolsCall({
       mcpUrl,
       token,
@@ -1204,6 +1206,7 @@ async function main() {
         ...(checkTier ? { check_tier: checkTier } : {}),
         ...(busy !== null ? { busy } : {}),
         ...(status === 'offline' && endReason ? { end_reason: endReason } : {}),
+        ...(telemetry ? { agent_stats: telemetry } : {}),
       },
       // Teardown must not be able to hang: a wedged socket here would keep a dead
       // agent's process alive instead of letting it exit and free the chip.

@@ -26,6 +26,8 @@ import {
   resolveHookConversationId,
   syncStateTranscriptPath,
 } from './mirror-turn.mjs'
+import { checkPinAfterTool } from './pin-check.mjs'
+import { checkRepoLinkAfterTool } from './repo-link-nudge.mjs'
 import {
   appendRequestEvent,
   launchForRequest,
@@ -57,10 +59,21 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
     syncStateTranscriptPath(state, parseTranscriptPath(raw), conversationId)
   }
   const connectionId = state?.connection_id || resolveOwnConnectionId(conversationId, { home })
+  const notices = []
 
   // 0. Commit provenance claim/release tracking & unclaimed edit nudge staging
   try {
     handlePost(payload, { env })
+  } catch {
+    /* non-fatal */
+  }
+
+  // 0b. Folder pin check (.devspec/project.json)
+  try {
+    const pinOut = checkPinAfterTool(payload)
+    if (pinOut?.hookSpecificOutput?.additionalContext) {
+      notices.push(pinOut.hookSpecificOutput.additionalContext)
+    }
   } catch {
     /* non-fatal */
   }
@@ -86,6 +99,14 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
   if (bareToolName === 'run_command' || bareToolName === 'Bash') {
     try {
       await handleBashPost(payload, { env, ...(call ? { call } : {}) })
+    } catch {
+      /* non-fatal */
+    }
+    try {
+      const repoNudge = await checkRepoLinkAfterTool(payload, { env, ...(call ? { call } : {}) })
+      if (repoNudge?.hookSpecificOutput?.additionalContext) {
+        notices.push(repoNudge.hookSpecificOutput.additionalContext)
+      }
     } catch {
       /* non-fatal */
     }
@@ -147,9 +168,21 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
   const unreadRaw = postToolNotice({ input: payload, env, home })
   if (unreadRaw) {
     try {
-      return JSON.parse(unreadRaw)
+      const parsed = JSON.parse(unreadRaw)
+      if (parsed?.hookSpecificOutput?.additionalContext) {
+        notices.push(parsed.hookSpecificOutput.additionalContext)
+      }
     } catch {
-      return null
+      /* ignore */
+    }
+  }
+
+  if (notices.length > 0) {
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PostToolUse',
+        additionalContext: notices.join('\n\n'),
+      },
     }
   }
 

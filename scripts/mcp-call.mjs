@@ -127,7 +127,17 @@ export async function mcpToolsCall({
       .map((c) => c.text)
     const joined = textParts.join('\n')
     if (payload.result?.isError) {
-      throw new Error(joined || 'MCP tool error')
+      let details = payload.result?.structuredContent ?? null
+      if (!details) {
+        try {
+          details = JSON.parse(joined)
+        } catch {
+          /* older plain refusal */
+        }
+      }
+      const err = new Error(joined || 'MCP tool error')
+      err.details = details
+      throw err
     }
     let data
     try {
@@ -140,3 +150,68 @@ export async function mcpToolsCall({
   const data = payload.result ?? payload
   return includeMeta ? { data, meta: payload.result?._meta ?? null } : data
 }
+
+export async function mcpToolsList({
+  mcpUrl,
+  token,
+  connectionCapability = null,
+  timeoutMs = 0,
+} = {}) {
+  const controller = new AbortController()
+  let timeoutTimer = null
+  if (timeoutMs > 0) {
+    timeoutTimer = setTimeout(() => controller.abort(), timeoutMs)
+    if (typeof timeoutTimer.unref === 'function') timeoutTimer.unref()
+  }
+  let res
+  try {
+    res = await fetch(mcpUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+        ...(connectionCapability
+          ? { 'x-devspec-connection-capability': connectionCapability }
+          : {}),
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: Date.now(),
+        method: 'tools/list',
+        params: {},
+      }),
+      signal: controller.signal,
+    })
+  } finally {
+    if (timeoutTimer) clearTimeout(timeoutTimer)
+  }
+  const text = await res.text()
+  if (!res.ok) {
+    throw new Error(`MCP HTTP ${res.status}: ${text.slice(0, 400)}`)
+  }
+  let payload = null
+  try {
+    payload = JSON.parse(text)
+  } catch {
+    for (const line of text.split('\n')) {
+      const trimmed = line.trim()
+      if (trimmed.startsWith('data:')) {
+        try {
+          payload = JSON.parse(trimmed.slice(5).trim())
+          break
+        } catch {
+          /* continue */
+        }
+      }
+    }
+  }
+  if (!payload) {
+    throw new Error(`Unparseable MCP response: ${text.slice(0, 200)}`)
+  }
+  if (payload.error) {
+    throw new Error(payload.error.message || JSON.stringify(payload.error))
+  }
+  return Array.isArray(payload.result?.tools) ? payload.result.tools : []
+}
+

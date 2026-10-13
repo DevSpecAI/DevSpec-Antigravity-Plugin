@@ -267,6 +267,14 @@ Follow the served contract for everything after work entry.
 
 Use the on-demand bridge with one JSON object: `node "<plugin>/scripts/devspec-plan.mjs" [--connection-id <uuid>] '{"action":"..."}'`. Create once; use `advance` for one atomic current-complete / optional-amend / next-start transition at meaningful phase boundaries. On reconnect, read the authoritative current plan/revision before mutation. Every existing-plan mutation carries `expected_revision`; cross-plan work carries explicit `plan_id`. Another owner's plan is read-only awareness. Adopt only an orphaned same-owner plan with explicit `plan_id` + revision; server capability authorization decides, never projection presence. Complete when outcome and steps are achieved; otherwise continue, explicitly hand off/adopt, or abandon. Closing a plan does not end remote control.
 
+### 8c. Room polls and directed questions
+
+Use the on-demand capability-gated bridges with one JSON object:
+- **Room polls (`manage_poll`):** `node "<plugin>/scripts/devspec-poll.mjs" [--connection-id <uuid>] [--schema] ['{"action":"..."}']`
+- **Directed questions (`manage_directed_question`):** `node "<plugin>/scripts/devspec-question.mjs" [--connection-id <uuid>] [--schema] ['{"action":"..."}']`
+
+Both bridges read the bound connection's private capability from local state and enforce the served `devspec://product/interaction-event-contract` and `devspec://product/session-poll-contract`.
+
 ### 9. Stopping
 
 Prefer **`/devspec-remote-stop`** — it detaches + marks the connection offline immediately. Simply exiting leaves a stale chip for up to ~90s (the poller self-terminates on owner death).
