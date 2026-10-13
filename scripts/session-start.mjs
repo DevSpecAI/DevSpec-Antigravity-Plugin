@@ -14,7 +14,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { LOADED_PLUGIN_VERSION } from './connection-version.mjs'
 import {
@@ -22,7 +22,13 @@ import {
   storeTiers,
   takeTiersFor,
 } from './instruction-tiers.mjs'
-import { hostTokenFromEnv, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import {
+  DEFAULT_PROD_URL,
+  formatMissingAuthMessage,
+  hostTokenFromEnv,
+  resolveDevspecMcpAuth,
+  verifyAndPinDevspecAuth,
+} from './resolve-mcp-auth.mjs'
 import {
   ensurePollerForConnection,
   reapDeadPollers,
@@ -38,6 +44,8 @@ import {
   syncStateTranscriptPath,
 } from './mirror-turn.mjs'
 
+const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+
 function readStdin() {
   try {
     return fs.readFileSync(0, 'utf8')
@@ -47,9 +55,68 @@ function readStdin() {
 }
 
 /**
- * Determine whether startup auto-connect is enabled via environment or `.devspec/project.json`.
+ * Non-destructively configure `statusLine` in `~/.gemini/antigravity-cli/settings.json`
+ * when no custom statusLine is set yet.
  */
-export function connectAtStartupEnabled(env = process.env, { cwd = process.cwd() } = {}) {
+export function ensureStatusLineConfigured({
+  home = os.homedir(),
+  pluginRoot = PLUGIN_ROOT,
+} = {}) {
+  if (!home) return { updated: false, reason: 'no_home' }
+  const settingsPath = path.join(home, '.gemini', 'antigravity-cli', 'settings.json')
+  const scriptPath = path.join(pluginRoot, 'scripts', 'statusline.mjs')
+  const desiredCommand = `node "${scriptPath}"`
+
+  let settings = {}
+  try {
+    if (fs.existsSync(settingsPath)) {
+      const parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf8'))
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        settings = parsed
+      }
+    }
+  } catch {
+    return { updated: false, reason: 'invalid_settings_json' }
+  }
+
+  const existing = settings.statusLine
+  if (existing) {
+    const existingCmd =
+      typeof existing === 'string'
+        ? existing.trim()
+        : typeof existing?.command === 'string'
+          ? existing.command.trim()
+          : ''
+    if (existingCmd) {
+      // Only update if it points to a DevSpec statusline.mjs path that no longer exists
+      const m = existingCmd.match(/["']([^"']*statusline\.mjs)["']/)
+      if (!m || fs.existsSync(m[1])) {
+        return { updated: false, reason: 'already_configured', settingsPath }
+      }
+    }
+  }
+
+  settings.statusLine = {
+    type: 'command',
+    command: desiredCommand,
+  }
+  try {
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n')
+    return { updated: true, settingsPath, command: desiredCommand }
+  } catch {
+    return { updated: false, reason: 'write_failed', settingsPath }
+  }
+}
+
+/**
+ * Determine whether startup auto-connect is enabled via environment, `.devspec/project.json`,
+ * or the presence of a valid DevSpec MCP token (unless explicitly disabled).
+ */
+export function connectAtStartupEnabled(
+  env = process.env,
+  { cwd = process.cwd(), home = undefined } = {},
+) {
   const rawEnv = String(
     env?.DEVSPEC_CONNECT_AT_STARTUP ?? env?.DEVSPEC_AUTO_CONNECT ?? '',
   )
@@ -62,12 +129,20 @@ export function connectAtStartupEnabled(env = process.env, { cwd = process.cwd()
     const pinPath = path.join(cwd, '.devspec', 'project.json')
     if (fs.existsSync(pinPath)) {
       const pin = JSON.parse(fs.readFileSync(pinPath, 'utf8'))
+      if (pin?.connect_at_startup === false || pin?.auto_connect === false) return false
       if (pin?.connect_at_startup === true || pin?.auto_connect === true) return true
     }
   } catch {
     /* ignore */
   }
-  return false
+
+  const effectiveHome = home || env?.HOME || os.homedir()
+  const auth = resolveDevspecMcpAuth(cwd, {
+    env,
+    home: effectiveHome,
+    hostToken: hostTokenFromEnv(env, { cwd, home: effectiveHome }),
+  })
+  return Boolean(auth?.ok && auth?.token)
 }
 
 /**
@@ -108,11 +183,27 @@ export async function autoConnectAtStartup({
   writeStateFn = writeStateFile,
   writeBondFn = writeLocalBond,
   ensurePollerFn = ensurePollerForConnection,
+  verifyAuthFn = verifyAndPinDevspecAuth,
   home = undefined,
 } = {}) {
-  const auth = resolveDevspecMcpAuth(cwd, { hostToken: hostTokenFromEnv(env) })
+  const effectiveHome = home || env?.HOME || os.homedir()
+  let auth = null
+  if (callMcp === defaultCallMcp) {
+    try {
+      auth = await verifyAuthFn(cwd, { env, home: effectiveHome })
+    } catch {
+      auth = null
+    }
+  }
+  if (!auth?.token) {
+    auth = resolveDevspecMcpAuth(cwd, {
+      env,
+      home: effectiveHome,
+      hostToken: hostTokenFromEnv(env, { cwd, home: effectiveHome }),
+    })
+  }
   if (!auth?.token) return null
-  const mcpUrl = auth.mcp_url || 'https://api.devspec.ai/api/mcp'
+  const mcpUrl = auth.mcp_url || DEFAULT_PROD_URL
   const ownerPid = resolveOwnerPid('auto', null)
   const agentVersion = LOADED_PLUGIN_VERSION
   const reg = await callMcp({
@@ -195,9 +286,17 @@ export async function runSessionStart(
     writeBondFn = writeLocalBond,
     ensurePollerFn = ensurePollerForConnection,
     reapPollersFn = reapDeadPollers,
+    verifyAuthFn = verifyAndPinDevspecAuth,
     home = undefined,
   } = {},
 ) {
+  const effectiveHome = home || env?.HOME || os.homedir()
+  try {
+    ensureStatusLineConfigured({ home: effectiveHome })
+  } catch {
+    /* non-fatal */
+  }
+
   try {
     reapPollersFn({ agent: AGENT_NAME })
   } catch {
@@ -208,7 +307,13 @@ export async function runSessionStart(
   const transcriptPath = parseTranscriptPath(raw)
   let state = loadStateFn(conversationId)
 
-  if (!state?.connection_id && connectAtStartupEnabled(env, { cwd })) {
+  const auth = resolveDevspecMcpAuth(cwd, {
+    env,
+    home: effectiveHome,
+    hostToken: hostTokenFromEnv(env, { cwd, home: effectiveHome }),
+  })
+
+  if (!state?.connection_id && connectAtStartupEnabled(env, { cwd, home: effectiveHome })) {
     try {
       state = await autoConnectAtStartup({
         cwd,
@@ -219,7 +324,8 @@ export async function runSessionStart(
         writeStateFn,
         writeBondFn,
         ensurePollerFn,
-        home,
+        verifyAuthFn,
+        home: effectiveHome,
       })
     } catch {
       /* non-fatal */
@@ -227,6 +333,14 @@ export async function runSessionStart(
   }
 
   if (!state?.connection_id) {
+    if (!auth?.ok || !auth?.token) {
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'SessionStart',
+          additionalContext: `${auth?.error || formatMissingAuthMessage()}\nIf the user asks about DevSpec or remote control, report this message verbatim and do not guess or search for tokens across unrelated files.`,
+        },
+      }
+    }
     return null
   }
 

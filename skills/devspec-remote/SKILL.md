@@ -157,9 +157,12 @@ node "<plugin>/scripts/remote-control-state.mjs" write \
   [--codename '<session_codename if any>']
 ```
 
-This resolves the MCP token (env → `~/.gemini/antigravity-cli/mcp_config.json` then cwd `.gemini/antigravity-cli/mcp_config.json` → project `.mcp.json` last — never `~/.claude.json`), mechanically re-registers the same token/local-id bond with `connection_capability_version: 1`, stores the returned `_meta` secret only in the mode-0600 connection state, and **auto-starts the continuous poller**. This is mandatory for `already_live` too and must finish before step 7; a pre-capability state or failed/stale rotation leaves plan access unavailable rather than reusing an old secret. It also reaps provably-dead pollers for this agent. Confirm `plan_capability.ok` and `poller.ok` / `poller.pid`; never print or place the capability in a prompt. Opt out with `--no-poller` (tests only).
+This resolves the MCP token (`~/.devspec/auth.json` verified pin → env → `~/.gemini/antigravity-cli/mcp_config.json` then cwd `.gemini/antigravity-cli/mcp_config.json` → project `.mcp.json` last — never `~/.claude.json`), mechanically re-registers the same token/local-id bond with `connection_capability_version: 1`, stores the returned `_meta` secret only in the mode-0600 connection state, and **auto-starts the continuous poller**. This is mandatory for `already_live` too and must finish before step 7; a pre-capability state or failed/stale rotation leaves plan access unavailable rather than reusing an old secret. It also reaps provably-dead pollers for this agent. Confirm `plan_capability.ok` and `poller.ok` / `poller.pid`; never print or place the capability in a prompt. Opt out with `--no-poller` (tests only).
 
-If `auth_ok: false`, print the `warning` and tell the user to fix MCP auth. If `poller.ok` is false, show `warning_poller`.
+If `auth_ok: false` (or if registration in step 4 fails with `missing_token`), tell the user verbatim and stop:
+> DevSpec is not configured properly: place your "dvs_..." token in ~/.gemini/antigravity-cli/mcp_config.json under mcpServers.devspec.headers.Authorization ("Bearer dvs_..."), then restart agy.
+
+If `poller.ok` is false, show `warning_poller`.
 
 ### 6. Read the room for context (ONLY when attached)
 
@@ -193,7 +196,7 @@ The poller (no LLM tokens while idle) runs **one long-poll** (`poll_connection`)
 - **Exit 1** only for terminal stop (disabled / UI End / owner gone / connection stood down). **Exit 2** = bad args.
 - **Rides out a recoverable teardown by itself.** If the server says the connection is gone but will not attribute it to a person — the shape a server redeploy produces — the poller retries rather than exiting. Only `end_reason` of `ui` or `local_stop` is a deliberate human end and stops it dead. You will see `recoverable, not a UI end; retrying` in its log; that is the poller working, not failing.
 
-**Wait-for-owner (wakes the model — required):** after the poller is up, run the wait command under the host's background/monitor mechanism:
+**Wait-for-owner (wakes the model — required):** after the poller is up, launch the wait command in the background with Antigravity's `run_command` host tool (`WaitMsBeforeAsync: 500`):
 
 ```bash
 # FIRST arm only (just connected) — skip historical inbox:
@@ -206,7 +209,7 @@ node "<plugin>/scripts/devspec-remote-wait.mjs" --connection-id "$CONNECTION_ID"
 node "<plugin>/scripts/devspec-remote-wait.mjs" --connection-id "$CONNECTION_ID" --owner-pid "$PPID" --pending
 ```
 
-Run it under the Antigravity **`monitor`** tool so each stdout line notifies the chat. When you see a `type":"wake"` / `owner_message` line → act → **re-arm only this wait** with `monitor` again using **`--pending`**. Exit **1** → connection ended/disabled/owner gone — stop. Never re-arm with `--from-end`.
+Launch `devspec-remote-wait.mjs` in the background with Antigravity's `run_command` host tool (`WaitMsBeforeAsync: 500`) so Antigravity automatically wakes you when the background command exits with a `type":"wake"` / `owner_message` payload. After you finish handling that turn → **always re-arm this wait** in the background (`WaitMsBeforeAsync: 500`) with **`--pending`**. Never kill a running wait task unless the user explicitly runs `/devspec-remote-stop`, and never re-arm with `--from-end`. Exit **1** → connection ended/disabled/owner gone — check why before standing down.
 
 **Exit 1 → check WHY before you stand down.** "Ended" and "ended by a human" are not the same thing:
 

@@ -22,7 +22,7 @@ import { findProjectPin } from './devspec-scope.mjs'
 import { resolveOwnConnectionId } from './launch-guard.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveHookConversationId } from './mirror-turn.mjs'
-import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { DEFAULT_PROD_URL, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 
 const REMOTE_DIR = '.devspec/remote-control'
 const AGENT_DIR = AGENT_NAME.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
@@ -303,7 +303,7 @@ export async function sendTelemetry({ connectionId, home = os.homedir(), call = 
   }
   if (!token) return { ok: false, reason: 'no_token' }
   await call({
-    mcpUrl: mcpUrl || 'https://api.devspec.ai/api/mcp',
+    mcpUrl: mcpUrl || DEFAULT_PROD_URL,
     token,
     name: 'heartbeat_connection',
     arguments: {
@@ -493,6 +493,20 @@ export function renderStatusLine(rawInput = '', { home = os.homedir(), env = pro
     null
 
   const view = readConnectionView({ home, conversationId, cwd, env })
+  if (!view) {
+    const hasInputContext = Boolean(
+      cwd ||
+        (typeof input.conversation_id === 'string' && input.conversation_id.trim()) ||
+        (typeof input.session_id === 'string' && input.session_id.trim()),
+    )
+    if (hasInputContext) {
+      const auth = resolveDevspecMcpAuth(cwd || process.cwd(), { home, env })
+      if (!auth.ok) {
+        return 'DevSpec: not configured — add dvs_ token to ~/.gemini/antigravity-cli/mcp_config.json'
+      }
+    }
+    return ''
+  }
   let telemetry = null
   if (view?.connectionId) {
     telemetry =

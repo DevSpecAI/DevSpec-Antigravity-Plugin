@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.14.0
+
+### Antigravity CLI (`agy`) 3-step setup, verified token pinning, and auto-started remote listener
+
+- **Verified token pinning (`~/.devspec/auth.json`) and placeholder filtering:** `scripts/resolve-mcp-auth.mjs` now validates `dvs_` tokens, ignores placeholder strings (`dvs_YOUR_...`) and unexpanded `${...}` templates, falls back to `https://devspec.ai/api/mcp` when no `serverUrl` is specified, and pins verified working tokens to `~/.devspec/auth.json` (`0600`) after `verify_agent_connection` so stale local project configs cannot shadow a working token.
+- **Automatic `statusLine` setup and startup connection:** `scripts/session-start.mjs` now non-destructively configures `statusLine` in `~/.gemini/antigravity-cli/settings.json` when unset, automatically registers the `agy` session and starts the background poller when a valid token is present (`DEVSPEC_CONNECT_AT_STARTUP=0` to disable), and surfaces a deterministic remediation message (plus `DevSpec: not configured` in `scripts/statusline.mjs`) when no `dvs_` token is configured, governed by `devspec://product/implementation-contract`.
+- **Streamlined `agy` CLI documentation and background wait guidance:** `README.md` and `skills/devspec-remote/SKILL.md` now focus exclusively on Antigravity CLI (`agy`) with a 3-step cross-platform install (`~/.gemini/config/plugins/antigravity-devspec-autopilot-extension`) and background `devspec-remote-wait.mjs` execution (`WaitMsBeforeAsync: 500`, `--pending` on re-arm).
+
 ## 0.13.0
 
 ### Antigravity parity with Claude Code and Pi plugins

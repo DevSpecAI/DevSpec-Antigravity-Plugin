@@ -14,7 +14,14 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
+import {
+  DEFAULT_PROD_URL,
+  formatMissingAuthMessage,
+  hostTokenFromEnv,
+  readPinnedAuth,
+  resolveDevspecMcpAuth,
+  verifyAndPinDevspecAuth,
+} from './resolve-mcp-auth.mjs'
 
 let root
 let fakeHome
@@ -33,7 +40,7 @@ beforeEach(() => {
   // Stop walkMcpJson before it climbs into the real user home (which may have ~/.mcp.json).
   fs.writeFileSync(
     path.join(root, '.mcp.json'),
-    JSON.stringify({ mcpServers: { devspec: { url: 'https://api.devspec.ai/api/mcp' } } }),
+    JSON.stringify({ mcpServers: { devspec: { url: DEFAULT_PROD_URL } } }),
   )
 })
 
@@ -50,7 +57,7 @@ function proj(name) {
   fs.mkdirSync(d, { recursive: true })
   return d
 }
-function agConfig(dir, token, url = 'https://api.devspec.ai/api/mcp') {
+function agConfig(dir, token, url = DEFAULT_PROD_URL) {
   const c = path.join(dir, '.gemini', 'antigravity-cli')
   fs.mkdirSync(c, { recursive: true })
   fs.writeFileSync(
@@ -61,7 +68,7 @@ function agConfig(dir, token, url = 'https://api.devspec.ai/api/mcp') {
 function mcpJson(dir, token) {
   fs.writeFileSync(
     path.join(dir, '.mcp.json'),
-    JSON.stringify({ mcpServers: { devspec: { url: 'https://api.devspec.ai/api/mcp', headers: { Authorization: `Bearer ${token}` } } } }),
+    JSON.stringify({ mcpServers: { devspec: { url: DEFAULT_PROD_URL, headers: { Authorization: `Bearer ${token}` } } } }),
   )
 }
 
@@ -130,7 +137,7 @@ describe('resolveDevspecMcpAuth (Antigravity)', { concurrency: false }, () => {
     const d = proj('urlonly')
     const c = path.join(d, '.gemini', 'antigravity-cli')
     fs.mkdirSync(c, { recursive: true })
-    fs.writeFileSync(path.join(c, 'mcp_config.json'), JSON.stringify({ mcpServers: { devspec: { serverUrl: 'https://api.devspec.ai/api/mcp' } } }))
+    fs.writeFileSync(path.join(c, 'mcp_config.json'), JSON.stringify({ mcpServers: { devspec: { serverUrl: DEFAULT_PROD_URL } } }))
     const auth = resolveDevspecMcpAuth(d)
     assert.equal(auth.ok, false)
     assert.match(auth.error, /antigravity-cli[\\/]mcp_config\.json/)
@@ -141,7 +148,7 @@ describe('resolveDevspecMcpAuth (Antigravity)', { concurrency: false }, () => {
     process.env.DEVSPEC_MCP_TOKEN = 'dvs_env_only'
     const auth = resolveDevspecMcpAuth(d)
     assert.equal(auth.ok, true)
-    assert.equal(auth.mcp_url, 'https://api.devspec.ai/api/mcp')
+    assert.equal(auth.mcp_url, 'https://devspec.ai/api/mcp')
   })
 
   it('defaults to the production API host when the config entry has a token but no URL', () => {
@@ -154,7 +161,7 @@ describe('resolveDevspecMcpAuth (Antigravity)', { concurrency: false }, () => {
     )
     const auth = resolveDevspecMcpAuth(d)
     assert.equal(auth.token, 'dvs_no_url')
-    assert.equal(auth.mcp_url, 'https://api.devspec.ai/api/mcp')
+    assert.equal(auth.mcp_url, 'https://devspec.ai/api/mcp')
   })
 
   it('honours a staging serverUrl override rather than falling back to production', () => {
@@ -163,5 +170,47 @@ describe('resolveDevspecMcpAuth (Antigravity)', { concurrency: false }, () => {
     const auth = resolveDevspecMcpAuth(d)
     assert.equal(auth.token, 'dvs_staging')
     assert.equal(auth.mcp_url, 'https://api.devspecstaging.com/api/mcp')
+  })
+
+  it('ignores placeholder tokens like dvs_YOUR_DEVSPEC_MCP_TOKEN or non-dvs_ tokens in config files', () => {
+    const d = proj('placeholder')
+    agConfig(fakeHome, 'dvs_YOUR_DEVSPEC_MCP_TOKEN')
+    mcpJson(d, 'not_a_dvs_token')
+    const auth = resolveDevspecMcpAuth(d)
+    assert.equal(auth.ok, false)
+    assert.equal(auth.error, formatMissingAuthMessage())
+  })
+
+  it('formats a deterministic OS-aware missing auth message for POSIX and Windows', () => {
+    assert.equal(
+      formatMissingAuthMessage('linux'),
+      'DevSpec is not configured properly: place your "dvs_..." token in ~/.gemini/antigravity-cli/mcp_config.json under mcpServers.devspec.headers.Authorization ("Bearer dvs_..."), then restart agy.',
+    )
+    assert.equal(
+      formatMissingAuthMessage('win32'),
+      'DevSpec is not configured properly: place your "dvs_..." token in %USERPROFILE%\\.gemini\\antigravity-cli\\mcp_config.json under mcpServers.devspec.headers.Authorization ("Bearer dvs_..."), then restart agy.',
+    )
+  })
+
+  it('verifies candidate tokens and pins the working token to ~/.devspec/auth.json when multiple tokens exist', async () => {
+    const d = proj('multitoken')
+    agConfig(fakeHome, 'dvs_stale_home_token')
+    agConfig(d, 'dvs_working_project_token')
+
+    const res = await verifyAndPinDevspecAuth(d, {
+      home: fakeHome,
+      verifyToken: async ({ token }) => token === 'dvs_working_project_token',
+    })
+    assert.equal(res.ok, true)
+    assert.equal(res.token, 'dvs_working_project_token')
+
+    const pinned = readPinnedAuth({ home: fakeHome })
+    assert.equal(pinned?.token, 'dvs_working_project_token')
+
+    // Subsequent resolveDevspecMcpAuth and hostTokenFromEnv prefer the verified pinned candidate
+    const resolved = resolveDevspecMcpAuth(d, { home: fakeHome })
+    assert.equal(resolved.ok, true)
+    assert.equal(resolved.token, 'dvs_working_project_token')
+    assert.equal(hostTokenFromEnv(process.env, { cwd: d, home: fakeHome }), 'dvs_working_project_token')
   })
 })

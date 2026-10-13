@@ -459,4 +459,72 @@ describe('Item 5 Parity: statusline.mjs rendering and telemetry', () => {
     assert.deepEqual(norm.model, { provider: 'anthropic', id: 'claude-sonnet-4-5' })
     assert.ok(recordStatuslineTelemetry(stdinPayload, { home, connectionId: CONN_ID }))
   })
+
+  it('auto-configures statusLine in settings.json and surfaces missing-auth notice in statusline and SessionStart', async () => {
+    const { connectAtStartupEnabled, ensureStatusLineConfigured, runSessionStart } = await import(
+      './session-start.mjs'
+    )
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-agy-setup-'))
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-agy-cwd-'))
+
+    // 1. ensureStatusLineConfigured writes statusLine when missing and preserves existing keys
+    const settingsPath = path.join(home, '.gemini', 'antigravity-cli', 'settings.json')
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+    fs.writeFileSync(settingsPath, JSON.stringify({ theme: 'dark' }, null, 2))
+    const cfg1 = ensureStatusLineConfigured({ home })
+    assert.equal(cfg1.updated, true)
+    const parsedSettings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'))
+    assert.equal(parsedSettings.theme, 'dark')
+    assert.equal(parsedSettings.statusLine.type, 'command')
+    assert.match(parsedSettings.statusLine.command, /statusline\.mjs/)
+
+    // Second call preserves existing statusLine when script exists on disk
+    const cfg2 = ensureStatusLineConfigured({ home })
+    assert.equal(cfg2.updated, false)
+    assert.equal(cfg2.reason, 'already_configured')
+
+    // 2. connectAtStartupEnabled defaults to true when valid token is configured, unless disabled
+    assert.equal(connectAtStartupEnabled({}, { cwd, home }), false)
+    assert.equal(
+      connectAtStartupEnabled({ DEVSPEC_MCP_TOKEN: 'dvs_valid_test_token_123456' }, { cwd, home }),
+      true,
+    )
+    assert.equal(
+      connectAtStartupEnabled(
+        { DEVSPEC_MCP_TOKEN: 'dvs_valid_test_token_123456', DEVSPEC_CONNECT_AT_STARTUP: '0' },
+        { cwd, home },
+      ),
+      false,
+    )
+
+    // 3. renderStatusLine shows not-configured notice when no dvs_ token exists
+    const unconfiguredLine = renderStatusLine(
+      JSON.stringify({ conversation_id: 'conv-missing-auth', cwd }),
+      { home, env: {} },
+    )
+    assert.equal(
+      unconfiguredLine,
+      'DevSpec: not configured — add dvs_ token to ~/.gemini/antigravity-cli/mcp_config.json',
+    )
+
+    // 4. runSessionStart returns deterministic missing-auth remediation context when unconfigured
+    const startOut = await runSessionStart(
+      JSON.stringify({ conversation_id: 'conv-missing-auth', cwd }),
+      {
+        home,
+        cwd,
+        env: {},
+        loadStateFn: () => null,
+      },
+    )
+    assert.ok(startOut?.hookSpecificOutput?.additionalContext)
+    assert.match(
+      startOut.hookSpecificOutput.additionalContext,
+      /DevSpec is not configured properly: place your "dvs_\.\.\." token in ~\/\.gemini\/antigravity-cli\/mcp_config\.json/,
+    )
+    assert.match(
+      startOut.hookSpecificOutput.additionalContext,
+      /report this message verbatim and do not guess or search for tokens/,
+    )
+  })
 })
