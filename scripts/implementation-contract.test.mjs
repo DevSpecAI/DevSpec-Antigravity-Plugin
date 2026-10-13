@@ -92,13 +92,13 @@ describe('MCP-served implementation contract', () => {
     assert.match(independenceSurface, /owns every plugin file|owns this script independently/i)
   })
 
-  it('leaves UserPromptSubmit on mirror-turn transport rather than inventing contract injection', () => {
+  it('leaves PreInvocation on pre-invocation transport rather than inventing contract injection', () => {
     const hooks = JSON.parse(read('hooks.json'))
-    assert.deepEqual(hooks['devspec-remote-control-mirror'].UserPromptSubmit, [
+    assert.deepEqual(hooks['devspec-remote-control-mirror'].PreInvocation, [
       {
         type: 'command',
-        command: 'node "./scripts/mirror-turn.mjs" user_prompt',
-        timeout: 30,
+        command: 'node "./scripts/pre-invocation.mjs"',
+        timeout: 10,
       },
     ])
   })

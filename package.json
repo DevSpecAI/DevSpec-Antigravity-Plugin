@@ -2,8 +2,12 @@
   "name": "devspec-antigravity-plugin",
   "version": "0.12.2",
   "private": true,
+  "type": "module",
   "description": "DevSpec skills and remote-control hooks for Antigravity.",
   "license": "MIT",
+  "scripts": {
+    "test": "node --test scripts/*.test.mjs"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/DevSpecAI/DevSpec-Antigravity-Plugin"
@@ -15,3 +19,4 @@
     "remote-control"
   ]
 }
+

@@ -115,6 +115,10 @@ function parseArgs(argv) {
     else if (a === '--title') out.title = argv[++i]
     else if (a === '--local-id' || a === '--local_id' || a === '--conversation-id') {
       out['local-id'] = argv[++i]
+    } else if (a === '--transcript-path' || a === '--transcript_path') {
+      out['transcript-path'] = argv[++i]
+    } else if (a === '--event') {
+      out.event = argv[++i]
     } else if (a === '--max-age-minutes' || a === '--max_age_minutes') {
       out['max-age-minutes'] = argv[++i]
     } else if (a === '--owner-pid') {
@@ -182,6 +186,51 @@ function findPollerPidsForConnection(connectionId) {
 }
 
 /**
+ * Linux /proc owner-pid self-resolution. Walks parent process ancestry up to maxHops
+ * looking for the owning Antigravity host process (`agy`, `antigravity`, or
+ * `language_server_*`) so callers inside subshells or hooks that cannot rely on
+ * `$PPID` still anchor the poller to the real Antigravity process.
+ */
+export function resolveOwnerPidAutoLinux(
+  startPid = process.pid,
+  { maxHops = 12, procRoot = '/proc' } = {},
+) {
+  if (process.platform !== 'linux' && procRoot === '/proc') return null
+  let pid = Number.parseInt(String(startPid), 10)
+  if (!Number.isInteger(pid) || pid <= 1) return null
+  for (let i = 0; i < maxHops && pid > 1; i++) {
+    let statusText = ''
+    try {
+      statusText = fs.readFileSync(path.join(procRoot, String(pid), 'status'), 'utf8')
+    } catch {
+      break
+    }
+    const nameMatch = statusText.match(/^Name:\s*(.+)$/m)
+    const ppidMatch = statusText.match(/^PPid:\s*(\d+)$/m)
+    const comm = (nameMatch?.[1] || '').trim()
+    let cmdline = ''
+    try {
+      cmdline = fs
+        .readFileSync(path.join(procRoot, String(pid), 'cmdline'), 'utf8')
+        .replace(/\0/g, ' ')
+        .trim()
+    } catch {
+      /* ignore */
+    }
+    if (
+      /^(agy|antigravity|language_server_[a-z0-9_.-]+)$/i.test(comm) ||
+      /(^|[\s/])(agy|antigravity|language_server_[a-z0-9_.-]+)(\s|$)/i.test(cmdline)
+    ) {
+      return pid
+    }
+    const nextPid = Number.parseInt(ppidMatch?.[1] || '', 10)
+    if (!Number.isInteger(nextPid) || nextPid <= 1 || nextPid === pid) break
+    pid = nextPid
+  }
+  return null
+}
+
+/**
  * Windows-only owner-pid self-resolution (item 3cddb3b4). On win32 this process is
  * commonly invoked from Git Bash (MSYS), whose own `$$`/`$PPID` are MSYS-internal
  * numbers that do NOT correspond to any real Win32 process — querying Win32_Process
@@ -190,8 +239,8 @@ function findPollerPidsForConnection(connectionId) {
  * an orphan sentinel, not a resolvable process). node.exe itself, unlike the MSYS
  * shell, IS a genuine Win32 process, so `process.pid` (this script's own pid) is a
  * real, queryable anchor — walk its Win32_Process ancestry until we reach the owning
- * `claude.exe`, however many shell layers sit in between. A single short-lived
- * PowerShell call does the whole walk (fast: one process spawn, no polling).
+ * host process (`agy.exe`, `antigravity.exe`, or `claude.exe`), however many shell
+ * layers sit in between. A single short-lived PowerShell call does the whole walk.
  */
 export function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 12, timeoutMs = 4000 } = {}) {
   if (process.platform !== 'win32') return null
@@ -202,7 +251,7 @@ export function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 1
     `for ($i = 0; $i -lt ${maxHops}; $i++) {`,
     '  $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction SilentlyContinue',
     '  if (-not $proc) { break }',
-    "  if ($proc.Name -ieq 'claude.exe') { Write-Output $proc.ProcessId; break }",
+    "  if ($proc.Name -ieq 'agy.exe' -or $proc.Name -ieq 'antigravity.exe' -or $proc.Name -ieq 'claude.exe') { Write-Output $proc.ProcessId; break }",
     '  if (-not $proc.ParentProcessId -or $proc.ParentProcessId -eq $p) { break }',
     '  $p = $proc.ParentProcessId',
     '}',
@@ -222,15 +271,16 @@ export function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 1
 
 /**
  * Resolve the effective owner-pid for this call: an explicit, valid `--owner-pid`
- * always wins (any platform); otherwise attempt the Windows self-resolution above;
- * otherwise fall back to a previously-recorded value (still better than nothing on
- * a platform/setup where auto-resolution isn't available). Returns null if none.
+ * always wins (any platform); otherwise attempt Linux `/proc` or Windows ancestry
+ * self-resolution above; otherwise fall back to a previously-recorded value.
  */
 export function resolveOwnerPid(explicitArg, prevValue) {
   const explicit = Number.parseInt(String(explicitArg ?? ''), 10)
   if (Number.isInteger(explicit) && explicit > 1) return explicit
-  const auto = resolveOwnerPidAutoWindows()
-  if (auto) return auto
+  const autoLinux = resolveOwnerPidAutoLinux()
+  if (autoLinux) return autoLinux
+  const autoWin = resolveOwnerPidAutoWindows()
+  if (autoWin) return autoWin
   const prev = Number.parseInt(String(prevValue ?? ''), 10)
   return Number.isInteger(prev) && prev > 1 ? prev : null
 }
@@ -558,7 +608,7 @@ function sanitizeLocalId(id) {
   return s || null
 }
 
-function localBondPath(agent, localId) {
+export function localBondPath(agent, localId) {
   return path.join(LOCAL_DIR, agentSlug(agent), `${localId}.json`)
 }
 
@@ -580,15 +630,21 @@ function localBondPath(agent, localId) {
  * MAX_TURN_MS (1h). Live bug: Working / bouncing dots stuck after every remote reply
  * (Grok item a6b3f881, Claude item 87117120 — same root cause, both plugins).
  *
- * Tools with no per-conversation id at all (Cursor, Antigravity) correctly resolve
- * null here and are disambiguated by selectBoundState's single-connection fallback.
+ * Antigravity hooks receive `conversationId` and `transcriptPath` on stdin JSON,
+ * and subprocesses may carry `DEVSPEC_REMOTE_LOCAL_ID` or `ANTIGRAVITY_CONVERSATION_ID`.
+ * Note: `ANTIGRAVITY_TRAJECTORY_ID` is a per-trajectory UUID (distinct from the
+ * conversation ID) and is intentionally NOT used as `local_id`.
  */
 export function detectLocalId(args = {}, env = process.env) {
-  const fromArg = sanitizeLocalId(args['local-id'] || args.localId || args.local_id)
+  const fromArg = sanitizeLocalId(
+    args['local-id'] || args.localId || args.local_id || args.conversationId || args.conversation_id,
+  )
   if (fromArg) return { local_id: fromArg, source: 'arg' }
 
   const envPairs = [
     ['DEVSPEC_REMOTE_LOCAL_ID', env.DEVSPEC_REMOTE_LOCAL_ID],
+    ['ANTIGRAVITY_CONVERSATION_ID', env.ANTIGRAVITY_CONVERSATION_ID],
+    ['CONVERSATION_ID', env.CONVERSATION_ID],
     ['CODEX_THREAD_ID', env.CODEX_THREAD_ID],
     ['CLAUDE_CODE_SESSION_ID', env.CLAUDE_CODE_SESSION_ID],
     ['CLAUDE_SESSION_ID', env.CLAUDE_SESSION_ID],
@@ -600,6 +656,32 @@ export function detectLocalId(args = {}, env = process.env) {
     if (id) return { local_id: id, source: `env:${name}` }
   }
   return { local_id: null, source: null }
+}
+
+/**
+ * Infer the Antigravity conversation transcript path from a conversation UUID.
+ * Antigravity stores conversation transcripts at:
+ *   `<appDataDir>/brain/<conversationId>/.system_generated/logs/transcript.jsonl`
+ */
+export function inferAntigravityTranscriptPath(localId, env = process.env) {
+  const id = sanitizeLocalId(localId)
+  if (!id) return null
+  const appDataDir =
+    env.ANTIGRAVITY_APP_DATA_DIR || path.join(os.homedir(), '.gemini', 'antigravity-cli')
+  const candidate = path.join(
+    appDataDir,
+    'brain',
+    id,
+    '.system_generated',
+    'logs',
+    'transcript.jsonl',
+  )
+  try {
+    if (fs.existsSync(candidate)) return candidate
+  } catch {
+    /* ignore */
+  }
+  return null
 }
 
 export function mintLocalId() {
@@ -629,12 +711,12 @@ export function isRecoverableEndReason(endReason) {
   )
 }
 
-function readLocalBond(agent, localId) {
+export function readLocalBond(agent, localId) {
   if (!localId) return null
   return readJson(localBondPath(agent, localId))
 }
 
-function writeLocalBond(agent, localId, patch) {
+export function writeLocalBond(agent, localId, patch) {
   const p = localBondPath(agent, localId)
   const prev = readJson(p) || {}
   const next = {
@@ -859,6 +941,54 @@ export async function negotiateConnectionCapability({
     return { ok: true, version: 1, value: capability.value }
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/**
+ * Move a live connection onto a new conversation of the SAME Antigravity process
+ * (e.g. when a new conversation starts or resumes under a startup listener).
+ */
+export function rebondConnectionToConversation({
+  agent = AGENT_NAME,
+  connectionId,
+  localId,
+  transcriptPath = null,
+} = {}) {
+  const id = sanitizeLocalId(localId)
+  if (!connectionId || !id) return { ok: false, reason: 'missing_ids' }
+  const perPath = connectionPath(connectionId)
+  const state = readJson(perPath)
+  if (!state || state.enabled === false) return { ok: false, reason: 'connection_not_live' }
+  const agentName = agent || state.agent_name || AGENT_NAME
+  const resolvedTranscriptPath =
+    (typeof transcriptPath === 'string' && transcriptPath.trim() ? transcriptPath.trim() : null) ||
+    inferAntigravityTranscriptPath(id) ||
+    state.transcript_path ||
+    null
+  const bond = writeLocalBond(agentName, id, {
+    status: 'live',
+    connection_id: connectionId,
+    session_id: state.session_id ?? null,
+    session_codename: state.session_codename ?? null,
+    title: state.title ?? null,
+    cwd: state.cwd ?? null,
+    end_reason: null,
+    cursor_after_message_id: state.cursor_after_message_id || null,
+    transcript_path: resolvedTranscriptPath,
+  })
+  writeJson(perPath, {
+    ...state,
+    local_id: id,
+    transcript_path: resolvedTranscriptPath,
+    updated_at: new Date().toISOString(),
+  })
+  return {
+    ok: true,
+    connection_id: connectionId,
+    local_id: id,
+    transcript_path: resolvedTranscriptPath,
+    bond_path: localBondPath(agentName, id),
+    bond,
   }
 }
 
@@ -1176,17 +1306,73 @@ if (isMain) {
     process.exit(0)
   }
 
+  if (cmd === 'orient' || cmd === 'context') {
+    const agentName = args.agent || AGENT_NAME
+    let payload = null
+    if (cmd === 'context' && !process.stdin.isTTY) {
+      try {
+        payload = JSON.parse(fs.readFileSync(0, 'utf8') || '{}')
+      } catch {
+        payload = null
+      }
+    }
+    const stdinConvId = payload?.conversationId || payload?.session_id
+    const detected = detectLocalId(
+      stdinConvId ? { ...args, 'local-id': stdinConvId } : args,
+      process.env,
+    )
+    const bond = detected.local_id ? readLocalBond(agentName, detected.local_id) : null
+    const connectionId = args['connection-id'] || bond?.connection_id || null
+    const state = connectionId ? readJson(connectionPath(connectionId)) : null
+    if (!connectionId || !state) {
+      if (cmd === 'context') process.exit(0)
+      process.stdout.write(
+        'This conversation is not connected to DevSpec. Nothing to orient on.\n',
+      )
+      process.exit(1)
+    }
+    if (cmd === 'context') {
+      const additionalContext = [
+        `DevSpec connection active: connection_id=${connectionId}`,
+        state.session_codename ? `codename=${state.session_codename}` : '',
+        state.session_id ? `session_id=${state.session_id}` : 'sessionless',
+        detected.local_id ? `local_id=${detected.local_id}` : '',
+      ]
+        .filter(Boolean)
+        .join(' | ')
+      process.stdout.write(
+        JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: args.event === 'SessionStart' ? 'SessionStart' : 'PreInvocation',
+            additionalContext,
+          },
+        }) + '\n',
+      )
+      process.exit(0)
+    }
+    const lines = [
+      `connection_id: ${connectionId}`,
+      `codename: ${state.session_codename || '—'}`,
+      `session_id: ${state.session_id || 'none (sessionless — there is no room to answer in)'}`,
+      `local_id: ${state.local_id || detected.local_id || '—'}`,
+      `transcript_path: ${state.transcript_path || '—'}`,
+    ]
+    process.stdout.write(lines.join('\n') + '\n')
+    process.exit(0)
+  }
+
   if (cmd === 'disable-local') {
     // SessionEnd teardown: resolve THIS conversation's bound connection (no
     // --connection-id needed) and disable it.
     const agentName = args.agent || AGENT_NAME
     let localId = detectLocalId(args, process.env).local_id
-    // SessionEnd hook delivers the conversation id on stdin as { session_id }.
+    // Hook delivers the conversation id on stdin as { conversationId } or { session_id }.
     if (!localId && !process.stdin.isTTY) {
       try {
         const raw = fs.readFileSync(0, 'utf8')
         const j = JSON.parse(raw || '{}')
-        if (typeof j.session_id === 'string') localId = sanitizeLocalId(j.session_id)
+        const stdinId = j.conversationId || j.session_id
+        if (typeof stdinId === 'string') localId = sanitizeLocalId(stdinId)
       } catch {
         /* no stdin payload */
       }
@@ -1235,6 +1421,15 @@ if (isMain) {
     // The conversation this write belongs to — stamped INTO the per-connection state
     // so the mirror hook can bind strictly to THIS conversation.
     const localId = detectLocalId(args, process.env).local_id
+    const explicitTranscriptPath =
+      typeof args['transcript-path'] === 'string' && args['transcript-path'].trim()
+        ? args['transcript-path'].trim()
+        : null
+    const transcriptPath =
+      explicitTranscriptPath ||
+      prev.transcript_path ||
+      inferAntigravityTranscriptPath(localId, process.env) ||
+      null
     // Optional attached session (present for --session / --new; absent = sessionless).
     const sessionId =
       typeof args.session === 'string' && args.session.length >= 8 ? args.session : prev.session_id ?? null
@@ -1260,6 +1455,7 @@ if (isMain) {
       session_id: sessionId,
       agent_name: agentName,
       local_id: localId ?? prev.local_id ?? null,
+      transcript_path: transcriptPath,
       owner_pid: ownerPid,
       project_id: projectId,
       mcp_url: args.url || auth.mcp_url || prev.mcp_url || 'https://api.devspec.ai/api/mcp',
@@ -1290,6 +1486,7 @@ if (isMain) {
         cwd,
         end_reason: null,
         cursor_after_message_id: prev.cursor_after_message_id || null,
+        transcript_path: transcriptPath,
       })
     }
 
@@ -1306,6 +1503,7 @@ if (isMain) {
       auth_source: state.auth_source,
       token_present: !!state.token,
       local_id: localId,
+      transcript_path: transcriptPath,
       bond_path: bond ? localBondPath(agentName, localId) : null,
       project_id: projectId,
       plan_capability: {

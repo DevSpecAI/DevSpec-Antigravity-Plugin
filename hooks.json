@@ -1,18 +1,57 @@
 {
   "devspec-remote-control-mirror": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "node \"./scripts/session-start.mjs\"",
+        "timeout": 30
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "node \"./scripts/pre-invocation.mjs\"",
+        "timeout": 10
+      }
+    ],
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "node \"./scripts/post-invocation.mjs\"",
+        "timeout": 15
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"./scripts/devspec-tool-input.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"./scripts/post-tool-dispatch.mjs\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "type": "command",
         "command": "node \"./scripts/mirror-turn.mjs\" stop",
         "timeout": 30
       }
-    ],
-    "UserPromptSubmit": [
-      {
-        "type": "command",
-        "command": "node \"./scripts/mirror-turn.mjs\" user_prompt",
-        "timeout": 30
-      }
     ]
   }
 }
+

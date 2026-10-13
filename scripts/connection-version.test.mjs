@@ -54,7 +54,7 @@ test('Connect uses the actual scripts layout and the mechanical caller, not a fi
   assert.ok(skill.includes('connection-call.mjs" attach_connection'))
   assert.ok(!skill.includes('<plugin>/hooks/scripts/'))
   const hooks = JSON.parse(readFileSync(join(root, 'hooks.json'), 'utf8'))
-  assert.ok(!JSON.stringify(hooks).includes('PreToolUse'))
+  assert.ok(!JSON.stringify(hooks).includes('hooks/scripts/'))
 })
 test('an installed artifact reports its own loaded package rather than later file contents', async () => {
   const fixture = mkdtempSync(join(tmpdir(), 'antigravity-version-artifact-'))

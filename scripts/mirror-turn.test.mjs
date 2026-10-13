@@ -19,6 +19,14 @@ import {
   prepareAgentMirrorText,
   explicitReplyMarkerPath,
   consumeExplicitReplyMarker,
+  parseTranscriptPath,
+  extractUserRequestText,
+  extractLatestTranscriptStep,
+  launchedAntigravityBackgroundWork,
+  handleMirrorTurn,
+  recordOwnedLaunch,
+  writeTurnMarker,
+  readTurnMarker,
 } from './mirror-turn.mjs'
 
 describe('resolveHookConversationId', () => {
@@ -247,3 +255,117 @@ describe('explicit-reply marker (double-post guard, item b9fb49a9)', () => {
     assert.equal(path.dirname(p), path.join(os.homedir(), '.devspec', 'remote-control', 'connections'))
   })
 })
+
+describe('Antigravity native hook payload & transcript handling', () => {
+  it('resolves Antigravity conversationId and transcriptPath from stdin JSON', () => {
+    const raw = JSON.stringify({
+      conversationId: 'ca2d5a24-57ea-4252-90d0-82d4dd2504d1',
+      transcriptPath: '/tmp/brain/ca2d5a24/.system_generated/logs/transcript.jsonl',
+    })
+    assert.equal(resolveHookConversationId(raw, {}), 'ca2d5a24-57ea-4252-90d0-82d4dd2504d1')
+    assert.equal(
+      parseTranscriptPath(raw),
+      '/tmp/brain/ca2d5a24/.system_generated/logs/transcript.jsonl',
+    )
+  })
+
+  it('extracts user prompt from <USER_REQUEST> wrapper in Antigravity transcript.jsonl', () => {
+    const wrapped = '<USER_REQUEST>\nFix the hook schema\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nfoo\n</ADDITIONAL_METADATA>'
+    assert.equal(extractUserRequestText(wrapped), 'Fix the hook schema')
+  })
+
+  it('mirrors USER_INPUT on PreInvocation once, skips mid-turn PLANNER_RESPONSE, and holds Stop on subagent launch', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-mirror-test-'))
+    const connId = '11111111-2222-4333-8444-555555555555'
+    const convId = 'ca2d5a24-57ea-4252-90d0-82d4dd2504d1'
+    const transcriptFile = path.join(tmpDir, 'transcript.jsonl')
+    try {
+      fs.writeFileSync(
+        path.join(tmpDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          session_id: '22222222-3333-4444-8555-666666666666',
+          local_id: convId,
+          agent_name: 'Antigravity',
+          token: 'dvs_test',
+          mcp_url: 'https://fixture.invalid/api/mcp',
+        }),
+      )
+      fs.writeFileSync(
+        transcriptFile,
+        JSON.stringify({
+          step_index: 1,
+          type: 'USER_INPUT',
+          source: 'USER_EXPLICIT',
+          content: '<USER_REQUEST>\nShip parity item 1\n</USER_REQUEST>',
+        }) + '\n',
+      )
+
+      const calls = []
+      const mockCall = async (req) => {
+        calls.push(req)
+        return { ok: true }
+      }
+
+      const hookInput = JSON.stringify({
+        conversationId: convId,
+        transcriptPath: transcriptFile,
+      })
+
+      // 1st PreInvocation: mirrors local_prompt + sets busy: true
+      const first = await handleMirrorTurn('user_prompt', hookInput, {
+        env: {},
+        connectionsDir: tmpDir,
+        legacyPath: path.join(tmpDir, 'legacy.json'),
+        call: mockCall,
+      })
+      assert.equal(first.ok, true)
+      assert.equal(calls.length, 2)
+      assert.equal(calls[0].name, 'post_session_message')
+      assert.equal(calls[0].arguments.message, 'Ship parity item 1')
+      assert.equal(calls[1].name, 'heartbeat_connection')
+      assert.equal(calls[1].arguments.busy, true)
+
+      // Append PLANNER_RESPONSE (mid-turn tool step) -> next PreInvocation is deduplicated
+      fs.appendFileSync(
+        transcriptFile,
+        JSON.stringify({
+          step_index: 2,
+          type: 'PLANNER_RESPONSE',
+          source: 'MODEL',
+          content: '',
+        }) + '\n',
+      )
+      const second = await handleMirrorTurn('user_prompt', hookInput, {
+        env: {},
+        connectionsDir: tmpDir,
+        legacyPath: path.join(tmpDir, 'legacy.json'),
+        call: mockCall,
+      })
+      assert.equal(second.skipped, 'mid_turn_pre_invocation')
+      assert.equal(calls.length, 2)
+
+      // Launch a subagent in this turn -> Stop holds the turn open
+      const launch = launchedAntigravityBackgroundWork(
+        'invoke_subagent',
+        { Subagents: [{ Role: 'Researcher' }] },
+        { output: '{"conversationId":"subagent-uuid-1"}' },
+      )
+      assert.equal(launch?.id, 'subagent-uuid-1')
+      recordOwnedLaunch(connId, launch, { dir: tmpDir })
+
+      const heldStop = await handleMirrorTurn('stop', hookInput, {
+        env: {},
+        connectionsDir: tmpDir,
+        legacyPath: path.join(tmpDir, 'legacy.json'),
+        call: mockCall,
+      })
+      assert.equal(heldStop.held, true)
+      assert.equal(readTurnMarker(connId, tmpDir)?.held, true)
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+})
+
