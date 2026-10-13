@@ -350,7 +350,12 @@ export function resolveHookConversationId(hookInput, env = process.env) {
   const fromEnv = detectLocalId({}, env).local_id
   if (fromEnv) return fromEnv
   try {
-    const parsed = JSON.parse(hookInput || '{}')
+    const parsed =
+      typeof hookInput === 'string'
+        ? JSON.parse(hookInput || '{}')
+        : hookInput && typeof hookInput === 'object'
+          ? hookInput
+          : {}
     if (typeof parsed.conversationId === 'string' && parsed.conversationId.trim()) {
       return parsed.conversationId.trim()
     }

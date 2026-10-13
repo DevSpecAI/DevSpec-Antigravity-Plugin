@@ -2,12 +2,14 @@
 /**
  * Antigravity PostInvocation hook for DevSpec.
  *
- * Runs after each LLM step in Antigravity. Keeps `transcript_path` and `local_id`
- * synchronized on the bound connection state and provides the hook surface for
- * post-invocation room unread awareness.
+ * Runs after each LLM step in Antigravity:
+ * 1. Keeps `transcript_path` and `local_id` synchronized on the bound connection state.
+ * 2. Injects mid-turn room unread awareness (`injectSteps` + `additionalContext`)
+ *    when unpresented room messages arrived during the step.
  */
 
 import fs from 'node:fs'
+import os from 'node:os'
 import { pathToFileURL } from 'node:url'
 import {
   loadState,
@@ -15,6 +17,7 @@ import {
   resolveHookConversationId,
   syncStateTranscriptPath,
 } from './mirror-turn.mjs'
+import { invocationNotice } from './room-unread.mjs'
 
 function readStdin() {
   try {
@@ -24,12 +27,21 @@ function readStdin() {
   }
 }
 
-export async function runPostInvocation(raw = '', { env = process.env } = {}) {
+export async function runPostInvocation(raw = '', { env = process.env, home = os.homedir() } = {}) {
+  let input = {}
+  try {
+    input = typeof raw === 'string' ? JSON.parse(raw || '{}') : raw || {}
+  } catch {
+    input = {}
+  }
   const conversationId = resolveHookConversationId(raw, env)
   const state = loadState(conversationId)
-  if (!state) return null
-  const transcriptPath = parseTranscriptPath(raw)
-  syncStateTranscriptPath(state, transcriptPath, conversationId)
+  if (state) {
+    const transcriptPath = parseTranscriptPath(raw)
+    syncStateTranscriptPath(state, transcriptPath, conversationId)
+  }
+  const notice = invocationNotice({ input, env, home })
+  if (notice) return notice
   return null
 }
 

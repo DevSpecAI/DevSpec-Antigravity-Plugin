@@ -82,8 +82,8 @@ const LOCAL_DIR = path.join(DEVSPEC_DIR, 'remote-control', 'local')
 /** Default window for stop → remote again in the same local conversation. */
 const DEFAULT_RECONNECT_MAX_AGE_MINUTES = 30
 
-function connectionPath(connectionId) {
-  return path.join(CONNECTIONS_DIR, `${connectionId}.json`)
+function connectionPath(connectionId, connDir = CONNECTIONS_DIR) {
+  return path.join(connDir, `${connectionId}.json`)
 }
 
 function readJson(filePath) {
@@ -98,6 +98,26 @@ function readJson(filePath) {
 function writeJson(filePath, state) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true })
   fs.writeFileSync(filePath, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 })
+}
+
+export function readStateFile(connectionId, connDir = CONNECTIONS_DIR) {
+  if (!connectionId) return null
+  return readJson(connectionPath(connectionId, connDir))
+}
+
+export function writeStateFile(idOrState, stateOrDir = CONNECTIONS_DIR, maybeDir = CONNECTIONS_DIR) {
+  if (idOrState && typeof idOrState === 'object') {
+    const connId = idOrState.connection_id
+    if (!connId) return null
+    const dir = typeof stateOrDir === 'string' ? stateOrDir : CONNECTIONS_DIR
+    const next = { ...idOrState, connection_id: connId }
+    writeJson(connectionPath(connId, dir), next)
+    return next
+  }
+  if (!idOrState || !stateOrDir || typeof stateOrDir !== 'object') return null
+  const next = { ...stateOrDir, connection_id: idOrState }
+  writeJson(connectionPath(idOrState, maybeDir), next)
+  return next
 }
 
 function parseArgs(argv) {
@@ -608,8 +628,13 @@ function sanitizeLocalId(id) {
   return s || null
 }
 
-export function localBondPath(agent, localId) {
-  return path.join(LOCAL_DIR, agentSlug(agent), `${localId}.json`)
+function resolveLocalDir(rcOrLocalDir = LOCAL_DIR) {
+  if (!rcOrLocalDir || typeof rcOrLocalDir !== 'string') return LOCAL_DIR
+  return path.basename(rcOrLocalDir) === 'local' ? rcOrLocalDir : path.join(rcOrLocalDir, 'local')
+}
+
+export function localBondPath(agent, localId, rcOrLocalDir = LOCAL_DIR) {
+  return path.join(resolveLocalDir(rcOrLocalDir), agentSlug(agent), `${localId}.json`)
 }
 
 /**
@@ -711,13 +736,25 @@ export function isRecoverableEndReason(endReason) {
   )
 }
 
-export function readLocalBond(agent, localId) {
+export function readLocalBond(agentOrLocalId, localIdOrDir = null, maybeDir = LOCAL_DIR) {
+  // Support both readLocalBond(agent, localId, dir?) and readLocalBond(localId, dir?)
+  const isPathSecond =
+    typeof localIdOrDir === 'string' && (localIdOrDir.includes('/') || localIdOrDir.includes('\\'))
+  const agent = isPathSecond || localIdOrDir === null ? AGENT_NAME : agentOrLocalId
+  const localId = isPathSecond || localIdOrDir === null ? agentOrLocalId : localIdOrDir
+  const dir = isPathSecond ? localIdOrDir : maybeDir
   if (!localId) return null
-  return readJson(localBondPath(agent, localId))
+  return readJson(localBondPath(agent, localId, dir))
 }
 
-export function writeLocalBond(agent, localId, patch) {
-  const p = localBondPath(agent, localId)
+export function writeLocalBond(agentOrLocalId, localIdOrPatch, patchOrDir = null, maybeDir = LOCAL_DIR) {
+  // Support both writeLocalBond(agent, localId, patch, dir?) and writeLocalBond(localId, patch, dir?)
+  const isPatchSecond = localIdOrPatch && typeof localIdOrPatch === 'object'
+  const agent = isPatchSecond ? AGENT_NAME : agentOrLocalId
+  const localId = isPatchSecond ? agentOrLocalId : localIdOrPatch
+  const patch = isPatchSecond ? localIdOrPatch : patchOrDir || {}
+  const dir = isPatchSecond ? (typeof patchOrDir === 'string' ? patchOrDir : LOCAL_DIR) : maybeDir
+  const p = localBondPath(agent, localId, dir)
   const prev = readJson(p) || {}
   const next = {
     ...prev,

@@ -1,33 +1,216 @@
 #!/usr/bin/env node
 /**
- * Antigravity PreToolUse hook for DevSpec MCP tools (`mcp_devspec_*`).
+ * Antigravity PreToolUse hook for DevSpec MCP tools (`mcp_devspec_*`, `mcp__devspec__*`)
+ * and background launches (`run_command`, `invoke_subagent`, `schedule`).
  *
- * Stamping & launch-guard entry point (expanded in Parity Item 2).
+ * 1. Denies background launches (`run_command`, `invoke_subagent`, `schedule`) when
+ *    a turn carries multiple requesters and the agent has not run `devspec-serve-request.mjs`.
+ * 2. Holds `post_session_message` once on `PreToolUse` when unread room messages
+ *    arrived mid-turn (`prePostHoldObject`).
+ * 3. Denies ambiguous multi-requester DevSpec writes unless disambiguated via
+ *    `devspec-serve-request.mjs` or an explicit `work_claim_ref` / `provenance_ref`.
+ * 4. Mechanically stamps `connection_id`, `project_id`, `local_session_id`,
+ *    `provenance_ref`, `request_ref`, `agent_name`, and `plugin_version` into
+ *    `overwrite` (and `hookSpecificOutput.updatedInput`) when unambiguous.
  */
 
 import fs from 'node:fs'
-import { pathToFileURL } from 'node:url'
+import os from 'node:os'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { AGENT_NAME } from './agent-identity.mjs'
+import { versionedConnectionArguments } from './connection-version.mjs'
+import { launchGuard, resolveOwnConnectionId } from './launch-guard.mjs'
+import { resolveHookConversationId } from './mirror-turn.mjs'
+import { readStateFile } from './remote-control-state.mjs'
+import { stampRequest } from './request-ref.mjs'
+import { prePostHoldObject } from './room-unread.mjs'
 
-function readStdin() {
+const CONNECTION_SUBJECT = /(?:^|_)connection(?:_|$)|^report_(?:pickup|keepalive|complete|request)$/
+
+const PROJECTLESS_TOOLS = new Set([
+  'list_projects',
+  'verify_agent_connection',
+  'devspec_help_search',
+  'get_personal_instructions',
+  'update_personal_instructions',
+])
+
+const LOCAL_SESSION_ID_TOOLS = new Set([
+  'update_action_item',
+  'claim_work_item',
+  'record_implementation',
+  'record_automation_run',
+])
+
+const AGENT_NAME_TOOLS = new Set([
+  'create_action_item',
+  'surface_session_action_items',
+  'create_session',
+  'post_session_message',
+  'register_connection',
+  'heartbeat_connection',
+  'poll_connection',
+])
+
+export function parseDevspecToolName(toolName) {
+  const s = String(toolName || '')
+  const match = /^(?:mcp__(?:plugin_devspec_)?devspec__|mcp_devspec_|devspec__)([a-z0-9_]+)$/.exec(s)
+  return match ? match[1] : null
+}
+
+function readProjectPin(cwd) {
+  if (!cwd) return null
   try {
-    return fs.readFileSync(0, 'utf8')
+    const file = path.join(cwd, '.devspec', 'project.json')
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'))
+    const id = data?.project_id ?? data?.id
+    return typeof id === 'string' && /^[0-9a-f-]{36}$/i.test(id) ? id : null
   } catch {
-    return ''
+    return null
   }
 }
 
-export async function runDevspecToolInput(_raw = '') {
-  return null
-}
+export function prepareDevspecToolInput(input, { env = process.env, home = os.homedir() } = {}) {
+  if (!input || typeof input !== 'object') return {}
 
-async function main() {
-  const raw = readStdin()
-  const out = await runDevspecToolInput(raw)
-  if (out) {
-    process.stdout.write(JSON.stringify(out) + '\n')
+  // 1. Background launch guard during multi-requester turns
+  const guard = launchGuard(input, { home, env })
+  if (guard?.decision === 'deny' || guard?.hookSpecificOutput?.permissionDecision === 'deny') {
+    return guard
   }
-  process.exit(0)
+
+  const rawToolName = input.tool_name ?? input.toolName ?? ''
+  const verb = parseDevspecToolName(rawToolName)
+  const toolInput = input.tool_input ?? input.toolInput
+  if (!verb || !toolInput || typeof toolInput !== 'object' || Array.isArray(toolInput)) {
+    return {}
+  }
+
+  // 2. Pre-post room unread hold (once per unpresented batch before post_session_message)
+  if (verb === 'post_session_message') {
+    const hold = prePostHoldObject({ input, env, home })
+    if (hold) return hold
+  }
+
+  const conversationId = resolveHookConversationId(input, env)
+  const connectionId = resolveOwnConnectionId(conversationId, { home })
+  const connDir = path.join(home, '.devspec', 'remote-control', 'connections')
+  const connState = connectionId ? readStateFile(connectionId, connDir) : null
+
+  let next = { ...toolInput }
+
+  // 3. Project scope stamping (from bound connection state or .devspec/project.json pin)
+  if (!PROJECTLESS_TOOLS.has(verb)) {
+    const boundProjectId =
+      (typeof connState?.project_id === 'string' && connState.project_id ? connState.project_id : null) ||
+      readProjectPin(input.cwd || process.cwd())
+    if (boundProjectId) {
+      if (next.project_id && next.project_id !== boundProjectId && connState?.project_id === boundProjectId) {
+        const reason =
+          'This conversation uses another DevSpec project. Start a fresh Antigravity conversation to switch projects.'
+        return {
+          decision: 'deny',
+          reason,
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            permissionDecisionReason: reason,
+          },
+        }
+      }
+      if (!next.project_id) {
+        next.project_id = boundProjectId
+      }
+    }
+  }
+
+  // 4. Connection ID stamping
+  if (
+    connectionId &&
+    !CONNECTION_SUBJECT.test(verb) &&
+    next.connection_id === undefined &&
+    next.session_id === undefined
+  ) {
+    next.connection_id = connectionId
+  }
+
+  // 5. Local session ID & provider stamping
+  if (conversationId && LOCAL_SESSION_ID_TOOLS.has(verb) && !next.local_session_id) {
+    next.local_session_id = conversationId
+  }
+  if (verb === 'claim_work_item' && !next.provider) {
+    next.provider = 'antigravity'
+  }
+  if (verb === 'register_connection' && conversationId && !next.local_id) {
+    next.local_id = conversationId
+  }
+
+  // 6. Fixed agent_name stamping
+  if (AGENT_NAME_TOOLS.has(verb) && next.agent_name !== AGENT_NAME) {
+    next.agent_name = AGENT_NAME
+  }
+
+  // 7. Request ref & provenance_ref stamping (or multi-requester denial)
+  const request = stampRequest(verb, next, connectionId, input.agent_id, {
+    home,
+    connectionState: connState,
+  })
+  if (request.deny) {
+    return {
+      decision: 'deny',
+      reason: request.deny,
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: request.deny,
+      },
+    }
+  }
+  next = versionedConnectionArguments(verb, request.args)
+
+  // Check if anything changed
+  const changed =
+    verb === 'register_connection' ||
+    verb === 'attach_connection' ||
+    JSON.stringify(next) !== JSON.stringify(toolInput)
+  if (!changed) return {}
+
+  return {
+    decision: 'allow',
+    overwrite: next,
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      updatedInput: next,
+    },
+  }
 }
 
-const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
-if (isMain) main()
+export async function runDevspecToolInput(raw = '', options = {}) {
+  let parsed = {}
+  try {
+    parsed = typeof raw === 'string' ? JSON.parse(raw || '{}') : raw || {}
+  } catch {
+    return null
+  }
+  const out = prepareDevspecToolInput(parsed, options)
+  return out && Object.keys(out).length > 0 ? out : null
+}
+
+let isMain = false
+try {
+  isMain = Boolean(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))
+} catch {
+  /* imported */
+}
+if (isMain) {
+  try {
+    const raw = fs.readFileSync(0, 'utf8')
+    const out = prepareDevspecToolInput(JSON.parse(raw || '{}'))
+    if (out && Object.keys(out).length > 0) {
+      process.stdout.write(JSON.stringify(out) + '\n')
+    }
+  } catch {
+    /* non-fatal */
+  }
+}
