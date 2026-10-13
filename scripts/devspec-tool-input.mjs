@@ -19,6 +19,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AGENT_NAME } from './agent-identity.mjs'
+import { handleBashPre } from './commit-observation.mjs'
+import { handlePre } from './commit-provenance.mjs'
 import { versionedConnectionArguments } from './connection-version.mjs'
 import { launchGuard, resolveOwnConnectionId } from './launch-guard.mjs'
 import { resolveHookConversationId } from './mirror-turn.mjs'
@@ -194,7 +196,30 @@ export async function runDevspecToolInput(raw = '', options = {}) {
     return null
   }
   const out = prepareDevspecToolInput(parsed, options)
-  return out && Object.keys(out).length > 0 ? out : null
+  if (out && Object.keys(out).length > 0) return out
+
+  const prov = await handlePre(parsed, options)
+  if (prov?.hookSpecificOutput?.permissionDecision === 'deny') {
+    return {
+      decision: 'deny',
+      reason: prov.hookSpecificOutput.permissionDecisionReason,
+      ...prov,
+    }
+  }
+
+  const effectiveInput = prov?.hookSpecificOutput?.updatedInput
+    ? { ...parsed, tool_input: prov.hookSpecificOutput.updatedInput }
+    : parsed
+  handleBashPre(effectiveInput, options)
+
+  if (prov?.hookSpecificOutput?.updatedInput) {
+    return {
+      decision: 'allow',
+      overwrite: prov.hookSpecificOutput.updatedInput,
+      ...prov,
+    }
+  }
+  return prov || null
 }
 
 let isMain = false
@@ -204,13 +229,15 @@ try {
   /* imported */
 }
 if (isMain) {
-  try {
-    const raw = fs.readFileSync(0, 'utf8')
-    const out = prepareDevspecToolInput(JSON.parse(raw || '{}'))
-    if (out && Object.keys(out).length > 0) {
-      process.stdout.write(JSON.stringify(out) + '\n')
+  ;(async () => {
+    try {
+      const raw = fs.readFileSync(0, 'utf8')
+      const out = await runDevspecToolInput(raw)
+      if (out && Object.keys(out).length > 0) {
+        process.stdout.write(JSON.stringify(out) + '\n')
+      }
+    } catch {
+      /* non-fatal */
     }
-  } catch {
-    /* non-fatal */
-  }
+  })()
 }

@@ -11,6 +11,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import { pathToFileURL } from 'node:url'
+import { pendingNudgeNotice } from './commit-provenance.mjs'
 import {
   loadState,
   parseTranscriptPath,
@@ -41,7 +42,21 @@ export async function runPostInvocation(raw = '', { env = process.env, home = os
     syncStateTranscriptPath(state, transcriptPath, conversationId)
   }
   const notice = invocationNotice({ input, env, home })
+  const nudge = pendingNudgeNotice({ input, env })
+  if (notice && nudge) {
+    const combined = `${notice.additionalContext}\n\n${nudge.additionalContext}`
+    return {
+      ...notice,
+      injectSteps: [...(notice.injectSteps || []), ...(nudge.injectSteps || [])],
+      additionalContext: combined,
+      hookSpecificOutput: {
+        ...notice.hookSpecificOutput,
+        additionalContext: combined,
+      },
+    }
+  }
   if (notice) return notice
+  if (nudge) return nudge
   return null
 }
 

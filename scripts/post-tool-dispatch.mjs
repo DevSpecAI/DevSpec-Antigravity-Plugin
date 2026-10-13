@@ -15,6 +15,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { handleBashPost } from './commit-observation.mjs'
+import { handlePost } from './commit-provenance.mjs'
 import { resolveOwnConnectionId } from './launch-guard.mjs'
 import {
   explicitReplyMarkerPath,
@@ -40,7 +42,7 @@ function readStdin() {
   }
 }
 
-export async function runPostToolDispatch(raw = '', { env = process.env, home = os.homedir() } = {}) {
+export async function runPostToolDispatch(raw = '', { env = process.env, home = os.homedir(), call } = {}) {
   let payload = {}
   try {
     payload = typeof raw === 'string' ? JSON.parse(raw || '{}') : raw || {}
@@ -55,6 +57,13 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
     syncStateTranscriptPath(state, parseTranscriptPath(raw), conversationId)
   }
   const connectionId = state?.connection_id || resolveOwnConnectionId(conversationId, { home })
+
+  // 0. Commit provenance claim/release tracking & unclaimed edit nudge staging
+  try {
+    handlePost(payload, { env })
+  } catch {
+    /* non-fatal */
+  }
 
   // 1. Explicit reply marker when the agent calls post_session_message
   if (
@@ -72,8 +81,16 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
     }
   }
 
-  // 2. Record background subagent / command / schedule launches
+  // 2. Record background subagent / command / schedule launches & git commit observations
   const bareToolName = toolName.replace(/^default_api:/, '')
+  if (bareToolName === 'run_command' || bareToolName === 'Bash') {
+    try {
+      await handleBashPost(payload, { env, ...(call ? { call } : {}) })
+    } catch {
+      /* non-fatal */
+    }
+  }
+
   if (
     bareToolName === 'invoke_subagent' ||
     bareToolName === 'run_command' ||

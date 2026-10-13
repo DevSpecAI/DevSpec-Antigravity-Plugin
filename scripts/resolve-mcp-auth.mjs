@@ -116,8 +116,9 @@ export function hostTokenFromEnv(env = process.env) {
 }
 
 export function resolveDevspecMcpAuth(cwd = process.cwd(), opts = {}) {
-  const envToken = process.env.DEVSPEC_MCP_TOKEN || process.env.DEVSPEC_TOKEN || null
-  const envUrl = process.env.DEVSPEC_MCP_URL || null
+  const env = opts.env || process.env
+  const envToken = env.DEVSPEC_MCP_TOKEN || env.DEVSPEC_TOKEN || null
+  const envUrl = env.DEVSPEC_MCP_URL || null
   if (envToken) {
     return { ok: true, token: envToken, mcp_url: envUrl || DEFAULT_PROD_URL, source: 'env' }
   }
