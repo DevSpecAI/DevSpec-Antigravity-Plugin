@@ -322,7 +322,11 @@ describe('Item 5 Parity: pin-check.mjs and repo-link-nudge.mjs', () => {
 
     const tmpDir = makeTempHome()
     const remoteUrl = 'https://github.com/org/unlinked-repo.git'
-    const env = { ...process.env, DEVSPEC_PROVENANCE_DIR: path.join(tmpDir, 'prov') }
+    const env = {
+      ...process.env,
+      DEVSPEC_ANTIGRAVITY_STATE_DIR: path.join(tmpDir, 'prov'),
+      DEVSPEC_PROVENANCE_DIR: path.join(tmpDir, 'prov'),
+    }
 
     const payload = {
       session_id: 'conv-123',

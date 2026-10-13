@@ -62,6 +62,7 @@ function bareToolName(toolName) {
 export function stateDir(env = process.env) {
   if (env.DEVSPEC_ANTIGRAVITY_STATE_DIR) return env.DEVSPEC_ANTIGRAVITY_STATE_DIR
   if (env.DEVSPEC_CLAUDE_STATE_DIR) return env.DEVSPEC_CLAUDE_STATE_DIR
+  if (env.DEVSPEC_PROVENANCE_DIR) return env.DEVSPEC_PROVENANCE_DIR
   const uid = typeof process.getuid === 'function' ? process.getuid() : 'user'
   return path.join(os.tmpdir(), `devspec-antigravity-provenance-${uid}`)
 }
