@@ -20,6 +20,8 @@ import {
   explicitReplyMarkerPath,
   consumeExplicitReplyMarker,
   parseTranscriptPath,
+  normalizeTranscriptPath,
+  syncStateTranscriptPath,
   extractUserRequestText,
   extractLatestTranscriptStep,
   launchedAntigravityBackgroundWork,
@@ -402,6 +404,47 @@ describe('Antigravity native hook payload & transcript handling', () => {
       label: 'Run build in background',
     })
   })
+
+  it('normalizes transcript_full.jsonl to compact transcript.jsonl when sibling exists and avoids rewriting state on PostInvocation', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-transcript-norm-'))
+    try {
+      const compactPath = path.join(tmpDir, 'transcript.jsonl')
+      const fullPath = path.join(tmpDir, 'transcript_full.jsonl')
+      fs.writeFileSync(compactPath, '{}\n')
+      fs.writeFileSync(fullPath, '{}\n')
+
+      assert.equal(normalizeTranscriptPath(fullPath), compactPath)
+      assert.equal(
+        parseTranscriptPath(JSON.stringify({ transcriptPath: fullPath })),
+        compactPath,
+      )
+
+      const connId = '33333333-4444-4555-8666-777777777777'
+      const convId = 'ca2d5a24-57ea-4252-90d0-82d4dd2504d1'
+      const stateFile = path.join(tmpDir, `${connId}.json`)
+      const state = {
+        enabled: true,
+        connection_id: connId,
+        local_id: convId,
+        transcript_path: compactPath,
+      }
+      fs.writeFileSync(stateFile, JSON.stringify(state, null, 2))
+
+      // PreInvocation passes transcript_full.jsonl -> normalizes to compactPath, no rewrite needed
+      assert.equal(
+        syncStateTranscriptPath(state, fullPath, convId, { connectionsDir: tmpDir }),
+        false,
+      )
+      // PostInvocation passes null transcriptPath -> preserves existing compactPath, no rewrite needed
+      assert.equal(
+        syncStateTranscriptPath(state, null, convId, { connectionsDir: tmpDir }),
+        false,
+      )
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
 })
+
 
 

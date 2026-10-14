@@ -515,6 +515,7 @@ describe('Item 5 Parity: statusline.mjs rendering and telemetry', () => {
         cwd,
         env: {},
         loadStateFn: () => null,
+        reapPollersFn: () => [],
       },
     )
     assert.ok(startOut?.hookSpecificOutput?.additionalContext)

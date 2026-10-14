@@ -291,6 +291,26 @@ function readStdin() {
 }
 
 /**
+ * Normalize an Antigravity transcript path so `transcript_full.jsonl` (sent by
+ * PreInvocation / Stop hooks) and `transcript.jsonl` (inferred by SessionStart /
+ * PostInvocation) resolve to the same canonical compact `transcript.jsonl` path
+ * whenever the compact sibling exists on disk.
+ */
+export function normalizeTranscriptPath(rawPath) {
+  if (typeof rawPath !== 'string' || !rawPath.trim()) return null
+  const trimmed = rawPath.trim()
+  if (path.basename(trimmed) === 'transcript_full.jsonl') {
+    const compactSibling = path.join(path.dirname(trimmed), 'transcript.jsonl')
+    try {
+      if (fs.existsSync(compactSibling)) return compactSibling
+    } catch {
+      /* ignore */
+    }
+  }
+  return trimmed
+}
+
+/**
  * Extract the transcript path from hook stdin JSON.
  * Antigravity sends `transcriptPath` (camelCase) and `transcript_path` (snake_case).
  */
@@ -298,10 +318,10 @@ export function parseTranscriptPath(hookInput) {
   try {
     const parsed = JSON.parse(hookInput || '{}')
     if (typeof parsed.transcriptPath === 'string' && parsed.transcriptPath.trim()) {
-      return parsed.transcriptPath.trim()
+      return normalizeTranscriptPath(parsed.transcriptPath)
     }
     if (typeof parsed.transcript_path === 'string' && parsed.transcript_path.trim()) {
-      return parsed.transcript_path.trim()
+      return normalizeTranscriptPath(parsed.transcript_path)
     }
   } catch {
     /* ignore */
@@ -322,7 +342,8 @@ export function syncStateTranscriptPath(
 ) {
   if (!state?.connection_id) return false
   const resolvedPath =
-    (typeof transcriptPath === 'string' && transcriptPath.trim() ? transcriptPath.trim() : null) ||
+    normalizeTranscriptPath(transcriptPath) ||
+    normalizeTranscriptPath(state.transcript_path) ||
     inferAntigravityTranscriptPath(conversationId || state.local_id)
   if (!resolvedPath) return false
   if (state.transcript_path === resolvedPath && (!conversationId || state.local_id === conversationId)) {
