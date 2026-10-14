@@ -12,17 +12,21 @@
  *    pinned project, attached session title, active claimed work item, and context fill.
  */
 
+import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { canonicalRepo, readClaims } from './commit-provenance.mjs'
-import { findProjectPin } from './devspec-scope.mjs'
+import { readConversationProject } from './conversation-project.mjs'
+import { findProjectPin, gitRemoteOrigin } from './devspec-scope.mjs'
 import { resolveOwnConnectionId } from './launch-guard.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveHookConversationId } from './mirror-turn.mjs'
+import { resolveOwnerPid } from './remote-control-state.mjs'
 import { DEFAULT_PROD_URL, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { connectAtStartupEnabled } from './session-start.mjs'
 
 const REMOTE_DIR = '.devspec/remote-control'
 const AGENT_DIR = AGENT_NAME.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
@@ -355,6 +359,35 @@ export function readConnectionView({
     }
   }
 
+  // If no conversation bond exists yet (e.g. newly opened Antigravity window before first prompt),
+  // match a live connection anchored to this Antigravity window's owner_pid.
+  if (!connection) {
+    const ownerPid = resolveOwnerPid('auto', null)
+    if (ownerPid) {
+      const connDir = path.join(home, REMOTE_DIR, 'connections')
+      try {
+        for (const f of fs.readdirSync(connDir)) {
+          if (!/^[0-9a-f-]{36}\.json$/i.test(f)) continue
+          const parsed = parseJson(fs.readFileSync(path.join(connDir, f), 'utf8'))
+          if (
+            parsed &&
+            parsed.enabled !== false &&
+            !parsed.ended_from_ui &&
+            String(parsed.agent_name || '').toLowerCase() === AGENT_NAME.toLowerCase() &&
+            Number(parsed.owner_pid) === Number(ownerPid) &&
+            (!conversationId || !parsed.local_id || parsed.local_id === conversationId)
+          ) {
+            connection = parsed
+            connectionId = parsed.connection_id
+            break
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
   const effectiveCwd = cwd || connection?.cwd || null
   let pin = null
   if (effectiveCwd) {
@@ -373,6 +406,19 @@ export function readConnectionView({
       /* ignore */
     }
   }
+  let convProjectName = ''
+  if (conversationId) {
+    try {
+      const cp = readConversationProject(conversationId, { home })
+      if (cp?.status === 'selected' && cp.project?.name) {
+        convProjectName = cleanLabel(cp.project.name)
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  const connectionProjectName = cleanLabel(connection?.project_name || '')
+  const resolvedProjectName = convProjectName || connectionProjectName || pinProjectName
 
   const work = []
   if (conversationId && effectiveCwd) {
@@ -396,7 +442,7 @@ export function readConnectionView({
       connectionId: null,
       state: 'local',
       codename: '',
-      projectName: pinProjectName || (pin?.project_id ? `pinned (${shortCode(pin.project_id)})` : ''),
+      projectName: resolvedProjectName || (pin?.project_id ? `pinned (${shortCode(pin.project_id)})` : ''),
       sessionId: null,
       sessionTitle: '',
       work,
@@ -430,10 +476,65 @@ export function readConnectionView({
     connectionId,
     state,
     codename,
-    projectName: pinProjectName,
+    projectName: resolvedProjectName,
     sessionId,
     sessionTitle,
     work,
+  }
+}
+
+/**
+ * Trigger a non-blocking background auto-connect once when an Antigravity window
+ * opens in a linked repository before any prompt has been typed.
+ */
+export function maybeSpawnWindowAutoConnect({
+  cwd,
+  ownerPid = resolveOwnerPid('auto', null),
+  conversationId = null,
+  home = os.homedir(),
+  env = process.env,
+  spawnImpl = spawn,
+} = {}) {
+  if (!cwd || !ownerPid) return { spawned: false, reason: 'missing_cwd_or_owner' }
+  if (!connectAtStartupEnabled(env, { cwd, home })) {
+    return { spawned: false, reason: 'disabled_or_unconfigured' }
+  }
+  const hasScope = Boolean(gitRemoteOrigin(cwd) || findProjectPin(cwd, { home }))
+  if (!hasScope) return { spawned: false, reason: 'no_folder_scope' }
+
+  const lockDir = path.join(home, REMOTE_DIR)
+  const lockFile = path.join(lockDir, `autoconnect-${ownerPid}.lock`)
+  try {
+    if (fs.existsSync(lockFile)) {
+      const stat = fs.statSync(lockFile)
+      if (Date.now() - stat.mtimeMs < 60_000) {
+        return { spawned: false, reason: 'already_attempted' }
+      }
+    }
+    fs.mkdirSync(lockDir, { recursive: true })
+    fs.writeFileSync(lockFile, `${Date.now()}\n`, { mode: 0o600 })
+  } catch {
+    return { spawned: false, reason: 'lock_failed' }
+  }
+
+  const sessionStartScript = path.join(
+    path.dirname(fileURLToPath(import.meta.url)),
+    'session-start.mjs',
+  )
+  const args = [sessionStartScript, '--auto-connect', '--cwd', cwd, '--owner-pid', String(ownerPid)]
+  if (conversationId) args.push('--conversation-id', String(conversationId))
+  try {
+    const child = spawnImpl(process.execPath, args, {
+      cwd,
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+      env,
+    })
+    child.unref?.()
+    return { spawned: true, pid: child.pid || null, ownerPid }
+  } catch {
+    return { spawned: false, reason: 'spawn_failed' }
   }
 }
 
@@ -493,7 +594,7 @@ export function renderStatusLine(rawInput = '', { home = os.homedir(), env = pro
     null
 
   const view = readConnectionView({ home, conversationId, cwd, env })
-  if (!view) {
+  if (!view || view.state === 'local') {
     const hasInputContext = Boolean(
       cwd ||
         (typeof input.conversation_id === 'string' && input.conversation_id.trim()) ||
@@ -504,8 +605,11 @@ export function renderStatusLine(rawInput = '', { home = os.homedir(), env = pro
       if (!auth.ok) {
         return 'DevSpec: not configured — add dvs_ token to ~/.gemini/config/mcp_config.json'
       }
+      if (cwd) {
+        maybeSpawnWindowAutoConnect({ cwd, conversationId, home, env })
+      }
     }
-    return ''
+    if (!view) return ''
   }
   let telemetry = null
   if (view?.connectionId) {

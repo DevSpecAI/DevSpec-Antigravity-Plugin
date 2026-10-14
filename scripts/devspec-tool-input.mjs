@@ -270,9 +270,12 @@ if (isMain) {
     try {
       const raw = fs.readFileSync(0, 'utf8')
       const out = await runDevspecToolInput(raw)
-      process.stdout.write(JSON.stringify(toProtoPreToolResult(out)) + '\n')
+      const proto = toProtoPreToolResult(out)
+      if (proto && proto.decision) {
+        process.stdout.write(JSON.stringify(proto) + '\n')
+      }
     } catch {
-      process.stdout.write('{}\n')
+      /* fail open on hook error: empty stdout allows normal execution */
     }
   })()
 }

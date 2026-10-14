@@ -88,8 +88,15 @@ try {
 if (isMain) {
   try {
     const out = launchGuard(JSON.parse(fs.readFileSync(0, 'utf8') || '{}'))
-    process.stdout.write(JSON.stringify(out) + '\n')
+    if (out?.decision) {
+      process.stdout.write(
+        JSON.stringify({
+          decision: out.decision,
+          ...(out.reason ? { reason: out.reason } : {}),
+        }) + '\n',
+      )
+    }
   } catch {
-    process.stdout.write('{}\n')
+    /* fail open: empty stdout allows normal execution */
   }
 }

@@ -23,6 +23,7 @@ import {
   storeTiers,
   takeTiersFor,
 } from './instruction-tiers.mjs'
+import { storeRepositoryContext } from './repository-context.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import {
   DEFAULT_PROD_URL,
@@ -32,6 +33,7 @@ import {
   verifyAndPinDevspecAuth,
 } from './resolve-mcp-auth.mjs'
 import {
+  ensureListenerForConnection,
   ensurePollerForConnection,
   inferAntigravityTranscriptPath,
   reapDeadPollers,
@@ -227,12 +229,14 @@ async function defaultCallMcp({ mcpUrl, token, name, arguments: args }) {
 export async function autoConnectAtStartup({
   cwd = process.cwd(),
   conversationId = null,
+  ownerPid: explicitOwnerPid = null,
   transcriptPath = null,
   env = process.env,
   callMcp = defaultCallMcp,
   writeStateFn = writeStateFile,
   writeBondFn = writeLocalBond,
   ensurePollerFn = ensurePollerForConnection,
+  ensureListenerFn = ensureListenerForConnection,
   verifyAuthFn = verifyAndPinDevspecAuth,
   home = undefined,
 } = {}) {
@@ -254,7 +258,7 @@ export async function autoConnectAtStartup({
   }
   if (!auth?.token) return null
   const mcpUrl = auth.mcp_url || DEFAULT_PROD_URL
-  const ownerPid = resolveOwnerPid('auto', null)
+  const ownerPid = resolveOwnerPid(explicitOwnerPid || 'auto', null)
   const agentVersion = LOADED_PLUGIN_VERSION
   const gitRemote = gitRemoteOrigin(cwd)
   const pinnedProjectId = findProjectPin(cwd, { home: effectiveHome })?.project_id || null
@@ -271,6 +275,7 @@ export async function autoConnectAtStartup({
       ...(pinnedProjectId ? { pinned_project_id: pinnedProjectId } : {}),
       machine_label: os.hostname(),
       connection_capability_version: 1,
+      project_selection_version: 1,
       capabilities: {
         can_execute: true,
         can_edit_files: true,
@@ -283,12 +288,14 @@ export async function autoConnectAtStartup({
   const connectionId = reg?.connection_id || reg?.connection?.id || null
   if (!connectionId) return null
 
-  if (reg?.instructions) {
-    storeTiers(connectionId, reg.instructions, home ? { home } : {})
-  }
+  const connDir = path.join(effectiveHome, '.devspec', 'remote-control', 'connections')
+  storeTiers(connectionId, reg, { home: effectiveHome, dir: connDir })
+  storeRepositoryContext(connectionId, reg, { dir: connDir })
 
   const resolvedProjectId =
     reg?.project_id || reg?.connection?.project_id || pinnedProjectId || null
+  const resolvedProjectName =
+    reg?.project_selection?.project?.name || reg?.project_name || null
   const resolvedTranscriptPath =
     transcriptPath || inferAntigravityTranscriptPath(conversationId, env) || null
 
@@ -298,6 +305,7 @@ export async function autoConnectAtStartup({
     session_id: reg?.session_id || null,
     session_codename: reg?.codename || reg?.connection?.codename || null,
     project_id: resolvedProjectId,
+    ...(resolvedProjectName ? { project_name: resolvedProjectName } : {}),
     agent_name: AGENT_NAME,
     agent_version: agentVersion,
     local_id: conversationId || null,
@@ -314,6 +322,15 @@ export async function autoConnectAtStartup({
           connection_capability_version: reg.connection_capability_version || 1,
         }
       : {}),
+    ...(reg?.instruction_tiers_version && reg?.instruction_tiers_hash
+      ? {
+          instruction_tiers_version: reg.instruction_tiers_version,
+          instruction_tiers_hash: reg.instruction_tiers_hash,
+        }
+      : {}),
+    ...(env.ANTIGRAVITY_LS_ADDRESS ? { ls_address: env.ANTIGRAVITY_LS_ADDRESS } : {}),
+    ...(env.ANTIGRAVITY_CSRF_TOKEN ? { csrf_token: env.ANTIGRAVITY_CSRF_TOKEN } : {}),
+    ...(env.ANTIGRAVITY_AGENTAPI_EXE ? { agentapi_exe: env.ANTIGRAVITY_AGENTAPI_EXE } : {}),
     updated_at: new Date().toISOString(),
   }
   writeStateFn(connectionId, statePayload)
@@ -337,6 +354,20 @@ export async function autoConnectAtStartup({
     })
   } catch {
     /* non-fatal */
+  }
+  if (ensureListenerFn !== ensureListenerForConnection || ensurePollerFn === ensurePollerForConnection) {
+    try {
+      ensureListenerFn(connectionId, {
+        cwd,
+        ownerPid,
+        conversationId,
+        reuseRunning: true,
+        connDir,
+        env,
+      })
+    } catch {
+      /* non-fatal */
+    }
   }
   return statePayload
 }
@@ -501,6 +532,29 @@ export function toProtoSessionStartResult(out) {
 }
 
 async function main() {
+  const argv = process.argv.slice(2)
+  if (argv.includes('--auto-connect')) {
+    let cwdArg = process.cwd()
+    let ownerPidArg = null
+    let convArg = null
+    for (let i = 0; i < argv.length; i++) {
+      if (argv[i] === '--cwd' && argv[i + 1]) cwdArg = argv[++i]
+      else if (argv[i] === '--owner-pid' && argv[i + 1]) ownerPidArg = argv[++i]
+      else if (argv[i] === '--conversation-id' && argv[i + 1]) convArg = argv[++i]
+    }
+    try {
+      cleanupLegacyPluginMcpConfig()
+      ensureStatusLineConfigured()
+      await autoConnectAtStartup({
+        cwd: cwdArg,
+        ownerPid: ownerPidArg,
+        conversationId: convArg,
+      })
+    } catch {
+      /* non-fatal */
+    }
+    process.exit(0)
+  }
   const raw = readStdin()
   const out = await runSessionStart(raw)
   process.stdout.write(JSON.stringify(toProtoSessionStartResult(out)) + '\n')

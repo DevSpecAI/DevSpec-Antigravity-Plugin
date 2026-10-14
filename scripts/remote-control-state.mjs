@@ -70,6 +70,7 @@ const LEGACY_PATH = path.join(DEVSPEC_DIR, 'remote-control.json')
 const CONNECTIONS_DIR = path.join(DEVSPEC_DIR, 'remote-control', 'connections')
 const THIS_DIR = path.dirname(fileURLToPath(import.meta.url))
 const POLLER_SCRIPT = path.join(THIS_DIR, 'devspec-remote-poll.mjs')
+const LISTENER_SCRIPT = path.join(THIS_DIR, 'devspec-remote-listen.mjs')
 
 function pollerPidPath(connectionId) {
   return path.join(CONNECTIONS_DIR, `${connectionId}.poll.pid`)
@@ -77,6 +78,123 @@ function pollerPidPath(connectionId) {
 
 function pollerLogPath(connectionId) {
   return path.join(CONNECTIONS_DIR, `${connectionId}.poll.log`)
+}
+
+export function listenerInfoPath(connectionId, connDir = CONNECTIONS_DIR) {
+  return path.join(connDir, `${connectionId}.listener.json`)
+}
+
+export function isListenerAlive(connectionId, connDir = CONNECTIONS_DIR) {
+  if (!connectionId) return false
+  const info = readJson(listenerInfoPath(connectionId, connDir))
+  const pid = Number(info?.pid)
+  if (!Number.isInteger(pid) || pid <= 1) return false
+  return ownerAlive(pid)
+}
+
+export function stopListenerForConnection(connectionId, connDir = CONNECTIONS_DIR) {
+  const file = listenerInfoPath(connectionId, connDir)
+  const info = readJson(file)
+  const pid = Number(info?.pid)
+  let killed = false
+  if (Number.isInteger(pid) && pid > 1) {
+    try {
+      process.kill(pid, 'SIGTERM')
+      killed = true
+    } catch {
+      /* already gone */
+    }
+  }
+  try {
+    fs.rmSync(file, { force: true })
+  } catch {
+    /* ignore */
+  }
+  return { connection_id: connectionId, pid: Number.isInteger(pid) ? pid : null, killed }
+}
+
+export function ensureListenerForConnection(connectionId, opts = {}) {
+  if (!connectionId || connectionId.length < 8) return { ok: false, error: 'missing connection id' }
+  if (!fs.existsSync(LISTENER_SCRIPT)) {
+    return { ok: false, error: `listener script missing: ${LISTENER_SCRIPT}` }
+  }
+  const connDir = opts.connDir || CONNECTIONS_DIR
+  if (opts.reuseRunning && isListenerAlive(connectionId, connDir)) {
+    const info = readJson(listenerInfoPath(connectionId, connDir))
+    return {
+      ok: true,
+      reused: true,
+      connection_id: connectionId,
+      pid: info?.pid || null,
+      owner_pid: info?.owner_pid || null,
+    }
+  }
+  const resolveOwnerPidFn = opts.resolveOwnerPid || resolveOwnerPid
+  const ownerPid = resolveOwnerPidFn(opts.ownerPid, null)
+  if (ownerPid === null) {
+    return { ok: false, error: 'missing owner_pid for listener' }
+  }
+  stopListenerForConnection(connectionId, connDir)
+  fs.mkdirSync(connDir, { recursive: true })
+  const logPath = path.join(connDir, `${connectionId}.listen.log`)
+  let logFd
+  try {
+    logFd = fs.openSync(logPath, 'a')
+  } catch (e) {
+    return { ok: false, error: `could not open listen log: ${e.message}` }
+  }
+  const listenArgs = [LISTENER_SCRIPT, '--connection-id', connectionId, '--owner-pid', String(ownerPid)]
+  if (opts.conversationId) listenArgs.push('--conversation-id', String(opts.conversationId))
+  if (opts.cwd) listenArgs.push('--cwd', String(opts.cwd))
+
+  let child
+  try {
+    child = spawn(process.execPath, listenArgs, {
+      cwd: opts.cwd || process.cwd(),
+      detached: true,
+      stdio: ['ignore', logFd, logFd],
+      windowsHide: true,
+      env: opts.env || process.env,
+    })
+  } catch (e) {
+    try {
+      fs.closeSync(logFd)
+    } catch {
+      /* ignore */
+    }
+    return { ok: false, error: `listener spawn failed: ${e.message}` }
+  }
+  try {
+    fs.closeSync(logFd)
+  } catch {
+    /* ignore */
+  }
+  child.unref()
+  const pid = child.pid
+  if (!pid) return { ok: false, error: 'listener spawn returned no pid' }
+  const payload = {
+    pid,
+    owner_pid: ownerPid,
+    connection_id: connectionId,
+    conversation_id: opts.conversationId || null,
+    status: 'serving',
+    started_at: new Date().toISOString(),
+  }
+  writeJson(listenerInfoPath(connectionId, connDir), payload)
+  return { ok: true, connection_id: connectionId, pid, owner_pid: ownerPid }
+}
+
+export function knownInstructionTiersFor(connectionId, connDir = CONNECTIONS_DIR) {
+  if (!connectionId) return null
+  const state = readStateFile(connectionId, connDir)
+  if (
+    state?.instruction_tiers_version === 1 &&
+    typeof state.instruction_tiers_hash === 'string' &&
+    /^sha256:[a-f0-9]{64}$/.test(state.instruction_tiers_hash)
+  ) {
+    return { version: 1, hash: state.instruction_tiers_hash }
+  }
+  return null
 }
 const LOCAL_DIR = path.join(DEVSPEC_DIR, 'remote-control', 'local')
 
@@ -487,12 +605,14 @@ function disableConnectionState(connectionId, { agent = null, localId = null } =
   }
   const bonds = markBondsStoppedForConnection(connectionId, 'local_stop')
   const killResult = stopPollerForConnection(connectionId)
+  const listenerResult = stopListenerForConnection(connectionId)
   return {
     ok: true,
     enabled: false,
     connection_id: connectionId,
     path: perPath,
     poller: killResult,
+    listener: listenerResult,
     bonds_stopped: bonds.length,
   }
 }
@@ -817,11 +937,13 @@ function markBondsStoppedForConnection(connectionId, endReason = 'local_stop') {
 export function resolveLocalAction({
   agent = AGENT_NAME,
   localId = null,
+  ownerPid = null,
   forceNew = false,
   maxAgeMinutes = DEFAULT_RECONNECT_MAX_AGE_MINUTES,
   now = Date.now(),
   readBond = readLocalBond,
   readConnection = (id) => readJson(connectionPath(id)),
+  listStates = scanConnectionStates,
 } = {}) {
   const agentName = agent || AGENT_NAME
   const maxAgeMs =
@@ -848,7 +970,29 @@ export function resolveLocalAction({
     }
   }
 
-  const bond = localId ? readBond(agentName, localId) : null
+  let bond = localId ? readBond(agentName, localId) : null
+  // If this conversation has no bond yet, check if this exact Antigravity window
+  // (owner_pid) already auto-connected at startup with local_id === null.
+  if (localId && (!bond || !bond.connection_id) && Number.isInteger(Number(ownerPid)) && Number(ownerPid) > 1) {
+    const matchingStartup = listStates().find(
+      (s) =>
+        s &&
+        s.enabled !== false &&
+        !s.ended_from_ui &&
+        !s.local_id &&
+        String(s.agent_name || '').toLowerCase() === String(agentName).toLowerCase() &&
+        Number(s.owner_pid) === Number(ownerPid),
+    )
+    if (matchingStartup?.connection_id) {
+      rebondConnectionToConversation({
+        agent: agentName,
+        connectionId: matchingStartup.connection_id,
+        localId,
+      })
+      bond = readBond(agentName, localId)
+    }
+  }
+
   if (!localId || !bond || !bond.connection_id) {
     return {
       ok: true,
@@ -1034,6 +1178,207 @@ export function rebondConnectionToConversation({
     bond_path: localBondPath(agentName, id),
     bond,
   }
+}
+
+/**
+ * Shared connection state + bond + poller + listener writer used by
+ * `devspec-remote-connect.mjs`, `session-start.mjs`, and `remote-control-state.mjs write`.
+ */
+export async function writeConnectionState({
+  connectionId,
+  sessionId: explicitSessionId = null,
+  agent = AGENT_NAME,
+  projectId: explicitProjectId = null,
+  projectName: explicitProjectName = null,
+  cwd = process.cwd(),
+  localId: explicitLocalId = null,
+  ownerPid: explicitOwnerPid = null,
+  codename = null,
+  title = null,
+  instructionTiers = null,
+  connectionCapability = null,
+  noPoller = false,
+  env = process.env,
+  home = os.homedir(),
+  transcriptPath: explicitTranscriptPath = null,
+} = {}) {
+  const connDir = path.join(home, '.devspec', 'remote-control', 'connections')
+  const rcDir = path.join(home, '.devspec', 'remote-control')
+  const legacyPath = path.join(home, '.devspec', 'remote-control.json')
+  const prev = readJson(connectionPath(connectionId, connDir)) || {}
+  const agentName = agent || prev.agent_name || AGENT_NAME
+  const detected = detectLocalId({ 'local-id': explicitLocalId }, env)
+  const localId = detected.local_id || prev.local_id || null
+  const transcriptPath =
+    explicitTranscriptPath ||
+    prev.transcript_path ||
+    inferAntigravityTranscriptPath(localId, env) ||
+    null
+  const sessionId =
+    typeof explicitSessionId === 'string' && explicitSessionId.length >= 8
+      ? explicitSessionId
+      : prev.session_id ?? null
+  const ownerPid = resolveOwnerPid(explicitOwnerPid, prev.owner_pid)
+  const hostToken = hostTokenFromEnv(env, { cwd, home })
+  const auth = resolveDevspecMcpAuth(cwd, { hostToken, env, home })
+  let projectId =
+    explicitProjectId || prev.project_id || findProjectPin(cwd, { home })?.project_id || null
+  const projectName = explicitProjectName || prev.project_name || null
+  const gitRemote = gitRemoteOrigin(cwd)
+
+  let capability = null
+  if (typeof connectionCapability === 'string' && connectionCapability.startsWith('dvsc_')) {
+    capability = { ok: true, version: 1, value: connectionCapability }
+  } else if (auth.ok && localId) {
+    capability = await negotiateConnectionCapability({
+      mcpUrl: auth.mcp_url || prev.mcp_url,
+      token: auth.token || prev.token,
+      projectId,
+      gitRemote,
+      localId,
+      connectionId,
+      agentName,
+      cwd,
+      onProjectId: (resolvedId) => {
+        if (!projectId && resolvedId) projectId = resolvedId
+      },
+    })
+  } else if (typeof prev.connection_capability === 'string' && prev.connection_capability.startsWith('dvsc_')) {
+    capability = {
+      ok: true,
+      version: prev.connection_capability_version || 1,
+      value: prev.connection_capability,
+    }
+  } else {
+    capability = { ok: false, error: auth.error || 'MCP auth or local_id unavailable' }
+  }
+
+  const state = {
+    ...applyConnectionCapabilityRotation(prev, capability),
+    enabled: true,
+    connection_id: connectionId,
+    session_id: sessionId,
+    agent_name: agentName,
+    local_id: localId,
+    transcript_path: transcriptPath,
+    owner_pid: ownerPid,
+    project_id: projectId,
+    ...(projectName ? { project_name: projectName } : {}),
+    mcp_url: auth.mcp_url || prev.mcp_url || 'https://devspec.ai/api/mcp',
+    token: auth.token || prev.token || undefined,
+    auth_source: auth.source || auth.error || prev.auth_source || null,
+    auth_ok: !!auth.ok || !!prev.auth_ok,
+    cwd,
+    ...(gitRemote ? { git_remote: gitRemote } : {}),
+    session_codename: codename || prev.session_codename || prev.codename || null,
+    title: title || prev.title || null,
+    ...(title && sessionId
+      ? { session_title: title, session_title_for: sessionId }
+      : {}),
+    ...(instructionTiers?.hash && instructionTiers?.version
+      ? {
+          instruction_tiers_version: instructionTiers.version,
+          instruction_tiers_hash: instructionTiers.hash,
+        }
+      : {}),
+    ...(env.ANTIGRAVITY_LS_ADDRESS ? { ls_address: env.ANTIGRAVITY_LS_ADDRESS } : {}),
+    ...(env.ANTIGRAVITY_CSRF_TOKEN ? { csrf_token: env.ANTIGRAVITY_CSRF_TOKEN } : {}),
+    ...(env.ANTIGRAVITY_AGENTAPI_EXE ? { agentapi_exe: env.ANTIGRAVITY_AGENTAPI_EXE } : {}),
+    ended_from_ui: false,
+    end_reason: null,
+    updated_at: new Date().toISOString(),
+  }
+
+  const perPath = connectionPath(connectionId, connDir)
+  writeJson(perPath, state)
+  writeJson(legacyPath, state)
+
+  let bond = null
+  if (localId) {
+    bond = writeLocalBond(
+      agentName,
+      localId,
+      {
+        status: 'live',
+        connection_id: connectionId,
+        session_id: sessionId,
+        session_codename: state.session_codename,
+        title: state.title,
+        cwd,
+        end_reason: null,
+        cursor_after_message_id: prev.cursor_after_message_id || null,
+        transcript_path: transcriptPath,
+      },
+      rcDir,
+    )
+  }
+
+  const result = {
+    ok: true,
+    path: perPath,
+    legacy_path: legacyPath,
+    connection_id: state.connection_id,
+    session_id: state.session_id,
+    session_codename: state.session_codename,
+    title: state.title,
+    mcp_url: state.mcp_url,
+    auth_ok: state.auth_ok,
+    auth_source: state.auth_source,
+    token_present: !!state.token,
+    local_id: localId,
+    owner_pid: ownerPid,
+    transcript_path: transcriptPath,
+    bond_path: bond ? localBondPath(agentName, localId, rcDir) : null,
+    project_id: projectId,
+    project_name: projectName,
+    plan_capability: {
+      ok: capability.ok,
+      version: capability.ok ? capability.version : null,
+      error: capability.ok ? null : capability.error,
+    },
+  }
+  if (!state.auth_ok) result.warning = auth.error
+  if (!localId) {
+    result.warning_local =
+      'No --local-id / conversation env; soft-reconnect and already_live will not work until write is called with a local id.'
+  }
+
+  const wantPoller = state.auth_ok && !noPoller
+  if (wantPoller) {
+    try {
+      const reaped = reapDeadPollers({ agent: agentName, exceptConnectionId: connectionId })
+      if (reaped.length) result.reaped = reaped
+    } catch {
+      /* non-fatal */
+    }
+    const reuseRunning =
+      !!prev.token &&
+      prev.token === state.token &&
+      (prev.mcp_url || null) === (state.mcp_url || null) &&
+      (Number(prev.owner_pid) || null) === (Number(state.owner_pid) || null)
+    const poller = ensurePollerForConnection(connectionId, {
+      cwd,
+      ownerPid,
+      sessionId,
+      reuseRunning,
+    })
+    result.poller = poller
+    if (!poller.ok) {
+      result.warning_poller = poller.error
+    }
+    const listener = ensureListenerForConnection(connectionId, {
+      cwd,
+      ownerPid,
+      conversationId: localId,
+      reuseRunning: true,
+      connDir,
+      env,
+    })
+    result.listener = listener
+  } else if (noPoller) {
+    result.poller = { ok: true, skipped: true, reason: 'no-poller' }
+  }
+  return result
 }
 
 // --- CLI entry (skipped when imported for tests) ---
@@ -1276,6 +1621,57 @@ if (isMain) {
     }
     const result = stopPollerForConnection(connectionId)
     process.stdout.write(JSON.stringify({ ok: true, ...result }) + '\n')
+    process.exit(0)
+  }
+
+  if (cmd === 'status') {
+    const connectionId = args['connection-id'] || readJson(LEGACY_PATH)?.connection_id
+    if (!connectionId) {
+      process.stderr.write('Usage: remote-control-state.mjs status --connection-id <uuid>\n')
+      process.exit(2)
+    }
+    const s = readJson(connectionPath(connectionId))
+    if (!s) {
+      process.stdout.write(
+        JSON.stringify({
+          ok: false,
+          connection_id: connectionId,
+          found: false,
+          reconnect: {
+            action: 'reconnect',
+            instruction: 'State file not found; re-run devspec-remote-connect.mjs to establish the bond.',
+          },
+        }) + '\n',
+      )
+      process.exit(1)
+    }
+    const endedFromUi = s.ended_from_ui === true || s.end_reason === 'ui' || s.end_reason === 'ended_from_ui'
+    const localStop = s.end_reason === 'local_stop'
+    const ownerDead = Number.isInteger(s.owner_pid) && s.owner_pid > 1 && !ownerAlive(s.owner_pid)
+    const standDown = endedFromUi || localStop || ownerDead
+    process.stdout.write(
+      JSON.stringify(
+        {
+          ok: true,
+          connection_id: s.connection_id,
+          session_id: s.session_id || null,
+          enabled: s.enabled !== false,
+          ended_from_ui: endedFromUi,
+          end_reason: s.end_reason || null,
+          owner_alive: !ownerDead,
+          token_present: Boolean(s.token),
+          connection_capability_present: typeof s.connection_capability === 'string',
+          reconnect: {
+            action: standDown ? 'stand_down' : 'reconnect',
+            instruction: standDown
+              ? 'Connection was deliberately ended or owner process exited. Stand down and do not re-register.'
+              : 'Connection end was not attributed to a human stop. Re-run devspec-remote-connect.mjs once to resume.',
+          },
+        },
+        null,
+        2,
+      ) + '\n',
+    )
     process.exit(0)
   }
 
