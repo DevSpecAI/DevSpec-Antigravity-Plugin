@@ -184,12 +184,49 @@ describe('resolveDevspecMcpAuth (Antigravity)', { concurrency: false }, () => {
   it('formats a deterministic OS-aware missing auth message for POSIX and Windows', () => {
     assert.equal(
       formatMissingAuthMessage('linux'),
-      'DevSpec is not configured properly: place your "dvs_..." token in ~/.gemini/antigravity-cli/mcp_config.json under mcpServers.devspec.headers.Authorization ("Bearer dvs_..."), then restart agy.',
+      'DevSpec is not configured properly: run `agy mcp add --header "Authorization: Bearer dvs_..." devspec https://devspec.ai/api/mcp` or place your "dvs_..." token in ~/.gemini/config/mcp_config.json (or ~/.gemini/antigravity-cli/mcp_config.json) under mcpServers.devspec.headers.Authorization ("Bearer dvs_..."), then restart agy.',
     )
     assert.equal(
       formatMissingAuthMessage('win32'),
-      'DevSpec is not configured properly: place your "dvs_..." token in %USERPROFILE%\\.gemini\\antigravity-cli\\mcp_config.json under mcpServers.devspec.headers.Authorization ("Bearer dvs_..."), then restart agy.',
+      'DevSpec is not configured properly: run `agy mcp add --header "Authorization: Bearer dvs_..." devspec https://devspec.ai/api/mcp` or place your "dvs_..." token in %USERPROFILE%\\.gemini\\config\\mcp_config.json (or %USERPROFILE%\\.gemini\\antigravity-cli\\mcp_config.json) under mcpServers.devspec.headers.Authorization ("Bearer dvs_..."), then restart agy.',
     )
+  })
+
+  it('reads ~/.gemini/config/mcp_config.json (migrated agy global path) and prefers it over legacy path', () => {
+    const d = proj('migratedconfig')
+    agConfig(fakeHome, 'dvs_legacy_home')
+    const cfgDir = path.join(fakeHome, '.gemini', 'config')
+    fs.mkdirSync(cfgDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(cfgDir, 'mcp_config.json'),
+      JSON.stringify({
+        mcpServers: {
+          devspec: {
+            url: 'https://api.devspecstaging.com/api/mcp',
+            headers: { Authorization: 'Bearer dvs_migrated_home' },
+          },
+        },
+      }),
+    )
+    const auth = resolveDevspecMcpAuth(d, { home: fakeHome })
+    assert.equal(auth.ok, true)
+    assert.equal(auth.token, 'dvs_migrated_home')
+    assert.equal(auth.mcp_url, 'https://api.devspecstaging.com/api/mcp')
+    assert.match(auth.source, /\.gemini[\\/]config[\\/]mcp_config\.json$/)
+  })
+
+  it('reuses ~/.pi/agent/devspec/auth.json when no Antigravity config token is set yet', () => {
+    const d = proj('piauth')
+    const piDir = path.join(fakeHome, '.pi', 'agent', 'devspec')
+    fs.mkdirSync(piDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(piDir, 'auth.json'),
+      JSON.stringify({ token: 'dvs_from_pi_store', url: 'https://api.devspecstaging.com/api/mcp' }),
+    )
+    const auth = resolveDevspecMcpAuth(d, { home: fakeHome })
+    assert.equal(auth.ok, true)
+    assert.equal(auth.token, 'dvs_from_pi_store')
+    assert.equal(auth.mcp_url, 'https://api.devspecstaging.com/api/mcp')
   })
 
   it('verifies candidate tokens and pins the working token to ~/.devspec/auth.json when multiple tokens exist', async () => {

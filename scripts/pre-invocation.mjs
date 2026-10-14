@@ -38,12 +38,17 @@ export async function runPreInvocation(raw = '', options = {}) {
   return null
 }
 
+export function toProtoPreInvocationResult(out) {
+  if (!out || typeof out !== 'object' || !Array.isArray(out.injectSteps) || out.injectSteps.length === 0) {
+    return {}
+  }
+  return { injectSteps: out.injectSteps }
+}
+
 async function main() {
   const raw = readStdin()
   const out = await runPreInvocation(raw)
-  if (out) {
-    process.stdout.write(JSON.stringify(out) + '\n')
-  }
+  process.stdout.write(JSON.stringify(toProtoPreInvocationResult(out)) + '\n')
   process.exit(0)
 }
 

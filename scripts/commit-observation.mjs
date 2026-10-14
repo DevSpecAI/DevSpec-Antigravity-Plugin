@@ -56,7 +56,7 @@ export function commitRepoDir(command, cwd) {
 }
 
 function extractCommand(input) {
-  const toolInput = input?.tool_input ?? input?.toolInput ?? {}
+  const toolInput = input?.tool_input ?? input?.toolInput ?? input?.toolCall?.args ?? {}
   if (typeof toolInput.command === 'string') return toolInput.command
   if (typeof toolInput.CommandLine === 'string') return toolInput.CommandLine
   return null
@@ -292,9 +292,10 @@ export async function handleBashPost(input, options = {}) {
     if (!before || before.version !== 1 || !Number.isFinite(before.at) || now < before.at || now - before.at > OBSERVATION_TTL_MS) {
       return null
     }
-    const response = input.tool_response ?? input.toolResponse
+    const response = input.tool_response ?? input.toolResponse ?? input.result
     if (
       input.is_error === true ||
+      (typeof input.error === 'string' && input.error.trim().length > 0) ||
       response?.is_error === true ||
       response?.interrupted === true ||
       (typeof response?.exit_code === 'number' && response.exit_code !== 0) ||

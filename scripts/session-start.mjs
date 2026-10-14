@@ -84,8 +84,28 @@ export function parseHookCwd(hookInput, fallbackCwd = process.cwd()) {
 }
 
 /**
+ * Remove any leftover untracked placeholder `mcp_config.json` inside the plugin
+ * directory so Antigravity does not hang trying to connect `antigravity-devspec-autopilot-extension_devspec`.
+ */
+export function cleanupLegacyPluginMcpConfig({ pluginRoot = PLUGIN_ROOT } = {}) {
+  if (!pluginRoot) return { removed: false, reason: 'no_plugin_root' }
+  const legacyMcpPath = path.join(pluginRoot, 'mcp_config.json')
+  try {
+    if (!fs.existsSync(legacyMcpPath)) return { removed: false, reason: 'not_present' }
+    const raw = fs.readFileSync(legacyMcpPath, 'utf8')
+    if (raw.includes('dvs_YOUR_DEVSPEC_MCP_TOKEN')) {
+      fs.rmSync(legacyMcpPath, { force: true })
+      return { removed: true, path: legacyMcpPath }
+    }
+    return { removed: false, reason: 'custom_config_kept' }
+  } catch {
+    return { removed: false, reason: 'error' }
+  }
+}
+
+/**
  * Non-destructively configure `statusLine` in `~/.gemini/antigravity-cli/settings.json`
- * when no custom statusLine is set yet.
+ * when no custom statusLine is set yet (with `stack_with_default: true`).
  */
 export function ensureStatusLineConfigured({
   home = os.homedir(),
@@ -117,9 +137,11 @@ export function ensureStatusLineConfigured({
           ? existing.command.trim()
           : ''
     if (existingCmd) {
-      // Only update if it points to a DevSpec statusline.mjs path that no longer exists
       const m = existingCmd.match(/["']([^"']*statusline\.mjs)["']/)
-      if (!m || fs.existsSync(m[1])) {
+      if (!m) {
+        return { updated: false, reason: 'already_configured', settingsPath }
+      }
+      if (fs.existsSync(m[1]) && typeof existing === 'object' && existing.stack_with_default === true) {
         return { updated: false, reason: 'already_configured', settingsPath }
       }
     }
@@ -128,6 +150,7 @@ export function ensureStatusLineConfigured({
   settings.statusLine = {
     type: 'command',
     command: desiredCommand,
+    stack_with_default: true,
   }
   try {
     fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
@@ -336,6 +359,11 @@ export async function runSessionStart(
   const effectiveHome = home || env?.HOME || os.homedir()
   const effectiveCwd = parseHookCwd(raw, cwd)
   try {
+    cleanupLegacyPluginMcpConfig()
+  } catch {
+    /* non-fatal */
+  }
+  try {
     ensureStatusLineConfigured({ home: effectiveHome })
   } catch {
     /* non-fatal */
@@ -461,12 +489,21 @@ export async function runSessionStart(
   }
 }
 
+/**
+ * Convert an internal SessionStart hook result to strict Antigravity protojson
+ * (`SessionStartHookResult` accepts only `injectSteps`).
+ */
+export function toProtoSessionStartResult(out) {
+  if (!out || typeof out !== 'object' || !Array.isArray(out.injectSteps) || out.injectSteps.length === 0) {
+    return {}
+  }
+  return { injectSteps: out.injectSteps }
+}
+
 async function main() {
   const raw = readStdin()
   const out = await runSessionStart(raw)
-  if (out) {
-    process.stdout.write(JSON.stringify(out) + '\n')
-  }
+  process.stdout.write(JSON.stringify(toProtoSessionStartResult(out)) + '\n')
   process.exit(0)
 }
 

@@ -226,6 +226,39 @@ export async function runDevspecToolInput(raw = '', options = {}) {
   return prov || null
 }
 
+export function toProtoPreToolResult(out) {
+  if (!out || typeof out !== 'object') return {}
+  const decision =
+    typeof out.decision === 'string' && out.decision
+      ? out.decision
+      : typeof out.hookSpecificOutput?.permissionDecision === 'string' && out.hookSpecificOutput.permissionDecision
+        ? out.hookSpecificOutput.permissionDecision
+        : null
+  const overwrite =
+    out.overwrite && typeof out.overwrite === 'object' && !Array.isArray(out.overwrite)
+      ? out.overwrite
+      : out.hookSpecificOutput?.updatedInput && typeof out.hookSpecificOutput.updatedInput === 'object'
+        ? out.hookSpecificOutput.updatedInput
+        : null
+  if (!decision && !overwrite) return {}
+  const proto = {
+    decision: decision || 'allow',
+  }
+  const reason =
+    typeof out.reason === 'string' && out.reason
+      ? out.reason
+      : typeof out.hookSpecificOutput?.permissionDecisionReason === 'string' &&
+          out.hookSpecificOutput.permissionDecisionReason
+        ? out.hookSpecificOutput.permissionDecisionReason
+        : null
+  if (reason) proto.reason = reason
+  if (Array.isArray(out.permissionOverrides) && out.permissionOverrides.length > 0) {
+    proto.permissionOverrides = out.permissionOverrides
+  }
+  if (overwrite) proto.overwrite = overwrite
+  return proto
+}
+
 let isMain = false
 try {
   isMain = Boolean(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))
@@ -237,11 +270,9 @@ if (isMain) {
     try {
       const raw = fs.readFileSync(0, 'utf8')
       const out = await runDevspecToolInput(raw)
-      if (out && Object.keys(out).length > 0) {
-        process.stdout.write(JSON.stringify(out) + '\n')
-      }
+      process.stdout.write(JSON.stringify(toProtoPreToolResult(out)) + '\n')
     } catch {
-      /* non-fatal */
+      process.stdout.write('{}\n')
     }
   })()
 }

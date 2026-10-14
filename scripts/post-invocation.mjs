@@ -60,12 +60,22 @@ export async function runPostInvocation(raw = '', { env = process.env, home = os
   return null
 }
 
+export function toProtoPostInvocationResult(out) {
+  if (!out || typeof out !== 'object' || !Array.isArray(out.injectSteps) || out.injectSteps.length === 0) {
+    return {}
+  }
+  return {
+    injectSteps: out.injectSteps,
+    ...(typeof out.terminationBehavior === 'string' && out.terminationBehavior
+      ? { terminationBehavior: out.terminationBehavior }
+      : {}),
+  }
+}
+
 async function main() {
   const raw = readStdin()
   const out = await runPostInvocation(raw)
-  if (out) {
-    process.stdout.write(JSON.stringify(out) + '\n')
-  }
+  process.stdout.write(JSON.stringify(toProtoPostInvocationResult(out)) + '\n')
   process.exit(0)
 }
 

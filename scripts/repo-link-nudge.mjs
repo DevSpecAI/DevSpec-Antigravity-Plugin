@@ -84,15 +84,22 @@ function remember(file) {
  */
 export async function handleBashPost(input, deps = {}) {
   const env = deps.env ?? process.env
-  const toolInput = input?.tool_input ?? input?.toolInput ?? {}
+  const toolInput = input?.tool_input ?? input?.toolInput ?? input?.toolCall?.args ?? {}
   const command = typeof toolInput.command === 'string' ? toolInput.command : toolInput.CommandLine
   if (!looksRemoteCreating(command)) return null
+  const ws = Array.isArray(input?.workspacePaths)
+    ? input.workspacePaths[0]
+    : Array.isArray(input?.workspace_paths)
+      ? input.workspace_paths[0]
+      : null
   const cwd =
     typeof input?.cwd === 'string' && input.cwd
       ? input.cwd
-      : typeof toolInput?.Cwd === 'string' && toolInput.Cwd
-        ? toolInput.Cwd
-        : null
+      : typeof ws === 'string' && ws
+        ? ws
+        : typeof toolInput?.Cwd === 'string' && toolInput.Cwd
+          ? toolInput.Cwd
+          : null
   if (!cwd) return null
   const repoDir = path.resolve(cwd, commitRepoDir(command, cwd) || cwd)
 
@@ -106,7 +113,9 @@ export async function handleBashPost(input, deps = {}) {
       ? input.session_id
       : typeof input?.conversation_id === 'string' && input.conversation_id
         ? input.conversation_id
-        : 'no-session'
+        : typeof input?.conversationId === 'string' && input.conversationId
+          ? input.conversationId
+          : 'no-session'
   const marker = markerPath(sessionId, pin.project_id, remote, env)
   if (alreadySaid(marker)) return null
 

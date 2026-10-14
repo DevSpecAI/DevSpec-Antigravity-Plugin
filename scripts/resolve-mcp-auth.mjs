@@ -35,9 +35,9 @@ export const DEFAULT_PROD_URL = 'https://devspec.ai/api/mcp'
 export function formatMissingAuthMessage(platform = process.platform) {
   const configPath =
     platform === 'win32'
-      ? '%USERPROFILE%\\.gemini\\antigravity-cli\\mcp_config.json'
-      : '~/.gemini/antigravity-cli/mcp_config.json'
-  return `DevSpec is not configured properly: place your "dvs_..." token in ${configPath} under mcpServers.devspec.headers.Authorization ("Bearer dvs_..."), then restart agy.`
+      ? '%USERPROFILE%\\.gemini\\config\\mcp_config.json (or %USERPROFILE%\\.gemini\\antigravity-cli\\mcp_config.json)'
+      : '~/.gemini/config/mcp_config.json (or ~/.gemini/antigravity-cli/mcp_config.json)'
+  return `DevSpec is not configured properly: run \`agy mcp add --header "Authorization: Bearer dvs_..." devspec https://devspec.ai/api/mcp\` or place your "dvs_..." token in ${configPath} under mcpServers.devspec.headers.Authorization ("Bearer dvs_..."), then restart agy.`
 }
 
 export function isValidConfigToken(token) {
@@ -128,6 +128,22 @@ export function writePinnedAuth(
   }
 }
 
+export function readPiAuth({ home = os.homedir() } = {}) {
+  if (!home) return null
+  const file = path.join(home, '.pi', 'agent', 'devspec', 'auth.json')
+  const parsed = readJson(file)
+  if (!parsed || !isValidConfigToken(parsed.token)) return null
+  const url =
+    (typeof parsed.mcp_url === 'string' && parsed.mcp_url.trim()) ||
+    (typeof parsed.url === 'string' && parsed.url.trim()) ||
+    DEFAULT_PROD_URL
+  return {
+    token: parsed.token.trim(),
+    mcp_url: url,
+    source: file,
+  }
+}
+
 function walkMcpJson(startDir) {
   let dir = path.resolve(startDir || process.cwd())
   for (let i = 0; i < 12; i++) {
@@ -146,10 +162,12 @@ function walkMcpJson(startDir) {
 }
 
 function antigravityConfigCandidates(cwd = process.cwd(), home = os.homedir()) {
-  const rel = ['.gemini', 'antigravity-cli', 'mcp_config.json']
+  const resolvedCwd = path.resolve(cwd || process.cwd())
   const files = [
-    path.join(home, ...rel),
-    path.join(path.resolve(cwd || process.cwd()), ...rel),
+    path.join(home, '.gemini', 'config', 'mcp_config.json'),
+    path.join(home, '.gemini', 'antigravity-cli', 'mcp_config.json'),
+    path.join(resolvedCwd, '.gemini', 'config', 'mcp_config.json'),
+    path.join(resolvedCwd, '.gemini', 'antigravity-cli', 'mcp_config.json'),
   ]
   const out = []
   for (const file of files) {
@@ -194,13 +212,14 @@ export function hostTokenFromEnv(env = process.env, { cwd = process.cwd(), home 
   const envTok = env.DEVSPEC_MCP_TOKEN || env.DEVSPEC_TOKEN
   if (isNonPlaceholderToken(envTok)) return envTok.trim()
   const pinned = readPinnedAuth({ home })
+  const piAuth = readPiAuth({ home })
   const agCandidates = antigravityConfigCandidates(cwd, home)
   const fromProject = walkMcpJson(cwd)
-  const allCandidates = [...agCandidates, ...(fromProject ? [fromProject] : [])].filter((c) => c.token)
+  const allCandidates = [...agCandidates, ...(fromProject ? [fromProject] : []), ...(piAuth ? [piAuth] : [])].filter((c) => c.token)
   if (pinned?.token && allCandidates.some((c) => c.token === pinned.token)) {
     return pinned.token
   }
-  return antigravityConfigAuth(cwd, { home })?.token || pinned?.token || null
+  return antigravityConfigAuth(cwd, { home })?.token || pinned?.token || piAuth?.token || null
 }
 
 export function resolveDevspecMcpAuth(cwd = process.cwd(), opts = {}) {
@@ -216,13 +235,14 @@ export function resolveDevspecMcpAuth(cwd = process.cwd(), opts = {}) {
   const ag = antigravityConfigAuth(cwd, { home })
   const fromProject = walkMcpJson(cwd)
   const pinned = readPinnedAuth({ home })
+  const piAuth = readPiAuth({ home })
 
   const hostToken = isNonPlaceholderToken(opts.hostToken) ? opts.hostToken.trim() : null
   if (hostToken) {
     return {
       ok: true,
       token: hostToken,
-      mcp_url: envUrl || ag?.mcp_url || fromProject?.mcp_url || pinned?.mcp_url || DEFAULT_PROD_URL,
+      mcp_url: envUrl || ag?.mcp_url || fromProject?.mcp_url || pinned?.mcp_url || piAuth?.mcp_url || DEFAULT_PROD_URL,
       source: 'host',
     }
   }
@@ -274,6 +294,15 @@ export function resolveDevspecMcpAuth(cwd = process.cwd(), opts = {}) {
       token: pinned.token,
       mcp_url: envUrl || pinned.mcp_url || ag?.mcp_url || fromProject?.mcp_url || DEFAULT_PROD_URL,
       source: pinned.source,
+    }
+  }
+
+  if (piAuth?.token) {
+    return {
+      ok: true,
+      token: piAuth.token,
+      mcp_url: envUrl || piAuth.mcp_url || ag?.mcp_url || fromProject?.mcp_url || DEFAULT_PROD_URL,
+      source: piAuth.source,
     }
   }
 
@@ -340,10 +369,12 @@ export async function verifyAndPinDevspecAuth(
 
   const agCandidates = antigravityConfigCandidates(cwd, home).filter((c) => c.token)
   const pinned = readPinnedAuth({ home })
+  const piAuth = readPiAuth({ home })
   const fromProject = walkMcpJson(cwd)
   const rawList = [
     ...agCandidates,
     ...(pinned?.token ? [pinned] : []),
+    ...(piAuth?.token ? [piAuth] : []),
     ...(fromProject?.token ? [fromProject] : []),
   ]
 

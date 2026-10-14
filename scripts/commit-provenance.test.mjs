@@ -359,7 +359,8 @@ describe('unclaimed-edit provenance nudge lifecycle via PostInvocation', () => {
     assert.ok(invOut, 'PostInvocation should return the staged provenance nudge')
     assert.equal(Array.isArray(invOut.injectSteps), true)
     assert.equal(invOut.injectSteps.length, 1)
-    assert.match(invOut.injectSteps[0].ephemeralMessage.content, /no work item is claimed/i)
+    assert.equal(typeof invOut.injectSteps[0].ephemeralMessage, 'string')
+    assert.match(invOut.injectSteps[0].ephemeralMessage, /no work item is claimed/i)
     assert.match(invOut.additionalContext, /no work item is claimed/i)
 
     // Subsequent PostInvocation and edits in the same session+repo stay quiet
@@ -554,5 +555,37 @@ describe('commit-observation.mjs — pre/post git commit observation', () => {
       { env, boundConnection: () => connState, call: async (v) => calls.push(v) },
     )
     assert.equal(calls.length, 0)
+  })
+
+  it('tracks claims and stamps commits from Antigravity protojson payloads (toolCall.name, toolCall.args, workspacePaths)', async () => {
+    handlePost(
+      {
+        conversationId: CONVERSATION,
+        workspacePaths: [repo],
+        toolCall: {
+          name: 'mcp_devspec_claim_work_item',
+          args: { action_item_id: ITEM, provenance_ref: PROV_REF },
+        },
+      },
+      { env },
+    )
+    assert.deepEqual(readClaims(scope(), { env }), [ITEM])
+
+    const preResult = await runDevspecToolInput(
+      JSON.stringify({
+        conversationId: CONVERSATION,
+        workspacePaths: [repo],
+        toolCall: {
+          name: 'run_command',
+          args: { CommandLine: 'git commit -m "feat: protojson payload"', Cwd: repo },
+        },
+      }),
+      { env },
+    )
+    assert.equal(preResult.decision, 'allow')
+    assert.equal(
+      preResult.overwrite.CommandLine,
+      `git commit -m "feat: protojson payload [devspec:${ITEM}]"`,
+    )
   })
 })

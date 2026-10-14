@@ -18,15 +18,22 @@ const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
 
 /** The pin files this tool call could have written. */
 export function candidatePins(input, { root = gitRoot } = {}) {
-  const rawTool = String(input?.tool_name || input?.toolName || '')
+  const rawTool = String(input?.tool_name || input?.toolName || input?.toolCall?.name || '')
   const tool = rawTool.replace(/^default_api:/, '')
-  const toolInput = input?.tool_input ?? input?.toolInput ?? {}
+  const toolInput = input?.tool_input ?? input?.toolInput ?? input?.toolCall?.args ?? {}
+  const ws = Array.isArray(input?.workspacePaths)
+    ? input.workspacePaths[0]
+    : Array.isArray(input?.workspace_paths)
+      ? input.workspace_paths[0]
+      : null
   const cwd =
     typeof input?.cwd === 'string' && input.cwd
       ? input.cwd
-      : typeof toolInput?.Cwd === 'string' && toolInput.Cwd
-        ? toolInput.Cwd
-        : null
+      : typeof ws === 'string' && ws
+        ? ws
+        : typeof toolInput?.Cwd === 'string' && toolInput.Cwd
+          ? toolInput.Cwd
+          : null
   if (tool === 'Bash' || tool === 'run_command') {
     const cmd = typeof toolInput.command === 'string' ? toolInput.command : toolInput.CommandLine
     if (!cwd || typeof cmd !== 'string' || !cmd.includes(PIN_RELATIVE)) return []

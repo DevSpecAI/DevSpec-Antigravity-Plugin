@@ -338,7 +338,7 @@ export function invocationNotice({ input, env = process.env, home = os.homedir()
   if (!text) return null
   return {
     additionalContext: text,
-    injectSteps: [{ ephemeralMessage: { content: text } }],
+    injectSteps: [{ ephemeralMessage: text }],
   }
 }
 
@@ -347,7 +347,8 @@ export function invocationNotice({ input, env = process.env, home = os.homedir()
  * Returns hook object `{ decision: 'deny', reason, hookSpecificOutput }` or null.
  */
 export function prePostHoldObject({ input, env = process.env, home = os.homedir(), scriptPath = SCRIPT_PATH } = {}) {
-  if (!isPostSessionMessageTool(input?.tool_name ?? input?.toolName ?? null)) return null
+  const rawToolName = input?.tool_name ?? input?.toolName ?? input?.toolCall?.name ?? null
+  if (!isPostSessionMessageTool(rawToolName)) return null
   if (input?.agent_id) return null
   const room = resolveRoom({ input, env, home })
   if (!room) return null

@@ -502,7 +502,7 @@ export function renderStatusLine(rawInput = '', { home = os.homedir(), env = pro
     if (hasInputContext) {
       const auth = resolveDevspecMcpAuth(cwd || process.cwd(), { home, env })
       if (!auth.ok) {
-        return 'DevSpec: not configured — add dvs_ token to ~/.gemini/antigravity-cli/mcp_config.json'
+        return 'DevSpec: not configured — add dvs_ token to ~/.gemini/config/mcp_config.json'
       }
     }
     return ''

@@ -461,13 +461,32 @@ describe('Item 5 Parity: statusline.mjs rendering and telemetry', () => {
   })
 
   it('auto-configures statusLine in settings.json and surfaces missing-auth notice in statusline and SessionStart', async () => {
-    const { connectAtStartupEnabled, ensureStatusLineConfigured, runSessionStart } = await import(
-      './session-start.mjs'
-    )
+    const {
+      cleanupLegacyPluginMcpConfig,
+      connectAtStartupEnabled,
+      ensureStatusLineConfigured,
+      runSessionStart,
+      toProtoSessionStartResult,
+    } = await import('./session-start.mjs')
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-agy-setup-'))
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-agy-cwd-'))
 
-    // 1. ensureStatusLineConfigured writes statusLine when missing and preserves existing keys
+    // 0. cleanupLegacyPluginMcpConfig removes leftover placeholder mcp_config.json
+    const fakePluginRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-agy-plugin-'))
+    const legacyMcp = path.join(fakePluginRoot, 'mcp_config.json')
+    fs.writeFileSync(
+      legacyMcp,
+      JSON.stringify({
+        mcpServers: {
+          devspec: { headers: { Authorization: 'Bearer dvs_YOUR_DEVSPEC_MCP_TOKEN' } },
+        },
+      }),
+    )
+    const cleaned = cleanupLegacyPluginMcpConfig({ pluginRoot: fakePluginRoot })
+    assert.equal(cleaned.removed, true)
+    assert.equal(fs.existsSync(legacyMcp), false)
+
+    // 1. ensureStatusLineConfigured writes statusLine with stack_with_default: true when missing and preserves existing keys
     const settingsPath = path.join(home, '.gemini', 'antigravity-cli', 'settings.json')
     fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
     fs.writeFileSync(settingsPath, JSON.stringify({ theme: 'dark' }, null, 2))
@@ -476,9 +495,10 @@ describe('Item 5 Parity: statusline.mjs rendering and telemetry', () => {
     const parsedSettings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'))
     assert.equal(parsedSettings.theme, 'dark')
     assert.equal(parsedSettings.statusLine.type, 'command')
+    assert.equal(parsedSettings.statusLine.stack_with_default, true)
     assert.match(parsedSettings.statusLine.command, /statusline\.mjs/)
 
-    // Second call preserves existing statusLine when script exists on disk
+    // Second call preserves existing statusLine when script exists on disk and stack_with_default is true
     const cfg2 = ensureStatusLineConfigured({ home })
     assert.equal(cfg2.updated, false)
     assert.equal(cfg2.reason, 'already_configured')
@@ -504,10 +524,10 @@ describe('Item 5 Parity: statusline.mjs rendering and telemetry', () => {
     )
     assert.equal(
       unconfiguredLine,
-      'DevSpec: not configured — add dvs_ token to ~/.gemini/antigravity-cli/mcp_config.json',
+      'DevSpec: not configured — add dvs_ token to ~/.gemini/config/mcp_config.json',
     )
 
-    // 4. runSessionStart returns deterministic missing-auth remediation context when unconfigured
+    // 4. runSessionStart returns deterministic missing-auth remediation context when unconfigured, and toProtoSessionStartResult strips hookSpecificOutput
     const startOut = await runSessionStart(
       JSON.stringify({ conversation_id: 'conv-missing-auth', cwd }),
       {
@@ -521,11 +541,14 @@ describe('Item 5 Parity: statusline.mjs rendering and telemetry', () => {
     assert.ok(startOut?.hookSpecificOutput?.additionalContext)
     assert.match(
       startOut.hookSpecificOutput.additionalContext,
-      /DevSpec is not configured properly: place your "dvs_\.\.\." token in ~\/\.gemini\/antigravity-cli\/mcp_config\.json/,
+      /DevSpec is not configured properly: .*~\/\.gemini\/config\/mcp_config\.json/,
     )
     assert.match(
       startOut.hookSpecificOutput.additionalContext,
       /report this message verbatim and do not guess or search for tokens/,
     )
+    const protoStart = toProtoSessionStartResult(startOut)
+    assert.deepEqual(Object.keys(protoStart), ['injectSteps'])
+    assert.equal(protoStart.hookSpecificOutput, undefined)
   })
 })

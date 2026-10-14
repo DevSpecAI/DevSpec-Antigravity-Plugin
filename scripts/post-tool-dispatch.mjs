@@ -16,7 +16,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { handleBashPost } from './commit-observation.mjs'
-import { handlePost } from './commit-provenance.mjs'
+import { handlePost, stagePendingNudge } from './commit-provenance.mjs'
 import { isSessionReplyToolCall } from './devspec-remote-poll.mjs'
 import { resolveOwnConnectionId } from './launch-guard.mjs'
 import {
@@ -179,10 +179,14 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
   }
 
   if (notices.length > 0) {
+    const joined = notices.join('\n\n')
+    if (conversationId) {
+      stagePendingNudge(conversationId, joined, { env })
+    }
     return {
       hookSpecificOutput: {
         hookEventName: 'PostToolUse',
-        additionalContext: notices.join('\n\n'),
+        additionalContext: joined,
       },
     }
   }
@@ -190,12 +194,18 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
   return null
 }
 
+/**
+ * Antigravity PostToolHookResult expects `{}` (or `{ overwriteResult }`).
+ * Post-tool notices are staged via `stagePendingNudge` and injected on `PostInvocation`.
+ */
+export function toProtoPostToolResult() {
+  return {}
+}
+
 async function main() {
   const raw = readStdin()
-  const out = await runPostToolDispatch(raw)
-  if (out) {
-    process.stdout.write(JSON.stringify(out) + '\n')
-  }
+  await runPostToolDispatch(raw)
+  process.stdout.write(JSON.stringify(toProtoPostToolResult()) + '\n')
   process.exit(0)
 }
 

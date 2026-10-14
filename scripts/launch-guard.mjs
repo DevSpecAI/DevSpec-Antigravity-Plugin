@@ -52,8 +52,8 @@ export function resolveOwnConnectionId(conversationId, { home = os.homedir() } =
 }
 
 export function launchGuard(input, { home = os.homedir(), env = process.env } = {}) {
-  const toolName = input?.tool_name ?? input?.toolName ?? ''
-  const toolInput = input?.tool_input ?? input?.toolInput ?? {}
+  const toolName = input?.tool_name ?? input?.toolName ?? input?.toolCall?.name ?? ''
+  const toolInput = input?.tool_input ?? input?.toolInput ?? input?.toolCall?.args ?? {}
   if (!startsBackgroundWork(toolName, toolInput)) return {}
   const conversationId = resolveHookConversationId(input, env)
   const connectionId = resolveOwnConnectionId(conversationId, { home })

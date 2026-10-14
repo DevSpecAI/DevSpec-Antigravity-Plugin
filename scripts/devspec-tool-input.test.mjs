@@ -286,7 +286,8 @@ describe('room-unread.mjs pre-post hold and injectSteps awareness', () => {
       })
       assert.ok(postInv, 'PostInvocation returns unread awareness')
       assert.ok(Array.isArray(postInv.injectSteps), 'includes injectSteps array')
-      assert.match(postInv.injectSteps[0].ephemeralMessage.content, /"unread":2/)
+      assert.equal(typeof postInv.injectSteps[0].ephemeralMessage, 'string')
+      assert.match(postInv.injectSteps[0].ephemeralMessage, /"unread":2/)
 
       // 4. Reader marks messages read
       const readRes = readerOutput({ connectionId: CONN_ID, sessionId: SESS_ID, dir: fx.connDir })

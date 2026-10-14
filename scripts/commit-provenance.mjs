@@ -146,13 +146,20 @@ export function resolveProvenanceSessionId(input, env = process.env) {
 
 export function resolveProvenanceCwd(input) {
   if (!input || typeof input !== 'object') return null
-  const toolInput = input.tool_input ?? input.toolInput ?? {}
+  const toolInput = input.tool_input ?? input.toolInput ?? input.toolCall?.args ?? {}
   if (typeof input.cwd === 'string' && input.cwd) return input.cwd
+  const ws = Array.isArray(input.workspacePaths)
+    ? input.workspacePaths[0]
+    : Array.isArray(input.workspace_paths)
+      ? input.workspace_paths[0]
+      : null
+  if (typeof ws === 'string' && ws) return ws
   if (typeof toolInput.Cwd === 'string' && toolInput.Cwd) return toolInput.Cwd
   if (typeof toolInput.cwd === 'string' && toolInput.cwd) return toolInput.cwd
   const targetFile =
     toolInput.TargetFile ??
     toolInput.targetFile ??
+    toolInput.AbsolutePath ??
     toolInput.file_path ??
     toolInput.notebook_path ??
     null
@@ -304,9 +311,7 @@ export function pendingNudgeNotice({ input = {}, env = process.env } = {}) {
   return {
     injectSteps: [
       {
-        ephemeralMessage: {
-          content: message,
-        },
+        ephemeralMessage: message,
       },
     ],
     additionalContext: message,
@@ -657,7 +662,7 @@ export function handleSessionStart() {
 
 export function handlePost(input, options = {}) {
   const { env = process.env, now = Date.now(), platform = process.platform } = options
-  const rawName = input?.tool_name ?? input?.toolName
+  const rawName = input?.tool_name ?? input?.toolName ?? input?.toolCall?.name
   const verb = devspecToolVerb(rawName)
   const tool = bareToolName(rawName)
 
@@ -711,8 +716,9 @@ export function handlePost(input, options = {}) {
 }
 
 function parseClaimResponse(input) {
-  const response = input?.tool_response ?? input?.toolResponse
-  const toolInput = input?.tool_input ?? input?.toolInput ?? {}
+  if (typeof input?.error === 'string' && input.error.trim().length > 0) return null
+  const response = input?.tool_response ?? input?.toolResponse ?? input?.result
+  const toolInput = input?.tool_input ?? input?.toolInput ?? input?.toolCall?.args ?? {}
   const texts = []
   const collect = (value) => {
     if (typeof value === 'string') { texts.push(value); return }
@@ -755,7 +761,7 @@ function parseClaimResponse(input) {
 
 export async function handlePre(input, options = {}) {
   const { env = process.env, now = Date.now(), platform = process.platform } = options
-  const tool = bareToolName(input?.tool_name ?? input?.toolName)
+  const tool = bareToolName(input?.tool_name ?? input?.toolName ?? input?.toolCall?.name)
   if (!COMMAND_TOOLS.has(tool) && !EDIT_TOOLS.has(tool)) return null
 
   let scope
@@ -778,7 +784,7 @@ export async function handlePre(input, options = {}) {
     return maybeNudge(scope, { env, now, platform })
   }
 
-  const toolInput = input?.tool_input ?? input?.toolInput ?? {}
+  const toolInput = input?.tool_input ?? input?.toolInput ?? input?.toolCall?.args ?? {}
   const command =
     typeof toolInput.command === 'string'
       ? toolInput.command

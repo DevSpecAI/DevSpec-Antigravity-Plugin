@@ -699,6 +699,20 @@ export async function handleMirrorTurn(
     })
   }
 
+  let parsedHookInput = {}
+  try {
+    parsedHookInput = typeof raw === 'string' ? JSON.parse(raw || '{}') : raw || {}
+  } catch {
+    parsedHookInput = {}
+  }
+  if (
+    parsedHookInput?.parentConversationId ||
+    parsedHookInput?.parent_conversation_id ||
+    parsedHookInput?.agent_id
+  ) {
+    return { ok: true, skipped: 'subagent_invocation' }
+  }
+
   const conversationId = resolveHookConversationId(raw, env)
   const state = loadState(conversationId, { connectionsDir, legacyPath })
   if (!state) return { ok: true, skipped: 'no_bound_state' }
@@ -843,9 +857,14 @@ export async function handleMirrorTurn(
   }
 }
 
+export function toProtoStopResult() {
+  return {}
+}
+
 async function main() {
   const raw = readStdin()
   await handleMirrorTurn(mode, raw)
+  process.stdout.write(JSON.stringify(toProtoStopResult()) + '\n')
   process.exit(0)
 }
 
