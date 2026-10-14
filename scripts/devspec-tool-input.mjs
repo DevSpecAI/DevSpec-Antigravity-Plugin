@@ -82,9 +82,9 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
     return guard
   }
 
-  const rawToolName = input.tool_name ?? input.toolName ?? ''
+  const rawToolName = input.tool_name ?? input.toolName ?? input.toolCall?.name ?? ''
   const verb = parseDevspecToolName(rawToolName)
-  const toolInput = input.tool_input ?? input.toolInput
+  const toolInput = input.tool_input ?? input.toolInput ?? input.toolCall?.args
   if (!verb || !toolInput || typeof toolInput !== 'object' || Array.isArray(toolInput)) {
     return {}
   }
@@ -101,12 +101,16 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
   const connState = connectionId ? readStateFile(connectionId, connDir) : null
 
   let next = { ...toolInput }
+  const effectiveCwd =
+    (Array.isArray(input.workspacePaths) && input.workspacePaths[0]) ||
+    input.cwd ||
+    process.cwd()
 
   // 3. Project scope stamping (from bound connection state or .devspec/project.json pin)
   if (!PROJECTLESS_TOOLS.has(verb)) {
     const boundProjectId =
       (typeof connState?.project_id === 'string' && connState.project_id ? connState.project_id : null) ||
-      readProjectPin(input.cwd || process.cwd())
+      readProjectPin(effectiveCwd)
     if (boundProjectId) {
       if (next.project_id && next.project_id !== boundProjectId && connState?.project_id === boundProjectId) {
         const reason =

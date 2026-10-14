@@ -62,6 +62,9 @@ export function writeTurnMarker(connectionId, extra = {}, dir = CONNECTIONS_DIR)
   }
   try {
     fs.mkdirSync(dir, { recursive: true })
+    if (!existing) {
+      fs.rmSync(path.join(dir, `${connectionId}.explicit-reply`), { force: true })
+    }
     fs.writeFileSync(turnMarkerPath(connectionId, dir), JSON.stringify(payload), {
       mode: 0o600,
     })
@@ -209,6 +212,14 @@ export function launchedAntigravityBackgroundWork(toolName, toolInput, toolRespo
   // Antigravity: run_command sent to background (non-daemon).
   if (name === 'run_command' || name === 'default_api:run_command') {
     if (input.IsDaemon === true) return null
+    const cmdLine = String(input.CommandLine || input.command || '')
+    if (
+      cmdLine.includes('devspec-remote-wait.mjs') ||
+      cmdLine.includes('devspec-remote-listen.mjs') ||
+      cmdLine.includes('devspec-remote-poll.mjs')
+    ) {
+      return null
+    }
     const outText =
       typeof resp.output === 'string'
         ? resp.output
@@ -230,6 +241,14 @@ export function launchedAntigravityBackgroundWork(toolName, toolInput, toolRespo
 
   // Claude Code / generic Agent or Bash background task support
   if (name === 'Bash' && (input.run_in_background === true || resp.backgroundTaskId)) {
+    const cmdLine = String(input.command || input.CommandLine || '')
+    if (
+      cmdLine.includes('devspec-remote-wait.mjs') ||
+      cmdLine.includes('devspec-remote-listen.mjs') ||
+      cmdLine.includes('devspec-remote-poll.mjs')
+    ) {
+      return null
+    }
     const id = resp.backgroundTaskId || resp.task_id || resp.id
     if (id) return { id: String(id), kind: 'command', label: input.description || 'bash' }
   }
@@ -252,9 +271,9 @@ export function recordBackgroundLaunch(
     return false
   }
   const found = launchedAntigravityBackgroundWork(
-    input?.tool_name,
-    input?.tool_input,
-    input?.tool_response,
+    input?.tool_name ?? input?.toolName ?? input?.toolCall?.name,
+    input?.tool_input ?? input?.toolInput ?? input?.toolCall?.args,
+    input?.tool_response ?? input?.toolResponse ?? input?.result,
   )
   if (!found) return false
   const state = load(resolveHookConversationId(raw))

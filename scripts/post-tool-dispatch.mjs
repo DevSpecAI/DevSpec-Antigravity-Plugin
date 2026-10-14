@@ -17,6 +17,7 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { handleBashPost } from './commit-observation.mjs'
 import { handlePost } from './commit-provenance.mjs'
+import { isSessionReplyToolCall } from './devspec-remote-poll.mjs'
 import { resolveOwnConnectionId } from './launch-guard.mjs'
 import {
   explicitReplyMarkerPath,
@@ -52,7 +53,13 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
     return null
   }
 
-  const toolName = String(payload.tool_name || payload.toolName || '')
+  const toolName = String(
+    payload.tool_name || payload.toolName || payload.toolCall?.name || '',
+  )
+  const toolInput =
+    payload.tool_input ?? payload.toolInput ?? payload.toolCall?.args ?? {}
+  const toolResponse =
+    payload.tool_response ?? payload.toolResponse ?? payload.result
   const conversationId = resolveHookConversationId(raw, env)
   const state = loadState(conversationId)
   if (state) {
@@ -78,14 +85,8 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
     /* non-fatal */
   }
 
-  // 1. Explicit reply marker when the agent calls post_session_message
-  if (
-    connectionId &&
-    (toolName === 'mcp_devspec_post_session_message' ||
-      toolName === 'mcp__devspec__post_session_message' ||
-      toolName.endsWith(':post_session_message') ||
-      toolName === 'post_session_message')
-  ) {
+  // 1. Explicit reply marker when the agent calls post_session_message (non-trail)
+  if (connectionId && isSessionReplyToolCall(toolName, toolInput)) {
     try {
       const p = explicitReplyMarkerPath(connectionId)
       fs.writeFileSync(p, JSON.stringify({ at: Date.now() }), { mode: 0o600 })
@@ -130,8 +131,8 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
         const reqState = readRequestState(connectionId, { dir })
         const launch = launchForRequest(
           bareToolName,
-          payload.tool_input ?? payload.toolInput,
-          payload.tool_response ?? payload.toolResponse,
+          toolInput,
+          toolResponse,
           payload.tool_use_id ?? payload.toolUseId
         )
         if (launch) {

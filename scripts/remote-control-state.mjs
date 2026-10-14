@@ -63,6 +63,7 @@ import {
   stripConnectionCapability,
 } from './connection-capability-state.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
+import { findProjectPin, gitRemoteOrigin } from './devspec-scope.mjs'
 
 const DEVSPEC_DIR = path.join(os.homedir(), '.devspec')
 const LEGACY_PATH = path.join(DEVSPEC_DIR, 'remote-control.json')
@@ -944,13 +945,15 @@ export async function negotiateConnectionCapability({
   mcpUrl,
   token,
   projectId,
+  gitRemote = null,
   localId,
   connectionId,
   agentName = AGENT_NAME,
   cwd = process.cwd(),
   call = mcpToolsCall,
+  onProjectId = null,
 } = {}) {
-  if (!mcpUrl || !token || !projectId || !localId || !connectionId) {
+  if (!mcpUrl || !token || (!projectId && !gitRemote) || !localId || !connectionId) {
     return { ok: false, error: 'capability negotiation requires MCP auth, project-id, local-id, and connection-id' }
   }
   try {
@@ -959,7 +962,8 @@ export async function negotiateConnectionCapability({
       token,
       name: 'register_connection',
       arguments: {
-        project_id: projectId,
+        ...(projectId ? { project_id: projectId } : {}),
+        ...(gitRemote ? { git_remote: gitRemote } : {}),
         local_id: localId,
         agent_name: agentName,
         cwd,
@@ -970,6 +974,9 @@ export async function negotiateConnectionCapability({
     })
     if (result?.data?.connection_id !== connectionId) {
       return { ok: false, error: 'capability negotiation returned a different connection bond' }
+    }
+    if (typeof onProjectId === 'function' && typeof result?.data?.project_id === 'string' && result.data.project_id) {
+      onProjectId(result.data.project_id)
     }
     const capability = result?.meta?.devspec?.connection_capability
     if (capability?.version !== 1 || typeof capability.value !== 'string' || !capability.value.startsWith('dvsc_')) {
@@ -1473,16 +1480,21 @@ if (isMain) {
     // Owner-process anchor for self-termination (see devspec-remote-poll.mjs and
     // resolveOwnerPid / resolveOwnerPidAutoWindows above for the win32 self-resolve path).
     const ownerPid = resolveOwnerPid(args['owner-pid'], prev.owner_pid)
-    const projectId = args['project-id'] || prev.project_id || null
+    let projectId = args['project-id'] || prev.project_id || findProjectPin(cwd)?.project_id || null
+    const gitRemote = gitRemoteOrigin(cwd)
     const capability = auth.ok
       ? await negotiateConnectionCapability({
           mcpUrl: args.url || auth.mcp_url || prev.mcp_url,
           token: auth.token || prev.token,
           projectId,
+          gitRemote,
           localId,
           connectionId,
           agentName,
           cwd,
+          onProjectId: (resolvedId) => {
+            if (!projectId && resolvedId) projectId = resolvedId
+          },
         })
       : { ok: false, error: auth.error || 'MCP auth unavailable' }
     const state = {

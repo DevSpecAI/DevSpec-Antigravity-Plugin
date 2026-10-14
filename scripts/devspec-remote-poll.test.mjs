@@ -833,6 +833,59 @@ describe('extractAntigravityTrailFromTranscript & streamTurnTrailIfChanged', () 
     })
     assert.equal(second.posted, false)
     assert.equal(calls.length, 1)
+
+    // Once post_session_message and devspec-remote-wait.mjs run at the end of the turn,
+    // streamTurnTrailIfChanged must skip posting a trailing phase:'trail' update (which
+    // would otherwise create an empty "No response" bubble on the server).
+    const postReplyLines = [
+      ...sampleTranscript.trim().split('\n'),
+      JSON.stringify({
+        step_index: 5,
+        type: 'PLANNER_RESPONSE',
+        created_at: '2026-10-13T22:00:08.000Z',
+        tool_calls: [
+          {
+            id: 'tc-4',
+            name: 'run_command',
+            args: {
+              CommandLine: 'node -e "mcpToolsCall({ name: \'post_session_message\', arguments: { content: \'Done\' } })"',
+            },
+          },
+        ],
+      }),
+      JSON.stringify({
+        step_index: 6,
+        type: 'PLANNER_RESPONSE',
+        created_at: '2026-10-13T22:00:09.000Z',
+        thinking: 'Now re-arm the remote wait listener.',
+        tool_calls: [
+          {
+            id: 'tc-5',
+            name: 'run_command',
+            args: {
+              CommandLine: 'node scripts/devspec-remote-wait.mjs --connection-id ' + ME + ' --pending',
+            },
+          },
+        ],
+      }),
+    ]
+    fs.writeFileSync(transcriptPath, postReplyLines.join('\n') + '\n', 'utf8')
+    const afterReply = await streamTurnTrailIfChanged({
+      transcriptPath,
+      sinceMs: Date.parse('2026-10-13T22:00:01.000Z'),
+      sessionId: 'sess-12345678',
+      connectionId: ME,
+      mcpUrl: 'https://api.devspec.ai/api/mcp',
+      token: 'tok',
+      prevSignature: first.signature,
+      callMcp: async (req) => {
+        calls.push(req)
+        return {}
+      },
+    })
+    assert.equal(afterReply.posted, false)
+    assert.equal(afterReply.skipped, 'reply_already_posted')
+    assert.equal(calls.length, 1)
     fs.rmSync(tmpDir, { recursive: true, force: true })
   })
 })
@@ -863,7 +916,8 @@ describe('session-start auto-connect, cached instruction tiers, and sidecar wake
     try {
       const out = await runSessionStart(
         JSON.stringify({
-          conversation_id: 'conv-auto-12345678',
+          conversationId: 'conv-auto-12345678',
+          workspacePaths: ['/workspace/devspecv2'],
           transcript_path: '/tmp/transcript.jsonl',
         }),
         {
@@ -884,15 +938,19 @@ describe('session-start auto-connect, cached instruction tiers, and sidecar wake
             return {
               connection_id: 'conn-auto-99999999',
               codename: 'Swift Falcon',
+              project_id: 'proj-resolved-by-git-remote',
               instructions: { tier_0: 'Always ground with DevSpec first.' },
             }
           },
         },
       )
       assert.ok(out?.hookSpecificOutput?.additionalContext)
+      assert.ok(Array.isArray(out?.injectSteps))
       assert.match(out.hookSpecificOutput.additionalContext, /Swift Falcon/)
       assert.match(out.hookSpecificOutput.additionalContext, /Always ground with DevSpec first\./)
       assert.ok(writtenStates.has('conn-auto-99999999'))
+      assert.equal(writtenStates.get('conn-auto-99999999').cwd, '/workspace/devspecv2')
+      assert.equal(writtenStates.get('conn-auto-99999999').project_id, 'proj-resolved-by-git-remote')
       assert.ok(writtenBonds.has('Antigravity:conv-auto-12345678'))
       assert.ok(ensuredPollers.length >= 1)
     } finally {

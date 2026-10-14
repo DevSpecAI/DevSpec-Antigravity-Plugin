@@ -367,5 +367,41 @@ describe('Antigravity native hook payload & transcript handling', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true })
     }
   })
+
+  it('ignores devspec-remote-wait.mjs and devspec-remote-listen.mjs background launches so Stop is not held open', () => {
+    const waiter = launchedAntigravityBackgroundWork(
+      'default_api:run_command',
+      {
+        CommandLine: 'node "/home/user/.gemini/config/plugins/antigravity-devspec-autopilot-extension/scripts/devspec-remote-wait.mjs" --connection-id "conn-1" --owner-pid "$PPID" --pending',
+        WaitMsBeforeAsync: 500,
+      },
+      { output: 'Command sent to background with background task ID: task-wait-1' },
+    )
+    assert.equal(waiter, null)
+
+    const listener = launchedAntigravityBackgroundWork(
+      'run_command',
+      {
+        CommandLine: 'node scripts/devspec-remote-listen.mjs --connection-id conn-1',
+      },
+      { output: 'TaskId: task-listen-1' },
+    )
+    assert.equal(listener, null)
+
+    const realBg = launchedAntigravityBackgroundWork(
+      'default_api:run_command',
+      {
+        CommandLine: 'npm run build',
+        toolSummary: 'Run build in background',
+      },
+      { output: 'Command sent to background with background task ID: task-build-1' },
+    )
+    assert.deepEqual(realBg, {
+      id: 'task-build-1',
+      kind: 'command',
+      label: 'Run build in background',
+    })
+  })
 })
+
 

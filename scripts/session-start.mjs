@@ -17,11 +17,13 @@ import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { LOADED_PLUGIN_VERSION } from './connection-version.mjs'
+import { findProjectPin, gitRemoteOrigin } from './devspec-scope.mjs'
 import {
   formatTiersForStartup,
   storeTiers,
   takeTiersFor,
 } from './instruction-tiers.mjs'
+import { mcpToolsCall } from './mcp-call.mjs'
 import {
   DEFAULT_PROD_URL,
   formatMissingAuthMessage,
@@ -31,6 +33,7 @@ import {
 } from './resolve-mcp-auth.mjs'
 import {
   ensurePollerForConnection,
+  inferAntigravityTranscriptPath,
   reapDeadPollers,
   rebondConnectionToConversation,
   resolveOwnerPid,
@@ -52,6 +55,32 @@ function readStdin() {
   } catch {
     return ''
   }
+}
+
+/**
+ * Extract the active workspace path from Antigravity hook stdin JSON.
+ * Antigravity executes hook commands with `process.cwd()` set to the plugin directory,
+ * passing the user's active workspace in `workspacePaths: ["/path/to/workspace"]`.
+ */
+export function parseHookCwd(hookInput, fallbackCwd = process.cwd()) {
+  try {
+    const parsed =
+      typeof hookInput === 'string'
+        ? JSON.parse(hookInput || '{}')
+        : hookInput && typeof hookInput === 'object'
+          ? hookInput
+          : {}
+    const ws = Array.isArray(parsed.workspacePaths)
+      ? parsed.workspacePaths[0]
+      : Array.isArray(parsed.workspace_paths)
+        ? parsed.workspace_paths[0]
+        : null
+    if (typeof ws === 'string' && ws.trim()) return ws.trim()
+    if (typeof parsed.cwd === 'string' && parsed.cwd.trim()) return parsed.cwd.trim()
+  } catch {
+    /* ignore */
+  }
+  return fallbackCwd
 }
 
 /**
@@ -147,27 +176,25 @@ export function connectAtStartupEnabled(
 
 /**
  * Default JSON-RPC caller for `register_connection` during startup auto-connect.
+ * Uses `mcpToolsCall` so both JSON and SSE responses as well as `_meta.devspec.connection_capability`
+ * are parsed properly.
  */
 async function defaultCallMcp({ mcpUrl, token, name, arguments: args }) {
-  const res = await fetch(mcpUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json, text/event-stream',
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'tools/call',
-      params: { name, arguments: args },
-    }),
+  const res = await mcpToolsCall({
+    mcpUrl,
+    token,
+    name,
+    arguments: args,
+    includeMeta: true,
+    timeoutMs: 15_000,
   })
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  const text = await res.text()
-  const json = JSON.parse(text)
-  const rawText = json?.result?.content?.[0]?.text
-  return rawText ? JSON.parse(rawText) : json?.result || {}
+  const data = res?.data && typeof res.data === 'object' ? { ...res.data } : {}
+  const cap = res?.meta?.devspec?.connection_capability
+  if (cap && typeof cap.value === 'string' && cap.value.startsWith('dvsc_')) {
+    data.connection_capability = cap.value
+    data.connection_capability_version = cap.version || 1
+  }
+  return data
 }
 
 /**
@@ -206,6 +233,8 @@ export async function autoConnectAtStartup({
   const mcpUrl = auth.mcp_url || DEFAULT_PROD_URL
   const ownerPid = resolveOwnerPid('auto', null)
   const agentVersion = LOADED_PLUGIN_VERSION
+  const gitRemote = gitRemoteOrigin(cwd)
+  const pinnedProjectId = findProjectPin(cwd, { home: effectiveHome })?.project_id || null
   const reg = await callMcp({
     mcpUrl,
     token: auth.token,
@@ -215,7 +244,10 @@ export async function autoConnectAtStartup({
       agent_version: agentVersion,
       local_id: conversationId || undefined,
       cwd,
+      ...(gitRemote ? { git_remote: gitRemote } : {}),
+      ...(pinnedProjectId ? { pinned_project_id: pinnedProjectId } : {}),
       machine_label: os.hostname(),
+      connection_capability_version: 1,
       capabilities: {
         can_execute: true,
         can_edit_files: true,
@@ -232,16 +264,23 @@ export async function autoConnectAtStartup({
     storeTiers(connectionId, reg.instructions, home ? { home } : {})
   }
 
+  const resolvedProjectId =
+    reg?.project_id || reg?.connection?.project_id || pinnedProjectId || null
+  const resolvedTranscriptPath =
+    transcriptPath || inferAntigravityTranscriptPath(conversationId, env) || null
+
   const statePayload = {
     enabled: true,
     connection_id: connectionId,
     session_id: reg?.session_id || null,
     session_codename: reg?.codename || reg?.connection?.codename || null,
+    project_id: resolvedProjectId,
     agent_name: AGENT_NAME,
     agent_version: agentVersion,
     local_id: conversationId || null,
-    transcript_path: transcriptPath || null,
+    transcript_path: resolvedTranscriptPath,
     cwd,
+    ...(gitRemote ? { git_remote: gitRemote } : {}),
     owner_pid: ownerPid || null,
     token: auth.token,
     mcp_url: mcpUrl,
@@ -257,8 +296,12 @@ export async function autoConnectAtStartup({
   writeStateFn(connectionId, statePayload)
   if (conversationId) {
     writeBondFn(AGENT_NAME, conversationId, {
+      status: 'live',
       connection_id: connectionId,
       session_id: statePayload.session_id,
+      session_codename: statePayload.session_codename,
+      cwd,
+      transcript_path: resolvedTranscriptPath,
       enabled: true,
     })
   }
@@ -291,6 +334,7 @@ export async function runSessionStart(
   } = {},
 ) {
   const effectiveHome = home || env?.HOME || os.homedir()
+  const effectiveCwd = parseHookCwd(raw, cwd)
   try {
     ensureStatusLineConfigured({ home: effectiveHome })
   } catch {
@@ -307,16 +351,16 @@ export async function runSessionStart(
   const transcriptPath = parseTranscriptPath(raw)
   let state = loadStateFn(conversationId)
 
-  const auth = resolveDevspecMcpAuth(cwd, {
+  const auth = resolveDevspecMcpAuth(effectiveCwd, {
     env,
     home: effectiveHome,
-    hostToken: hostTokenFromEnv(env, { cwd, home: effectiveHome }),
+    hostToken: hostTokenFromEnv(env, { cwd: effectiveCwd, home: effectiveHome }),
   })
 
-  if (!state?.connection_id && connectAtStartupEnabled(env, { cwd, home: effectiveHome })) {
+  if (!state?.connection_id && connectAtStartupEnabled(env, { cwd: effectiveCwd, home: effectiveHome })) {
     try {
       state = await autoConnectAtStartup({
-        cwd,
+        cwd: effectiveCwd,
         conversationId,
         transcriptPath,
         env,
@@ -334,10 +378,18 @@ export async function runSessionStart(
 
   if (!state?.connection_id) {
     if (!auth?.ok || !auth?.token) {
+      const missingAuthContext = `${auth?.error || formatMissingAuthMessage()}\nIf the user asks about DevSpec or remote control, report this message verbatim and do not guess or search for tokens across unrelated files.`
       return {
+        injectSteps: [
+          {
+            systemMessage: {
+              systemMessage: missingAuthContext,
+            },
+          },
+        ],
         hookSpecificOutput: {
           hookEventName: 'SessionStart',
-          additionalContext: `${auth?.error || formatMissingAuthMessage()}\nIf the user asks about DevSpec or remote control, report this message verbatim and do not guess or search for tokens across unrelated files.`,
+          additionalContext: missingAuthContext,
         },
       }
     }
@@ -367,7 +419,7 @@ export async function runSessionStart(
   if (state.auth_ok !== false && state.token) {
     try {
       ensurePollerFn(state.connection_id, {
-        cwd: state.cwd || cwd,
+        cwd: state.cwd || effectiveCwd,
         ownerPid: state.owner_pid || currentOwnerPid,
         sessionId: state.session_id || null,
         reuseRunning: true,
@@ -381,6 +433,7 @@ export async function runSessionStart(
     `DevSpec Remote Control active (${state.session_codename || state.connection_id.slice(0, 8)})`,
     `connection_id=${state.connection_id}`,
     state.session_id ? `session_id=${state.session_id}` : 'sessionless',
+    state.project_id ? `project_id=${state.project_id}` : '',
     conversationId ? `local_session_id=${conversationId}` : '',
   ].filter(Boolean)
 
@@ -394,6 +447,13 @@ export async function runSessionStart(
     : parts.join(' | ')
 
   return {
+    injectSteps: [
+      {
+        systemMessage: {
+          systemMessage: additionalContext,
+        },
+      },
+    ],
     hookSpecificOutput: {
       hookEventName: 'SessionStart',
       additionalContext,

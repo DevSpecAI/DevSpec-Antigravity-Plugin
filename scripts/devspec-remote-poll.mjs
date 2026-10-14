@@ -129,10 +129,14 @@ function readTurnMarker(connectionId) {
  * The long-lived poller re-asserts busy while this marker is fresh; Stop /
  * mirror-turn clears it when the agent turn ends.
  */
+function explicitReplyMarkerPath(connectionId) {
+  return path.join(CONNECTIONS_DIR, `${connectionId}.explicit-reply`)
+}
 function writeTurnMarker(connectionId) {
   if (!connectionId) return
   try {
     fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
+    fs.rmSync(explicitReplyMarkerPath(connectionId), { force: true })
     fs.writeFileSync(turnMarkerPath(connectionId), JSON.stringify({ startedAt: Date.now() }), {
       mode: 0o600,
     })
@@ -970,6 +974,54 @@ export function summarizeThinkingText(text, maxLen = 140) {
     : firstParagraph
 }
 
+export function isSessionReplyToolCall(toolName, args = {}) {
+  const name = String(toolName || '')
+  if (
+    name === 'post_session_message' ||
+    name === 'mcp_devspec_post_session_message' ||
+    name === 'mcp__devspec__post_session_message' ||
+    name.endsWith(':post_session_message') ||
+    name.endsWith('__post_session_message')
+  ) {
+    return args?.phase !== 'trail' && args?.turn_kind !== 'local_prompt'
+  }
+  if (name === 'run_command' || name === 'default_api:run_command' || name === 'Bash') {
+    const cmdLine = String(args?.CommandLine || args?.command || '')
+    if (cmdLine.includes('post_session_message') && !/phase\s*:\s*['"]trail['"]/.test(cmdLine)) {
+      return true
+    }
+  }
+  return false
+}
+
+export function isRemotePlumbingToolCall(toolName, args = {}) {
+  if (isSessionReplyToolCall(toolName, args)) return true
+  const name = String(toolName || '')
+  if (
+    /(?:^|:|__)(?:post_session_message|heartbeat_connection|poll_connection|report_pickup|report_keepalive|report_complete|report_blocked|register_connection|attach_connection)$/.test(
+      name,
+    )
+  ) {
+    return true
+  }
+  if (name === 'run_command' || name === 'default_api:run_command' || name === 'Bash') {
+    const cmdLine = String(args?.CommandLine || args?.command || '')
+    if (
+      cmdLine.includes('devspec-remote-wait.mjs') ||
+      cmdLine.includes('devspec-remote-listen.mjs') ||
+      cmdLine.includes('devspec-remote-poll.mjs') ||
+      cmdLine.includes('remote-control-state.mjs') ||
+      cmdLine.includes('connection-call.mjs') ||
+      cmdLine.includes('post_session_message') ||
+      cmdLine.includes('heartbeat_connection') ||
+      cmdLine.includes('report_complete')
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
 /**
  * Extract structured trail events and cumulative Markdown from an Antigravity
  * `transcript.jsonl` raw string for the active turn.
@@ -988,6 +1040,7 @@ export function extractAntigravityTrailFromTranscript(
   const events = []
   const bullets = []
   let seq = 0
+  let replyPosted = false
 
   for (const rawLine of String(rawText || '').split(/\r?\n/)) {
     const trimmed = rawLine.trim()
@@ -1005,6 +1058,41 @@ export function extractAntigravityTrailFromTranscript(
       if (Number.isFinite(stepMs) && stepMs < cutoffMs) continue
     }
 
+    const rawToolCalls = Array.isArray(step.tool_calls) ? step.tool_calls : []
+    const parsedToolCalls = rawToolCalls.map((tc) => {
+      const toolName = tc?.name || tc?.tool_name || tc?.function?.name || 'tool'
+      let args = tc?.arguments ?? tc?.args ?? tc?.input ?? tc?.function?.arguments ?? {}
+      if (typeof args === 'string') {
+        try {
+          args = JSON.parse(args)
+        } catch {
+          args = {}
+        }
+      }
+      return { toolName, args }
+    })
+
+    // Once the agent posts its session reply for this turn, stop accumulating trail
+    // events — any further phase:'trail' call after the reply would cause the server
+    // to insert a brand-new empty streaming external_agent row ("No response").
+    if (parsedToolCalls.some((tc) => isSessionReplyToolCall(tc.toolName, tc.args))) {
+      replyPosted = true
+      break
+    }
+
+    const visibleToolCalls = parsedToolCalls.filter(
+      (tc) => !isRemotePlumbingToolCall(tc.toolName, tc.args),
+    )
+
+    // Skip steps whose only tool calls are remote-control plumbing (e.g. re-arming
+    // devspec-remote-wait.mjs) or final text-only response steps with no tool calls.
+    if (parsedToolCalls.length > 0 && visibleToolCalls.length === 0) {
+      continue
+    }
+    if (parsedToolCalls.length === 0 && typeof step.content === 'string' && step.content.trim()) {
+      continue
+    }
+
     if (typeof step.thinking === 'string' && step.thinking.trim()) {
       const summary = summarizeThinkingText(step.thinking)
       if (summary) {
@@ -1019,19 +1107,11 @@ export function extractAntigravityTrailFromTranscript(
       }
     }
 
-    const toolCalls = Array.isArray(step.tool_calls) ? step.tool_calls : []
-    for (const tc of toolCalls) {
-      const toolName = tc?.name || tc?.tool_name || tc?.function?.name || 'tool'
-      let args = tc?.arguments ?? tc?.args ?? tc?.input ?? tc?.function?.arguments ?? {}
-      if (typeof args === 'string') {
-        try {
-          args = JSON.parse(args)
-        } catch {
-          args = {}
-        }
-      }
-
-      if (toolName === 'invoke_subagent' && Array.isArray(args?.Subagents)) {
+    for (const { toolName, args } of visibleToolCalls) {
+      if (
+        (toolName === 'invoke_subagent' || toolName === 'default_api:invoke_subagent') &&
+        Array.isArray(args?.Subagents)
+      ) {
         for (const sub of args.Subagents) {
           const role = sub?.Role || sub?.TypeName || 'subagent'
           const typeName = sub?.TypeName || 'self'
@@ -1071,7 +1151,7 @@ export function extractAntigravityTrailFromTranscript(
 
   const markdown = bullets.join('\n')
   const signature = JSON.stringify(events.map((e) => [e.kind, e.label || e.action || e.role]))
-  return { events, markdown, signature }
+  return { events, markdown, signature, replyPosted }
 }
 
 /**
@@ -1091,15 +1171,33 @@ export async function streamTurnTrailIfChanged({
   if (!transcriptPath || !sessionId || !connectionId || !fs.existsSync(transcriptPath)) {
     return { posted: false, signature: prevSignature, events: [], markdown: '' }
   }
+  if (fs.existsSync(explicitReplyMarkerPath(connectionId))) {
+    return {
+      posted: false,
+      skipped: 'reply_already_posted',
+      signature: prevSignature,
+      events: [],
+      markdown: '',
+    }
+  }
   let raw = ''
   try {
     raw = fs.readFileSync(transcriptPath, 'utf8')
   } catch {
     return { posted: false, signature: prevSignature, events: [], markdown: '' }
   }
-  const { events, markdown, signature } = extractAntigravityTrailFromTranscript(raw, {
+  const { events, markdown, signature, replyPosted } = extractAntigravityTrailFromTranscript(raw, {
     sinceMs,
   })
+  if (replyPosted) {
+    return {
+      posted: false,
+      skipped: 'reply_already_posted',
+      signature: prevSignature,
+      events,
+      markdown,
+    }
+  }
   if (events.length === 0 || !markdown || signature === prevSignature) {
     return { posted: false, signature: prevSignature, events, markdown }
   }
