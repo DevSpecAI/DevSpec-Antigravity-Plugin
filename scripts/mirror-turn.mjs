@@ -26,6 +26,7 @@ import {
   inferAntigravityTranscriptPath,
   localBondPath,
 } from './remote-control-state.mjs'
+import { readConnectionTelemetry } from './statusline.mjs'
 
 const MODES = new Set(['user_prompt', 'stop', 'background_launch', 'subagent_stop'])
 const mode = MODES.has(process.argv[2]) ? process.argv[2] : 'stop'
@@ -1190,6 +1191,7 @@ export async function handleMirrorTurn(
               /* ignore */
             }
           }
+          const telemetry = connectionId ? readConnectionTelemetry(connectionId) : null
           const fallbackArgs = {
             connection_id: connectionId,
             session_id: sessionId,
@@ -1197,6 +1199,15 @@ export async function handleMirrorTurn(
             message: rawStopText,
             ...(trail.markdown ? { work_trail: trail.markdown } : {}),
             ...(trail.events.length > 0 ? { trail_events: trail.events } : {}),
+            ...(telemetry ? { agent_stats: telemetry } : {}),
+            ...(telemetry?.model?.id
+              ? {
+                  model: {
+                    providerID: telemetry.model.provider || 'google',
+                    modelID: telemetry.model.id,
+                  },
+                }
+              : {}),
           }
           try {
             await call({

@@ -460,6 +460,15 @@ describe('Item 5 Parity: statusline.mjs rendering and telemetry', () => {
       context_window: { tokens: 50000, window: 200000, percent: 25 },
     })
     assert.deepEqual(norm.model, { provider: 'anthropic', id: 'claude-sonnet-4-5' })
+
+    // Verify Antigravity effort-suffixed display model ('Gemini 4 Argon (High)') is stripped
+    // to 'Gemini 4 Argon' while preserving thinkingLevel='high'
+    const normArgon = normalizeStatuslineTelemetryInput({
+      model: { id: 'Gemini 4 Argon (High)', display_name: 'Gemini 4 Argon (High)', effort: 'High' },
+      context_window: { tokens: 29010, window: 1048576, percent: 3.5 },
+    })
+    assert.deepEqual(normArgon.model, { provider: 'google', id: 'Gemini 4 Argon' })
+    assert.equal(normArgon.thinkingLevel, 'high')
     assert.ok(recordStatuslineTelemetry(stdinPayload, { home, connectionId: CONN_ID }))
   })
 

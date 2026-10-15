@@ -136,6 +136,23 @@ describe('PreToolUse mechanical input stamping (overwrite)', () => {
     try {
       const transcriptPath = path.join(fx.home, 'transcript.jsonl')
       fs.writeFileSync(
+        path.join(fx.connDir, `${CONN_ID}.telemetry.json`),
+        JSON.stringify({
+          v: 1,
+          conversation_id: CONV_ID,
+          report: {
+            v: 1,
+            model: { provider: 'google', id: 'Gemini 4 Argon (High)' },
+            thinkingLevel: 'high',
+            supportedThinkingLevels: ['low', 'medium', 'high', 'max'],
+            context: { tokens: 29010, window: 1048576, percent: 3.5 },
+            turn: { input: 3001, output: 163, cacheRead: 25846, cacheWrite: 0, costUsd: 0, messages: 1 },
+            session: { input: 20158, output: 696, cacheRead: 25846, cacheWrite: 0, costUsd: 0, turns: 1 },
+            at: new Date().toISOString(),
+          },
+        }) + '\n',
+      )
+      fs.writeFileSync(
         transcriptPath,
         [
           JSON.stringify({
@@ -167,6 +184,7 @@ describe('PreToolUse mechanical input stamping (overwrite)', () => {
             ToolName: 'post_session_message',
             Arguments: {
               message: 'Completed the check.',
+              model: { providerID: 'google', modelID: 'gemini-3.1-pro-preview' },
             },
           },
         },
@@ -177,6 +195,14 @@ describe('PreToolUse mechanical input stamping (overwrite)', () => {
       assert.ok(res.overwrite?.Arguments)
       assert.equal(res.overwrite.Arguments.connection_id, CONN_ID)
       assert.equal(res.overwrite.Arguments.agent_name, 'Antigravity')
+      assert.deepEqual(res.overwrite.Arguments.model, {
+        providerID: 'google',
+        modelID: 'Gemini 4 Argon',
+      })
+      assert.deepEqual(res.overwrite.Arguments.agent_stats?.model, {
+        provider: 'google',
+        id: 'Gemini 4 Argon',
+      })
       assert.match(res.overwrite.Arguments.work_trail, /Reading room state/)
       assert.equal(res.overwrite.Arguments.trail_events.length, 2)
       assert.equal(

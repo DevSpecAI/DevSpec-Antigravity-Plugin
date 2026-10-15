@@ -38,7 +38,20 @@ const AGENT_DIR = AGENT_NAME.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const SAFE_ID_RE = /^[a-zA-Z0-9._-]{1,128}$/
 const EFFORT_LEVELS = ['low', 'medium', 'high', 'max']
+const EFFORT_SUFFIX_RE = /^(.*?)\s*\((low|medium|high|xhigh|max)(?:\s+thinking)?\)\s*$/i
+const PLACEHOLDER_MODEL_ID_RE = /^MODEL_PLACEHOLDER_/i
 const DEFAULT_TELEMETRY_MAX_AGE_MS = 30 * 60 * 1000
+
+export function splitModelEffortSuffix(text) {
+  if (typeof text !== 'string') return { id: '', effort: null }
+  const trimmed = text.trim()
+  if (!trimmed) return { id: '', effort: null }
+  const match = EFFORT_SUFFIX_RE.exec(trimmed)
+  if (!match) return { id: trimmed, effort: null }
+  const base = match[1].trim()
+  const effort = match[2].toLowerCase()
+  return { id: base || trimmed, effort }
+}
 
 export function bondPath(home, conversationId) {
   return path.join(home, REMOTE_DIR, 'local', AGENT_DIR, `${conversationId}.json`)
@@ -140,8 +153,21 @@ export function contextFigures(cw) {
 export function parseTelemetryRecord(text) {
   const value = parseJson(text)
   if (!value || value.v !== 1) return null
-  const report = value.report
-  if (!report || typeof report !== 'object' || report.v !== 1) return null
+  const rawReport = value.report
+  if (!rawReport || typeof rawReport !== 'object' || rawReport.v !== 1) return null
+  let report = rawReport
+  if (typeof rawReport.model?.id === 'string') {
+    const { id: cleanId, effort: suffixEffort } = splitModelEffortSuffix(rawReport.model.id)
+    if (cleanId && cleanId !== rawReport.model.id) {
+      report = {
+        ...rawReport,
+        model: { ...rawReport.model, id: cleanId },
+        thinkingLevel:
+          rawReport.thinkingLevel ??
+          (suffixEffort && EFFORT_LEVELS.includes(suffixEffort) ? suffixEffort : null),
+      }
+    }
+  }
   return {
     conversationId: typeof value.conversation_id === 'string' ? value.conversation_id : null,
     report,
@@ -166,22 +192,33 @@ export function normalizeStatuslineTelemetryInput(
       : null
 
   const rawModel = input.model
-  const modelIdStr =
+  const candidateId =
     typeof rawModel === 'string'
       ? rawModel.trim()
-      : typeof rawModel?.id === 'string'
-        ? rawModel.id.trim()
-        : typeof rawModel?.model_id === 'string'
-          ? rawModel.model_id.trim()
-          : typeof rawModel?.display_name === 'string'
-            ? rawModel.display_name.trim()
-            : ''
+      : typeof rawModel?.display_name === 'string' &&
+          rawModel.display_name.trim() &&
+          PLACEHOLDER_MODEL_ID_RE.test(String(rawModel?.id || rawModel?.model_id || '').trim())
+        ? rawModel.display_name.trim()
+        : typeof rawModel?.id === 'string' && rawModel.id.trim()
+          ? rawModel.id.trim()
+          : typeof rawModel?.model_id === 'string' && rawModel.model_id.trim()
+            ? rawModel.model_id.trim()
+            : typeof rawModel?.display_name === 'string'
+              ? rawModel.display_name.trim()
+              : ''
+  const { id: modelIdStr, effort: suffixEffort } = splitModelEffortSuffix(candidateId)
   const providerStr = typeof rawModel === 'object' && rawModel ? rawModel.provider : input.provider
   const model = modelIdStr
     ? { provider: inferModelProvider(modelIdStr, providerStr), id: modelIdStr }
     : before?.model ?? null
 
-  const rawEffort = input.thinking_level ?? input.thinkingLevel ?? input.effort ?? rawModel?.effort ?? null
+  const rawEffort =
+    input.thinking_level ??
+    input.thinkingLevel ??
+    input.effort ??
+    rawModel?.effort ??
+    suffixEffort ??
+    null
   const thinkingLevel =
     typeof rawEffort === 'string' && EFFORT_LEVELS.includes(rawEffort.toLowerCase())
       ? rawEffort.toLowerCase()

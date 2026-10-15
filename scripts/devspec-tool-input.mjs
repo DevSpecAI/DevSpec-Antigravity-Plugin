@@ -33,6 +33,7 @@ import {
 import { inferAntigravityTranscriptPath, readStateFile } from './remote-control-state.mjs'
 import { stampRequest } from './request-ref.mjs'
 import { prePostHoldObject } from './room-unread.mjs'
+import { readConnectionTelemetry } from './statusline.mjs'
 
 const CONNECTION_SUBJECT = /(?:^|_)connection(?:_|$)|^report_(?:pickup|keepalive|complete|request)$/
 
@@ -253,8 +254,10 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
   next = versionedConnectionArguments(verb, request.args)
 
   // 8. For explicit session replies (non-trail, non-needs_input, non-local_prompt):
-  //    record the explicit reply marker and automatically attach `work_trail` +
-  //    `trail_events` from the current turn's Antigravity transcript if not already supplied.
+  //    record the explicit reply marker, stamp live mechanical telemetry (`agent_stats`
+  //    and `model`) so LLM-guessed model names never override the host-reported model,
+  //    and automatically attach `work_trail` + `trail_events` from the current turn's
+  //    Antigravity transcript if not already supplied.
   if (
     verb === 'post_session_message' &&
     next.phase !== 'trail' &&
@@ -264,6 +267,21 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
     const targetConnId = next.connection_id || connectionId
     if (targetConnId) {
       writeExplicitReplyMarker(targetConnId, connDir)
+      const telemetry = readConnectionTelemetry(targetConnId, { home })
+      if (telemetry) {
+        if (!next.agent_stats) {
+          next = { ...next, agent_stats: telemetry }
+        }
+        if (telemetry.model?.id) {
+          next = {
+            ...next,
+            model: {
+              providerID: telemetry.model.provider || 'google',
+              modelID: telemetry.model.id,
+            },
+          }
+        }
+      }
     }
     if (!next.work_trail && !next.trail_events) {
       const tPath =

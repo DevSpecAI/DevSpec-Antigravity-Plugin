@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.15.4
+
+### Mechanical runtime model stamping on session posts and effort-suffix normalization
+
+- **Normalize Antigravity statusLine model IDs (`scripts/statusline.mjs`):** `normalizeStatuslineTelemetryInput` and `parseTelemetryRecord` now strip redundant trailing effort suffixes such as `(High)`, `(Medium)`, `(Low)`, and `(Max)` from `model.id` while preserving `thinkingLevel`, recording `Gemini 4 Argon` rather than `Gemini 4 Argon (High)`.
+- **Stamp live host telemetry model onto `post_session_message` (`scripts/devspec-tool-input.mjs`, `scripts/mirror-turn.mjs`):** `PreToolUse` on `post_session_message` answer/error calls (and the `Stop` fallback reply) now attaches `agent_stats` and overrides `model` (`{ providerID, modelID }`) from the connection's live telemetry so LLM-guessed model names (such as `gemini-3.1-pro-preview`) never override the host-reported runtime model (`Gemini 4 Argon`).
+
+## 0.15.3
+
+### Preserve Working state across mid-turn posts and long turns, and format system_notices in listen
+
+- **Mid-turn `post_session_message` and `>10m` turn `Working` continuity (`scripts/post-tool-dispatch.mjs`, `scripts/devspec-remote-poll.mjs`):** Re-assert `.turn` after mid-turn `post_session_message` progress replies and keep long turns active via `lastToolAt`.
+- **Sessionless `server_notice` formatting (`scripts/devspec-remote-listen.mjs`):** Format `canonical_system_notices` in `buildWakeDeliveryMessage` for `agentapi` wake delivery.
+
 ## 0.15.2
 
 ### Antigravity (`agy`) host latency and token-footprint optimizations
