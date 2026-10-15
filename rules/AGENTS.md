@@ -34,6 +34,6 @@ When working in a DevSpec-connected project or remote-controlled session in Anti
      - `reserve_work_items`: `{ action_item_ids: [uuid, ...], connection_id? }`
      - `claim_work_item`: `{ action_item_id, agent_branch, connection_id?, local_session_id? }`
      - `record_implementation`: `{ action_item_id, work_claim_ref, summary, commit_sha?, repository_id?, files_changed?: string[], pr_url?, connection_id?, local_session_id? }`
-     - `record_criterion_verdicts`: `{ action_item_id, work_claim_ref, verdicts: [{ criterion_id, status: "met"|"not_met"|"not_applicable", explanation }] }`
+     - `record_criterion_verdicts`: `{ action_item_id, work_claim_ref?, verdicts: [{ criterion_id, text, verdict: "met"|"not_met"|"unknown"|"intent_met", layer: "api_test"|"cli_test"|"schema_check"|"browser_test"|"human_confirmation", evidence: { action, result } }] }`
    - If any MCP tool output exceeds 10 KB and Antigravity spills it to `<appDataDir>/brain/<cid>/.system_generated/steps/<N>/output.txt`, **never** read the spilled JSON file with multi-page `view_file` reads; extract only the fields you need with a single `node -e` command or pass `fields: "compact"` / `limit`.
 
