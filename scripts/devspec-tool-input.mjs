@@ -23,8 +23,14 @@ import { handleBashPre } from './commit-observation.mjs'
 import { handlePre } from './commit-provenance.mjs'
 import { versionedConnectionArguments } from './connection-version.mjs'
 import { launchGuard, resolveOwnConnectionId } from './launch-guard.mjs'
-import { resolveHookConversationId } from './mirror-turn.mjs'
-import { readStateFile } from './remote-control-state.mjs'
+import {
+  extractAntigravityTrailFromTranscript,
+  parseTranscriptPath,
+  readTurnMarker,
+  resolveHookConversationId,
+  writeExplicitReplyMarker,
+} from './mirror-turn.mjs'
+import { inferAntigravityTranscriptPath, readStateFile } from './remote-control-state.mjs'
 import { stampRequest } from './request-ref.mjs'
 import { prePostHoldObject } from './room-unread.mjs'
 
@@ -61,6 +67,71 @@ export function parseDevspecToolName(toolName) {
   return match ? match[1] : null
 }
 
+function unquoteString(val) {
+  if (typeof val !== 'string') return val
+  const trimmed = val.trim()
+  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    try {
+      return JSON.parse(trimmed)
+    } catch {
+      return trimmed.slice(1, -1)
+    }
+  }
+  return trimmed
+}
+
+export function unwrapDevspecToolCall(toolName, rawToolInput) {
+  const directVerb = parseDevspecToolName(toolName)
+  if (directVerb) {
+    return {
+      verb: directVerb,
+      args:
+        rawToolInput && typeof rawToolInput === 'object' && !Array.isArray(rawToolInput)
+          ? rawToolInput
+          : null,
+      wrapped: false,
+      argumentsWasString: false,
+      argumentsKey: null,
+    }
+  }
+  const bare = String(toolName || '').replace(/^default_api:/, '')
+  if (
+    bare !== 'call_mcp_tool' ||
+    !rawToolInput ||
+    typeof rawToolInput !== 'object' ||
+    Array.isArray(rawToolInput)
+  ) {
+    return { verb: null, args: null, wrapped: false, argumentsWasString: false, argumentsKey: null }
+  }
+  const serverName = String(
+    unquoteString(rawToolInput.ServerName ?? rawToolInput.server_name ?? ''),
+  ).toLowerCase()
+  if (serverName !== 'devspec') {
+    return { verb: null, args: null, wrapped: false, argumentsWasString: false, argumentsKey: null }
+  }
+  const verb = unquoteString(rawToolInput.ToolName ?? rawToolInput.tool_name ?? '')
+  if (typeof verb !== 'string' || !/^[a-z0-9_]+$/.test(verb)) {
+    return { verb: null, args: null, wrapped: false, argumentsWasString: false, argumentsKey: null }
+  }
+  const argumentsKey = Object.hasOwn(rawToolInput, 'arguments') ? 'arguments' : 'Arguments'
+  const rawArgs = rawToolInput[argumentsKey]
+  if (typeof rawArgs === 'string') {
+    const unquoted = unquoteString(rawArgs)
+    try {
+      const parsed = typeof unquoted === 'string' ? JSON.parse(unquoted) : unquoted
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return { verb, args: parsed, wrapped: true, argumentsWasString: true, argumentsKey }
+      }
+    } catch {
+      return { verb: null, args: null, wrapped: false, argumentsWasString: false, argumentsKey: null }
+    }
+  }
+  if (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)) {
+    return { verb, args: rawArgs, wrapped: true, argumentsWasString: false, argumentsKey }
+  }
+  return { verb, args: {}, wrapped: true, argumentsWasString: false, argumentsKey }
+}
+
 function readProjectPin(cwd) {
   if (!cwd) return null
   try {
@@ -83,8 +154,14 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
   }
 
   const rawToolName = input.tool_name ?? input.toolName ?? input.toolCall?.name ?? ''
-  const verb = parseDevspecToolName(rawToolName)
-  const toolInput = input.tool_input ?? input.toolInput ?? input.toolCall?.args
+  const rawToolInput = input.tool_input ?? input.toolInput ?? input.toolCall?.args
+  const {
+    verb,
+    args: toolInput,
+    wrapped,
+    argumentsWasString,
+    argumentsKey,
+  } = unwrapDevspecToolCall(rawToolName, rawToolInput)
   if (!verb || !toolInput || typeof toolInput !== 'object' || Array.isArray(toolInput)) {
     return {}
   }
@@ -175,6 +252,45 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
   }
   next = versionedConnectionArguments(verb, request.args)
 
+  // 8. For explicit session replies (non-trail, non-needs_input, non-local_prompt):
+  //    record the explicit reply marker and automatically attach `work_trail` +
+  //    `trail_events` from the current turn's Antigravity transcript if not already supplied.
+  if (
+    verb === 'post_session_message' &&
+    next.phase !== 'trail' &&
+    next.phase !== 'needs_input' &&
+    next.turn_kind !== 'local_prompt'
+  ) {
+    const targetConnId = next.connection_id || connectionId
+    if (targetConnId) {
+      writeExplicitReplyMarker(targetConnId, connDir)
+    }
+    if (!next.work_trail && !next.trail_events) {
+      const tPath =
+        parseTranscriptPath(JSON.stringify(input)) ||
+        connState?.transcript_path ||
+        inferAntigravityTranscriptPath(conversationId || connState?.local_id)
+      if (tPath && fs.existsSync(tPath)) {
+        try {
+          const turnMarker = targetConnId ? readTurnMarker(targetConnId, connDir) : null
+          const { events, markdown } = extractAntigravityTrailFromTranscript(
+            fs.readFileSync(tPath, 'utf8'),
+            { sinceMs: turnMarker?.startedAt ?? null, stopAtReply: true },
+          )
+          if (markdown && events.length > 0) {
+            next = {
+              ...next,
+              work_trail: markdown,
+              trail_events: events,
+            }
+          }
+        } catch {
+          /* non-fatal */
+        }
+      }
+    }
+  }
+
   // Check if anything changed
   const changed =
     verb === 'register_connection' ||
@@ -182,12 +298,19 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
     JSON.stringify(next) !== JSON.stringify(toolInput)
   if (!changed) return {}
 
+  const finalOverwrite = wrapped
+    ? {
+        ...rawToolInput,
+        [argumentsKey || 'Arguments']: argumentsWasString ? JSON.stringify(next) : next,
+      }
+    : next
+
   return {
     decision: 'allow',
-    overwrite: next,
+    overwrite: finalOverwrite,
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
-      updatedInput: next,
+      updatedInput: finalOverwrite,
     },
   }
 }

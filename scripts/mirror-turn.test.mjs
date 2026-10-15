@@ -18,6 +18,7 @@ import {
   isOperationalChrome,
   prepareAgentMirrorText,
   explicitReplyMarkerPath,
+  writeExplicitReplyMarker,
   consumeExplicitReplyMarker,
   parseTranscriptPath,
   normalizeTranscriptPath,
@@ -444,7 +445,112 @@ describe('Antigravity native hook payload & transcript handling', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true })
     }
   })
+
+  it('posts a fallback post_session_message with work_trail on Stop when a remote turn ends without an explicit reply, and skips when explicit reply was posted', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-fallback-reply-'))
+    try {
+      const connId = '44444444-5555-4666-8777-888888888888'
+      const convId = 'conv-remote-fallback-1'
+      const sessId = 'sess-remote-fallback-1'
+      const transcriptPath = path.join(tmpDir, 'transcript.jsonl')
+
+      fs.writeFileSync(
+        path.join(tmpDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          session_id: sessId,
+          local_id: convId,
+          agent_name: 'Antigravity',
+          token: 'dvs_test_tok',
+          mcp_url: 'https://api.devspec.ai/api/mcp',
+          transcript_path: transcriptPath,
+        }),
+      )
+
+      const startedAt = Date.parse('2026-10-14T22:00:00.000Z')
+      fs.writeFileSync(
+        transcriptPath,
+        [
+          JSON.stringify({
+            step_index: 1,
+            type: 'SYSTEM_MESSAGE',
+            created_at: '2026-10-14T22:00:01.000Z',
+            content: '{"event":"wake","command_count":1}',
+          }),
+          JSON.stringify({
+            step_index: 2,
+            type: 'PLANNER_RESPONSE',
+            created_at: '2026-10-14T22:00:03.000Z',
+            thinking: 'Checking the status of the repository.',
+            tool_calls: [
+              {
+                name: 'view_file',
+                args: {
+                  AbsolutePath: '"/tmp/readme.md"',
+                  toolAction: '"Viewing readme.md"',
+                  toolSummary: '"View readme.md"',
+                },
+              },
+            ],
+          }),
+          JSON.stringify({
+            step_index: 3,
+            type: 'PLANNER_RESPONSE',
+            created_at: '2026-10-14T22:00:06.000Z',
+            content: 'Everything in readme.md looks clean and up to date.',
+          }),
+        ].join('\n') + '\n',
+      )
+
+      writeTurnMarker(connId, { startedAt, remoteTurn: true, held: false }, tmpDir)
+
+      const calls = []
+      const stopRes = await handleMirrorTurn(
+        'stop',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        {
+          env: {},
+          connectionsDir: tmpDir,
+          legacyPath: path.join(tmpDir, 'legacy.json'),
+          call: async (req) => {
+            calls.push(req)
+            return { ok: true }
+          },
+        },
+      )
+      assert.equal(stopRes.ok, true)
+      const postCall = calls.find((c) => c.name === 'post_session_message')
+      assert.ok(postCall, 'posts fallback reply on Stop when no explicit post_session_message was called')
+      assert.equal(postCall.arguments.connection_id, connId)
+      assert.equal(postCall.arguments.session_id, sessId)
+      assert.equal(
+        postCall.arguments.message,
+        'Everything in readme.md looks clean and up to date.',
+      )
+      assert.match(postCall.arguments.work_trail, /Viewing readme\.md/)
+      assert.equal(postCall.arguments.trail_events.length, 2)
+
+      // Now verify that when writeExplicitReplyMarker was called during the turn, Stop does NOT post a duplicate reply
+      calls.length = 0
+      writeTurnMarker(connId, { startedAt, remoteTurn: true, held: false }, tmpDir)
+      writeExplicitReplyMarker(connId, tmpDir)
+      await handleMirrorTurn(
+        'stop',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        {
+          env: {},
+          connectionsDir: tmpDir,
+          legacyPath: path.join(tmpDir, 'legacy.json'),
+          call: async (req) => {
+            calls.push(req)
+            return { ok: true }
+          },
+        },
+      )
+      assert.equal(calls.find((c) => c.name === 'post_session_message'), undefined)
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
 })
-
-
-

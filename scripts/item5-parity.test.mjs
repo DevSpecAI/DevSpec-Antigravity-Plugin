@@ -369,7 +369,10 @@ describe('Item 5 Parity: pin-check.mjs and repo-link-nudge.mjs', () => {
         tool_name: 'write_to_file',
         tool_input: { TargetFile: pinFile },
       }),
-      { home: tmpDir },
+      {
+        home: tmpDir,
+        env: { DEVSPEC_ANTIGRAVITY_STATE_DIR: path.join(tmpDir, 'prov') },
+      },
     )
     assert.ok(res?.hookSpecificOutput?.additionalContext)
     assert.match(res.hookSpecificOutput.additionalContext, /project_id/)

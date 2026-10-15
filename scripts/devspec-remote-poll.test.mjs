@@ -38,8 +38,21 @@ import {
   openPushChannel,
   extractAntigravityTrailFromTranscript,
   streamTurnTrailIfChanged,
+  remoteIngressNegotiationArguments,
+  knownInstructionTierArguments,
+  writeRoomState,
 } from './devspec-remote-poll.mjs'
-import { storeTiers, takeTiersFor } from './instruction-tiers.mjs'
+import { captureInstructionContext, storeTiers, takeTiersFor } from './instruction-tiers.mjs'
+import { storeRepositoryContext, takeRepositoryContext } from './repository-context.mjs'
+import {
+  applyIngressToStore,
+  loadTranscriptStore,
+  persistTranscriptStore,
+  roomStatePath,
+  transcriptPaths,
+} from './room-transcript.mjs'
+import { materialiseBatchAttachments } from './attachment-store.mjs'
+import { commandOfferArguments, parseCommandOfferResponse } from './command-offer.mjs'
 import { connectAtStartupEnabled, runSessionStart } from './session-start.mjs'
 import { buildWakeDeliveryMessage, deliverWakeViaAgentApi } from './devspec-remote-listen.mjs'
 
@@ -988,3 +1001,116 @@ describe('session-start auto-connect, cached instruction tiers, and sidecar wake
   })
 })
 
+describe('Parity 3: room transcript, 4-tier instruction files, repository context, attachments, and command offers', () => {
+  it('negotiates ingress 1.6.0 versions and known_instruction_tiers_hash and writes 4-tier instruction & repository files', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-parity3-tiers-'))
+    try {
+      assert.deepEqual(remoteIngressNegotiationArguments(), {
+        ingress_version: 1,
+        delegated_scope_version: 1,
+        active_plan_projection_version: 1,
+        system_notice_version: 1,
+        sender_style_version: 1,
+        room_context_version: 1,
+        session_polls_projection_version: 2,
+      })
+
+      const tiersPayload = {
+        instruction_tiers_version: 1,
+        instruction_tiers_hash: `sha256:${'a'.repeat(64)}`,
+        owner_custom_instructions: 'Concise markdown',
+        owner_agent_rules: 'Tier 0 rules',
+        project_custom_instructions: 'Tier 1 project principles',
+        project_agent_rules: 'Tier 3 execution mechanics',
+      }
+      const contextFile = captureInstructionContext(ME, tiersPayload, { dir: tmpDir })
+      assert.ok(contextFile && fs.existsSync(contextFile))
+      assert.deepEqual(
+        knownInstructionTierArguments({
+          instruction_tiers_version: 1,
+          instruction_tiers_hash: `sha256:${'a'.repeat(64)}`,
+        }),
+        {
+          known_instruction_tiers_version: 1,
+          known_instruction_tiers_hash: `sha256:${'a'.repeat(64)}`,
+        },
+      )
+
+      const repoRegistration = {
+        project_id: PROJECT_ID,
+        repository_context: {
+          version: 1,
+          project_id: PROJECT_ID,
+          status: 'available',
+          repositories: [
+            {
+              id: '11111111-2222-4333-8444-555555555555',
+              full_name: 'DevSpecAI/DevSpecV2',
+              provider: 'github',
+              git_url: 'git@github.com:DevSpecAI/DevSpecV2.git',
+              target_branch: 'staging',
+              default_branch: 'staging',
+            },
+          ],
+        },
+      }
+      assert.equal(storeRepositoryContext(ME, repoRegistration, { dir: tmpDir }), true)
+      const formattedRepo = takeRepositoryContext(ME, 'conv-1', { dir: tmpDir })
+      assert.match(formattedRepo, /DevSpecAI\/DevSpecV2/)
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('persists local room transcript (.transcript.jsonl, .transcript-state.json) and .room.json and materialises attachments & command offers', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-parity3-room-'))
+    try {
+      const sessId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+      const store = loadTranscriptStore(ME, sessId, { dir: tmpDir, selfLabel: 'Antigravity · Roaming Zebra' })
+      const env = fixtureEnvelope()
+      applyIngressToStore(store, env, {
+        selfConnectionId: ME,
+        selfLabel: 'Antigravity · Roaming Zebra',
+      })
+      assert.equal(persistTranscriptStore(store, { dir: tmpDir }), true)
+
+      const tPaths = transcriptPaths(ME, sessId, tmpDir)
+      assert.equal(fs.existsSync(tPaths.transcript), true)
+      assert.equal(fs.existsSync(tPaths.state), true)
+
+      writeRoomState(
+        ME,
+        { session_id: sessId, ingress: env },
+        {},
+        { dir: tmpDir },
+      )
+      assert.equal(fs.existsSync(roomStatePath(ME, tmpDir)), true)
+
+      assert.deepEqual(commandOfferArguments({ negotiable: true }), { command_offer_version: 1 })
+      assert.deepEqual(
+        parseCommandOfferResponse({ command_offer_version: 1, command_offers: [] }),
+        { supported: true, offer: null, stale: false },
+      )
+
+      const batch = [
+        {
+          message_id: FIXTURE_ID.message,
+          attachments: [
+            {
+              filename: 'notes.bin',
+              mime_type: 'application/octet-stream',
+              content: Buffer.from('hello').toString('base64'),
+            },
+          ],
+        },
+      ]
+      const materialised = materialiseBatchAttachments(batch, {
+        dir: path.join(tmpDir, 'attachments'),
+      })
+      assert.ok(materialised[0].attachments[0].path)
+      assert.equal(fs.readFileSync(materialised[0].attachments[0].path, 'utf8'), 'hello')
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+})

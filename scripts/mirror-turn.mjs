@@ -458,12 +458,28 @@ export function selectBoundState(candidates, conversationId, agentName = null) {
  * post_session_message tool) when the agent itself already posted a reply this
  * turn. Cleared unconditionally once read so it can never leak into a later turn.
  */
-export function explicitReplyMarkerPath(connectionId) {
-  return path.join(CONNECTIONS_DIR, `${connectionId}.explicit-reply`)
+export function explicitReplyMarkerPath(connectionId, dir = CONNECTIONS_DIR) {
+  return path.join(dir, `${connectionId}.explicit-reply`)
 }
-export function consumeExplicitReplyMarker(connectionId) {
+
+export function writeExplicitReplyMarker(connectionId, dir = CONNECTIONS_DIR) {
   if (!connectionId) return false
-  const p = explicitReplyMarkerPath(connectionId)
+  try {
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(
+      explicitReplyMarkerPath(connectionId, dir),
+      JSON.stringify({ at: Date.now() }),
+      { mode: 0o600 },
+    )
+    return true
+  } catch {
+    return false
+  }
+}
+
+export function consumeExplicitReplyMarker(connectionId, dir = CONNECTIONS_DIR) {
+  if (!connectionId) return false
+  const p = explicitReplyMarkerPath(connectionId, dir)
   try {
     const existed = fs.existsSync(p)
     if (existed) fs.rmSync(p, { force: true })
@@ -615,8 +631,317 @@ export function isHarnessInjection(text) {
     t.includes('<task-notification') ||
     t.includes('[SYSTEM NOTIFICATION - NOT USER INPUT]') ||
     t.includes('This is an automated background-task event') ||
-    t.includes('<system-reminder>')
+    t.includes('<system-reminder>') ||
+    t.includes('[DevSpec Remote Wake]')
   )
+}
+
+function unquoteTranscriptString(val) {
+  if (typeof val !== 'string') return val
+  const trimmed = val.trim()
+  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    try {
+      return JSON.parse(trimmed)
+    } catch {
+      return trimmed.slice(1, -1)
+    }
+  }
+  return trimmed
+}
+
+export function summarizeThinkingText(text, maxLen = 140) {
+  if (typeof text !== 'string') return ''
+  const firstParagraph = text
+    .trim()
+    .split(/\r?\n\r?\n/)[0]
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!firstParagraph) return ''
+  return firstParagraph.length > maxLen
+    ? `${firstParagraph.slice(0, maxLen - 1).trimEnd()}…`
+    : firstParagraph
+}
+
+function unwrapMcpCallArgs(toolName, args = {}) {
+  const name = String(toolName || '').replace(/^default_api:/, '')
+  if (name === 'call_mcp_tool' && args && typeof args === 'object') {
+    const serverName = String(unquoteTranscriptString(args.ServerName ?? args.server_name ?? '')).toLowerCase()
+    if (serverName === 'devspec') {
+      const innerTool = String(unquoteTranscriptString(args.ToolName ?? args.tool_name ?? ''))
+      let innerArgs = args.Arguments ?? args.arguments ?? {}
+      if (typeof innerArgs === 'string') {
+        const unquoted = unquoteTranscriptString(innerArgs)
+        try {
+          innerArgs = typeof unquoted === 'string' ? JSON.parse(unquoted) : unquoted
+        } catch {
+          innerArgs = {}
+        }
+      }
+      return {
+        effectiveName: innerTool ? `mcp_devspec_${innerTool}` : name,
+        effectiveArgs: innerArgs && typeof innerArgs === 'object' ? innerArgs : {},
+      }
+    }
+  }
+  return {
+    effectiveName: String(toolName || ''),
+    effectiveArgs: args && typeof args === 'object' ? args : {},
+  }
+}
+
+export function isSessionReplyToolCall(toolName, args = {}) {
+  const { effectiveName: name, effectiveArgs } = unwrapMcpCallArgs(toolName, args)
+  if (
+    name === 'post_session_message' ||
+    name === 'mcp_devspec_post_session_message' ||
+    name === 'mcp__devspec__post_session_message' ||
+    name.endsWith(':post_session_message') ||
+    name.endsWith('__post_session_message')
+  ) {
+    return (
+      effectiveArgs?.phase !== 'trail' &&
+      effectiveArgs?.phase !== 'needs_input' &&
+      effectiveArgs?.turn_kind !== 'local_prompt'
+    )
+  }
+  if (name === 'run_command' || name === 'default_api:run_command' || name === 'Bash') {
+    const cmdLine = String(effectiveArgs?.CommandLine || effectiveArgs?.command || '')
+    if (cmdLine.includes('post_session_message') && !/phase\s*:\s*['"]trail['"]/.test(cmdLine)) {
+      return true
+    }
+  }
+  return false
+}
+
+export function isRemotePlumbingToolCall(toolName, args = {}) {
+  if (isSessionReplyToolCall(toolName, args)) return true
+  const { effectiveName: name, effectiveArgs } = unwrapMcpCallArgs(toolName, args)
+  if (
+    /(?:^|:|__|_)(?:post_session_message|heartbeat_connection|poll_connection|report_pickup|report_keepalive|report_complete|report_blocked|register_connection|attach_connection)$/.test(
+      name,
+    )
+  ) {
+    return true
+  }
+  if (name === 'run_command' || name === 'default_api:run_command' || name === 'Bash') {
+    const cmdLine = String(effectiveArgs?.CommandLine || effectiveArgs?.command || '')
+    if (
+      cmdLine.includes('devspec-remote-wait.mjs') ||
+      cmdLine.includes('devspec-remote-listen.mjs') ||
+      cmdLine.includes('devspec-remote-poll.mjs') ||
+      cmdLine.includes('remote-control-state.mjs') ||
+      cmdLine.includes('connection-call.mjs') ||
+      cmdLine.includes('post_session_message') ||
+      cmdLine.includes('heartbeat_connection') ||
+      cmdLine.includes('report_complete')
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
+ * Extract structured trail events and cumulative Markdown from an Antigravity
+ * `transcript.jsonl` raw string for the active turn.
+ */
+export function extractAntigravityTrailFromTranscript(
+  rawText,
+  { sinceIso = null, sinceMs = null, stopAtReply = true } = {},
+) {
+  const cutoffMs =
+    typeof sinceMs === 'number' && Number.isFinite(sinceMs)
+      ? sinceMs
+      : sinceIso
+        ? Date.parse(sinceIso)
+        : null
+
+  const events = []
+  const bullets = []
+  let seq = 0
+  let replyPosted = false
+
+  for (const rawLine of String(rawText || '').split(/\r?\n/)) {
+    const trimmed = rawLine.trim()
+    if (!trimmed) continue
+    let step
+    try {
+      step = JSON.parse(trimmed)
+    } catch {
+      continue
+    }
+    if (!step || step.type !== 'PLANNER_RESPONSE') continue
+
+    if (cutoffMs !== null && Number.isFinite(cutoffMs) && step.created_at) {
+      const stepMs = Date.parse(step.created_at)
+      if (Number.isFinite(stepMs) && stepMs < cutoffMs) continue
+    }
+
+    const rawToolCalls = Array.isArray(step.tool_calls) ? step.tool_calls : []
+    const parsedToolCalls = rawToolCalls.map((tc) => {
+      const toolName = tc?.name || tc?.tool_name || tc?.function?.name || 'tool'
+      let args = tc?.arguments ?? tc?.args ?? tc?.input ?? tc?.function?.arguments ?? {}
+      if (typeof args === 'string') {
+        try {
+          args = JSON.parse(args)
+        } catch {
+          args = {}
+        }
+      }
+      return { toolName, args }
+    })
+
+    if (stopAtReply && parsedToolCalls.some((tc) => isSessionReplyToolCall(tc.toolName, tc.args))) {
+      replyPosted = true
+      break
+    }
+
+    const visibleToolCalls = parsedToolCalls.filter(
+      (tc) => !isRemotePlumbingToolCall(tc.toolName, tc.args),
+    )
+
+    if (parsedToolCalls.length > 0 && visibleToolCalls.length === 0) {
+      continue
+    }
+    if (parsedToolCalls.length === 0 && typeof step.content === 'string' && step.content.trim()) {
+      continue
+    }
+
+    if (typeof step.thinking === 'string' && step.thinking.trim()) {
+      const summary = summarizeThinkingText(step.thinking)
+      if (summary) {
+        seq++
+        events.push({
+          seq,
+          kind: 'thinking',
+          label: summary,
+          step_index: step.step_index ?? null,
+        })
+        bullets.push(`- 💭 *${summary}*`)
+      }
+    }
+
+    for (const { toolName, args } of visibleToolCalls) {
+      let subagentsList = args?.Subagents
+      if (typeof subagentsList === 'string') {
+        try {
+          subagentsList = JSON.parse(unquoteTranscriptString(subagentsList))
+        } catch {
+          subagentsList = null
+        }
+      }
+      if (
+        (toolName === 'invoke_subagent' || toolName === 'default_api:invoke_subagent') &&
+        Array.isArray(subagentsList)
+      ) {
+        const rawAction = unquoteTranscriptString(args?.toolAction)
+        const rawSummary = unquoteTranscriptString(args?.toolSummary)
+        for (const sub of subagentsList) {
+          const role = unquoteTranscriptString(sub?.Role || sub?.TypeName) || 'subagent'
+          const typeName = unquoteTranscriptString(sub?.TypeName) || 'self'
+          const summary =
+            (typeof rawAction === 'string' && rawAction.trim()) ||
+            (typeof rawSummary === 'string' && rawSummary.trim()) ||
+            role
+          seq++
+          events.push({
+            seq,
+            kind: 'subagent',
+            role,
+            type_name: typeName,
+            action: summary,
+            step_index: step.step_index ?? null,
+          })
+          bullets.push(`- 🤖 **Subagent (${role})**: ${summary}`)
+        }
+        continue
+      }
+
+      const rawAction = unquoteTranscriptString(args?.toolAction)
+      const rawSummary = unquoteTranscriptString(args?.toolSummary)
+      const action =
+        (typeof rawAction === 'string' && rawAction.trim()) ||
+        (typeof rawSummary === 'string' && rawSummary.trim()) ||
+        toolName
+      const summary =
+        (typeof rawSummary === 'string' && rawSummary.trim()) || action
+      seq++
+      events.push({
+        seq,
+        kind: 'tool',
+        tool_name: toolName,
+        action,
+        summary,
+        step_index: step.step_index ?? null,
+      })
+      bullets.push(`- 🔧 ${action}`)
+    }
+  }
+
+  const markdown = bullets.join('\n')
+  const signature = JSON.stringify(events.map((e) => [e.kind, e.label || e.action || e.role]))
+  return { events, markdown, signature, replyPosted }
+}
+
+/**
+ * Extract the latest assistant `PLANNER_RESPONSE` text from `transcript.jsonl`
+ * for the current turn (after the latest `USER_INPUT` / `SYSTEM_MESSAGE` boundary
+ * or since `sinceMs`).
+ */
+export function extractLatestAssistantReplyFromTranscript(transcriptPath, { sinceMs = null } = {}) {
+  if (!transcriptPath) return null
+  let raw = ''
+  try {
+    const stat = fs.statSync(transcriptPath)
+    if (!stat.isFile() || stat.size === 0) return null
+    const readSize = Math.min(stat.size, 262_144)
+    const fd = fs.openSync(transcriptPath, 'r')
+    try {
+      const buf = Buffer.alloc(readSize)
+      fs.readSync(fd, buf, 0, readSize, stat.size - readSize)
+      raw = buf.toString('utf8')
+    } finally {
+      fs.closeSync(fd)
+    }
+  } catch {
+    return null
+  }
+
+  const lines = raw
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+  const steps = []
+  for (const line of lines) {
+    try {
+      steps.push(JSON.parse(line))
+    } catch {
+      /* skip partial first line in tail chunk */
+    }
+  }
+
+  // Find the last USER_INPUT step index so we only look at the current turn
+  let lastUserBoundary = -1
+  for (let i = steps.length - 1; i >= 0; i--) {
+    if (steps[i]?.type === 'USER_INPUT') {
+      lastUserBoundary = i
+      break
+    }
+  }
+
+  for (let i = steps.length - 1; i > lastUserBoundary; i--) {
+    const step = steps[i]
+    if (!step || step.type !== 'PLANNER_RESPONSE') continue
+    if (typeof sinceMs === 'number' && Number.isFinite(sinceMs) && step.created_at) {
+      const stepMs = Date.parse(step.created_at)
+      if (Number.isFinite(stepMs) && stepMs < sinceMs) continue
+    }
+    if (typeof step.content === 'string' && step.content.trim()) {
+      const cleaned = prepareAgentMirrorText(step.content)
+      if (cleaned) return cleaned
+    }
+  }
+  return null
 }
 
 const REMOTE_STATUS_BANNER = '━━━ DevSpec Remote Control ━━━'
@@ -733,13 +1058,14 @@ export async function handleMirrorTurn(
   const agentName = AGENT_NAME
   const connectionId = state.connection_id
   const sessionId = state.session_id || null
+  const effectiveTranscriptPath = hookTranscriptPath || state.transcript_path
 
   // In Antigravity, PreInvocation fires before EVERY LLM step in a multi-step turn.
   // If a `.turn` marker is already live AND the latest transcript step is not a new
   // USER_INPUT (or was already mirrored for this step_index), avoid duplicate
   // local_prompt posts and redundant heartbeats on every tool iteration.
   const existingMarker = readTurnMarker(connectionId, connectionsDir)
-  const latestStep = extractLatestTranscriptStep(hookTranscriptPath || state.transcript_path)
+  const latestStep = extractLatestTranscriptStep(effectiveTranscriptPath)
   const isNewUserInputStep =
     latestStep?.type === 'USER_INPUT' &&
     (typeof latestStep.step_index !== 'number' ||
@@ -774,11 +1100,22 @@ export async function handleMirrorTurn(
   }
 
   const text = extractLastText(raw, modeArg)
+  const rawStepContent = typeof latestStep?.content === 'string' ? latestStep.content : ''
+  const isRemoteWakeInput =
+    Boolean(existingMarker?.remoteTurn) ||
+    parsedHookInput?.remote_turn === true ||
+    (typeof text === 'string' && text.includes('[DevSpec Remote Wake]')) ||
+    rawStepContent.includes('[DevSpec Remote Wake]') ||
+    (latestStep?.type === 'SYSTEM_MESSAGE' &&
+      (rawStepContent.includes('"event":"wake"') ||
+        rawStepContent.includes('"event":"directives"') ||
+        rawStepContent.includes('"event":"automation_run"') ||
+        rawStepContent.includes('"event":"interaction_answer"') ||
+        rawStepContent.includes('"event":"question_dismissal"')))
+
   const skipMirror =
     modeArg === 'user_prompt' &&
     ((!!text && isHarnessInjection(text)) || latestStep?.type === 'SYSTEM_MESSAGE')
-
-  if (modeArg === 'stop') consumeExplicitReplyMarker(connectionId)
 
   try {
     if (
@@ -809,6 +1146,7 @@ export async function handleMirrorTurn(
     const turnActive = modeArg === 'user_prompt'
     if (turnActive) {
       const markerExtra = { held: false }
+      if (isRemoteWakeInput) markerExtra.remoteTurn = true
       if (typeof latestStep?.step_index === 'number') {
         markerExtra.lastStepIndex = latestStep.step_index
       }
@@ -822,7 +1160,52 @@ export async function handleMirrorTurn(
         writeTurnMarker(connectionId, { held: true }, connectionsDir)
         return { ok: true, held: true, outstanding: outstandingIds }
       }
+
+      const hadExplicitReply = consumeExplicitReplyMarker(connectionId, connectionsDir)
       clearTurnMarker(connectionId, connectionsDir)
+
+      // Remote-turn fallback reply: if this turn was initiated by a remote wake on an
+      // attached session and the agent ended the turn without calling post_session_message,
+      // extract the assistant's final response + work_trail from the transcript and post it
+      // so the session room never shows a blank / "No response" turn.
+      if (!hadExplicitReply && sessionId && (marker?.remoteTurn || parsedHookInput?.remote_turn === true)) {
+        const rawStopText =
+          (text ? prepareAgentMirrorText(text) : null) ||
+          extractLatestAssistantReplyFromTranscript(effectiveTranscriptPath, {
+            sinceMs: marker?.startedAt ?? null,
+          })
+        if (rawStopText) {
+          let trail = { markdown: '', events: [] }
+          if (effectiveTranscriptPath && fs.existsSync(effectiveTranscriptPath)) {
+            try {
+              trail = extractAntigravityTrailFromTranscript(
+                fs.readFileSync(effectiveTranscriptPath, 'utf8'),
+                { sinceMs: marker?.startedAt ?? null, stopAtReply: false },
+              )
+            } catch {
+              /* ignore */
+            }
+          }
+          const fallbackArgs = {
+            connection_id: connectionId,
+            session_id: sessionId,
+            agent_name: agentName,
+            message: rawStopText,
+            ...(trail.markdown ? { work_trail: trail.markdown } : {}),
+            ...(trail.events.length > 0 ? { trail_events: trail.events } : {}),
+          }
+          try {
+            await call({
+              mcpUrl,
+              token,
+              name: 'post_session_message',
+              arguments: fallbackArgs,
+            })
+          } catch {
+            /* non-fatal fallback */
+          }
+        }
+      }
     }
 
     if (connectionId) {

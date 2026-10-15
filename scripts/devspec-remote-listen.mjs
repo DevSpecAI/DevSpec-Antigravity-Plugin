@@ -19,7 +19,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { loadState } from './mirror-turn.mjs'
+import { loadState, writeTurnMarker } from './mirror-turn.mjs'
 import {
   ensurePollerForConnection,
   listenerInfoPath,
@@ -414,6 +414,7 @@ async function main() {
           })
           if (res.ok) {
             deliveredVia = 'agentapi'
+            writeTurnMarker(connectionId, { remoteTurn: true })
           } else if (!args.once) {
             // Do not advance offset if agentapi delivery failed in daemon mode,
             // so devspec-remote-wait.mjs or a later tick can deliver it.

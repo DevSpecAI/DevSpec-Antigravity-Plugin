@@ -130,6 +130,63 @@ describe('PreToolUse mechanical input stamping (overwrite)', () => {
       fx.cleanup()
     }
   })
+
+  it('unwraps call_mcp_tool for devspec, writes explicit-reply marker, and attaches work_trail + trail_events on post_session_message', () => {
+    const fx = makeFixture()
+    try {
+      const transcriptPath = path.join(fx.home, 'transcript.jsonl')
+      fs.writeFileSync(
+        transcriptPath,
+        [
+          JSON.stringify({
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            created_at: '2026-10-14T22:00:02.000Z',
+            thinking: 'Analyzing the room state before replying.',
+            tool_calls: [
+              {
+                name: 'view_file',
+                args: {
+                  AbsolutePath: '"/tmp/room.json"',
+                  toolAction: '"Reading room state"',
+                  toolSummary: '"Read room state"',
+                },
+              },
+            ],
+          }),
+        ].join('\n') + '\n',
+      )
+
+      const res = prepareDevspecToolInput(
+        {
+          conversationId: CONV_ID,
+          transcriptPath,
+          tool_name: 'call_mcp_tool',
+          tool_input: {
+            ServerName: 'devspec',
+            ToolName: 'post_session_message',
+            Arguments: {
+              message: 'Completed the check.',
+            },
+          },
+        },
+        { home: fx.home, env: {} },
+      )
+
+      assert.equal(res.decision, 'allow')
+      assert.ok(res.overwrite?.Arguments)
+      assert.equal(res.overwrite.Arguments.connection_id, CONN_ID)
+      assert.equal(res.overwrite.Arguments.agent_name, 'Antigravity')
+      assert.match(res.overwrite.Arguments.work_trail, /Reading room state/)
+      assert.equal(res.overwrite.Arguments.trail_events.length, 2)
+      assert.equal(
+        fs.existsSync(path.join(fx.connDir, `${CONN_ID}.explicit-reply`)),
+        true,
+      )
+    } finally {
+      fx.cleanup()
+    }
+  })
 })
 
 describe('Multi-requester ambiguity guard & devspec-serve-request.mjs', () => {

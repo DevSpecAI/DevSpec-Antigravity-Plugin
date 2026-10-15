@@ -1,176 +1,81 @@
 #!/usr/bin/env node
 /**
- * devspec-remote-wait — wake the coding agent when a new OWNER OR DELEGATED
- * COMMAND arrives
- * (CONNECTION-NATIVE, item fd51d80b).
+ * Durable inbox reader and Antigravity / Claude Code wake stream (`devspec-remote-wait.mjs`).
  *
- * Complements continuous `devspec-remote-poll.mjs` (heartbeats + inbox writer).
- * This process does **not** heartbeat. It watches the per-connection inbox written
- * by the poller and **exits 0** when a new `owner_messages` line appears after the
- * saved byte offset — so:
- *   - Claude Code: run_in_background → process exit wakes the model
- *   - Grok Build:  monitor tool on this process stdout → chat notification
- *
- * It wakes ONLY on `owner_messages` (server-stamped owner/delegated commands and
- * owner-authorized local dispatches).
- * `advisory_context` inbox entries (teammate / Dev / other-agent room context) are
- * DELIBERATELY ignored as a WAKE TRIGGER — advisory must never force a model wake or
- * an autonomous response.
- *
- * It is NOT ignored as CONTENT. An `owner_messages` entry carries the room the
- * command arrived into on its `context` field (owner-ambient + everyone-else, carried
- * forward by the poller since the last command), and this script prints that block in
- * the SAME stdout payload as the command — labelled, ahead of it, so the command is
- * the last thing read. That is the mechanical fix for item 27058153: the model cannot
- * receive the command without also receiving the room, so understanding the room
- * stops depending on a skill instruction being followed. Before this, advisory lived
- * only in a side file and Claude Code failed a live "1, 2, 3 … what's next?" test
- * while holding all three messages on disk.
- *
- * After the agent acts, re-arm THIS wait process only (not the poller) — with
- * `--pending`, which resumes from the saved inbox offset AND leaves the working
- * indicator alone, because a re-arm happens mid-turn by design (see armEndsTurn).
- * The offset acknowledges delivery, so it is committed only after the complete
- * model-visible event payload has been written successfully.
+ * Preserves the byte-offset cursor, armed-listener pidfile, one-shot fallback, and
+ * session-scoped `--stream` monitor architecture. Runtime wake inputs are revalidated
+ * `canonical_commands`, typed `canonical_control`, explicit `automation_run`,
+ * `interaction_answer`, or `question_dismissal` records written by `devspec-remote-poll.mjs`
+ * (plus backward-compatible `owner_messages` records).
  *
  * Usage:
- *   node devspec-remote-wait.mjs --connection-id <uuid> [--from-end|--pending] [--owner-pid <pid>]
- *
- * Exit codes:
- *   0  — one or more new owner_messages batches printed to stdout; agent should act
- *   1  — remote disabled / connection ended in state / owner gone / error
- *   2  — bad args
+ *   node devspec-remote-wait.mjs --connection-id <uuid> [--stream] [--from-end|--pending] [--owner-pid <pid>]
  */
 
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import {
+  attachmentDirFor,
+  describeAttachment,
+  materialiseAttachments,
+  MAX_INLINE_ATTACHMENT_CHARS,
+} from './attachment-store.mjs'
+import { questionHandoffEvent, validQuestionHandoff } from './command-offer.mjs'
+import {
+  buildInteractionAnswerEvents,
+  buildQueuedAnswerEvents,
+  dismissalDeliveryDecision,
+  INTERACTION_ANSWER_RECORD_TYPE,
+  QUEUED,
+  validateInteractionAnswerRecord,
+} from './interaction-events.mjs'
+import {
+  STATE_ABSENT,
+  STATE_OK,
+  STATE_UNREADABLE,
+  readPrivateJsonResult,
+  writePrivateJson,
+} from './private-state.mjs'
+import { DISMISSAL_RECORD_TYPE } from './question-dismissal-events.mjs'
+import {
+  resolveOwnerPid as resolveOwnerPidFromState,
+} from './remote-control-state.mjs'
+import {
+  isRemoteCommandProjectScope,
+  normalizeRemoteIngressV1,
+  REMOTE_INGRESS_RESOURCE_URI,
+} from './remote-ingress-v1.mjs'
+import { wakeNotice } from './room-unread.mjs'
+
+export { describeAttachment, materialiseAttachments, MAX_INLINE_ATTACHMENT_CHARS }
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
 const POLL_MS = 500
 const MAX_WAIT_MS = 24 * 60 * 60 * 1000
 
-/**
- * Remove the connection turn marker, so the continuous poller stops re-asserting
- * busy and emits `report_complete` on its next tick.
- */
-export function clearTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
-  if (!connectionId) return
-  try {
-    fs.rmSync(path.join(dir, `${connectionId}.turn`), { force: true })
-  } catch {
-    /* ignore */
-  }
+/** Wake delivered — act on it. */
+export const EXIT_WAKE = 0
+/** A human or the server ended this connection. Stand down. */
+export const EXIT_TERMINAL = 1
+/** Bad args. */
+export const EXIT_BAD_ARGS = 2
+/** This arm aged out with no owner mail. The connection is FINE — re-arm. */
+export const EXIT_REARM = 3
+/** Another listener already reads this connection's inbox. */
+export const EXIT_SUPERSEDED = 4
+
+export function resolveDeadline({ stream, ownerAnchor, startedAt, maxWaitMs = MAX_WAIT_MS } = {}) {
+  return stream && ownerAnchor ? null : startedAt + maxWaitMs
 }
 
-/**
- * Does THIS arm mean "the agent is idle", and so end any in-flight working phase?
- *
- * Only a FIRST arm does (item 68f7b30c). Arming is not a turn end: `--pending`
- * exists precisely because the documented pattern is to re-arm the instant the
- * agent wakes, so owner/delegated mail arriving mid-turn is not dropped — so a
- * re-arm happens DURING most turns, seconds into them. Treating every arm as idle made
- * the poller clear the marker it had just written on delivery, drop busy, and
- * emit `report_complete` while the agent worked on for another five minutes with
- * the driver's UI showing nothing. **Turn end is owned by the Stop hook**
- * (`mirror-turn.mjs stop`), which every plugin registers, plus MAX_TURN_MS in the
- * poller as the backstop for a host whose Stop hook never fires.
- *
- * A first arm (`--from-end`) genuinely is idle: the agent is connecting or
- * reconnecting and deliberately discarding the historical inbox, so a marker left
- * by a seed delivery belongs to a turn nobody will ever wake for, and must be
- * cleared or the connection shows a phantom "working" until MAX_TURN_MS elapses.
- * That is the case the original unconditional clear was written for.
- *
- * `--pending` wins over `--from-end` if both are somehow passed, matching the
- * offset precedence below — the safe direction, since keeping a live marker
- * costs a stale badge while dropping one hides real work.
- */
-export function armEndsTurn({ fromEnd, pending } = {}) {
-  return fromEnd === true && pending !== true
+export function waitPidPath(connectionId, dir = CONNECTIONS_DIR) {
+  return path.join(dir, `${connectionId}.wait.pid`)
 }
 
-/** Apply an arm's turn semantics. Returns whether the working phase was ended. */
-export function applyArmTurnSemantics(connectionId, args, dir = CONNECTIONS_DIR) {
-  if (!armEndsTurn(args)) return false
-  clearTurnMarker(connectionId, dir)
-  return true
-}
-
-function parseArgs(argv) {
-  // Default: resume from saved inbox_byte_offset so owner/delegated commands that
-  // arrived while the agent was mid-turn are NOT skipped. --from-end is only for
-  // the first arm after connect (ignore historical inbox). Live bug 2026-07-24:
-  // re-arm with --from-end after a wake permanently dropped concurrent command
-  // mail that the poller had already written to the inbox.
-  const out = { fromEnd: false, pending: false }
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i]
-    if (a === '--connection-id' || a === '--connection_id' || a === '--connection') {
-      out.connectionId = argv[++i]
-    } else if (a === '--from-end') out.fromEnd = true
-    else if (a === '--pending') {
-      out.pending = true
-      out.fromEnd = false
-    } else if (a === '--poll-ms') out.pollMs = Number(argv[++i]) || POLL_MS
-    else if (a === '--owner-pid') out.ownerPid = argv[++i]
-  }
-  return out
-}
-
-/**
- * Owner-pid resolution, deliberately SELF-CONTAINED.
- *
- * This plugin owns this script independently. Keeping owner-pid resolution here
- * avoids coupling the wait path to a different state layer; the small local helper
- * is intentional and must not be replaced by cross-plugin copying or synchronization.
- *
- * On Windows the caller's `--owner-pid "$PPID"` is usually an MSYS-internal number
- * that maps to no real Win32 process, so an explicit value is validated before it is
- * trusted and we otherwise walk this process's genuine ancestry to the owning host
- * (item 3cddb3b4). `remote-control-state.mjs` keeps its own copy for the write path.
- */
-function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 12, timeoutMs = 4000 } = {}) {
-  if (process.platform !== 'win32') return null
-  const pid = Number.parseInt(String(startPid), 10)
-  if (!Number.isInteger(pid) || pid < 1) return null
-  const script = [
-    `$p = ${pid}`,
-    `for ($i = 0; $i -lt ${maxHops}; $i++) {`,
-    '  $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction SilentlyContinue',
-    '  if (-not $proc) { break }',
-    "  if ($proc.Name -ieq 'claude.exe') { Write-Output $proc.ProcessId; break }",
-    '  if (-not $proc.ParentProcessId -or $proc.ParentProcessId -eq $p) { break }',
-    '  $p = $proc.ParentProcessId',
-    '}',
-  ].join('\n')
-  try {
-    const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
-      timeout: timeoutMs,
-      encoding: 'utf8',
-      windowsHide: true,
-    }).trim()
-    const found = Number.parseInt(out, 10)
-    return Number.isInteger(found) && found > 1 ? found : null
-  } catch {
-    return null
-  }
-}
-
-export function resolveOwnerPid(explicitArg, prevValue) {
-  const explicit = Number.parseInt(String(explicitArg ?? ''), 10)
-  if (Number.isInteger(explicit) && explicit > 1) return explicit
-  const auto = resolveOwnerPidAutoWindows()
-  if (auto) return auto
-  const prev = Number.parseInt(String(prevValue ?? ''), 10)
-  return Number.isInteger(prev) && prev > 1 ? prev : null
-}
-
-/** Owner (agent) process liveness — see devspec-remote-poll.mjs. EPERM = alive. */
-function ownerAlive(pid) {
+function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 1) return false
   try {
     process.kill(pid, 0)
@@ -180,63 +85,222 @@ function ownerAlive(pid) {
   }
 }
 
-function statePath(connectionId) {
-  return path.join(CONNECTIONS_DIR, `${connectionId}.json`)
+export function isWaitArgv(argv, connectionId) {
+  if (!Array.isArray(argv) || argv.length < 4 || !connectionId) return false
+  if (!/^node(\.exe)?$/i.test(path.basename(String(argv[0])))) return false
+  if (path.basename(String(argv[1])) !== 'devspec-remote-wait.mjs') return false
+  const at = argv.indexOf('--connection-id', 2)
+  return at !== -1 && argv[at + 1] === connectionId
 }
 
-function inboxPath(connectionId) {
-  return path.join(CONNECTIONS_DIR, `${connectionId}.inbox.jsonl`)
+export function waitHolderPid(connectionId, dir = CONNECTIONS_DIR) {
+  if (!connectionId) return null
+  let pid
+  try {
+    pid = Number.parseInt(fs.readFileSync(waitPidPath(connectionId, dir), 'utf8').trim(), 10)
+  } catch {
+    return null
+  }
+  if (!pidAlive(pid)) return null
+  let argv = null
+  try {
+    argv = fs.readFileSync(`/proc/${pid}/cmdline`).toString().split('\0').filter(Boolean)
+  } catch {
+    /* no /proc: a live pid is all there is */
+  }
+  if (argv !== null && !isWaitArgv(argv, connectionId)) return null
+  return pid
+}
+
+export function waitHolderOwnerPid(pid) {
+  try {
+    const argv = fs.readFileSync(`/proc/${pid}/cmdline`).toString().split('\0').filter(Boolean)
+    const at = argv.indexOf('--owner-pid', 2)
+    const owner = at === -1 ? NaN : Number.parseInt(argv[at + 1], 10)
+    return Number.isInteger(owner) && owner > 1 ? owner : null
+  } catch {
+    return null
+  }
+}
+
+export function isWaitArmed(connectionId, dir = CONNECTIONS_DIR) {
+  return waitHolderPid(connectionId, dir) !== null
+}
+
+function armWaitPidfile(connectionId, dir = CONNECTIONS_DIR) {
+  if (!connectionId) return
+  const p = waitPidPath(connectionId, dir)
+  try {
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(p, String(process.pid), { mode: 0o600 })
+  } catch {
+    return
+  }
+  const release = () => {
+    try {
+      const owner = Number.parseInt(fs.readFileSync(p, 'utf8').trim(), 10)
+      if (owner === process.pid) fs.rmSync(p, { force: true })
+    } catch {
+      /* ignore */
+    }
+  }
+  process.on('exit', release)
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    process.on(sig, () => {
+      release()
+      process.exit(EXIT_REARM)
+    })
+  }
+}
+
+export function clearTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
+  if (!connectionId) return
+  try {
+    fs.rmSync(path.join(dir, `${connectionId}.turn`), { force: true })
+  } catch {
+    /* ignore */
+  }
+}
+
+export function armEndsTurn({ fromEnd, pending } = {}) {
+  return fromEnd === true && pending !== true
+}
+
+export function applyArmTurnSemantics(connectionId, args, dir = CONNECTIONS_DIR) {
+  if (!armEndsTurn(args)) return false
+  clearTurnMarker(connectionId, dir)
+  return true
+}
+
+export function parseArgs(argv) {
+  const out = { fromEnd: false, pending: false, stream: false }
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]
+    if (a === '--connection-id' || a === '--connection_id' || a === '--connection') {
+      out.connectionId = argv[++i]
+    } else if (a === '--stream') out.stream = true
+    else if (a === '--from-end') out.fromEnd = true
+    else if (a === '--pending') {
+      out.pending = true
+      out.fromEnd = false
+    } else if (a === '--poll-ms') out.pollMs = Number(argv[++i]) || POLL_MS
+    else if (a === '--owner-pid') out.ownerPid = argv[++i]
+  }
+  return out
+}
+
+export function resolveOwnerPid(explicitArg, prevValue) {
+  return resolveOwnerPidFromState(explicitArg, prevValue)
+}
+
+function ownerAlive(pid) {
+  return pidAlive(pid)
+}
+
+function statePath(connectionId, dir = CONNECTIONS_DIR) {
+  return path.join(dir, `${connectionId}.json`)
+}
+
+function inboxPath(connectionId, dir = CONNECTIONS_DIR) {
+  return path.join(dir, `${connectionId}.inbox.jsonl`)
+}
+
+function readStateResult(connectionId, { dir = CONNECTIONS_DIR, legacyPath = LEGACY_STATE_PATH } = {}) {
+  const own = readPrivateJsonResult(statePath(connectionId, dir))
+  if (own.status !== STATE_ABSENT) return own
+  const legacy = readPrivateJsonResult(legacyPath)
+  if (legacy.status !== STATE_OK) return { status: STATE_ABSENT, value: null }
+  if (
+    connectionId &&
+    legacy.value?.connection_id &&
+    legacy.value.connection_id !== connectionId
+  ) {
+    return { status: STATE_ABSENT, value: null }
+  }
+  return legacy
+}
+
+function readDismissalState(connectionId) {
+  const result = readPrivateJsonResult(statePath(connectionId))
+  return result.status === STATE_OK ? result.value : null
 }
 
 function readState(connectionId) {
-  const paths = [statePath(connectionId), LEGACY_STATE_PATH]
-  for (const p of paths) {
-    try {
-      if (!fs.existsSync(p)) continue
-      const s = JSON.parse(fs.readFileSync(p, 'utf8'))
-      if (connectionId && s.connection_id && s.connection_id !== connectionId && p === LEGACY_STATE_PATH)
-        continue
-      return s
-    } catch {
-      /* next */
-    }
-  }
-  return null
+  const result = readStateResult(connectionId)
+  return result.status === STATE_OK ? result.value : null
 }
 
-function writeStatePatch(connectionId, patch) {
-  const prev = readState(connectionId) || { connection_id: connectionId }
+export function writeStatePatch(
+  connectionId,
+  patch,
+  { dir = CONNECTIONS_DIR, legacyPath = LEGACY_STATE_PATH } = {},
+) {
+  try {
+    const current = readStateResult(connectionId, { dir, legacyPath })
+    if (current.status === STATE_UNREADABLE || current.status === STATE_ABSENT) {
+      process.stderr.write(
+        `devspec-remote-wait: state ${current.status} for ${connectionId} — patch skipped to preserve the bond\n`,
+      )
+      return
+    }
+    const next = {
+      ...current.value,
+      ...patch,
+      connection_id: connectionId,
+      updated_at: new Date().toISOString(),
+    }
+    fs.mkdirSync(dir, { recursive: true })
+    writePrivateJson(statePath(connectionId, dir), next)
+    const leg = readPrivateJsonResult(legacyPath)
+    if (
+      leg.status === STATE_OK &&
+      leg.value &&
+      (!leg.value.connection_id || leg.value.connection_id === connectionId)
+    ) {
+      writePrivateJson(legacyPath, {
+        ...leg.value,
+        ...patch,
+        connection_id: connectionId,
+        updated_at: next.updated_at,
+      })
+    }
+  } catch (e) {
+    process.stderr.write(`devspec-remote-wait: state write failed: ${e.message}\n`)
+  }
+}
+
+function commitDeliveredOffset(
+  connectionId,
+  offset,
+  { dir = CONNECTIONS_DIR, legacyPath = LEGACY_STATE_PATH } = {},
+) {
+  const current = readStateResult(connectionId, { dir, legacyPath })
+  if (current.status === STATE_UNREADABLE) {
+    throw new Error(`state unreadable for ${connectionId}`)
+  }
+  if (current.status === STATE_ABSENT) {
+    return
+  }
   const next = {
-    ...prev,
-    ...patch,
+    ...current.value,
+    inbox_byte_offset: offset,
     connection_id: connectionId,
     updated_at: new Date().toISOString(),
   }
-  fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
-  // This canonical state write is the durable inbox acknowledgement. Let failure
-  // propagate so main's existing error path exits 1 instead of reporting a wake
-  // with a stale offset and exit 0.
-  fs.writeFileSync(statePath(connectionId), JSON.stringify(next, null, 2) + '\n', { mode: 0o600 })
-
-  // The connection-native state is canonical. Keep the compatibility mirror
-  // best-effort so a stale or malformed legacy file cannot invalidate its commit.
-  try {
-    if (fs.existsSync(LEGACY_STATE_PATH)) {
-      const leg = JSON.parse(fs.readFileSync(LEGACY_STATE_PATH, 'utf8'))
-      if (!leg.connection_id || leg.connection_id === connectionId) {
-        fs.writeFileSync(
-          LEGACY_STATE_PATH,
-          JSON.stringify(
-            { ...leg, ...patch, connection_id: connectionId, updated_at: next.updated_at },
-            null,
-            2,
-          ) + '\n',
-          { mode: 0o600 },
-        )
-      }
-    }
-  } catch {
-    /* ignore legacy */
+  fs.mkdirSync(dir, { recursive: true })
+  writePrivateJson(statePath(connectionId, dir), next)
+  const leg = readPrivateJsonResult(legacyPath)
+  if (
+    leg.status === STATE_OK &&
+    leg.value &&
+    (!leg.value.connection_id || leg.value.connection_id === connectionId)
+  ) {
+    writePrivateJson(legacyPath, {
+      ...leg.value,
+      inbox_byte_offset: offset,
+      connection_id: connectionId,
+      updated_at: next.updated_at,
+    })
   }
 }
 
@@ -253,180 +317,318 @@ function fileSize(p) {
 }
 
 /**
- * Read new bytes from offset; return { lines, newOffset }.
- * Incomplete trailing line (no final \n) is left for the next read.
+ * Complete JSONL records with absolute byte boundaries.
  */
-function readNewLines(file, offset) {
+export function readInboxRecords(file, offset) {
   const size = fileSize(file)
-  if (size <= offset) return { lines: [], newOffset: offset }
+  if (size <= offset) return []
   const fd = fs.openSync(file, 'r')
   try {
-    const len = size - offset
-    const buf = Buffer.alloc(len)
-    fs.readSync(fd, buf, 0, len, offset)
-    const text = buf.toString('utf8')
-    const lastNl = text.lastIndexOf('\n')
-    if (lastNl === -1) return { lines: [], newOffset: offset }
-    const completeText = text.slice(0, lastNl + 1)
-    const lines = completeText.split('\n').filter((l) => l.trim().length > 0)
-    const newOffset = offset + Buffer.byteLength(completeText, 'utf8')
-    return { lines, newOffset }
+    const buf = Buffer.alloc(size - offset)
+    const bytesRead = fs.readSync(fd, buf, 0, buf.length, offset)
+    const bytes = buf.subarray(0, bytesRead)
+    const records = []
+    let start = 0
+    for (let newline = bytes.indexOf(0x0a, start); newline !== -1; newline = bytes.indexOf(0x0a, start)) {
+      records.push({ line: bytes.subarray(start, newline).toString('utf8'), endOffset: offset + newline + 1 })
+      start = newline + 1
+    }
+    return records
   } finally {
     fs.closeSync(fd)
   }
 }
 
-/**
- * Owner/delegated-command batches ONLY. `advisory_context` entries are intentionally
- * excluded so room awareness never wakes the model or triggers an autonomous response.
- */
-export function parseOwnerBatches(lines) {
+const ROOM_STATE_SECTIONS = new Set([
+  'session_polls',
+  'still_to_discuss',
+  'active_session_plans',
+  'session_activity',
+])
+
+function validWakeContext(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const pathOrNull = (candidate) =>
+    typeof candidate === 'string' && path.isAbsolute(candidate) ? candidate : null
+  return {
+    transcript: pathOrNull(value.transcript),
+    room_state: pathOrNull(value.room_state),
+    room_state_changed: Array.isArray(value.room_state_changed)
+      ? [...new Set(value.room_state_changed.filter((section) => ROOM_STATE_SECTIONS.has(section)))]
+      : [],
+  }
+}
+
+const INBOX_UUID = /^(?:00000000-0000-0000-0000-000000000000|[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i
+
+function validateAutomationInboxRecord(record, connectionId) {
+  const d = record?.dispatch
+  const keys = [
+    'id', 'kind', 'run_id', 'automation_id', 'automation_name', 'trigger_kind', 'owner',
+    'permission', 'queued_at', 'delivery_connection_id', 'requester',
+  ]
+  const owner = d?.owner
+  const pressed = d?.trigger_kind === 'pressed'
+  const requesterOk = pressed
+    ? Boolean(
+        d.requester && typeof d.requester === 'object' && !Array.isArray(d.requester) &&
+        Object.keys(d.requester).length === 1 &&
+        typeof d.requester.user_id === 'string' && INBOX_UUID.test(d.requester.user_id),
+      )
+    : d?.requester === null
+  return Boolean(
+    record?.type === 'automation_run' &&
+    d && typeof d === 'object' && !Array.isArray(d) &&
+    Object.keys(d).length === keys.length && keys.every((key) => Object.hasOwn(d, key)) &&
+    d.kind === 'automation_run' &&
+    typeof d.id === 'string' && INBOX_UUID.test(d.id) && d.run_id === d.id &&
+    typeof d.automation_id === 'string' && INBOX_UUID.test(d.automation_id) &&
+    typeof d.automation_name === 'string' && d.automation_name.length > 0 &&
+    ['scheduled', 'event', 'pressed'].includes(d.trigger_kind) &&
+    owner && typeof owner === 'object' && !Array.isArray(owner) &&
+    Object.keys(owner).length === 2 &&
+    typeof owner.user_id === 'string' && INBOX_UUID.test(owner.user_id) &&
+    typeof owner.display_name === 'string' && owner.display_name.length > 0 &&
+    ['look_only', 'can_commit', 'can_push'].includes(d.permission) &&
+    d.delivery_connection_id === connectionId &&
+    typeof d.queued_at === 'string' && !Number.isNaN(Date.parse(d.queued_at)) &&
+    requesterOk,
+  )
+}
+
+/** Revalidate every executable durable record before it reaches the wake stream. */
+export function parseInboxBatches(lines, connectionId) {
   const batches = []
   for (const line of lines) {
+    if (!line || !String(line).trim()) continue
     try {
-      const obj = JSON.parse(line)
-      if (obj?.type === 'owner_messages' && Array.isArray(obj.messages) && obj.messages.length > 0) {
-        batches.push(obj)
+      const record = JSON.parse(line)
+      if (record.type === 'canonical_commands') {
+        const targetConnId = connectionId || record.connection_id
+        if (!targetConnId || record.connection_id !== targetConnId) continue
+        if (record.authoritative_source !== REMOTE_INGRESS_RESOURCE_URI) continue
+        const parsed = normalizeRemoteIngressV1(record.ingress, targetConnId)
+        if (!parsed.ok || !parsed.wake) continue
+        const ids = Array.isArray(record.execute_message_ids)
+          ? record.execute_message_ids
+          : parsed.envelope.command_message_ids
+        const commandIds = new Set(parsed.envelope.commands.map((command) => command.message_id))
+        if (ids.length === 0 || new Set(ids).size !== ids.length || ids.some((id) => !commandIds.has(id))) continue
+        batches.push({
+          ...record,
+          execute_message_ids: ids,
+          wake_context: validWakeContext(record.wake_context),
+          question_handoff: validQuestionHandoff(record.question_handoff, new Set(ids)),
+        })
+      } else if (record.type === 'canonical_control') {
+        const targetConnId = connectionId || record.connection_id
+        if (!targetConnId || record.connection_id !== targetConnId) continue
+        if (record.authoritative_source !== REMOTE_INGRESS_RESOURCE_URI) continue
+        const parsed = normalizeRemoteIngressV1(record.ingress, targetConnId)
+        if (
+          !parsed.ok ||
+          parsed.envelope.wake.kind !== 'control' ||
+          !parsed.envelope.wake.active ||
+          parsed.envelope.delivery_state !== 'live'
+        ) {
+          continue
+        }
+        batches.push(record)
+      } else if (record.type === INTERACTION_ANSWER_RECORD_TYPE || record.type === DISMISSAL_RECORD_TYPE) {
+        const targetConnId = connectionId || record.connection_id
+        if (!targetConnId || !validateInteractionAnswerRecord(record, targetConnId)) continue
+        batches.push(record)
+      } else if (connectionId && validateAutomationInboxRecord(record, connectionId)) {
+        batches.push(record)
+      } else if (
+        record.type === 'owner_messages' &&
+        Array.isArray(record.messages) &&
+        record.messages.length > 0 &&
+        (!connectionId || !record.connection_id || record.connection_id === connectionId)
+      ) {
+        batches.push(record)
       }
     } catch {
-      /* skip garbage */
+      /* malformed/incomplete records fail closed */
     }
   }
   return batches
 }
 
-/** Small text payloads are cheap and immediately useful, so they stay inline. */
-export const MAX_INLINE_ATTACHMENT_CHARS = 2048
-
-/** Filesystem-safe leaf name; never lets a filename escape the attachment dir. */
-function safeAttachmentName(filename) {
-  const base = path.basename(String(filename || 'attachment'))
-  const cleaned = base.replace(/[^a-zA-Z0-9._-]/g, '_').replace(/^\.+/, '')
-  return cleaned.slice(0, 120) || 'attachment'
-}
-
 /**
- * Turn one server attachment into something a model can actually use, WITHOUT
- * putting its payload in the wake event (item 99165e12).
- *
- * The server sends `content` (base64) and, for images, `dataUrl` — which is the same
- * bytes again with a prefix. Printing that verbatim is what the shared pollers used to
- * do, and it is the worse half of this bug: a 500KB screenshot became a **1.37MB**
- * stdout payload, ~341k tokens of base64 that the model cannot see as an image anyway.
- * Silently dropping it (what OpenCode did) at least stayed cheap; this detonated the
- * context window AND still failed to deliver the picture.
- *
- * So: decode once to a real file on disk and hand back a path. Every host in this
- * family can open a local file, and an image read from disk is a genuine image rather
- * than a base64 string. Small text stays inline because a path would be pure overhead.
- *
- * `writeFile` is injected so the decision is testable without touching a filesystem.
+ * Parse owner command batches (canonical `canonical_commands` or legacy `owner_messages`).
  */
-export function describeAttachment(a, { dir, messageId, index, writeFile } = {}) {
-  if (!a || typeof a !== 'object') return null
-  const filename = safeAttachmentName(a.filename)
-  const mimeType = typeof a.mimeType === 'string' ? a.mimeType : 'application/octet-stream'
-  const type = typeof a.type === 'string' ? a.type : 'document'
-  const sizeBytes = typeof a.sizeBytes === 'number' ? a.sizeBytes : null
-
-  // dataUrl is content re-encoded; prefer content and never carry both.
-  let b64 = typeof a.content === 'string' && a.content ? a.content : null
-  if (!b64 && typeof a.dataUrl === 'string') {
-    const comma = a.dataUrl.indexOf(',')
-    if (comma !== -1) b64 = a.dataUrl.slice(comma + 1)
-  }
-  if (!b64) return null
-
-  const base = { filename, mimeType, type, sizeBytes }
-
-  // Small text/markdown/json inline — a file path for 300 bytes helps nobody.
-  const isTextual = type === 'text' || /^text\/|json|xml|yaml/.test(mimeType)
-  if (isTextual) {
-    let decoded = null
-    try {
-      decoded = Buffer.from(b64, 'base64').toString('utf8')
-    } catch {
-      decoded = null
-    }
-    if (decoded !== null && decoded.length <= MAX_INLINE_ATTACHMENT_CHARS) {
-      return { ...base, delivery: 'inline', content: decoded }
-    }
-  }
-
-  if (!dir || typeof writeFile !== 'function') {
-    // No landing place — say so rather than pretend, and never inline the base64.
-    return {
-      ...base,
-      delivery: 'unavailable',
-      note: 'Attachment could not be written to disk; re-read it with get_session_transcript.',
-    }
-  }
-
-  const leaf = `${String(messageId || 'msg').slice(0, 12)}-${index}-${filename}`
-  const target = path.join(dir, leaf)
-  try {
-    writeFile(target, Buffer.from(b64, 'base64'))
-  } catch (e) {
-    return {
-      ...base,
-      delivery: 'unavailable',
-      note: `Attachment could not be written to disk (${e.message}); re-read it with get_session_transcript.`,
-    }
-  }
-  return {
-    ...base,
-    delivery: 'file',
-    path: target,
-    note:
-      type === 'image'
-        ? 'Image saved locally — OPEN THIS PATH to see it. It is part of the command, not decoration.'
-        : 'Saved locally — read this path if the command refers to it.',
-  }
+export function parseOwnerBatches(lines, connectionId) {
+  return parseInboxBatches(lines, connectionId).filter(
+    (record) => record.type === 'canonical_commands' || record.type === 'owner_messages',
+  )
 }
 
 /**
- * Replace a command's `attachments` with payload-free descriptors. Returns a NEW
- * message object; the inbox line on disk keeps the full payload as the durable record.
+ * Convert one durable canonical command record into wake events:
+ * one `owner_message` per command, an optional `room_unread` count summary, and one `wake`.
  */
-export function materialiseAttachments(message, opts = {}) {
-  const list = Array.isArray(message?.attachments) ? message.attachments : null
-  if (!list || list.length === 0) return message
-  const described = list
-    .map((a, i) => describeAttachment(a, { ...opts, messageId: message.id, index: i }))
-    .filter(Boolean)
-  if (described.length === 0) {
-    const { attachments, ...rest } = message
-    return rest
+export function buildCanonicalCommandEvents(batch, { inboxFile, unread = null } = {}) {
+  const ingress = batch?.ingress
+  const executeIds = new Set(Array.isArray(batch?.execute_message_ids) ? batch.execute_message_ids : [])
+  const commands = Array.isArray(ingress?.commands)
+    ? ingress.commands.filter((command) => executeIds.has(command.message_id))
+    : []
+  const sessionId = batch?.session_id ?? null
+  const pointers = batch?.wake_context ?? null
+  const events = []
+
+  for (const command of commands) {
+    const scopeAware = Object.hasOwn(command, 'project_scope')
+    const delegated = command.authority.kind === 'delegated'
+    const senderStyle = Array.isArray(ingress.sender_response_styles)
+      ? (ingress.sender_response_styles.find((style) => style.message_id === command.message_id)?.notes ?? [])
+      : []
+    const body = typeof command.content?.body === 'string' ? command.content.body : ''
+    if (batch.question_handoff?.source_message_id === command.message_id) {
+      events.push(questionHandoffEvent(batch.question_handoff, { sessionId }))
+    }
+    events.push({
+      type: 'owner_message',
+      from: command.requester?.display_name ?? null,
+      authority: command.authority.kind,
+      ...(typeof batch.instruction_context_file === 'string'
+        ? { instruction_context_file: batch.instruction_context_file }
+        : {}),
+      ...(senderStyle.length > 0 ? { style: true } : {}),
+      message_id: command.message_id,
+      unread: unread ? unread.unread + unread.updated : null,
+      body_chars: body.length,
+      body,
+      envelope_id: ingress.envelope_id,
+      session_id: sessionId,
+      authoritative: true,
+      executable: true,
+      authoritative_source: REMOTE_INGRESS_RESOURCE_URI,
+      message: command,
+      ...(senderStyle.length > 0 ? { sender_response_style: senderStyle } : {}),
+      ...(scopeAware ? { project_scope: command.project_scope } : {}),
+      ...(delegated && scopeAware
+        ? { project_scope_instruction: command.project_scope.instruction }
+        : {}),
+      notification_preview: {
+        authoritative: false,
+        executable: false,
+        text: null,
+        note: 'No preview is executable; the complete canonical command object above is authoritative.',
+      },
+    })
   }
-  return { ...message, attachments: described }
+
+  if (commands.length > 0 && unread) {
+    events.push({ type: 'room_unread', session_id: sessionId, advisory: true, executable: false, ...unread })
+  }
+
+  events.push({
+    type: 'wake',
+    reason: 'canonical_conversational_command',
+    transcript: pointers?.transcript ?? null,
+    room_state: pointers?.room_state ?? null,
+    room_state_changed: pointers?.room_state_changed ?? [],
+    session_id: sessionId,
+    count: commands.length,
+    envelope_id: ingress?.envelope_id ?? null,
+    command_message_ids: ingress?.command_message_ids ?? [],
+    inbox: inboxFile ?? null,
+    authoritative: false,
+    executable: false,
+    continuous_poller: true,
+    rearm: 'devspec-remote-wait',
+  })
+  return events
+}
+
+export function buildCanonicalControlEvents() {
+  return []
+}
+
+function automationRunCommandText(d) {
+  const permission =
+    d.permission === 'can_push'
+      ? 'You MAY edit, commit and push.'
+      : d.permission === 'can_commit'
+        ? 'You MAY edit and commit locally, but MUST NOT push.'
+        : 'This automation is LOOK ONLY — investigate and report, do not edit, commit or push anything.'
+  const started =
+    d.trigger_kind === 'pressed'
+      ? 'Someone pressed Run.'
+      : d.trigger_kind === 'scheduled'
+        ? 'This run started on a schedule.'
+        : 'This run started because of an event.'
+  const ownerName = d.owner?.display_name || 'the owner'
+  const run = `run_id: "${d.run_id}", connection_id: "${d.delivery_connection_id}"`
+  return [
+    `▶️ Automation run dispatched to this connection: "${d.automation_name}" (run ${d.run_id}).`,
+    started,
+    `Owner: ${ownerName}`,
+    '',
+    'What to do:',
+    `1. claim_automation_run({ ${run}, provider: "antigravity" }). If it comes back claimed: false, do what its message says.`,
+    '2. Follow the instruction returned by that claim, in this repo.',
+    `3. record_automation_run({ ${run}, … }) with one verdict and evidence per acceptance criterion.`,
+    '',
+    `Permission: ${permission}`,
+  ].join('\n')
+}
+
+export function buildAutomationRunEvents(batch, { inboxFile } = {}) {
+  return [
+    {
+      type: 'automation_run',
+      session_id: batch.session_id ?? null,
+      authoritative: true,
+      executable: true,
+      channel: 'explicit_automation_dispatch',
+      dispatch: batch.dispatch,
+      content: automationRunCommandText(batch.dispatch),
+    },
+    {
+      type: 'wake',
+      reason: 'automation_run',
+      run_id: batch.dispatch.run_id,
+      inbox: inboxFile ?? null,
+      authoritative: false,
+      executable: false,
+    },
+  ]
+}
+
+function stdoutLine(line) {
+  return new Promise((resolve, reject) => {
+    process.stdout.write(line, (error) => (error ? reject(error) : resolve()))
+  })
+}
+
+export async function writeEventSequence(events, writeLine = stdoutLine) {
+  for (const event of events) await writeLine(JSON.stringify(event) + '\n')
 }
 
 /**
- * Build the stdout events for one owner/delegated-command batch:
- *   1. an optional `room_context` event — the room the command arrived into,
- *   2. one `owner_message` per command,
- *   3. a trailing `wake` summary.
- *
- * ORDER IS DELIBERATE. Context first means the command is the LAST thing in the
- * payload, so the thing to act on is what the model reads most recently, and the room
- * reads as the background it is. The context event is explicitly labelled advisory on
- * both tiers; it is never a second list of things to do.
- *
- * Every event carries the batch's `session_id` (item b9fb49a9): the poller stamps this
- * on each inbox line, but it used to get dropped here, so the agent consuming the
- * stream had no live signal for which session a command belonged to and fell back to a
- * value cached at attach time — stale after a server-side reattach.
- *
- * The command-message event also promotes the validated root `project_scope` and its
- * exact server-owned instruction to model-visible fields. The instruction is copied
- * verbatim; this host does not recreate mutable project-delegation policy text.
+ * Legacy `owner_messages` event builder (retained for backward compatibility and tests).
  */
 export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, writeFile } = {}) {
   const sessionId = batch?.session_id ?? null
   const messages = Array.isArray(batch?.messages) ? batch.messages : []
   const ownerAmbient = Array.isArray(batch?.context?.owner_ambient) ? batch.context.owner_ambient : []
   const roomContext = Array.isArray(batch?.context?.room_context) ? batch.context.room_context : []
+  const activePlans = batch?.context?.active_session_plans ?? null
   const events = []
+
+  if (activePlans) {
+    events.push({
+      type: 'active_session_plans',
+      session_id: sessionId,
+      advisory: true,
+      executable: false,
+      active_session_plans: activePlans,
+      note: activePlans.authority_note,
+    })
+  }
 
   if (ownerAmbient.length > 0 || roomContext.length > 0) {
     events.push({
@@ -434,9 +636,6 @@ export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, write
       session_id: sessionId,
       advisory: true,
       counts: { owner_ambient: ownerAmbient.length, room_context: roomContext.length },
-      // Surfaced rather than hidden: a model that knows context was trimmed can ask
-      // for the transcript, where one that was told nothing would answer confidently
-      // from a partial room.
       dropped: batch?.context?.dropped ?? 0,
       owner_ambient: ownerAmbient,
       room_context: roomContext,
@@ -449,14 +648,14 @@ export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, write
   }
 
   for (const m of messages) {
-    // Attachments become on-disk files + descriptors. Emitting the server's base64
-    // verbatim used to blow the turn up ~2.7x the source image (item 99165e12).
-    const projectScope = m?.project_scope ?? null
+    const scopeAware = Boolean(m && typeof m === 'object' && Object.hasOwn(m, 'project_scope'))
+    const scopeValid = scopeAware ? isRemoteCommandProjectScope(m.project_scope, m.authority?.kind) : false
+    const delegated = scopeValid && m.authority?.kind === 'delegated'
     events.push({
       type: 'owner_message',
       session_id: sessionId,
-      project_scope: projectScope,
-      ...(projectScope ? { project_scope_instruction: projectScope.instruction } : {}),
+      ...(scopeValid ? { project_scope: m.project_scope } : {}),
+      ...(delegated ? { project_scope_instruction: m.project_scope.instruction } : {}),
       message: materialiseAttachments(m, { dir: attachmentDir, writeFile }),
     })
   }
@@ -475,25 +674,6 @@ export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, write
   return events
 }
 
-/**
- * Write a complete monitor payload and resolve only once the stream confirms it.
- * Keeping this promise boundary injectable makes acknowledgement ordering testable.
- */
-export function writeMonitorOutput(payload, stream = process.stdout) {
-  return new Promise((resolve, reject) => {
-    try {
-      stream.write(payload, (error) => (error ? reject(error) : resolve()))
-    } catch (error) {
-      reject(error)
-    }
-  })
-}
-
-/**
- * Generate and write every model-visible event before acknowledging the inbox bytes.
- * Any generation/output/commit error rejects; in particular, output failure leaves the
- * caller's durable offset unchanged so the same command is retryable on the next arm.
- */
 export async function emitOwnerMessageBatches(
   batches,
   {
@@ -501,17 +681,32 @@ export async function emitOwnerMessageBatches(
     attachmentDir,
     writeFile,
     newOffset,
-    writeOutput = writeMonitorOutput,
+    writeOutput = stdoutLine,
     commitOffset,
   } = {},
 ) {
-  const events = []
+  let delivered = 0
+  const lines = []
   for (const batch of batches) {
-    events.push(...buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, writeFile }))
+    const events =
+      batch.type === 'canonical_commands'
+        ? buildCanonicalCommandEvents(batch, { inboxFile })
+        : buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, writeFile })
+    for (const event of events) {
+      lines.push(JSON.stringify(event) + '\n')
+    }
+    delivered +=
+      batch.type === 'canonical_commands'
+        ? batch.execute_message_ids.length
+        : Array.isArray(batch.messages)
+          ? batch.messages.length
+          : 1
   }
-  const payload = events.map((event) => JSON.stringify(event)).join('\n') + '\n'
-  await writeOutput(payload)
-  if (typeof commitOffset === 'function') await commitOffset(newOffset)
+  await writeOutput(lines.join(''))
+  if (typeof commitOffset === 'function') {
+    await commitOffset(newOffset)
+  }
+  return delivered
 }
 
 async function main() {
@@ -519,22 +714,25 @@ async function main() {
   const connectionId = args.connectionId
   if (!connectionId) {
     process.stderr.write('devspec-remote-wait: missing --connection-id\n')
-    process.exit(2)
+    process.exit(EXIT_BAD_ARGS)
   }
 
   const state = readState(connectionId)
   if (state && state.enabled === false) {
     process.stderr.write('devspec-remote-wait: remote control disabled\n')
-    process.exit(1)
+    process.exit(EXIT_TERMINAL)
   }
 
-  // resolveOwnerPid validates the explicit --owner-pid before trusting it (falling
-  // back to auto-resolution / state.owner_pid otherwise) — plain `??` here would
-  // let an invalid caller-supplied value (e.g. Git Bash's non-numeric-on-Windows
-  // $PPID) win over a genuinely-correct value `write` already resolved into state
-  // (item 3cddb3b4).
   const ownerPid = resolveOwnerPid(args.ownerPid, state?.owner_pid)
   const ownerAnchor = ownerPid && ownerAlive(ownerPid) ? ownerPid : null
+
+  const holder = waitHolderPid(connectionId)
+  if (holder !== null && holder !== process.pid) {
+    process.stderr.write(
+      `devspec-remote-wait: another listener (pid ${holder}) already reads this connection — exit ${EXIT_SUPERSEDED}\n`,
+    )
+    process.exit(EXIT_SUPERSEDED)
+  }
 
   const file = inboxPath(connectionId)
   fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
@@ -543,86 +741,155 @@ async function main() {
   }
 
   let offset = 0
-  if (args.pending && typeof state?.inbox_byte_offset === 'number') {
-    offset = state.inbox_byte_offset
+  if (args.pending) {
+    offset = typeof state?.inbox_byte_offset === 'number' ? state.inbox_byte_offset : 0
   } else if (args.fromEnd) {
     offset = fileSize(file)
-    writeStatePatch(connectionId, { inbox_byte_offset: offset })
+    if (readDismissalState(connectionId)) writeStatePatch(connectionId, { inbox_byte_offset: offset })
   } else if (typeof state?.inbox_byte_offset === 'number') {
     offset = state.inbox_byte_offset
   } else {
     offset = fileSize(file)
   }
 
-  // Only a FIRST arm ends the working phase — a re-arm happens mid-turn by design
-  // (see armEndsTurn). Turn end is the Stop hook's job, not the wait's.
   applyArmTurnSemantics(connectionId, args)
+
+  armWaitPidfile(connectionId)
+  if (readDismissalState(connectionId)) {
+    writeStatePatch(connectionId, { wait_pid: process.pid, wait_armed_at: new Date().toISOString() })
+  }
 
   const pollMs = args.pollMs || POLL_MS
   const started = Date.now()
+  const deadline = resolveDeadline({ stream: args.stream, ownerAnchor, startedAt: started })
   process.stderr.write(
-    `devspec-remote-wait: watching ${file} offset=${offset} connection=${connectionId}\n`,
+    `devspec-remote-wait: watching ${file} offset=${offset} connection=${connectionId} ` +
+      `mode=${args.stream ? 'stream (session-scoped, wake=stdout line)' : 'one-shot (wake=exit 0)'} ` +
+      `deadline=${deadline === null ? `none (anchored to owner pid ${ownerAnchor})` : new Date(deadline).toISOString()}\n`,
   )
 
-  while (Date.now() - started < MAX_WAIT_MS) {
+  let delivered = 0
+  while (deadline === null || Date.now() < deadline) {
     const live = readState(connectionId)
     if (live && live.enabled === false) {
       process.stderr.write('devspec-remote-wait: disabled — exit 1\n')
-      process.exit(1)
+      process.exit(EXIT_TERMINAL)
     }
     if (ownerAnchor && !ownerAlive(ownerAnchor)) {
       process.stdout.write(
         JSON.stringify({ type: 'session_ended', reason: 'owner_gone', connection_id: connectionId }) + '\n',
       )
       process.stderr.write(`devspec-remote-wait: owner process ${ownerAnchor} gone — exit 1\n`)
-      process.exit(1)
+      process.exit(EXIT_TERMINAL)
     }
     if (live?.end_reason === 'ui' || live?.ended_from_ui) {
       process.stdout.write(
         JSON.stringify({ type: 'session_ended', reason: 'ended_from_ui', connection_id: connectionId }) + '\n',
       )
-      process.exit(1)
+      process.exit(EXIT_TERMINAL)
     }
 
-    const { lines, newOffset } = readNewLines(file, offset)
-    if (lines.length > 0) {
-      const batches = parseOwnerBatches(lines)
+    const records = readInboxRecords(file, offset)
+    if (records.length > 0) {
+      let deferred = false
+      for (const record of records) {
+        const [batch] = parseInboxBatches([record.line], connectionId)
+        if (batch) {
+          if (batch.type === DISMISSAL_RECORD_TYPE) {
+            const decision = dismissalDeliveryDecision(batch, readDismissalState(connectionId), connectionId)
+            if (decision === 'defer') {
+              deferred = true
+              break
+            }
+            if (decision === 'obsolete') {
+              offset = record.endOffset
+              continue
+            }
+          }
+          const events =
+            batch.type === 'canonical_commands'
+              ? buildCanonicalCommandEvents(batch, {
+                  inboxFile: file,
+                  unread: wakeNotice({ connectionId, sessionId: batch.session_id }),
+                })
+              : batch.type === 'canonical_control'
+                ? buildCanonicalControlEvents(batch, { inboxFile: file })
+                : batch.type === INTERACTION_ANSWER_RECORD_TYPE || batch.type === DISMISSAL_RECORD_TYPE
+                  ? batch.disposition === QUEUED
+                    ? buildQueuedAnswerEvents(batch, { inboxFile: file })
+                    : buildInteractionAnswerEvents(batch, { inboxFile: file })
+                  : batch.type === 'automation_run'
+                    ? buildAutomationRunEvents(batch, { inboxFile: file })
+                    : buildOwnerMessageEvents(batch, {
+                        inboxFile: file,
+                        attachmentDir: attachmentDirFor(connectionId),
+                      })
 
-      if (batches.length > 0) {
-        const attachmentDir = path.join(CONNECTIONS_DIR, `${connectionId}.attachments`)
-        await emitOwnerMessageBatches(batches, {
-          inboxFile: file,
-          attachmentDir,
-          newOffset,
-          writeFile: (target, buf) => {
-            fs.mkdirSync(path.dirname(target), { recursive: true })
-            fs.writeFileSync(target, buf, { mode: 0o600 })
-          },
-          commitOffset: (committedOffset) =>
-            writeStatePatch(connectionId, { inbox_byte_offset: committedOffset }),
-        })
-        offset = newOffset
-        process.stderr.write(
-          `devspec-remote-wait: wake (${batches.reduce((n, b) => n + b.messages.length, 0)} msg) — exit 0\n`,
-        )
-        process.exit(0)
+          if (batch.type === DISMISSAL_RECORD_TYPE) {
+            let emitted = false
+            for (const event of events) {
+              const decision = dismissalDeliveryDecision(batch, readDismissalState(connectionId), connectionId)
+              if (decision !== 'deliver') {
+                deferred = decision === 'defer'
+                break
+              }
+              await writeEventSequence([event])
+              emitted = true
+            }
+            if (deferred) break
+            if (!emitted) {
+              offset = record.endOffset
+              continue
+            }
+          } else {
+            await writeEventSequence(events)
+          }
+          delivered +=
+            batch.type === 'canonical_commands'
+              ? batch.execute_message_ids.length
+              : batch.type === 'owner_messages' && Array.isArray(batch.messages)
+                ? batch.messages.length
+                : 1
+        }
+        offset = record.endOffset
       }
 
-      // Non-command lines have no model-visible delivery to acknowledge.
-      offset = newOffset
-      writeStatePatch(connectionId, { inbox_byte_offset: offset })
+      commitDeliveredOffset(connectionId, offset)
+      if (deferred) {
+        await sleep(pollMs)
+        continue
+      }
+      if (delivered > 0) {
+        if (!args.stream) {
+          process.stderr.write(`devspec-remote-wait: wake (${delivered} msg) — exit 0\n`)
+          process.exit(EXIT_WAKE)
+        }
+        process.stderr.write(`devspec-remote-wait: streamed wake (${delivered} msg) — still watching\n`)
+        delivered = 0
+      }
     }
 
     await sleep(pollMs)
   }
 
-  process.stderr.write('devspec-remote-wait: max wait elapsed — exit 1\n')
-  process.exit(1)
+  if (args.stream) {
+    process.stdout.write(
+      JSON.stringify({
+        type: 'listener_rollover',
+        connection_id: connectionId,
+        reason: 'max_wait_elapsed',
+        note:
+          'The wake stream aged out after 24h. The connection is FINE and owner mail is ' +
+          'still landing in the inbox — re-arm the stream to keep waking on it. Your host ' +
+          'may label this exit a failure; it is not one. Nothing is lost: re-arm with ' +
+          '--stream --pending and the cursor resumes where this arm left off.',
+      }) + '\n',
+    )
+  }
+  process.stderr.write('devspec-remote-wait: max wait elapsed, connection is fine — exit 3 (re-arm)\n')
+  process.exit(EXIT_REARM)
 }
 
-// Run the CLI only when executed directly (skipped when imported for tests —
-// this module used to call main() unconditionally on import, which killed any
-// test file that imported its exports with "missing --connection-id").
 const isMain =
   Boolean(process.argv[1]) && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
 
