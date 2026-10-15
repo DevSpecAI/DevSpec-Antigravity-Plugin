@@ -12,7 +12,7 @@ Bring DevSpec into [Google Antigravity CLI](https://antigravity.google) (`agy`).
 
 ## What you can do with it
 
-- **⭐ Drive `agy` from your browser or phone (Remote Control).** Starting `agy` automatically registers a standby connection and starts the zero-token background poller, or run `/antigravity-devspec-autopilot-extension:devspec-remote` at any time to attach to a shared DevSpec session room. Teammates can follow along and add context in the same thread while server-verified owner and delegated commands drive the agent.
+- **⭐ Drive `agy` from your browser or phone (Remote Control).** Run `/antigravity-devspec-autopilot-extension:devspec-remote` in your terminal to connect this `agy` session to the DevSpec Agents page or attach it directly to a shared DevSpec session room. Teammates can follow along and add context in the same thread while server-verified owner and delegated commands drive the agent.
 - **Two-sided live transcript & subagent-aware turns.** Local prompts and final assistant responses are mirrored automatically from Antigravity's native `transcript.jsonl` (`PreInvocation` and `Stop` hooks). When Antigravity spawns background subagents (`invoke_subagent` / `send_message`), the plugin holds the remote turn open until all active subagents finish.
 - **Work a task end to end — or an ordered batch.** Point `agy` at an action item (or a list of items in order). It reserves the requested items, claims them one at a time, implements the change, runs checks, tags commits with `[devspec:<id>]`, and records implementation and criterion verdicts back to DevSpec.
 - **Verified commit provenance.** Automatic `PreToolUse` and `PostToolUse` hooks observe new git commits, track `[devspec:<id>]` commit trailers against claimed work items, and guard implementation reporting against unverified commit SHAs.
@@ -21,7 +21,7 @@ Bring DevSpec into [Google Antigravity CLI](https://antigravity.google) (`agy`).
   - **Room polls (`devspec-poll.mjs`):** Create, update, end, retract, or supersede structured room polls (with optional recommendations and write-ins) without blocking the agent turn.
   - **Directed questions (`devspec-question.mjs`):** Ask a specific person a `text`, `single_select`, or `multi_select` question in the room. When they answer or dismiss it in DevSpec, the poller delivers the canonical interaction or dismissal event and re-opens the exact continuation channel.
 - **Automatic project grounding, pin checks & repo-link nudges.** Starting a session grounds `agy` with your project summary, conventions, and active work. Writing a `.devspec/project.json` pin is validated immediately, and adding a new git remote to a pinned greenfield folder nudges you once if the repository isn't linked in DevSpec yet.
-- **Live status bar & runtime telemetry.** `SessionStart` automatically configures `scripts/statusline.mjs` in `~/.gemini/antigravity-cli/settings.json` to render a concise DevSpec status bar (`DevSpec: <Codename> · <Project> · “<Session>” · automation “<name>” · working on “<title>” (<code>) · <model> (<context%>%)`) with automatic session-title refresh (`scripts/session-title.mjs`) and forwards model and context-window telemetry on `heartbeat_connection`.
+- **Live status bar & runtime telemetry.** `SessionStart` automatically configures `scripts/statusline.mjs` in `~/.gemini/antigravity-cli/settings.json` to render a concise DevSpec status bar (`DevSpec: local (/devspec-remote to connect) · <Project>` before connecting, or `DevSpec: <Codename> · <Project> · “<Session>” · automation “<name>” · working on “<title>” (<code>) · <model> (<context%>%)` when connected) with automatic session-title refresh (`scripts/session-title.mjs`) and forwards model and context-window telemetry on `heartbeat_connection`.
 
 ---
 
@@ -85,13 +85,13 @@ New-Item -ItemType Directory -Force "$HOME\.gemini\config\plugins" | Out-Null
 git clone https://github.com/DevSpecAI/DevSpec-Antigravity-Plugin.git "$HOME\.gemini\config\plugins\antigravity-devspec-autopilot-extension"
 ```
 
-### 3. Start `agy`
+### 3. Start `agy` and run `/antigravity-devspec-autopilot-extension:devspec-remote` when you want remote control
 
 Start `agy` in any project directory. On startup, the plugin automatically:
 - Loads `rules/AGENTS.md` into `<user_rules>` so Antigravity has the complete DevSpec lazy MCP tool schemas, ~6 KB spill handling, symmetric session-reply rules, local room-context rules, and implementation-contract rules in every project.
-- Configures the DevSpec status bar (`statusLine`) in `~/.gemini/antigravity-cli/settings.json` (if no custom `statusLine` is already set).
-- Verifies your `dvs_` token against DevSpec, registers this `agy` session on the **Agents page**, caches your personal and project instruction rules (`<connectionId>.rules.md`), and starts the background poller (`DEVSPEC_CONNECT_AT_STARTUP=0` to opt out).
-- Injects initial project grounding and the four DevSpec instruction tiers (`owner_agent_rules`, `custom_instructions`, `agent_rules`, `workflow_guidance`) when the repository matches a DevSpec project.
+- Configures the DevSpec status bar (`statusLine`) in `~/.gemini/antigravity-cli/settings.json` (if no custom `statusLine` is already set), showing `DevSpec: local (/devspec-remote to connect) · <Project>` until you connect.
+- Injects initial project grounding when you start a local conversation in a repository linked to a DevSpec project.
+- When you want to connect your terminal to the **Agents page** or a **Session room** in DevSpec so it can receive remote commands, run `/antigravity-devspec-autopilot-extension:devspec-remote` (because `agy` only exposes `ANTIGRAVITY_CSRF_TOKEN` and `ANTIGRAVITY_LS_ADDRESS` to child processes of `/devspec-remote`'s tool execution, running `/devspec-remote` is what arms zero-token background wake delivery via `agentapi`).
 
 > **Updating:** When the Agents page in DevSpec shows an **Update** badge on your Antigravity connection, run `git -C ~/.gemini/config/plugins/antigravity-devspec-autopilot-extension pull` and start a new `agy` session.
 
@@ -105,16 +105,16 @@ Remote control lets you run a real `agy` session on your machine and steer it fr
 
 | Skill | What it does |
 |---|---|
-| `/antigravity-devspec-autopilot-extension:devspec-remote` | Run the one-shot mechanical connect script (`scripts/devspec-remote-connect.mjs`) to register or attach this `agy` conversation, cache instruction rules, start the poller, and arm `scripts/devspec-remote-wait.mjs` in the background. |
-| `/antigravity-devspec-autopilot-extension:devspec-remote-stop` | Disconnect this `agy` conversation from DevSpec and stop its poller (leaving any other active connections untouched). |
+| `/antigravity-devspec-autopilot-extension:devspec-remote` | Run the one-shot mechanical connect script (`scripts/devspec-remote-connect.mjs`) to register or attach this `agy` conversation, cache instruction rules, start the poller, and arm the persistent background listener (`scripts/devspec-remote-listen.mjs`). |
+| `/antigravity-devspec-autopilot-extension:devspec-remote-stop` | Disconnect this `agy` conversation from DevSpec and stop its poller and listener (leaving any other active connections untouched). |
 
-You can connect in three ways:
+You can connect in three ways using `/antigravity-devspec-autopilot-extension:devspec-remote`:
 
-1. **Automatic standby on the Agents page:** Starting `agy` with a valid `dvs_` token automatically registers your session on the Agents page with a codename (e.g. `Cosmic Raven`) and starts the background poller. You can also run `/antigravity-devspec-autopilot-extension:devspec-remote` manually at any time.
+1. **Standby on the Agents page (bare command):** Run `/antigravity-devspec-autopilot-extension:devspec-remote` in your terminal to register this `agy` conversation on the Agents page with a codename (e.g. `Cosmic Raven`) and arm the background poller + listener so you can attach it to any room from the DevSpec UI.
 2. **Attach to an existing DevSpec session:** Copy the connect command from a session's settings panel in DevSpec (or pass the session UUID) and run `/antigravity-devspec-autopilot-extension:devspec-remote --session <session-id>`.
 3. **Create and attach a new session:** Run `/antigravity-devspec-autopilot-extension:devspec-remote --new` (with an optional `--title "..."`) to create a fresh shared room and attach immediately.
 
-While waiting for instructions, a lightweight local Node poller (`scripts/devspec-remote-poll.mjs`) holds the long-poll connection to DevSpec, materializes room messages and room state to local files (`<connectionId>.transcript.jsonl`, `<connectionId>.room.json`, `<connectionId>.cursor.json`, `<connectionId>.rules.md`), and wakes the agent through `scripts/devspec-remote-wait.mjs` — **zero LLM tokens are spent while idle**, and room messages are never re-injected across turns unless read on demand (`scripts/room-unread.mjs`).
+While waiting for instructions, a lightweight local Node poller (`scripts/devspec-remote-poll.mjs`) holds the long-poll connection to DevSpec, materializes room messages and room state to local files (`<connectionId>.transcript.jsonl`, `<connectionId>.room.json`, `<connectionId>.cursor.json`, `<connectionId>.rules.md`), and the persistent background listener (`scripts/devspec-remote-listen.mjs`) delivers wakes directly into your active `agy` conversation via `agentapi send-message` — **zero LLM tokens are spent while idle**, and room messages are never re-injected across turns unless read on demand (`scripts/room-unread.mjs`).
 
 ### Shared session plans, room polls, and directed questions
 

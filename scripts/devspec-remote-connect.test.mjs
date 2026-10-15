@@ -424,19 +424,28 @@ describe('Window-open auto-connect & owner_pid startup connection rebonding', ()
       })
       assert.equal(action.local_id, CONV_ID)
 
-      // 3. maybeSpawnWindowAutoConnect spawns once per ownerPid and respects the lockfile
+      // 3. maybeSpawnWindowAutoConnect is disabled by default unless opted in, and when opted in spawns once per ownerPid
       const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-spawn-cwd-'))
       fs.mkdirSync(path.join(cwd, '.devspec'), { recursive: true })
       fs.writeFileSync(
         path.join(cwd, '.devspec', 'project.json'),
         JSON.stringify({ project_id: PROJ_ID }),
       )
+      const defaultDisabled = maybeSpawnWindowAutoConnect({
+        cwd,
+        ownerPid: 99999,
+        home,
+        env: { DEVSPEC_MCP_TOKEN: 'dvs_valid_test_token_123456' },
+      })
+      assert.equal(defaultDisabled.spawned, false)
+      assert.equal(defaultDisabled.reason, 'disabled_or_unconfigured')
+
       const spawns = []
       const firstSpawn = maybeSpawnWindowAutoConnect({
         cwd,
         ownerPid: 99999,
         home,
-        env: { DEVSPEC_MCP_TOKEN: 'dvs_valid_test_token_123456' },
+        env: { DEVSPEC_MCP_TOKEN: 'dvs_valid_test_token_123456', DEVSPEC_CONNECT_AT_STARTUP: '1' },
         spawnImpl: (cmd, args) => {
           spawns.push({ cmd, args })
           return { pid: 12345, unref() {} }
@@ -449,7 +458,7 @@ describe('Window-open auto-connect & owner_pid startup connection rebonding', ()
         cwd,
         ownerPid: 99999,
         home,
-        env: { DEVSPEC_MCP_TOKEN: 'dvs_valid_test_token_123456' },
+        env: { DEVSPEC_MCP_TOKEN: 'dvs_valid_test_token_123456', DEVSPEC_CONNECT_AT_STARTUP: '1' },
         spawnImpl: () => {
           throw new Error('should not spawn twice while lock is fresh')
         },
@@ -894,7 +903,7 @@ describe('Wandering Otter zombie & Working status regression guards (item bbf7b6
         cwd,
         ownerPid: process.pid,
         home,
-        env: { DEVSPEC_MCP_TOKEN: 'dvs_valid_test_token_123456' },
+        env: { DEVSPEC_MCP_TOKEN: 'dvs_valid_test_token_123456', DEVSPEC_CONNECT_AT_STARTUP: '1' },
         spawnImpl: () => {
           throw new Error('must not spawn when owner_pid already has a connection file')
         },
@@ -1042,6 +1051,43 @@ describe('Wandering Otter zombie & Working status regression guards (item bbf7b6
       'utf8',
     )
     assert.ok(serializedBytes <= 24_000, `expected <= 24000 bytes, got ${serializedBytes}`)
+  })
+
+  it('v0.16.0: renderStatusLine shows local (/devspec-remote to connect) · <Project> when opened in a DevSpec project before /devspec-remote is run', async () => {
+    const { renderStatusLine } = await import('./statusline.mjs')
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-v016-home-'))
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-v016-cwd-'))
+    fs.mkdirSync(path.join(cwd, '.devspec'), { recursive: true })
+    fs.writeFileSync(
+      path.join(cwd, '.devspec', 'project.json'),
+      JSON.stringify({ project_id: PROJ_ID, project_name: 'DevSpec' }),
+    )
+    try {
+      const line = renderStatusLine(
+        JSON.stringify({
+          cwd,
+          model: { id: 'Gemini 4 Argon (High)', display_name: 'Gemini 4 Argon (High)' },
+          context_window: { percent: 5 },
+        }),
+        {
+          home,
+          env: { HOME: home, DEVSPEC_MCP_TOKEN: 'dvs_valid_test_token_123456' },
+        },
+      )
+      assert.equal(
+        line,
+        'DevSpec: local (/devspec-remote to connect) · DevSpec · Gemini 4 Argon (5%)',
+      )
+      const connDir = path.join(home, '.devspec', 'remote-control', 'connections')
+      assert.equal(
+        fs.existsSync(connDir),
+        false,
+        'renderStatusLine must not auto-spawn a background connection on window open',
+      )
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
   })
 })
 

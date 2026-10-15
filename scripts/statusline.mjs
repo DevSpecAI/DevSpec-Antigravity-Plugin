@@ -494,7 +494,37 @@ export function readConnectionView({
   const rawConnProjName = cleanLabel(connection?.project_name || bond?.project_name || '')
   const connectionProjectName =
     rawConnProjName && !UUID_RE.test(rawConnProjName) ? rawConnProjName : ''
-  const resolvedProjectName = convProjectName || connectionProjectName || pinProjectName
+  let cwdProjectName = ''
+  if (!connection && effectiveCwd) {
+    try {
+      const connDir = path.join(home, REMOTE_DIR, 'connections')
+      if (fs.existsSync(connDir)) {
+        let bestMtime = -1
+        for (const f of fs.readdirSync(connDir)) {
+          if (!/^[0-9a-f-]{36}\.json$/i.test(f)) continue
+          const fullPath = path.join(connDir, f)
+          const parsed = parseJson(fs.readFileSync(fullPath, 'utf8'))
+          if (!parsed || parsed.cwd !== effectiveCwd) continue
+          const candidate = cleanLabel(parsed.project_name || '')
+          if (!candidate || UUID_RE.test(candidate)) continue
+          let mtime = 0
+          try {
+            mtime = fs.statSync(fullPath).mtimeMs
+          } catch {
+            mtime = 0
+          }
+          if (mtime >= bestMtime) {
+            cwdProjectName = candidate
+            bestMtime = mtime
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  const resolvedProjectName =
+    convProjectName || connectionProjectName || pinProjectName || cwdProjectName
 
   const work = []
   const workItems = []
@@ -571,7 +601,17 @@ export function readConnectionView({
     }
   }
 
-  if (!connection && !pin && work.length === 0 && !automation) return null
+  const hasGitRemote = Boolean(effectiveCwd && gitRemoteOrigin(effectiveCwd))
+  if (
+    !connection &&
+    !pin &&
+    !resolvedProjectName &&
+    !hasGitRemote &&
+    work.length === 0 &&
+    !automation
+  ) {
+    return null
+  }
 
   if (!connection) {
     return {
@@ -625,7 +665,8 @@ export function readConnectionView({
 
 /**
  * Trigger a non-blocking background auto-connect once when an Antigravity window
- * opens in a linked repository before any prompt has been typed.
+ * opens in a linked repository before any prompt has been typed (only when explicitly
+ * opted in via `DEVSPEC_CONNECT_AT_STARTUP=1` or `.devspec/project.json` `connect_at_startup: true`).
  */
 export function maybeSpawnWindowAutoConnect({
   cwd,
@@ -726,6 +767,8 @@ export function formatStatusLine(view, work = [], telemetry = null) {
     parts.push(`${view.codename || 'connected'} · ended from DevSpec`)
   } else if (view.state === 'disconnected') {
     parts.push(`${view.codename || 'connected'} · disconnected`)
+  } else if (view.state === 'local') {
+    parts.push('local (/devspec-remote to connect)')
   }
   if (view.projectName) parts.push(view.projectName)
   if (view.sessionId) {
@@ -794,9 +837,6 @@ export function renderStatusLine(rawInput = '', { home = os.homedir(), env = pro
       const auth = resolveDevspecMcpAuth(cwd || process.cwd(), { home, env })
       if (!auth.ok) {
         return 'DevSpec: not configured — add dvs_ token to ~/.gemini/config/mcp_config.json'
-      }
-      if (cwd) {
-        maybeSpawnWindowAutoConnect({ cwd, conversationId, home, env })
       }
     }
     if (!view) return ''

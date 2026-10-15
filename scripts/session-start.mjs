@@ -166,31 +166,40 @@ export function ensureStatusLineConfigured({
 }
 
 /**
- * Determine whether startup auto-connect is enabled via environment, `.devspec/project.json`,
- * or the presence of a valid DevSpec MCP token (unless explicitly disabled).
+ * Determine whether startup auto-connect is enabled via environment (`DEVSPEC_CONNECT_AT_STARTUP=1`)
+ * or `.devspec/project.json` (`connect_at_startup: true`).
+ * Defaults to `false` in Antigravity because `agy` only exposes `ANTIGRAVITY_CSRF_TOKEN` and
+ * `ANTIGRAVITY_LS_ADDRESS` to child processes of the `run_command` tool (invoked by
+ * `/antigravity-devspec-autopilot-extension:devspec-remote`), so connections registered at startup
+ * before `/devspec-remote` is run cannot receive remote wakes via `agentapi`.
  */
 export function connectAtStartupEnabled(
   env = process.env,
   { cwd = process.cwd(), home = undefined } = {},
 ) {
+  let explicitlyEnabled = false
   const rawEnv = String(
     env?.DEVSPEC_CONNECT_AT_STARTUP ?? env?.DEVSPEC_AUTO_CONNECT ?? '',
   )
     .trim()
     .toLowerCase()
-  if (rawEnv === '1' || rawEnv === 'true' || rawEnv === 'yes') return true
   if (rawEnv === '0' || rawEnv === 'false' || rawEnv === 'no') return false
+  if (rawEnv === '1' || rawEnv === 'true' || rawEnv === 'yes') explicitlyEnabled = true
 
-  try {
-    const pinPath = path.join(cwd, '.devspec', 'project.json')
-    if (fs.existsSync(pinPath)) {
-      const pin = JSON.parse(fs.readFileSync(pinPath, 'utf8'))
-      if (pin?.connect_at_startup === false || pin?.auto_connect === false) return false
-      if (pin?.connect_at_startup === true || pin?.auto_connect === true) return true
+  if (!explicitlyEnabled) {
+    try {
+      const pinPath = path.join(cwd, '.devspec', 'project.json')
+      if (fs.existsSync(pinPath)) {
+        const pin = JSON.parse(fs.readFileSync(pinPath, 'utf8'))
+        if (pin?.connect_at_startup === false || pin?.auto_connect === false) return false
+        if (pin?.connect_at_startup === true || pin?.auto_connect === true) explicitlyEnabled = true
+      }
+    } catch {
+      /* ignore */
     }
-  } catch {
-    /* ignore */
   }
+
+  if (!explicitlyEnabled) return false
 
   const effectiveHome = home || env?.HOME || os.homedir()
   const auth = resolveDevspecMcpAuth(cwd, {

@@ -515,10 +515,17 @@ describe('Item 5 Parity: statusline.mjs rendering and telemetry', () => {
     assert.equal(cfg2.updated, false)
     assert.equal(cfg2.reason, 'already_configured')
 
-    // 2. connectAtStartupEnabled defaults to true when valid token is configured, unless disabled
+    // 2. connectAtStartupEnabled defaults to false in Antigravity unless explicitly opted in
     assert.equal(connectAtStartupEnabled({}, { cwd, home }), false)
     assert.equal(
       connectAtStartupEnabled({ DEVSPEC_MCP_TOKEN: 'dvs_valid_test_token_123456' }, { cwd, home }),
+      false,
+    )
+    assert.equal(
+      connectAtStartupEnabled(
+        { DEVSPEC_MCP_TOKEN: 'dvs_valid_test_token_123456', DEVSPEC_CONNECT_AT_STARTUP: '1' },
+        { cwd, home },
+      ),
       true,
     )
     assert.equal(

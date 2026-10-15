@@ -5,7 +5,7 @@ description: "Connect this Antigravity session to DevSpec as a first-class agent
 
 # DevSpec Remote Control (connection-native)
 
-Register **this** local Antigravity session as a first-class DevSpec **connection**: it appears on the **Agents page** as an available agent, can be driven from phone/web, and — when attached to a session — mirrors its turns into that session's transcript.
+Register **this** local Antigravity session as a first-class DevSpec **connection**: it appears on the **Agents page** as an available agent, can be driven from phone/web, and — when attached to a session — mirrors its turns into that session's transcript. Because `agy` only exposes `ANTIGRAVITY_CSRF_TOKEN` and `ANTIGRAVITY_LS_ADDRESS` to child processes of `run_command`, running `/antigravity-devspec-autopilot-extension:devspec-remote` is the explicit entrypoint that registers the connection and arms zero-token background wake delivery via `agentapi`.
 
 ## DevSpec work contract
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.16.0
+
+### Explicit `/devspec-remote` connection model and `local (/devspec-remote to connect)` status bar indicator
+
+- **Make `/antigravity-devspec-autopilot-extension:devspec-remote` the explicit remote-control entrypoint (`scripts/session-start.mjs`, `scripts/statusline.mjs`):** Because Antigravity (`agy`) only exposes `ANTIGRAVITY_CSRF_TOKEN`, `ANTIGRAVITY_LS_ADDRESS`, and `ANTIGRAVITY_AGENTAPI_EXE` to child processes of the `run_command` tool (never to `statusLine` or `SessionStart`), connections registered automatically on window open before `/devspec-remote` was run had no `ANTIGRAVITY_CSRF_TOKEN` and could not receive remote wakes via `agentapi`. `connectAtStartupEnabled` in `scripts/session-start.mjs` now defaults to `false` (unless explicitly opted in via `DEVSPEC_CONNECT_AT_STARTUP=1` or `.devspec/project.json` `connect_at_startup: true`), and `renderStatusLine` in `scripts/statusline.mjs` no longer spawns background connections on window open.
+- **Clear `local (/devspec-remote to connect)` status bar indicator before connecting (`scripts/statusline.mjs`):** When an Antigravity terminal is opened in a linked DevSpec project or git repository before `/devspec-remote` has been run (`view.state === 'local'`), `readConnectionView` and `formatStatusLine` now display `DevSpec: local (/devspec-remote to connect) · <Project>` (resolving `<Project>` from `.devspec/project.json`, conversation selection, or the most recent connection in that workspace) instead of registering an unwakeable standby connection.
+- **Documentation alignment (`README.md`, `skills/devspec-remote/SKILL.md`, `docs/remote-control/remote-control-antigravity.md`):** Updated setup and remote-control documentation to clearly state that running `/antigravity-devspec-autopilot-extension:devspec-remote` is the way to connect an Antigravity terminal to DevSpec remote control.
+
 ## 0.15.9
 
 ### Zombie resurrection prevention on window close, accurate `Working` status upon wake delivery, HTTP LS port discovery, and `PreToolUse` >64 KB trail cap

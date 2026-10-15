@@ -21,14 +21,14 @@ Antigravity is **not** OpenCode-native inject and **not** the Codex app-server b
 
 | Topic | Antigravity |
 |---|---|
-| Invoke remote | One-shot `scripts/devspec-remote-connect.mjs` + background `scripts/devspec-remote-wait.mjs` via `devspec-remote` / `devspec-remote-stop` skills |
+| Invoke remote | Explicit `/antigravity-devspec-autopilot-extension:devspec-remote` (`scripts/devspec-remote-connect.mjs`) captures `ANTIGRAVITY_CSRF_TOKEN` + `ANTIGRAVITY_LS_ADDRESS` from `run_command` and starts `scripts/devspec-remote-poll.mjs` + `scripts/devspec-remote-listen.mjs` (`agentapi` wake delivery, or `scripts/devspec-remote-wait.mjs` fallback) |
 | Plugin rules | `rules/AGENTS.md` loaded automatically by `agy` when the plugin is enabled; personal + project rules cached to `<connectionId>.rules.md` (`scripts/instruction-rules.mjs`) |
 | Bond id | Host conversation / session env or native hook stdin (`conversation_id` / `session_id`) — never invent an id that won’t survive the next turn |
 | Agent name | `Antigravity` via `agent-identity` (no silent fallback to another host’s name) |
 | Local room state | `<connectionId>.transcript.jsonl`, `<connectionId>.room.json`, `<connectionId>.cursor.json` read on demand via `scripts/room-unread.mjs` |
 | Scripts | Owned and tested in this plugin; never copied from or synchronized with another host plugin |
 | Plans, Polls & Questions | Capability-backed `scripts/devspec-plan.mjs`, `scripts/devspec-poll.mjs`, and `scripts/devspec-question.mjs` are discovered on demand; no extra hot skill or broad allowlist |
-| Status & Telemetry | `scripts/statusline.mjs` + `scripts/session-title.mjs` render status bar (codename, project, refreshed session title, active automation, claimed action item title + short code, model + context%) and record `<connectionId>.telemetry.json` attached to `heartbeat_connection` |
+| Status & Telemetry | `scripts/statusline.mjs` + `scripts/session-title.mjs` render status bar (`local (/devspec-remote to connect)` before connecting; codename, project, refreshed session title, active automation, claimed action item title + short code, model + context% when connected) and record `<connectionId>.telemetry.json` attached to `heartbeat_connection` |
 
 ## Host limitation
 
