@@ -5,7 +5,7 @@
  * When a connection is working on an answered directed question, a conversational
  * command that arrives behind it is held back by the server (`delivery_retry`) until
  * that question's turn finishes. The server now advertises that held command on
- * `poll_connection` via `command_offers` (availability only — no body, no authority,
+ * `poll_connection` in its `command_offer` sidecar (availability only — no body, no authority,
  * no cursor movement) and lets this poller declare `command_handoff_ready` on the
  * next poll once the answer has been durably delivered into the model's wake stream,
  * retiring the question's attempt and delivering the canonical command in one move.

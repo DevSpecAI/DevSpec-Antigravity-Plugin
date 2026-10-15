@@ -554,4 +554,182 @@ describe('Item 5 Parity: statusline.mjs rendering and telemetry', () => {
     assert.deepEqual(Object.keys(protoStart), ['injectSteps'])
     assert.equal(protoStart.hookSpecificOutput, undefined)
   })
+
+  it('tracks session-title.mjs, claimed action item titles, and active automation runs across call_mcp_tool and helper scripts', async () => {
+    const { readSessionTitle, sessionTitleReadDue, UNTITLED_RETRY_MS } = await import(
+      './session-title.mjs'
+    )
+    const {
+      canonicalRepo,
+      handlePost,
+      readActiveAutomation,
+      readClaimDetails,
+      readClaimedWorkItems,
+    } = await import('./commit-provenance.mjs')
+
+    // 1. session-title.mjs cadence and readSessionTitle
+    assert.equal(sessionTitleReadDue({ sessionId: null, state: {} }), false)
+    assert.equal(
+      sessionTitleReadDue({ sessionId: SESS_ID, state: {}, lastAttemptAt: 0, now: 1000 }),
+      true,
+    )
+    assert.equal(
+      sessionTitleReadDue({
+        sessionId: SESS_ID,
+        state: { session_title_for: SESS_ID, session_title: 'New session' },
+        lastAttemptAt: 1000,
+        now: 1000 + UNTITLED_RETRY_MS - 1,
+      }),
+      false,
+    )
+    assert.equal(
+      sessionTitleReadDue({
+        sessionId: SESS_ID,
+        state: { session_title_for: SESS_ID, session_title: 'New session' },
+        lastAttemptAt: 1000,
+        now: 1000 + UNTITLED_RETRY_MS,
+      }),
+      true,
+    )
+    assert.equal(
+      sessionTitleReadDue({
+        sessionId: SESS_ID,
+        state: { session_title_for: SESS_ID, session_title: 'Fix login redirect' },
+        lastAttemptAt: 1000,
+        now: 1000 + UNTITLED_RETRY_MS * 10,
+      }),
+      false,
+    )
+
+    const fetchedTitle = await readSessionTitle({
+      call: async (req) => {
+        assert.equal(req.name, 'get_session_transcript')
+        assert.equal(req.arguments.session_id, SESS_ID)
+        assert.equal(req.arguments.limit, 1)
+        return { id: SESS_ID, title: 'Fix login redirect' }
+      },
+      mcpUrl: 'https://devspec.ai/api/mcp',
+      token: 'dvs_test',
+      sessionId: SESS_ID,
+    })
+    assert.equal(fetchedTitle, 'Fix login redirect')
+
+    // 2. Claiming action item with title via Antigravity call_mcp_tool and rendering in statusline
+    const home = makeTempHome()
+    const provDir = path.join(home, 'prov')
+    const env = { ...process.env, DEVSPEC_ANTIGRAVITY_STATE_DIR: provDir }
+    writeConnectionState(home, CONN_ID, { project_name: 'DevSpec' })
+    const bondDir = path.join(home, '.devspec', 'remote-control', 'local', 'antigravity')
+    fs.mkdirSync(bondDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(bondDir, 'conv-title-auto.json'),
+      JSON.stringify({ connection_id: CONN_ID, local_id: 'conv-title-auto' }),
+    )
+
+    const itemId = '2e2fd410-1f8d-46f0-a31c-f0d4497e8c73'
+    handlePost(
+      {
+        conversation_id: 'conv-title-auto',
+        cwd: home,
+        tool_name: 'default_api:call_mcp_tool',
+        tool_input: {
+          ServerName: 'devspec',
+          ToolName: 'claim_work_item',
+          Arguments: { action_item_id: itemId },
+        },
+        tool_response: JSON.stringify({
+          id: itemId,
+          title: 'Parity 4: Status Bar Rich Context',
+          claim_success: true,
+          work_claim_ref: '890207ab-b69f-4f6a-9ae7-ca3e3612754e',
+        }),
+      },
+      { env },
+    )
+
+    const scope = { sessionId: 'conv-title-auto', repoRoot: canonicalRepo(home) }
+    const claimedItems = readClaimedWorkItems(scope, { env })
+    assert.equal(claimedItems.length, 1)
+    assert.equal(claimedItems[0].id, itemId)
+    assert.equal(claimedItems[0].title, 'Parity 4: Status Bar Rich Context')
+    assert.equal(
+      readClaimDetails(scope, { env })?.work_claim_ref,
+      '890207ab-b69f-4f6a-9ae7-ca3e3612754e',
+    )
+
+    const statusWithWork = renderStatusLine(
+      JSON.stringify({ conversation_id: 'conv-title-auto', cwd: home }),
+      { home, env },
+    )
+    assert.match(statusWithWork, /DevSpec: Cosmic Raven · DevSpec · “Parity Session”/)
+    assert.match(
+      statusWithWork,
+      /working on “Parity 4: Status Bar Rich Context” \(2e2fd410\)/,
+    )
+
+    // 3. Claiming automation run via helper script (run_command) and clearing on record_automation_run
+    const runId = 'aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb'
+    handlePost(
+      {
+        conversation_id: 'conv-title-auto',
+        cwd: home,
+        tool_name: 'run_command',
+        tool_input: {
+          CommandLine: `node -e "mcpToolsCall({ name: 'claim_automation_run', arguments: { run_id: '${runId}' } })"`,
+        },
+        tool_response: {
+          stdout: JSON.stringify({
+            claimed: true,
+            run: { id: runId, automation_name: 'Nightly Smoke Suite' },
+            automation: { id: 'cccccccc-1111-4222-8333-dddddddddddd', name: 'Nightly Smoke Suite' },
+          }),
+        },
+      },
+      { env },
+    )
+
+    const activeAuto = readActiveAutomation(scope, { env })
+    assert.equal(activeAuto?.run_id, runId)
+    assert.equal(activeAuto?.automation_name, 'Nightly Smoke Suite')
+
+    const statusWithAuto = renderStatusLine(
+      JSON.stringify({ conversation_id: 'conv-title-auto', cwd: home }),
+      { home, env },
+    )
+    assert.match(statusWithAuto, /automation “Nightly Smoke Suite”/)
+
+    // Release work item and record automation run
+    handlePost(
+      {
+        conversation_id: 'conv-title-auto',
+        cwd: home,
+        tool_name: 'call_mcp_tool',
+        tool_input: {
+          ServerName: 'devspec',
+          ToolName: 'record_implementation',
+          Arguments: { action_item_id: itemId },
+        },
+        tool_response: JSON.stringify({ id: itemId, lifecycle: 'done' }),
+      },
+      { env },
+    )
+    handlePost(
+      {
+        conversation_id: 'conv-title-auto',
+        cwd: home,
+        tool_name: 'call_mcp_tool',
+        tool_input: {
+          ServerName: 'devspec',
+          ToolName: 'record_automation_run',
+          Arguments: { run_id: runId },
+        },
+        tool_response: JSON.stringify({ ok: true, run_id: runId }),
+      },
+      { env },
+    )
+
+    assert.equal(readClaimedWorkItems(scope, { env }).length, 0)
+    assert.equal(readActiveAutomation(scope, { env }), null)
+  })
 })
+

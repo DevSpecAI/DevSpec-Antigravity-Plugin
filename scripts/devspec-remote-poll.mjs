@@ -111,6 +111,7 @@ import {
   transcriptPollArguments,
   transcriptSummary,
 } from './room-transcript.mjs'
+import { readSessionTitle, sessionTitleReadDue } from './session-title.mjs'
 import { readConnectionTelemetry } from './statusline.mjs'
 
 export const REMOTE_INGRESS_VERSION = 1
@@ -1468,6 +1469,29 @@ async function main() {
   let roomFileSeen = {}
   let transcriptStore = sessionId ? loadTranscriptStore(connectionId, sessionId) : null
   let redrainRequested = false
+  let titleReadAt = 0
+  let titleReadInFlight = false
+
+  function refreshSessionTitle(liveState) {
+    if (
+      titleReadInFlight ||
+      !sessionTitleReadDue({ sessionId, state: liveState, lastAttemptAt: titleReadAt })
+    ) {
+      return
+    }
+    const forSession = sessionId
+    titleReadInFlight = true
+    titleReadAt = Date.now()
+    readSessionTitle({ call: mcpToolsCall, mcpUrl, token, sessionId: forSession })
+      .then((title) => {
+        if (title !== null && sessionId === forSession) {
+          patchState({ session_title: title, session_title_for: forSession })
+        }
+      })
+      .finally(() => {
+        titleReadInFlight = false
+      })
+  }
 
   function considerCommandOffer(res) {
     let parsed
@@ -2077,6 +2101,7 @@ async function main() {
       process.stderr.write('devspec-remote-poll: disabled — exiting\n')
       process.exit(1)
     }
+    refreshSessionTitle(liveState)
     if (
       typeof liveState?.connection_capability === 'string' &&
       liveState.connection_capability
@@ -2236,6 +2261,7 @@ async function main() {
       liveCursorV2 = null
       catchUpCursor = null
       needsSeed = true
+      titleReadAt = 0
       transcriptStore = sessionId ? loadTranscriptStore(connectionId, sessionId) : null
       redrainRequested = false
       roomAnnounced = {}

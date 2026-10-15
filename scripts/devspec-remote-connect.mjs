@@ -464,7 +464,7 @@ export async function connect(options = {}, deps = {}) {
     localId,
     ownerPid: effectiveOwnerPid,
     codename,
-    title,
+    title: title || registration.session_title || registration.title || null,
     instructionTiers:
       registration.instruction_tiers_hash && registration.instruction_tiers_version
         ? {

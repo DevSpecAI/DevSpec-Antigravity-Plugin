@@ -63,6 +63,7 @@ import {
   stripConnectionCapability,
 } from './connection-capability-state.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
+import { saveConversationProject } from './conversation-project.mjs'
 import { findProjectPin, gitRemoteOrigin } from './devspec-scope.mjs'
 
 const DEVSPEC_DIR = path.join(os.homedir(), '.devspec')
@@ -1159,11 +1160,25 @@ export function rebondConnectionToConversation({
     session_id: state.session_id ?? null,
     session_codename: state.session_codename ?? null,
     title: state.title ?? null,
+    project_id: state.project_id ?? null,
+    ...(state.project_name ? { project_name: state.project_name } : {}),
     cwd: state.cwd ?? null,
     end_reason: null,
     cursor_after_message_id: state.cursor_after_message_id || null,
     transcript_path: resolvedTranscriptPath,
   })
+  if (state.project_id && state.project_name && state.mcp_url) {
+    try {
+      saveConversationProject(
+        id,
+        state.mcp_url,
+        { id: state.project_id, name: state.project_name },
+        'folder',
+      )
+    } catch {
+      /* non-fatal */
+    }
+  }
   writeJson(perPath, {
     ...state,
     local_id: id,
@@ -1304,6 +1319,8 @@ export async function writeConnectionState({
         session_id: sessionId,
         session_codename: state.session_codename,
         title: state.title,
+        project_id: projectId,
+        ...(projectName ? { project_name: projectName } : {}),
         cwd,
         end_reason: null,
         cursor_after_message_id: prev.cursor_after_message_id || null,
@@ -1311,6 +1328,19 @@ export async function writeConnectionState({
       },
       rcDir,
     )
+    if (projectId && projectName && state.mcp_url) {
+      try {
+        saveConversationProject(
+          localId,
+          state.mcp_url,
+          { id: projectId, name: projectName },
+          'conversation',
+          { home },
+        )
+      } catch {
+        /* non-fatal */
+      }
+    }
   }
 
   const result = {

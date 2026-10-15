@@ -18,7 +18,12 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AGENT_NAME } from './agent-identity.mjs'
-import { canonicalRepo, readClaims } from './commit-provenance.mjs'
+import {
+  canonicalRepo,
+  readActiveAutomation,
+  readClaimedWorkItems,
+  readClaims,
+} from './commit-provenance.mjs'
 import { readConversationProject } from './conversation-project.mjs'
 import { findProjectPin, gitRemoteOrigin } from './devspec-scope.mjs'
 import { resolveOwnConnectionId } from './launch-guard.mjs'
@@ -401,7 +406,8 @@ export function readConnectionView({
   if (pin?.path) {
     try {
       const rawPin = parseJson(fs.readFileSync(pin.path, 'utf8'))
-      pinProjectName = cleanLabel(rawPin?.project_name || '')
+      const candidate = cleanLabel(rawPin?.project_name || '')
+      if (candidate && !UUID_RE.test(candidate)) pinProjectName = candidate
     } catch {
       /* ignore */
     }
@@ -411,31 +417,54 @@ export function readConnectionView({
     try {
       const cp = readConversationProject(conversationId, { home })
       if (cp?.status === 'selected' && cp.project?.name) {
-        convProjectName = cleanLabel(cp.project.name)
+        const candidate = cleanLabel(cp.project.name)
+        if (candidate && !UUID_RE.test(candidate)) convProjectName = candidate
       }
     } catch {
       /* ignore */
     }
   }
-  const connectionProjectName = cleanLabel(connection?.project_name || '')
+  const rawConnProjName = cleanLabel(connection?.project_name || bond?.project_name || '')
+  const connectionProjectName =
+    rawConnProjName && !UUID_RE.test(rawConnProjName) ? rawConnProjName : ''
   const resolvedProjectName = convProjectName || connectionProjectName || pinProjectName
 
   const work = []
+  const workItems = []
+  let automation = null
   if (conversationId && effectiveCwd) {
     try {
       const repoRoot = canonicalRepo(effectiveCwd)
-      const claimed = readClaims({ sessionId: conversationId, repoRoot }, { env })
-      if (Array.isArray(claimed)) {
-        for (const id of claimed) {
-          if (typeof id === 'string' && id) work.push(id)
+      const scope = { sessionId: conversationId, repoRoot }
+      const claimedItems = readClaimedWorkItems(scope, { env })
+      if (Array.isArray(claimedItems) && claimedItems.length > 0) {
+        for (const item of claimedItems) {
+          if (typeof item?.id === 'string' && item.id) {
+            work.push(item.id)
+            workItems.push({
+              id: item.id,
+              title: typeof item.title === 'string' && item.title ? cleanLabel(item.title) : null,
+            })
+          }
+        }
+      } else {
+        const claimed = readClaims(scope, { env })
+        if (Array.isArray(claimed)) {
+          for (const id of claimed) {
+            if (typeof id === 'string' && id) {
+              work.push(id)
+              workItems.push({ id, title: null })
+            }
+          }
         }
       }
+      automation = readActiveAutomation(scope, { env })
     } catch {
       /* ignore */
     }
   }
 
-  if (!connection && !pin && work.length === 0) return null
+  if (!connection && !pin && work.length === 0 && !automation) return null
 
   if (!connection) {
     return {
@@ -446,6 +475,8 @@ export function readConnectionView({
       sessionId: null,
       sessionTitle: '',
       work,
+      workItems,
+      automation,
     }
   }
 
@@ -480,6 +511,8 @@ export function readConnectionView({
     sessionId,
     sessionTitle,
     work,
+    workItems,
+    automation,
   }
 }
 
@@ -543,7 +576,12 @@ export function maybeSpawnWindowAutoConnect({
  */
 export function formatStatusLine(view, work = [], telemetry = null) {
   if (!view) return ''
-  const items = Array.isArray(work) && work.length > 0 ? work : view.work || []
+  const items =
+    Array.isArray(work) && work.length > 0
+      ? work
+      : Array.isArray(view.workItems) && view.workItems.length > 0
+        ? view.workItems
+        : view.work || []
   if (view.state === 'ended_from_devspec') {
     const name = view.codename || 'connected'
     return `DevSpec: ${name} · ended from DevSpec`
@@ -561,9 +599,29 @@ export function formatStatusLine(view, work = [], telemetry = null) {
   if (view.sessionId) {
     parts.push(view.sessionTitle ? `“${view.sessionTitle}”` : 'untitled session')
   }
+  if (view.automation?.automation_name) {
+    parts.push(`automation “${cleanLabel(view.automation.automation_name)}”`)
+  } else if (view.automation?.run_id) {
+    parts.push(`automation ${shortCode(view.automation.run_id)}`)
+  }
   if (items.length > 0) {
     const latest = items[items.length - 1]
-    parts.push(`working on ${shortCode(latest)}${items.length > 1 ? ` +${items.length - 1}` : ''}`)
+    const latestId = typeof latest === 'string' ? latest : latest?.id || ''
+    const matchedItem =
+      typeof latest === 'object' && latest?.title
+        ? latest
+        : Array.isArray(view.workItems)
+          ? view.workItems.find((w) => w?.id === latestId)
+          : null
+    const latestTitle = cleanLabel(matchedItem?.title || '')
+    const suffix = items.length > 1 ? ` +${items.length - 1}` : ''
+    if (latestTitle && latestId) {
+      parts.push(`working on “${latestTitle}” (${shortCode(latestId)})${suffix}`)
+    } else if (latestTitle) {
+      parts.push(`working on “${latestTitle}”${suffix}`)
+    } else if (latestId) {
+      parts.push(`working on ${shortCode(latestId)}${suffix}`)
+    }
   }
   if (telemetry?.model?.id) {
     const pct =

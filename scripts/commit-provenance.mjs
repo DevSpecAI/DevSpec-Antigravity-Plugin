@@ -34,7 +34,10 @@ const UUID_RE = new RegExp(`^${UUID}$`, 'i')
 const REFERENCE_RE = new RegExp(`\\[devspec:(${UUID})\\]`, 'i')
 
 const CLAIM_VERB = 'claim_work_item'
+const GET_ITEM_VERB = 'get_action_item'
 const RELEASE_VERBS = new Set(['record_implementation', 'fail_work_item', 'release_work_item'])
+const CLAIM_AUTOMATION_VERB = 'claim_automation_run'
+const RECORD_AUTOMATION_VERB = 'record_automation_run'
 
 /** Tools recognized as file edits across Antigravity and Claude Code. */
 const EDIT_TOOLS = new Set([
@@ -49,14 +52,42 @@ const EDIT_TOOLS = new Set([
 
 const COMMAND_TOOLS = new Set(['Bash', 'run_command'])
 
-export function devspecToolVerb(toolName) {
-  const s = String(toolName || '')
-  const match = /^(?:mcp__(?:plugin_devspec_)?devspec__|mcp_devspec_|devspec__)([a-z0-9_]+)$/.exec(s)
-  return match ? match[1] : null
-}
-
 function bareToolName(toolName) {
   return String(toolName || '').replace(/^default_api:/, '')
+}
+
+export function devspecToolVerb(toolName, toolInput = null) {
+  const s = String(toolName || '')
+  const match = /^(?:mcp__(?:plugin_devspec_)?devspec__|mcp_devspec_|devspec__)([a-z0-9_]+)$/.exec(s)
+  if (match) return match[1]
+  if (bareToolName(s) === 'call_mcp_tool' && toolInput && typeof toolInput === 'object') {
+    const server = String(
+      toolInput.ServerName ?? toolInput.server_name ?? toolInput.serverName ?? '',
+    ).toLowerCase()
+    const inner = String(toolInput.ToolName ?? toolInput.tool_name ?? toolInput.toolName ?? '')
+    if (server === 'devspec' && /^[a-z0-9_]+$/.test(inner)) return inner
+  }
+  return null
+}
+
+export function unwrapDevspecArgs(toolName, toolInput) {
+  if (!toolInput || typeof toolInput !== 'object') return {}
+  if (bareToolName(toolName) === 'call_mcp_tool') {
+    const inner = toolInput.Arguments ?? toolInput.arguments
+    if (inner && typeof inner === 'object' && !Array.isArray(inner)) return inner
+  }
+  return toolInput
+}
+
+export function detectCommandDevspecVerb(command) {
+  if (typeof command !== 'string' || !/\bnode\b/.test(command) || /\b--test\b/.test(command)) {
+    return null
+  }
+  const match =
+    /\b(claim_work_item|get_action_item|record_implementation|fail_work_item|release_work_item|claim_automation_run|record_automation_run)\b/.exec(
+      command,
+    )
+  return match ? match[1] : null
 }
 
 export function stateDir(env = process.env) {
@@ -200,7 +231,7 @@ function pendingNudgePathFor(sessionId, env = process.env) {
   return path.join(stateDir(env), `${digest}.pending-nudge.json`)
 }
 
-function readClaimsRecord(scope, { env = process.env, now = Date.now(), platform = process.platform } = {}) {
+export function readClaimsRecord(scope, { env = process.env, now = Date.now(), platform = process.platform } = {}) {
   const file = statePathFor(scope, 'claims', env)
   try {
     const stat = fs.lstatSync(file)
@@ -226,6 +257,19 @@ function readClaimsRecord(scope, { env = process.env, now = Date.now(), platform
 
 export function readClaims(scope, options = {}) {
   return readClaimsRecord(scope, options).claims
+}
+
+export function readClaimedWorkItems(scope, options = {}) {
+  const { claims, details } = readClaimsRecord(scope, options)
+  return claims.map((id) => {
+    const entry = details[id] && typeof details[id] === 'object' ? details[id] : {}
+    return {
+      id,
+      title: typeof entry.title === 'string' && entry.title.trim() ? entry.title.trim() : null,
+      work_claim_ref: typeof entry.work_claim_ref === 'string' ? entry.work_claim_ref : null,
+      provenance_ref: typeof entry.provenance_ref === 'string' ? entry.provenance_ref : null,
+    }
+  })
 }
 
 export function readClaimDetails(scope, options = {}) {
@@ -261,6 +305,77 @@ function writeClaims(scope, claims, details = {}, { env = process.env, now = Dat
     details: filteredDetails,
     updated_at: now,
   }, platform)
+}
+
+export function readActiveAutomation(scope, { env = process.env, now = Date.now(), platform = process.platform } = {}) {
+  const file = statePathFor(scope, 'automation', env)
+  try {
+    const stat = fs.lstatSync(file)
+    if (!stat.isFile() || stat.isSymbolicLink()) return null
+    if (enforcesPosixModes(platform) && (stat.mode & 0o077) !== 0) return null
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
+    if (parsed?.schema !== 1) return null
+    if (typeof parsed.updated_at !== 'number') return null
+    if (parsed.updated_at > now + FUTURE_SKEW_MS) return null
+    if (now - parsed.updated_at > CLAIM_MAX_AGE_MS) return null
+    if (parsed.session_id !== scope.sessionId || parsed.repo_root !== scope.repoRoot) return null
+    const runId = typeof parsed.run_id === 'string' && parsed.run_id.trim() ? parsed.run_id.trim() : null
+    const automationId =
+      typeof parsed.automation_id === 'string' && parsed.automation_id.trim()
+        ? parsed.automation_id.trim()
+        : null
+    const automationName =
+      typeof parsed.automation_name === 'string' && parsed.automation_name.trim()
+        ? parsed.automation_name.trim()
+        : null
+    if (!runId && !automationName) return null
+    return {
+      run_id: runId,
+      automation_id: automationId,
+      automation_name: automationName,
+    }
+  } catch {
+    return null
+  }
+}
+
+export function writeActiveAutomation(
+  scope,
+  automation,
+  { env = process.env, now = Date.now(), platform = process.platform } = {},
+) {
+  if (!automation || (!automation.run_id && !automation.automation_name)) return
+  const file = statePathFor(scope, 'automation', env)
+  atomicWritePrivate(
+    file,
+    {
+      schema: 1,
+      session_id: scope.sessionId,
+      repo_root: scope.repoRoot,
+      run_id: automation.run_id || null,
+      automation_id: automation.automation_id || null,
+      automation_name: automation.automation_name || null,
+      updated_at: now,
+    },
+    platform,
+  )
+}
+
+export function clearActiveAutomation(
+  scope,
+  runId = null,
+  { env = process.env, now = Date.now(), platform = process.platform } = {},
+) {
+  const file = statePathFor(scope, 'automation', env)
+  if (runId) {
+    const active = readActiveAutomation(scope, { env, now, platform })
+    if (active?.run_id && active.run_id.toLowerCase() !== String(runId).toLowerCase()) return
+  }
+  try {
+    fs.unlinkSync(file)
+  } catch {
+    /* nothing to remove */
+  }
 }
 
 export function stagePendingNudge(sessionId, message, { env = process.env, now = Date.now(), platform = process.platform } = {}) {
@@ -663,8 +778,17 @@ export function handleSessionStart() {
 export function handlePost(input, options = {}) {
   const { env = process.env, now = Date.now(), platform = process.platform } = options
   const rawName = input?.tool_name ?? input?.toolName ?? input?.toolCall?.name
-  const verb = devspecToolVerb(rawName)
+  const rawToolInput = input?.tool_input ?? input?.toolInput ?? input?.toolCall?.args ?? {}
   const tool = bareToolName(rawName)
+  const command =
+    typeof rawToolInput?.CommandLine === 'string'
+      ? rawToolInput.CommandLine
+      : typeof rawToolInput?.command === 'string'
+        ? rawToolInput.command
+        : ''
+  const verb =
+    devspecToolVerb(rawName, rawToolInput) ??
+    (COMMAND_TOOLS.has(tool) ? detectCommandDevspecVerb(command) : null)
 
   if (EDIT_TOOLS.has(tool)) {
     let scope
@@ -678,17 +802,44 @@ export function handlePost(input, options = {}) {
     } catch { return null }
     if (!marker) return null
     const claims = readClaims(scope, { env, now, platform })
-    if (claims.length === 0) {
+    if (claims.length === 0 && !readActiveAutomation(scope, { env, now, platform })) {
       maybeNudge(scope, { env, now, platform })
     }
     return null
   }
 
-  if (verb !== CLAIM_VERB && !RELEASE_VERBS.has(verb)) return null
+  if (verb === CLAIM_AUTOMATION_VERB) {
+    let scope
+    try { scope = scopeFrom(input, env) } catch { return null }
+    const parsedAuto = parseAutomationClaimResponse(input, rawName, rawToolInput, command)
+    if (!parsedAuto) return null
+    try {
+      writeActiveAutomation(scope, parsedAuto, { env, now, platform })
+      clearPendingNudge(scope.sessionId, { env })
+    } catch {
+      /* non-fatal */
+    }
+    return null
+  }
+
+  if (verb === RECORD_AUTOMATION_VERB) {
+    let scope
+    try { scope = scopeFrom(input, env) } catch { return null }
+    const recorded = parseAutomationRecordResponse(input, rawName, rawToolInput, command)
+    if (!recorded?.ok) return null
+    try {
+      clearActiveAutomation(scope, recorded.run_id, { env, now, platform })
+    } catch {
+      /* non-fatal */
+    }
+    return null
+  }
+
+  if (verb !== CLAIM_VERB && verb !== GET_ITEM_VERB && !RELEASE_VERBS.has(verb)) return null
   let scope
   try { scope = scopeFrom(input, env) } catch { return null }
 
-  const parsed = parseClaimResponse(input)
+  const parsed = parseClaimResponse(input, rawName, rawToolInput, command)
   if (!parsed?.id) return null
   const itemId = parsed.id
   const { claims: current, details } = readClaimsRecord(scope, { env, now, platform })
@@ -697,6 +848,7 @@ export function handlePost(input, options = {}) {
       const nextDetails = {
         ...details,
         [itemId]: {
+          title: parsed.title ?? details[itemId]?.title ?? null,
           work_claim_ref: parsed.work_claim_ref ?? details[itemId]?.work_claim_ref ?? null,
           provenance_ref: parsed.provenance_ref ?? details[itemId]?.provenance_ref ?? null,
           at: now,
@@ -704,6 +856,17 @@ export function handlePost(input, options = {}) {
       }
       writeClaims(scope, [...current, itemId], nextDetails, { env, now, platform })
       clearPendingNudge(scope.sessionId, { env })
+    } else if (verb === GET_ITEM_VERB) {
+      if (current.includes(itemId) && parsed.title) {
+        const nextDetails = {
+          ...details,
+          [itemId]: {
+            ...details[itemId],
+            title: parsed.title,
+          },
+        }
+        writeClaims(scope, current, nextDetails, { env, now, platform })
+      }
     } else {
       const nextDetails = { ...details }
       delete nextDetails[itemId]
@@ -715,46 +878,178 @@ export function handlePost(input, options = {}) {
   return null
 }
 
-function parseClaimResponse(input) {
-  if (typeof input?.error === 'string' && input.error.trim().length > 0) return null
-  const response = input?.tool_response ?? input?.toolResponse ?? input?.result
-  const toolInput = input?.tool_input ?? input?.toolInput ?? input?.toolCall?.args ?? {}
+function collectResponseTexts(response) {
   const texts = []
   const collect = (value) => {
     if (typeof value === 'string') { texts.push(value); return }
     if (Array.isArray(value)) { value.forEach(collect); return }
     if (value && typeof value === 'object') {
       if (typeof value.text === 'string') texts.push(value.text)
+      if (typeof value.stdout === 'string') texts.push(value.stdout)
+      if (typeof value.output === 'string') texts.push(value.output)
       for (const nested of Object.values(value)) if (nested && typeof nested === 'object') collect(nested)
     }
   }
   collect(response)
-  const requested = toolInput.action_item_id
+  return texts
+}
+
+function parseJsonCandidates(texts) {
+  const objects = []
+  for (const text of texts) {
+    try {
+      const parsed = JSON.parse(text)
+      const values = Array.isArray(parsed) ? parsed : [parsed]
+      for (const v of values) if (v && typeof v === 'object') objects.push(v)
+      continue
+    } catch {
+      /* try line-by-line JSON in command stdout */
+    }
+    for (const line of String(text).split(/\r?\n/)) {
+      const trimmed = line.trim()
+      if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) continue
+      try {
+        const parsed = JSON.parse(trimmed)
+        const values = Array.isArray(parsed) ? parsed : [parsed]
+        for (const v of values) if (v && typeof v === 'object') objects.push(v)
+      } catch {
+        /* ignore non-JSON line */
+      }
+    }
+  }
+  return objects
+}
+
+function extractItemTitle(value) {
+  if (!value || typeof value !== 'object') return null
+  const candidates = [
+    value.title,
+    value.item?.title,
+    value.action_item?.title,
+    value.details?.title,
+    value.details?.item?.title,
+  ]
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.trim()) return c.trim()
+  }
+  return null
+}
+
+function parseClaimResponse(
+  input,
+  rawName = input?.tool_name ?? input?.toolName ?? input?.toolCall?.name,
+  rawToolInput = input?.tool_input ?? input?.toolInput ?? input?.toolCall?.args ?? {},
+  command = '',
+) {
+  if (typeof input?.error === 'string' && input.error.trim().length > 0) return null
+  const response = input?.tool_response ?? input?.toolResponse ?? input?.result
+  const toolInput = unwrapDevspecArgs(rawName, rawToolInput)
+  const texts = collectResponseTexts(response)
+  let requested = toolInput.action_item_id
+  if (!requested && command) {
+    const m = new RegExp(`action_item_id['"\\s:]+(${UUID})`, 'i').exec(command)
+    if (m) requested = m[1]
+  }
   const requestedProvenanceRef = typeof toolInput.provenance_ref === 'string' ? toolInput.provenance_ref : null
   const requestedWorkClaimRef = typeof toolInput.work_claim_ref === 'string' ? toolInput.work_claim_ref : null
-  for (const text of texts) {
-    let parsed
-    try { parsed = JSON.parse(text) } catch { continue }
-    const values = Array.isArray(parsed) ? parsed : [parsed]
-    for (const value of values) {
-      if (!value || typeof value !== 'object') continue
-      if (value.error || value.success === false || value.ok === false) continue
-      const id = typeof value.id === 'string' ? value.id : null
-      if (id && UUID_RE.test(id)) {
-        return {
-          id: id.toLowerCase(),
-          work_claim_ref: typeof value.work_claim_ref === 'string' ? value.work_claim_ref : requestedWorkClaimRef,
-          provenance_ref: typeof value.provenance_ref === 'string' ? value.provenance_ref : requestedProvenanceRef,
-        }
+  for (const value of parseJsonCandidates(texts)) {
+    if (value.error || value.success === false || value.ok === false || value.claim_success === false) {
+      continue
+    }
+    const rawId =
+      typeof value.id === 'string'
+        ? value.id
+        : typeof value.action_item_id === 'string'
+          ? value.action_item_id
+          : typeof value.item?.id === 'string'
+            ? value.item.id
+            : null
+    if (rawId && UUID_RE.test(rawId)) {
+      return {
+        id: rawId.toLowerCase(),
+        title: extractItemTitle(value),
+        work_claim_ref: typeof value.work_claim_ref === 'string' ? value.work_claim_ref : requestedWorkClaimRef,
+        provenance_ref: typeof value.provenance_ref === 'string' ? value.provenance_ref : requestedProvenanceRef,
       }
     }
   }
   if (UUID_RE.test(requested || '') && !texts.some((t) => /"error"|not found|failed/i.test(t))) {
     return {
       id: requested.toLowerCase(),
+      title: null,
       work_claim_ref: requestedWorkClaimRef,
       provenance_ref: requestedProvenanceRef,
     }
+  }
+  return null
+}
+
+function parseAutomationClaimResponse(input, rawName, rawToolInput, command = '') {
+  if (typeof input?.error === 'string' && input.error.trim().length > 0) return null
+  const response = input?.tool_response ?? input?.toolResponse ?? input?.result
+  const toolInput = unwrapDevspecArgs(rawName, rawToolInput)
+  const texts = collectResponseTexts(response)
+  let requestedRunId = typeof toolInput.run_id === 'string' ? toolInput.run_id : null
+  if (!requestedRunId && command) {
+    const m = new RegExp(`run_id['"\\s:]+(${UUID}|[A-Za-z0-9_-]+)`, 'i').exec(command)
+    if (m) requestedRunId = m[1]
+  }
+  for (const value of parseJsonCandidates(texts)) {
+    if (value.error || value.success === false || value.ok === false || value.claimed === false) {
+      continue
+    }
+    const autoObj = value.automation && typeof value.automation === 'object' ? value.automation : null
+    const runObj = value.run && typeof value.run === 'object' ? value.run : null
+    const name =
+      (typeof autoObj?.name === 'string' && autoObj.name.trim()) ||
+      (typeof value.automation_name === 'string' && value.automation_name.trim()) ||
+      (typeof runObj?.automation_name === 'string' && runObj.automation_name.trim()) ||
+      null
+    const runId =
+      (typeof runObj?.id === 'string' && runObj.id.trim()) ||
+      (typeof runObj?.run_id === 'string' && runObj.run_id.trim()) ||
+      (typeof value.run_id === 'string' && value.run_id.trim()) ||
+      requestedRunId ||
+      null
+    const automationId =
+      (typeof autoObj?.id === 'string' && autoObj.id.trim()) ||
+      (typeof value.automation_id === 'string' && value.automation_id.trim()) ||
+      (typeof runObj?.automation_id === 'string' && runObj.automation_id.trim()) ||
+      null
+    if (value.claimed === true || name || (runId && autoObj)) {
+      return {
+        run_id: runId,
+        automation_id: automationId,
+        automation_name: name,
+      }
+    }
+  }
+  return null
+}
+
+function parseAutomationRecordResponse(input, rawName, rawToolInput, command = '') {
+  if (typeof input?.error === 'string' && input.error.trim().length > 0) return null
+  const response = input?.tool_response ?? input?.toolResponse ?? input?.result
+  const toolInput = unwrapDevspecArgs(rawName, rawToolInput)
+  const texts = collectResponseTexts(response)
+  let requestedRunId = typeof toolInput.run_id === 'string' ? toolInput.run_id : null
+  if (!requestedRunId && command) {
+    const m = new RegExp(`run_id['"\\s:]+(${UUID}|[A-Za-z0-9_-]+)`, 'i').exec(command)
+    if (m) requestedRunId = m[1]
+  }
+  for (const value of parseJsonCandidates(texts)) {
+    if (value.error || value.success === false || value.ok === false) return null
+    const runObj = value.run && typeof value.run === 'object' ? value.run : null
+    const runId =
+      (typeof value.run_id === 'string' && value.run_id.trim()) ||
+      (typeof runObj?.id === 'string' && runObj.id.trim()) ||
+      (typeof runObj?.run_id === 'string' && runObj.run_id.trim()) ||
+      requestedRunId ||
+      null
+    return { ok: true, run_id: runId }
+  }
+  if (!texts.some((t) => /"error"|not found|failed/i.test(t))) {
+    return { ok: true, run_id: requestedRunId }
   }
   return null
 }
