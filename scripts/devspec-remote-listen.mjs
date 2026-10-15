@@ -19,6 +19,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { formatSystemNoticeContent } from './devspec-remote-wait.mjs'
 import { loadState, writeTurnMarker } from './mirror-turn.mjs'
 import {
   ensurePollerForConnection,
@@ -84,9 +85,9 @@ export function parseListenArgs(argv = []) {
 }
 
 /**
- * Format an inbox entry (`owner_messages`, `canonical_commands`, `automation_run`,
- * `interaction_answer`, or `question_dismissal`) into a wake prompt suitable for
- * `agentapi send-message` / `agentapi new-conversation`.
+ * Format an inbox entry (`owner_messages`, `canonical_commands`, `canonical_system_notices`,
+ * `automation_run`, `interaction_answer`, or `question_dismissal`) into a wake prompt
+ * suitable for `agentapi send-message` / `agentapi new-conversation`.
  */
 export function buildWakeDeliveryMessage(entry) {
   if (!entry || typeof entry !== 'object') return null
@@ -113,6 +114,28 @@ export function buildWakeDeliveryMessage(entry) {
       const sender = c?.requester?.display_name || 'Owner'
       const body = typeof c?.content?.body === 'string' ? c.content.body.trim() : ''
       if (body) lines.push(`${sender} (${c?.authority?.kind || 'owner'}): ${body}`)
+    }
+    return lines.join('\n\n')
+  }
+
+  if (entry.type === 'canonical_system_notices') {
+    const ingress = entry.ingress
+    const executeIds = new Set(
+      Array.isArray(entry.execute_notice_ids)
+        ? entry.execute_notice_ids
+        : Array.isArray(ingress?.system_notices)
+          ? ingress.system_notices.map((n) => n?.notice_id).filter(Boolean)
+          : [],
+    )
+    const notices = Array.isArray(ingress?.system_notices)
+      ? ingress.system_notices.filter((n) => executeIds.size === 0 || executeIds.has(n?.notice_id))
+      : []
+    if (notices.length === 0) return null
+    const lines = ['[DevSpec Remote Wake]']
+    if (entry.session_id) lines.push(`Session: ${entry.session_id}`)
+    for (const notice of notices) {
+      const formatted = formatSystemNoticeContent(notice)
+      if (formatted) lines.push(formatted)
     }
     return lines.join('\n\n')
   }

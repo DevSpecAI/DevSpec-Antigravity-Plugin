@@ -55,14 +55,15 @@ export function writeTurnMarker(connectionId, extra = {}, dir = CONNECTIONS_DIR)
   if (!connectionId) return null
   const existing = readTurnMarker(connectionId, dir)
   const startedAt = typeof existing?.startedAt === 'number' ? existing.startedAt : Date.now()
+  const { preserveExplicitReply, ...restExtra } = extra || {}
   const payload = {
     ...(existing || {}),
     startedAt,
-    ...extra,
+    ...restExtra,
   }
   try {
     fs.mkdirSync(dir, { recursive: true })
-    if (!existing) {
+    if (!existing && !preserveExplicitReply) {
       fs.rmSync(path.join(dir, `${connectionId}.explicit-reply`), { force: true })
     }
     fs.writeFileSync(turnMarkerPath(connectionId, dir), JSON.stringify(payload), {
@@ -729,6 +730,8 @@ export function isRemotePlumbingToolCall(toolName, args = {}) {
       cmdLine.includes('devspec-remote-wait.mjs') ||
       cmdLine.includes('devspec-remote-listen.mjs') ||
       cmdLine.includes('devspec-remote-poll.mjs') ||
+      cmdLine.includes('devspec-remote-connect.mjs') ||
+      cmdLine.includes('devspec-remote-stop.mjs') ||
       cmdLine.includes('remote-control-state.mjs') ||
       cmdLine.includes('connection-call.mjs') ||
       cmdLine.includes('post_session_message') ||
@@ -1108,6 +1111,7 @@ export async function handleMirrorTurn(
     rawStepContent.includes('[DevSpec Remote Wake]') ||
     (latestStep?.type === 'SYSTEM_MESSAGE' &&
       (rawStepContent.includes('"event":"wake"') ||
+        rawStepContent.includes('"type":"system_notice"') ||
         rawStepContent.includes('"event":"directives"') ||
         rawStepContent.includes('"event":"automation_run"') ||
         rawStepContent.includes('"event":"interaction_answer"') ||

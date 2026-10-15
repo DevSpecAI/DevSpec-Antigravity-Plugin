@@ -309,6 +309,24 @@ export function isNoWorkingAttemptRefusal(err) {
   return /No working attempt to keep alive/i.test(message)
 }
 
+export function isTurnMarkerActive(marker, now = Date.now(), maxTurnMs = MAX_TURN_MS) {
+  if (!marker || typeof marker.startedAt !== 'number') return false
+  const lastActiveAt = Math.max(
+    marker.startedAt,
+    typeof marker.lastToolAt === 'number' ? marker.lastToolAt : 0,
+  )
+  return now - lastActiveAt < maxTurnMs
+}
+
+export function hasPostReplyToolActivity(marker, now = Date.now(), windowMs = 30_000) {
+  if (!marker || typeof marker.lastToolAt !== 'number') return false
+  if (now - marker.lastToolAt > windowMs) return false
+  if (typeof marker.lastReplyAt === 'number' && marker.lastToolAt <= marker.lastReplyAt) {
+    return false
+  }
+  return true
+}
+
 function ownerAlive(pid) {
   return pidIsAlive(pid)
 }
@@ -1491,6 +1509,8 @@ async function main() {
     }
   }
 
+  let prevTurnActive = false
+
   async function emitActivityVerb(verb) {
     if (!verb) return
     const plan = interactionActivityPlan({ verb, continuation: interactionContinuation })
@@ -1515,7 +1535,28 @@ async function main() {
     } catch (e) {
       process.stderr.write(`devspec-remote-poll: activity verb ${verb} (${name}) failed: ${e.message}\n`)
       if (isNoWorkingAttemptRefusal(e)) {
+        const currentMarker = readTurnMarker(connectionId)
+        if (verb === 'keepalive' && hasPostReplyToolActivity(currentMarker)) {
+          try {
+            await mcpToolsCall({
+              mcpUrl,
+              token,
+              name: 'report_pickup',
+              arguments: { connection_id: connectionId },
+              timeoutMs: 10_000,
+            })
+            process.stderr.write(
+              'devspec-remote-poll: post-reply tool activity detected — re-opened working attempt via report_pickup\n',
+            )
+            return
+          } catch (pickupErr) {
+            process.stderr.write(
+              `devspec-remote-poll: continuation report_pickup failed: ${pickupErr.message}\n`,
+            )
+          }
+        }
         clearTurnMarker(connectionId)
+        prevTurnActive = false
         process.stderr.write(
           'devspec-remote-poll: server reports no working attempt — clearing the stale turn marker\n',
         )
@@ -2177,7 +2218,6 @@ async function main() {
     `devspec-remote-poll: long-poll mode connection=${connectionId} session=${sessionId || '(none)'} inbox=${inboxPathForConnection(connectionId)}\n`,
   )
 
-  let prevTurnActive = false
   let sseWakePending = false
   if (process.env.DEVSPEC_DISABLE_SSE !== '1') {
     openPushChannel({
@@ -2248,13 +2288,14 @@ async function main() {
     }
 
     const marker = readTurnMarker(connectionId)
-    const turnActive = !!marker && Date.now() - marker.startedAt < MAX_TURN_MS
+    const turnActive = isTurnMarkerActive(marker)
     let busyArg = null
     if (turnActive) busyArg = true
     else if (lastBusySent === true) busyArg = false
 
-    await emitActivityVerb(verbForTurnTransition(prevTurnActive, turnActive))
+    const turnTransitionVerb = verbForTurnTransition(prevTurnActive, turnActive)
     prevTurnActive = turnActive
+    await emitActivityVerb(turnTransitionVerb)
 
     const tier = cadenceFor({ attached: !!sessionId, turnActive })
     if (tier.tier !== lastTier) {

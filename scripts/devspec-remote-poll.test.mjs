@@ -41,6 +41,8 @@ import {
   remoteIngressNegotiationArguments,
   knownInstructionTierArguments,
   writeRoomState,
+  isTurnMarkerActive,
+  hasPostReplyToolActivity,
 } from './devspec-remote-poll.mjs'
 import { captureInstructionContext, storeTiers, takeTiersFor } from './instruction-tiers.mjs'
 import { storeRepositoryContext, takeRepositoryContext } from './repository-context.mjs'
@@ -56,6 +58,13 @@ import { commandOfferArguments, parseCommandOfferResponse } from './command-offe
 import { connectAtStartupEnabled, runSessionStart } from './session-start.mjs'
 import { buildWakeDeliveryMessage, deliverWakeViaAgentApi } from './devspec-remote-listen.mjs'
 import { resolveLocalAction } from './remote-control-state.mjs'
+import { runPostToolDispatch } from './post-tool-dispatch.mjs'
+import {
+  clearTurnMarker,
+  explicitReplyMarkerPath,
+  readTurnMarker,
+  writeTurnMarker,
+} from './mirror-turn.mjs'
 
 const ME = 'conn-mine-1111'
 const OTHER_CONN = 'conn-theirs-2222'
@@ -1180,5 +1189,134 @@ describe('Parity 3: room transcript, 4-tier instruction files, repository contex
     assert.equal(res.connection_id, ME)
     assert.equal(res.local_id, 'c01518ab-467e-42e9-b1c9-bdb3557683c3')
     assert.equal(res.session_id, '7069bedd-878d-4c5a-b52c-b5cfc1bcd544')
+  })
+
+  it('keeps >10m turns active via lastToolAt and re-asserts .turn after an opening post_session_message acknowledgment', async () => {
+    const now = 1_700_000_000_000
+    const thirtyMinsAgo = now - 30 * 60 * 1000
+    const fiveSecsAgo = now - 5_000
+
+    // Without lastToolAt, a 30-minute-old turn marker expires at MAX_TURN_MS (10m)
+    assert.equal(isTurnMarkerActive({ startedAt: thirtyMinsAgo }, now), false)
+    // With recent lastToolAt, the turn remains active even 30 minutes into the turn
+    assert.equal(
+      isTurnMarkerActive({ startedAt: thirtyMinsAgo, lastToolAt: fiveSecsAgo }, now),
+      true,
+    )
+
+    // hasPostReplyToolActivity detects when a tool ran after post_session_message
+    assert.equal(
+      hasPostReplyToolActivity({ startedAt: thirtyMinsAgo, lastReplyAt: now - 4_000, lastToolAt: now - 1_000 }, now),
+      true,
+    )
+    assert.equal(
+      hasPostReplyToolActivity({ startedAt: thirtyMinsAgo, lastReplyAt: now - 1_000, lastToolAt: now - 4_000 }, now),
+      false,
+    )
+
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-post-tool-turn-'))
+    try {
+      const connDir = path.join(tmpHome, '.devspec', 'remote-control', 'connections')
+      const bondsDir = path.join(tmpHome, '.devspec', 'remote-control', 'bonds')
+      fs.mkdirSync(connDir, { recursive: true })
+      fs.mkdirSync(bondsDir, { recursive: true })
+      const connId = '2c6fc5a6-550e-4d60-8a9b-94714872079a'
+      const convId = '4f23be98-50fb-431f-9960-3930725805d6'
+      fs.writeFileSync(
+        path.join(connDir, `${connId}.json`),
+        JSON.stringify({
+          connection_id: connId,
+          agent_name: 'Antigravity',
+          local_id: convId,
+          session_id: 'ac485d38-a2de-4363-8515-0a0db598b706',
+          enabled: true,
+        }),
+      )
+      fs.writeFileSync(
+        path.join(bondsDir, `Antigravity.${convId}.json`),
+        JSON.stringify({
+          status: 'live',
+          connection_id: connId,
+          agent_name: 'Antigravity',
+          local_id: convId,
+        }),
+      )
+      writeTurnMarker(connId, { remoteTurn: true }, connDir)
+
+      // 1. Agent calls post_session_message ("On it...") via lazy call_mcp_tool
+      await runPostToolDispatch(
+        JSON.stringify({
+          conversationId: convId,
+          tool_name: 'default_api:call_mcp_tool',
+          tool_input: {
+            ServerName: 'devspec',
+            ToolName: 'post_session_message',
+            Arguments: {
+              connection_id: connId,
+              message: 'On it — building the server and plugin pieces now.',
+            },
+          },
+        }),
+        { home: tmpHome, env: { HOME: tmpHome } },
+      )
+      assert.equal(fs.existsSync(explicitReplyMarkerPath(connId, connDir)), true)
+      const afterReplyMarker = readTurnMarker(connId, connDir)
+      assert.equal(typeof afterReplyMarker?.lastReplyAt, 'number')
+
+      // 2. Poller clears .turn when server says no working attempt after post_session_message
+      clearTurnMarker(connId, connDir)
+      assert.equal(readTurnMarker(connId, connDir), null)
+
+      // 3. Agent continues working in the same turn (calls view_file): .turn is re-asserted
+      //    while .explicit-reply is preserved so Stop won't double-post a fallback reply
+      await runPostToolDispatch(
+        JSON.stringify({
+          conversationId: convId,
+          tool_name: 'default_api:view_file',
+          tool_input: { AbsolutePath: '/tmp/example.ts' },
+        }),
+        { home: tmpHome, env: { HOME: tmpHome } },
+      )
+      const resumedMarker = readTurnMarker(connId, connDir)
+      assert.ok(resumedMarker)
+      assert.equal(typeof resumedMarker.lastToolAt, 'number')
+      assert.equal(fs.existsSync(explicitReplyMarkerPath(connId, connDir)), true)
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
+    }
+  })
+
+  it('formats canonical_system_notices (server_notice) in buildWakeDeliveryMessage for sessionless agentapi delivery', () => {
+    const msg = buildWakeDeliveryMessage({
+      type: 'canonical_system_notices',
+      session_id: null,
+      execute_notice_ids: ['66666666-6666-4666-8666-666666666666'],
+      ingress: {
+        system_notices: [
+          {
+            kind: 'server_notice',
+            notice_id: '66666666-6666-4666-8666-666666666666',
+            topic: 'duplicate_detection',
+            notice_type: 'potential_duplicate',
+            summary: 'Action item "Add retry backoff" may duplicate "Retry backoff on poll".',
+            prompt: 'Inspect both items and call resolve_duplicate or record_duplicate_nonmatch.',
+            records: [
+              {
+                label: 'New item',
+                record_type: 'action_item',
+                record_id: '77777777-7777-4777-8777-777777777777',
+                title: 'Add retry backoff',
+                text: 'Add retry backoff to poll loop.',
+              },
+            ],
+            allowed_outcomes: ['resolve_duplicate', 'record_duplicate_nonmatch'],
+            allowed_tools: ['resolve_duplicate', 'record_duplicate_nonmatch'],
+          },
+        ],
+      },
+    })
+    assert.match(msg, /\[DevSpec Remote Wake\]/)
+    assert.match(msg, /\[DevSpec System Notice: duplicate_detection \/ potential_duplicate\]/)
+    assert.match(msg, /resolve_duplicate, record_duplicate_nonmatch/)
   })
 })

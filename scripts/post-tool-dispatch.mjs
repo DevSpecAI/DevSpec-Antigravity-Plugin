@@ -17,15 +17,18 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { handleBashPost } from './commit-observation.mjs'
 import { handlePost, stagePendingNudge } from './commit-provenance.mjs'
-import { isSessionReplyToolCall } from './devspec-remote-poll.mjs'
 import { resolveOwnConnectionId } from './launch-guard.mjs'
 import {
   explicitReplyMarkerPath,
+  isRemotePlumbingToolCall,
+  isSessionReplyToolCall,
   loadState,
   parseTranscriptPath,
+  readTurnMarker,
   recordBackgroundLaunch,
   resolveHookConversationId,
   syncStateTranscriptPath,
+  writeTurnMarker,
 } from './mirror-turn.mjs'
 import { checkPinAfterTool } from './pin-check.mjs'
 import { checkRepoLinkAfterTool } from './repo-link-nudge.mjs'
@@ -66,6 +69,7 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
     syncStateTranscriptPath(state, parseTranscriptPath(raw), conversationId)
   }
   const connectionId = state?.connection_id || resolveOwnConnectionId(conversationId, { home })
+  const connectionsDir = path.join(home, '.devspec', 'remote-control', 'connections')
   const notices = []
 
   // 0. Commit provenance claim/release tracking & unclaimed edit nudge staging
@@ -85,11 +89,37 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
     /* non-fatal */
   }
 
-  // 1. Explicit reply marker when the agent calls post_session_message (non-trail)
+  // 1. Explicit reply marker when the agent calls post_session_message (non-trail),
+  //    or refresh/re-assert .turn on non-plumbing work tools so mid-turn acknowledgments
+  //    ("On it...") and >10m turns continue showing Working in the UI.
+  const now = Date.now()
   if (connectionId && isSessionReplyToolCall(toolName, toolInput)) {
     try {
-      const p = explicitReplyMarkerPath(connectionId)
-      fs.writeFileSync(p, JSON.stringify({ at: Date.now() }), { mode: 0o600 })
+      const p = explicitReplyMarkerPath(connectionId, connectionsDir)
+      fs.writeFileSync(p, JSON.stringify({ at: now }), { mode: 0o600 })
+      const existingMarker = readTurnMarker(connectionId, connectionsDir)
+      if (existingMarker) {
+        writeTurnMarker(
+          connectionId,
+          { lastReplyAt: now, preserveExplicitReply: true },
+          connectionsDir,
+        )
+      }
+    } catch {
+      /* ignore */
+    }
+  } else if (connectionId && !isRemotePlumbingToolCall(toolName, toolInput)) {
+    try {
+      const existingMarker = readTurnMarker(connectionId, connectionsDir)
+      writeTurnMarker(
+        connectionId,
+        {
+          ...(existingMarker ? {} : { remoteTurn: Boolean(state?.session_id) }),
+          lastToolAt: now,
+          preserveExplicitReply: true,
+        },
+        connectionsDir,
+      )
     } catch {
       /* ignore */
     }
