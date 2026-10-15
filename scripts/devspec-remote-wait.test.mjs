@@ -18,7 +18,10 @@ import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import {
   parseOwnerBatches,
+  parseInboxBatches,
   buildOwnerMessageEvents,
+  buildCanonicalSystemNoticeEvents,
+  formatSystemNoticeContent,
   emitOwnerMessageBatches,
   describeAttachment,
   materialiseAttachments,
@@ -27,6 +30,7 @@ import {
   armEndsTurn,
   clearTurnMarker,
 } from './devspec-remote-wait.mjs'
+import { appendCanonicalInbox, scanPersistedInboxRecords } from './devspec-remote-poll.mjs'
 
 describe('parseOwnerBatches', () => {
   it('keeps only owner_messages lines with a non-empty messages array', () => {
@@ -556,3 +560,128 @@ describe('arming and the working indicator (item 68f7b30c)', () => {
     })
   })
 })
+
+describe('canonical_system_notices delivery (server_notice & unlinked_commit_item_review)', () => {
+  const CONNECTION = '10000000-0000-4000-8000-000000000001'
+  const NOTICE_ID = '71000000-0000-4000-8000-000000000001'
+  const NOTICE_ENVELOPE = {
+    kind: 'devspec.remote_ingress',
+    schema_version: 1,
+    contract_version: '1.6.0',
+    policy_version: '2026-09-24.1',
+    envelope_id: '60000000-0000-4000-8000-000000000099',
+    connection: {
+      connection_id: CONNECTION,
+      agent_name: 'Antigravity',
+      codename: 'Calm Fox',
+      label: 'Antigravity / Calm Fox',
+    },
+    wake: { kind: 'system_notice', active: true, reason_id: 'exact_connection_system_notice' },
+    delivery_state: 'live',
+    command_message_ids: [],
+    commands: [],
+    system_notices: [
+      {
+        version: 1,
+        kind: 'server_notice',
+        notice_id: NOTICE_ID,
+        topic: 'coherence_finding',
+        notice_type: 'reversal',
+        summary: 'Protected decision reversed by new record',
+        prompt: 'Review the protected record and your reversing record below.',
+        contract_uri: 'devspec://product/remote-ingress-contract',
+        records: [
+          {
+            label: 'Protected record (existing decision)',
+            record_type: 'memory',
+            record_id: '81000000-0000-4000-8000-000000000001',
+            title: 'All deliveries use canonical ingress',
+            text: 'All remote deliveries must use the canonical ingress envelope.',
+            url: 'https://app.devspec.ai/projects/devspec/memory/81000000-0000-4000-8000-000000000001',
+          },
+          {
+            label: 'Reversing record (conflicting change)',
+            record_type: 'memory',
+            record_id: '82000000-0000-4000-8000-000000000002',
+            title: 'Bypass canonical ingress for notices',
+            text: 'Notices bypass canonical ingress and post directly.',
+            url: null,
+          },
+        ],
+        allowed_outcomes: ['keep_protected', 'propose_override', 'retract_new_record'],
+        allowed_tools: ['retract_memory', 'supersede_memory', 'manage_protected_intent'],
+      },
+    ],
+    room_context: { version: 1, messages: [], coverage: null },
+    control: null,
+    context: { human_context: [], agent_context: [], ai_context: [], system_context: [] },
+    window: {
+      policy_version: '2026-09-24.1',
+      returned: 0,
+      total_known: 0,
+      source_window: { start: null, end: null },
+      truncated: false,
+      has_more: false,
+      next_cursor: null,
+      fetch_id: null,
+      omission_reason: null,
+    },
+  }
+
+  it('persists canonical_system_notices once with deduplication and wakes the agent even when session_id is null', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-sys-notice-'))
+    const file = path.join(dir, `${CONNECTION}.inbox.jsonl`)
+    try {
+      const index = scanPersistedInboxRecords('')
+      const writeRecord = (_cid, rec) => {
+        fs.appendFileSync(file, JSON.stringify(rec) + '\n', { mode: 0o600 })
+        return true
+      }
+      const first = appendCanonicalInbox(CONNECTION, NOTICE_ENVELOPE, index, {
+        sessionId: null,
+        channel: 'system_notice',
+        writeRecord,
+      })
+      assert.equal(first.ok, true)
+      assert.equal(first.appended, true)
+      assert.deepEqual(first.executeNoticeIds, [NOTICE_ID])
+
+      const duplicate = appendCanonicalInbox(CONNECTION, {
+        ...NOTICE_ENVELOPE,
+        envelope_id: '60000000-0000-4000-8000-000000000098',
+      }, index, {
+        sessionId: null,
+        channel: 'system_notice',
+        writeRecord,
+      })
+      assert.equal(duplicate.ok, true)
+      assert.equal(duplicate.appended, false)
+
+      const scanned = scanPersistedInboxRecords(fs.readFileSync(file, 'utf8'))
+      assert.equal(scanned.systemNoticeIds.has(NOTICE_ID), true)
+
+      const batches = parseInboxBatches(fs.readFileSync(file, 'utf8').trim().split('\n'), CONNECTION)
+      assert.equal(batches.length, 1)
+      assert.equal(batches[0].type, 'canonical_system_notices')
+      assert.deepEqual(batches[0].execute_notice_ids, [NOTICE_ID])
+
+      const events = buildCanonicalSystemNoticeEvents(batches[0], { inboxFile: file })
+      assert.equal(events.length, 2)
+      assert.equal(events[0].type, 'system_notice')
+      assert.equal(events[0].kind, 'server_notice')
+      assert.equal(events[0].topic, 'coherence_finding')
+      assert.equal(events[0].notice_type, 'reversal')
+      assert.equal(events[0].session_id, null)
+      assert.equal(events[0].records.length, 2)
+      assert.match(events[0].content, /Protected record \(existing decision\)/)
+      assert.match(events[0].content, /All remote deliveries must use the canonical ingress envelope\./)
+      assert.equal(events[1].type, 'wake')
+      assert.equal(events[1].reason, 'exact_connection_system_notice')
+      assert.equal(events[1].session_id, null)
+      assert.deepEqual(events[1].system_notice_ids, [NOTICE_ID])
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+

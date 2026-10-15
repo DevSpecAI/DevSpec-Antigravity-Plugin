@@ -643,6 +643,38 @@ describe('strict 1.4 system notices', () => {
     return built
   }
 
+  const serverNotice = (over = {}) => ({
+    version: 1,
+    kind: 'server_notice',
+    notice_id: '71000000-0000-4000-8000-000000000001',
+    topic: 'coherence_finding',
+    notice_type: 'reversal',
+    summary: 'Protected decision reversed by new record',
+    prompt: 'Review the protected record and your reversing record below.',
+    contract_uri: 'devspec://product/remote-ingress-contract',
+    records: [
+      {
+        label: 'Protected record (existing decision)',
+        record_type: 'memory',
+        record_id: '81000000-0000-4000-8000-000000000001',
+        title: 'All deliveries use canonical ingress',
+        text: 'All remote deliveries must use the canonical ingress envelope.',
+        url: 'https://app.devspec.ai/projects/devspec/memory/81000000-0000-4000-8000-000000000001',
+      },
+      {
+        label: 'Reversing record (conflicting change)',
+        record_type: 'memory',
+        record_id: '82000000-0000-4000-8000-000000000002',
+        title: 'Bypass canonical ingress for notices',
+        text: 'Notices bypass canonical ingress and post directly.',
+        url: null,
+      },
+    ],
+    allowed_outcomes: ['keep_protected', 'propose_override', 'retract_new_record'],
+    allowed_tools: ['retract_memory', 'supersede_memory', 'manage_protected_intent'],
+    ...over,
+  })
+
   it('requires the array, empty on an ordinary command wake', () => {
     assert.equal(normalizeRemoteIngressV1(noticed(), CONNECTION).ok, true)
   })
@@ -655,9 +687,45 @@ describe('strict 1.4 system notices', () => {
 
   it('refuses notices sitting alongside commands', () => {
     const result = normalizeRemoteIngressV1(noticed({
-      system_notices: [{ version: 1, kind: 'unlinked_commit_item_review' }],
+      system_notices: [serverNotice()],
     }), CONNECTION)
     assert.equal(result.ok, false)
     assert.match(result.error, /nonempty iff wake kind is system_notice/)
+  })
+
+  it('accepts a general server_notice envelope with wake.kind === system_notice', () => {
+    const notice = serverNotice()
+    const env = noticed({
+      commands: [],
+      command_message_ids: [],
+      wake: { kind: 'system_notice', active: true, reason_id: 'exact_connection_system_notice' },
+      system_notices: [notice],
+      window: metadata([], { policy_version: REMOTE_INGRESS_SYSTEM_NOTICE_POLICY_VERSION }),
+    })
+    const result = normalizeRemoteIngressV1(env, CONNECTION)
+    assert.equal(result.ok, true)
+    assert.equal(result.wake, false)
+    assert.equal(result.reason, 'system_notice')
+    assert.equal(result.envelope.system_notices.length, 1)
+    assert.equal(result.envelope.system_notices[0].kind, 'server_notice')
+    assert.equal(result.envelope.system_notices[0].records.length, 2)
+  })
+
+  it('rejects malformed server_notice payloads (missing records, extra keys, bad contract_uri)', () => {
+    for (const bad of [
+      serverNotice({ records: [] }),
+      serverNotice({ contract_uri: 'devspec://wrong' }),
+      serverNotice({ extra: true }),
+      serverNotice({ records: [{ ...serverNotice().records[0], similarity: 0.91 }] }),
+    ]) {
+      const env = noticed({
+        commands: [],
+        command_message_ids: [],
+        wake: { kind: 'system_notice', active: true, reason_id: 'exact_connection_system_notice' },
+        system_notices: [bad],
+        window: metadata([], { policy_version: REMOTE_INGRESS_SYSTEM_NOTICE_POLICY_VERSION }),
+      })
+      assert.equal(normalizeRemoteIngressV1(env, CONNECTION).ok, false)
+    }
   })
 })

@@ -676,6 +676,83 @@ export function isStillToDiscussProjectionV1(value) {
   )
 }
 
+const FULL_LOWERCASE_SHA = /^[0-9a-f]{40}$/
+const UNLINKED_COMMIT_NOTICE_OUTCOMES = [
+  'correct_item',
+  'link_item',
+  'resolve_duplicate',
+  'dismiss_item',
+  'confirm_item_correct',
+  'defer_follow_up',
+]
+const UNLINKED_COMMIT_NOTICE_TOOLS = [
+  'get_action_item',
+  'update_action_item',
+  'link_action_items',
+  'supersede_action_item',
+]
+
+function exactStringTuple(value, expected) {
+  return (
+    Array.isArray(value) &&
+    value.length === expected.length &&
+    value.every((item, index) => item === expected[index])
+  )
+}
+
+function serverNoticeRecord(value) {
+  return (
+    exactKeys(value, ['label', 'record_type', 'record_id', 'title', 'text', 'url']) &&
+    nonempty(value.label) && value.label.length <= 200 &&
+    nonempty(value.record_type) && value.record_type.length <= 120 &&
+    nonempty(value.record_id) && value.record_id.length <= 200 &&
+    nullable(value.title, (title) => nonempty(title) && title.length <= 500) &&
+    nonempty(value.text) && value.text.length <= 8000 &&
+    nullable(value.url, (url) => nonempty(url) && url.length <= 500)
+  )
+}
+
+export function isSystemNoticeV1(value) {
+  if (!record(value) || value.version !== SYSTEM_NOTICE_VERSION || value.contract_uri !== REMOTE_INGRESS_RESOURCE_URI) {
+    return false
+  }
+  if (value.kind === 'unlinked_commit_item_review') {
+    return (
+      exactKeys(value, [
+        'version', 'kind', 'notice_id', 'commit_sha', 'action_item_id',
+        'action_item_title', 'branch', 'contract_uri', 'allowed_outcomes', 'allowed_tools',
+      ]) &&
+      uuid(value.notice_id) &&
+      typeof value.commit_sha === 'string' && FULL_LOWERCASE_SHA.test(value.commit_sha) &&
+      uuid(value.action_item_id) &&
+      nonempty(value.action_item_title) && value.action_item_title.length <= 500 &&
+      nonempty(value.branch) && value.branch.length <= 500 &&
+      exactStringTuple(value.allowed_outcomes, UNLINKED_COMMIT_NOTICE_OUTCOMES) &&
+      exactStringTuple(value.allowed_tools, UNLINKED_COMMIT_NOTICE_TOOLS)
+    )
+  }
+  if (value.kind === 'server_notice') {
+    return (
+      exactKeys(value, [
+        'version', 'kind', 'notice_id', 'topic', 'notice_type',
+        'summary', 'prompt', 'contract_uri', 'records', 'allowed_outcomes', 'allowed_tools',
+      ]) &&
+      uuid(value.notice_id) &&
+      nonempty(value.topic) && value.topic.length <= 120 &&
+      nonempty(value.notice_type) && value.notice_type.length <= 120 &&
+      nonempty(value.summary) && value.summary.length <= 500 &&
+      nonempty(value.prompt) && value.prompt.length <= 8000 &&
+      Array.isArray(value.records) && value.records.length >= 1 && value.records.length <= 10 &&
+      value.records.every(serverNoticeRecord) &&
+      Array.isArray(value.allowed_outcomes) && value.allowed_outcomes.length <= 16 &&
+      value.allowed_outcomes.every((entry) => nonempty(entry) && entry.length <= 120) &&
+      Array.isArray(value.allowed_tools) && value.allowed_tools.length <= 16 &&
+      value.allowed_tools.every((entry) => nonempty(entry) && entry.length <= 120)
+    )
+  }
+  return false
+}
+
 export function isSenderResponseStyleV1(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   if (!exactKeys(value, ['message_id', 'notes'])) return false
@@ -982,6 +1059,10 @@ function envelopeV1(value) {
     }
     if (hasNotices && (value.commands.length > 0 || value.control !== null)) {
       return 'system notices cannot accompany commands or control'
+    }
+    if (hasNotices && (!value.system_notices.every(isSystemNoticeV1) ||
+        new Set(value.system_notices.map((notice) => notice.notice_id)).size !== value.system_notices.length)) {
+      return 'invalid system_notices'
     }
   }
   if (senderStyleLane && Object.hasOwn(value, 'sender_response_styles')) {
