@@ -244,6 +244,165 @@ export function setCurrentRequest(
   return appendRequestEvent(connectionId, { op: 'current', ref }, { dir })
 }
 
+function tag(text, name) {
+  const match = String(text || '').match(new RegExp(`<${name}>\\s*([^<]*?)\\s*</${name}>`))
+  return match ? match[1] : null
+}
+
+function ownerMessageIds(text) {
+  const ids = []
+  for (const line of String(text || '').split('\n')) {
+    const start = line.indexOf('{')
+    if (start < 0 || !line.includes('owner_message')) continue
+    try {
+      const event = JSON.parse(line.slice(start))
+      if (event?.type === 'owner_message' && UUID.test(event.message_id ?? '')) ids.push(event.message_id)
+    } catch {
+      const match = line.match(/"message_id":"([0-9a-f-]{36})"/i)
+      if (match && UUID.test(match[1])) ids.push(match[1])
+    }
+  }
+  return ids
+}
+
+export function commandRequestsInWake(text, state) {
+  const refs = []
+  if (!state?.open) return refs
+  for (const messageId of ownerMessageIds(text)) {
+    for (const [id, info] of state.open) {
+      if (info.message_id === messageId && !refs.includes(id)) refs.push(id)
+    }
+  }
+  return refs
+}
+
+function carriedBy(entry, state) {
+  return {
+    ref: state.open.has(entry.request) || entry.request === NO_REQUEST ? entry.request : UNSTATED,
+    also: (entry.also ?? []).filter((id) => state.open.has(id) && id !== entry.request),
+  }
+}
+
+export function requestForWake({ origin, text, state }) {
+  const kind = typeof origin === 'string' ? origin : origin?.kind
+  if (kind === 'task-notification') {
+    for (const key of [tag(text, 'task-id'), tag(text, 'tool-use-id')]) {
+      const launch = key ? state.launches.get(key) : null
+      if (launch) return carriedBy(launch, state)
+    }
+    const commands = commandRequestsInWake(text, state)
+    if (commands.length > 0) return { ref: commands.at(-1), also: commands.slice(0, -1) }
+    if (ownerMessageIds(text).length > 0) return { ref: UNSTATED, also: [] }
+    if (/"type"\s*:\s*"automation_run"/.test(String(text || ''))) return { ref: NO_REQUEST, also: [] }
+    return { ref: UNSTATED, also: [] }
+  }
+  if (kind === 'scheduled-trigger') {
+    const prompt = String(text || '').trim()
+    const matched = [...state.schedules].reverse().filter((schedule) => schedule.prompt === prompt)
+    if (matched.length === 0) return { ref: UNSTATED, also: [] }
+    const first = carriedBy(matched[0], state)
+    const also = new Set(first.also)
+    for (const schedule of matched.slice(1)) {
+      const other = carriedBy(schedule, state)
+      for (const id of [other.ref, ...other.also]) {
+        if (id !== first.ref && (UUID.test(id) || id === NO_REQUEST)) also.add(id)
+      }
+    }
+    return { ref: first.ref, also: [...also] }
+  }
+  return { ref: UNSTATED, also: [] }
+}
+
+export function notifiedKeys(text) {
+  return [tag(text, 'task-id'), tag(text, 'tool-use-id')].filter((key) => key && KEY.test(key))
+}
+
+export function promptArrival({ fromAPerson, origin, text, midTurn = false, state, newId = randomUUID }) {
+  const events = []
+  if (fromAPerson) {
+    const id = newId()
+    events.push(midTurn ? { op: 'joined', id } : { op: 'current', ref: id })
+    return { events, typedId: id }
+  }
+  const { ref, also } = requestForWake({ origin, text, state })
+  if (midTurn) {
+    for (const id of [ref, ...also]) events.push({ op: 'joined', id })
+  } else {
+    events.push({ op: 'current', ref: ref === UNSTATED ? null : ref })
+    for (const id of also) events.push({ op: 'joined', id })
+  }
+  const kind = typeof origin === 'string' ? origin : origin?.kind
+  if (kind === 'task-notification') {
+    for (const key of notifiedKeys(text)) events.push({ op: 'notified', key })
+  }
+  return { events, typedId: null }
+}
+
+/**
+ * Record the active request(s) in `<connectionId>.requests.jsonl` when a remote inbox
+ * batch (`canonical_commands`, `automation_run`, or legacy `owner_messages`) is delivered
+ * by `devspec-remote-wait.mjs` or `devspec-remote-listen.mjs`.
+ *
+ * In Antigravity, background `devspec-remote-wait.mjs` wakes resume the model without
+ * invoking `PreInvocation`, so recording `op: 'current'` at wake delivery guarantees
+ * `requestRefForWrite` and `provenanceRefForWrite` resolve the active request during the turn.
+ */
+export function recordDeliveredBatchRequests(
+  connectionId,
+  batch,
+  { dir = path.join(os.homedir(), '.devspec', 'remote-control', 'connections') } = {},
+) {
+  if (!connectionId || !batch || typeof batch !== 'object') return []
+  const events = []
+  if (Array.isArray(batch)) {
+    const state = readRequestState(connectionId, { dir })
+    const refs = []
+    for (const item of batch) {
+      const msgId = item?.message_id ?? item?.message?.id ?? null
+      const provRef = item?.provenance_ref ?? item?.message?.provenance_ref ?? null
+      for (const [id, info] of state.open) {
+        if (
+          ((msgId && info.message_id === msgId) || (provRef && info.provenance_ref === provRef)) &&
+          !refs.includes(id)
+        ) {
+          refs.push(id)
+        }
+      }
+    }
+    if (refs.length > 0) {
+      events.push({ op: 'current', ref: refs.at(-1) })
+      for (const id of refs.slice(0, -1)) events.push({ op: 'joined', id })
+    }
+  } else if (batch.type === 'canonical_commands') {
+    const state = readRequestState(connectionId, { dir })
+    const executeIds = Array.isArray(batch.execute_message_ids)
+      ? batch.execute_message_ids
+      : Array.isArray(batch.ingress?.command_message_ids)
+        ? batch.ingress.command_message_ids
+        : []
+    const refs = []
+    for (const messageId of executeIds) {
+      for (const [id, info] of state.open) {
+        if (info.message_id === messageId && !refs.includes(id)) refs.push(id)
+      }
+    }
+    if (refs.length > 0) {
+      events.push({ op: 'current', ref: refs.at(-1) })
+      for (const id of refs.slice(0, -1)) events.push({ op: 'joined', id })
+    } else if (executeIds.length > 0) {
+      events.push({ op: 'current', ref: null })
+    }
+  } else if (batch.type === 'automation_run') {
+    events.push({ op: 'current', ref: NO_REQUEST })
+  } else if (batch.type === 'owner_messages') {
+    events.push({ op: 'current', ref: null })
+  }
+  for (const event of events) {
+    appendRequestEvent(connectionId, event, { dir })
+  }
+  return events
+}
+
 export function requestRefForWrite(state, agentId = null) {
   if (!state) return null
   if (agentId) {
@@ -333,6 +492,14 @@ export function requestsWithWorkPending(state, { backgroundTasks = null, session
     if (crons.some((cron) => cronIsSchedule(cron, schedule))) hold(schedule)
   }
   return pending
+}
+
+export function absentLaunches(state, backgroundTasks) {
+  if (!Array.isArray(backgroundTasks)) return []
+  const listed = new Set(backgroundTasks.map((task) => task?.id).filter((id) => typeof id === 'string'))
+  return [...new Set(state.launches.values())]
+    .filter((launch) => launch.notifies && !launch.notified && state.open.has(launch.request) && !listed.has(launch.key))
+    .map((launch) => launch.key)
 }
 
 export function rotateRequestLog(

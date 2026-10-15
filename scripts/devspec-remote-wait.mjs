@@ -47,6 +47,7 @@ import {
   normalizeRemoteIngressV1,
   REMOTE_INGRESS_RESOURCE_URI,
 } from './remote-ingress-v1.mjs'
+import { recordDeliveredBatchRequests } from './requests.mjs'
 import { wakeNotice } from './room-unread.mjs'
 
 export { describeAttachment, materialiseAttachments, MAX_INLINE_ATTACHMENT_CHARS }
@@ -975,6 +976,11 @@ async function main() {
             }
           } else {
             await writeEventSequence(events)
+          }
+          try {
+            recordDeliveredBatchRequests(connectionId, batch, { dir: CONNECTIONS_DIR })
+          } catch {
+            /* non-fatal */
           }
           delivered +=
             batch.type === 'canonical_commands'

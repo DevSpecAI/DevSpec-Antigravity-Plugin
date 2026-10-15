@@ -213,6 +213,72 @@ describe('PreToolUse mechanical input stamping (overwrite)', () => {
       fx.cleanup()
     }
   })
+
+  it('strips invalid provenance_ref on post_session_message, stamps local_turn + command_turn_unbound on local terminal turns, and stamps request_ref from typed_prompt onto supersede_memory', () => {
+    const fx = makeFixture()
+    try {
+      const typedReqId = 'e9999999-9999-4999-8999-999999999999'
+      appendRequestEvent(
+        CONN_ID,
+        {
+          op: 'open',
+          id: typedReqId,
+          kind: 'typed_prompt',
+          requested_by: USER_1,
+        },
+        { dir: fx.connDir },
+      )
+      appendRequestEvent(CONN_ID, { op: 'current', ref: typedReqId }, { dir: fx.connDir })
+
+      // 1. supersede_memory during a local terminal turn gets request_ref stamped from typed_prompt
+      const memRes = prepareDevspecToolInput(
+        {
+          conversationId: CONV_ID,
+          tool_name: 'call_mcp_tool',
+          tool_input: {
+            ServerName: 'devspec',
+            ToolName: 'supersede_memory',
+            Arguments: {
+              id: '5f1b7e0e-eb4e-4b33-9e97-949956384705',
+              title: 'Architecture decision',
+              body: 'Updated body',
+            },
+          },
+        },
+        { home: fx.home, env: {} },
+      )
+      assert.equal(memRes.decision, 'allow')
+      assert.equal(memRes.overwrite.Arguments.connection_id, CONN_ID)
+      assert.equal(memRes.overwrite.Arguments.project_id, PROJ_ID)
+      assert.equal(memRes.overwrite.Arguments.request_ref, typedReqId)
+
+      // 2. post_session_message during a local terminal turn strips provenance_ref and stamps command_turn_unbound: true, local_turn: true
+      const postRes = prepareDevspecToolInput(
+        {
+          conversationId: CONV_ID,
+          tool_name: 'call_mcp_tool',
+          tool_input: {
+            ServerName: 'devspec',
+            ToolName: 'post_session_message',
+            Arguments: {
+              message: 'Answered your local terminal prompt and mirrored to the session.',
+              provenance_ref: 'devspec://session-message-provenance/v1',
+              complete_turn: true,
+            },
+          },
+        },
+        { home: fx.home, env: {} },
+      )
+      assert.equal(postRes.decision, 'allow')
+      assert.equal(postRes.overwrite.Arguments.connection_id, CONN_ID)
+      assert.equal(postRes.overwrite.Arguments.provenance_ref, undefined)
+      assert.equal(postRes.overwrite.Arguments.command_turn_unbound, true)
+      assert.equal(postRes.overwrite.Arguments.local_turn, true)
+      assert.equal(postRes.overwrite.Arguments.complete_turn, true)
+    } finally {
+      fx.cleanup()
+    }
+  })
 })
 
 describe('Multi-requester ambiguity guard & devspec-serve-request.mjs', () => {

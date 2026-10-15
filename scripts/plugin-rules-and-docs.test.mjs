@@ -19,20 +19,27 @@ describe('Item 5 parity: rules/AGENTS.md, package version 0.15.0, and documentat
     assert.match(content, /room-unread\.mjs/)
     assert.match(content, /\.transcript\.jsonl/)
     assert.match(content, /\.room\.json/)
+    assert.match(content, /supersede_memory/)
+    assert.match(content, /create_resource/)
+    assert.match(content, /update_resource/)
+    assert.match(content, /manage_discussion_point/)
+    assert.match(content, /complete_turn:\s*true/)
+    assert.match(content, /never pass `provenance_ref`/)
   })
 
-  it('bumps package.json and CHANGELOG.md to 0.15.5', () => {
+  it('bumps package.json and CHANGELOG.md to 0.15.6', () => {
     const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'))
-    assert.equal(pkg.version, '0.15.5')
+    assert.equal(pkg.version, '0.15.6')
     const changelog = fs.readFileSync(path.join(ROOT, 'CHANGELOG.md'), 'utf8')
-    assert.match(changelog, /^## 0\.15\.5\b/m)
+    assert.match(changelog, /^## 0\.15\.6\b/m)
   })
 
-  it('documents ~/.gemini/config/mcp_config.json and agy mcp add in README.md and has no non-existent agy flags', () => {
+  it('documents ~/.gemini/config/mcp_config.json, agy mcp add, and why the plugin is required in README.md and has no non-existent agy flags', () => {
     const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8')
     assert.match(readme, /~\/\.gemini\/config\/mcp_config\.json/)
     assert.match(readme, /agy mcp add/)
     assert.match(readme, /rules\/AGENTS\.md/)
+    assert.match(readme, /Installing the plugin is required alongside the MCP server/)
     assert.match(readme, /devspec-remote-connect\.mjs/)
     assert.match(readme, /room-unread\.mjs/)
     assert.doesNotMatch(readme, /--install-plugin|--update-plugins/)

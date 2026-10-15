@@ -26,6 +26,21 @@ import {
   inferAntigravityTranscriptPath,
   localBondPath,
 } from './remote-control-state.mjs'
+import {
+  localTurnScope,
+  localTurnToComplete,
+  startLocalTurn,
+} from './local-turn.mjs'
+import {
+  absentLaunches,
+  appendRequestEvent,
+  closeRequest,
+  openRequest,
+  promptArrival,
+  readRequestState,
+  requestsWithWorkPending,
+  rotateRequestLog,
+} from './requests.mjs'
 import { readConnectionTelemetry } from './statusline.mjs'
 
 const MODES = new Set(['user_prompt', 'stop', 'background_launch', 'subagent_stop'])
@@ -1008,6 +1023,24 @@ export function prepareAgentMirrorText(text) {
   return t.slice(0, 12000)
 }
 
+export function patchOwnState(connectionId, patch, connectionsDir = CONNECTIONS_DIR) {
+  if (!connectionId || !patch || typeof patch !== 'object') return false
+  const file = path.join(connectionsDir, `${connectionId}.json`)
+  try {
+    if (!fs.existsSync(file)) return false
+    const current = JSON.parse(fs.readFileSync(file, 'utf8'))
+    const updated = {
+      ...current,
+      ...patch,
+      updated_at: new Date().toISOString(),
+    }
+    fs.writeFileSync(file, JSON.stringify(updated, null, 2), { mode: 0o600 })
+    return true
+  } catch {
+    return false
+  }
+}
+
 /**
  * Execute the mirror-turn lifecycle logic in-process or from CLI.
  */
@@ -1051,14 +1084,14 @@ export async function handleMirrorTurn(
 
   let token = state.token
   let mcpUrl = state.mcp_url
-  if (!token) {
+  if (!token || !mcpUrl) {
     const auth = resolveDevspecMcpAuth(state.cwd || process.cwd())
-    token = auth.token
+    token = token || auth.token
     mcpUrl = mcpUrl || auth.mcp_url
   }
   if (!token) return { ok: true, skipped: 'no_auth_token' }
 
-  mcpUrl = mcpUrl || 'https://api.devspec.ai/api/mcp'
+  mcpUrl = mcpUrl || 'https://devspec.ai/api/mcp'
   const agentName = AGENT_NAME
   const connectionId = state.connection_id
   const sessionId = state.session_id || null
@@ -1105,30 +1138,103 @@ export async function handleMirrorTurn(
 
   const text = extractLastText(raw, modeArg)
   const rawStepContent = typeof latestStep?.content === 'string' ? latestStep.content : ''
+  const isExplicitUserInputStep =
+    latestStep?.type === 'USER_INPUT' &&
+    !rawStepContent.includes('[DevSpec Remote Wake]') &&
+    parsedHookInput?.remote_turn !== true
   const isRemoteWakeInput =
-    Boolean(existingMarker?.remoteTurn) ||
-    parsedHookInput?.remote_turn === true ||
-    (typeof text === 'string' && text.includes('[DevSpec Remote Wake]')) ||
-    rawStepContent.includes('[DevSpec Remote Wake]') ||
-    (latestStep?.type === 'SYSTEM_MESSAGE' &&
-      (rawStepContent.includes('"event":"wake"') ||
-        rawStepContent.includes('"type":"system_notice"') ||
-        rawStepContent.includes('"event":"directives"') ||
-        rawStepContent.includes('"event":"automation_run"') ||
-        rawStepContent.includes('"event":"interaction_answer"') ||
-        rawStepContent.includes('"event":"question_dismissal"')))
+    !isExplicitUserInputStep &&
+    (Boolean(existingMarker?.remoteTurn) ||
+      parsedHookInput?.remote_turn === true ||
+      (typeof text === 'string' && text.includes('[DevSpec Remote Wake]')) ||
+      rawStepContent.includes('[DevSpec Remote Wake]') ||
+      (latestStep?.type === 'SYSTEM_MESSAGE' &&
+        (rawStepContent.includes('"event":"wake"') ||
+          rawStepContent.includes('"type":"system_notice"') ||
+          rawStepContent.includes('"event":"directives"') ||
+          rawStepContent.includes('"event":"automation_run"') ||
+          rawStepContent.includes('"event":"interaction_answer"') ||
+          rawStepContent.includes('"event":"question_dismissal"'))))
 
   const skipMirror =
     modeArg === 'user_prompt' &&
     ((!!text && isHarnessInjection(text)) || latestStep?.type === 'SYSTEM_MESSAGE')
 
+  const fromAPerson =
+    modeArg === 'user_prompt' &&
+    !isRemoteWakeInput &&
+    !skipMirror &&
+    Boolean(text && String(text).trim())
+
+  let typedRequest = null
+  if (fromAPerson && connectionId) {
+    try {
+      const arrival = promptArrival({
+        fromAPerson: true,
+        text,
+        midTurn: false,
+        state: readRequestState(connectionId, { dir: connectionsDir }),
+      })
+      for (const event of arrival.events) {
+        appendRequestEvent(connectionId, event, { dir: connectionsDir })
+      }
+      if (arrival.typedId) typedRequest = { id: arrival.typedId, midTurn: false }
+    } catch {
+      /* non-fatal */
+    }
+  }
+
+  const callRequest = (args) =>
+    call({
+      mcpUrl,
+      token,
+      connectionCapability: state.connection_capability,
+      name: 'report_request',
+      arguments: args,
+    })
+
   try {
+    let admittedLocalTurn = null
+    if (fromAPerson && connectionId && sessionId && state.connection_capability) {
+      const scope = localTurnScope(state, sessionId)
+      if (scope) {
+        admittedLocalTurn = await startLocalTurn({
+          scope,
+          previousAttemptId: state.local_turn?.attempt_id ?? null,
+          call: (args) =>
+            call({
+              mcpUrl,
+              token,
+              connectionCapability: state.connection_capability,
+              name: 'report_pickup',
+              arguments: args,
+            }),
+        })
+        if (admittedLocalTurn) {
+          patchOwnState(connectionId, { local_turn: admittedLocalTurn }, connectionsDir)
+          state.local_turn = admittedLocalTurn
+        }
+      }
+    }
+
+    if (typedRequest && connectionId && state.connection_capability) {
+      await openRequest({
+        connectionId,
+        kind: 'typed_prompt',
+        call: callRequest,
+        dir: connectionsDir,
+        id: typedRequest.id,
+      }).catch(() => null)
+    }
+
+    let localPromptMirrored = false
     if (
       modeArg === 'user_prompt' &&
       sessionId &&
       text &&
       String(text).trim() &&
-      !skipMirror
+      !skipMirror &&
+      !isRemoteWakeInput
     ) {
       const cleaned = String(text).trim().slice(0, 12000)
       if (cleaned) {
@@ -1145,13 +1251,18 @@ export async function handleMirrorTurn(
           name: 'post_session_message',
           arguments: postArgs,
         })
+        localPromptMirrored = true
       }
     }
 
     const turnActive = modeArg === 'user_prompt'
     if (turnActive) {
-      const markerExtra = { held: false }
-      if (isRemoteWakeInput) markerExtra.remoteTurn = true
+      const markerExtra = {
+        held: false,
+        remoteTurn: Boolean(isRemoteWakeInput),
+        localPromptMirrored: Boolean(localPromptMirrored),
+        ...(admittedLocalTurn ? { localTurn: admittedLocalTurn } : {}),
+      }
       if (typeof latestStep?.step_index === 'number') {
         markerExtra.lastStepIndex = latestStep.step_index
       }
@@ -1169,11 +1280,16 @@ export async function handleMirrorTurn(
       const hadExplicitReply = consumeExplicitReplyMarker(connectionId, connectionsDir)
       clearTurnMarker(connectionId, connectionsDir)
 
-      // Remote-turn fallback reply: if this turn was initiated by a remote wake on an
-      // attached session and the agent ended the turn without calling post_session_message,
-      // extract the assistant's final response + work_trail from the transcript and post it
-      // so the session room never shows a blank / "No response" turn.
-      if (!hadExplicitReply && sessionId && (marker?.remoteTurn || parsedHookInput?.remote_turn === true)) {
+      // Session fallback reply: if this turn ran on an attached session (either a remote wake
+      // OR a local terminal prompt mirrored to the session) and the agent ended the turn
+      // without calling post_session_message, extract the assistant's final response +
+      // work_trail from the transcript and post it so the session room never misses the reply.
+      const isRemoteTurn = Boolean(marker?.remoteTurn || parsedHookInput?.remote_turn === true)
+      const isLocalMirroredTurn = Boolean(
+        !isRemoteTurn &&
+          (marker?.localPromptMirrored || marker?.localTurn || state?.local_turn),
+      )
+      if (!hadExplicitReply && sessionId && (isRemoteTurn || isLocalMirroredTurn)) {
         const rawStopText =
           (text ? prepareAgentMirrorText(text) : null) ||
           extractLatestAssistantReplyFromTranscript(effectiveTranscriptPath, {
@@ -1197,6 +1313,13 @@ export async function handleMirrorTurn(
             session_id: sessionId,
             agent_name: agentName,
             message: rawStopText,
+            ...(isLocalMirroredTurn
+              ? {
+                  command_turn_unbound: true,
+                  local_turn: true,
+                  complete_turn: true,
+                }
+              : {}),
             ...(trail.markdown ? { work_trail: trail.markdown } : {}),
             ...(trail.events.length > 0 ? { trail_events: trail.events } : {}),
             ...(telemetry ? { agent_stats: telemetry } : {}),
@@ -1221,6 +1344,68 @@ export async function handleMirrorTurn(
           }
         }
       }
+
+      if (connectionId) {
+        await call({
+          mcpUrl,
+          token,
+          name: 'heartbeat_connection',
+          arguments: {
+            connection_id: connectionId,
+            agent_name: agentName,
+            status: 'live',
+            busy: false,
+          },
+        })
+        const localAttempt = localTurnToComplete(
+          state.local_turn || marker?.localTurn,
+          sessionId,
+        )
+        try {
+          await call({
+            mcpUrl,
+            token,
+            name: 'report_complete',
+            arguments: localAttempt
+              ? { connection_id: connectionId, attempt_id: localAttempt, reason: 'turn_end' }
+              : { connection_id: connectionId, reason: 'turn_end' },
+          })
+        } catch {
+          /* non-fatal — the poller's marker-driven backstop still runs */
+        }
+        if (state.local_turn) {
+          patchOwnState(connectionId, { local_turn: null }, connectionsDir)
+          state.local_turn = null
+        }
+        if (state.connection_capability) {
+          try {
+            const requests = readRequestState(connectionId, { dir: connectionsDir })
+            if (requests.open.size > 0) {
+              const pending = requestsWithWorkPending(requests, { backgroundTasks: [] })
+              const finished = [...requests.open.keys()].filter(
+                (id) => requests.started.has(id) && !pending.has(id),
+              )
+              await Promise.all(
+                finished.map((requestId) =>
+                  closeRequest({
+                    connectionId,
+                    requestId,
+                    call: callRequest,
+                    dir: connectionsDir,
+                  }),
+                ),
+              )
+            }
+            for (const key of absentLaunches(requests, [])) {
+              appendRequestEvent(connectionId, { op: 'absent', key }, { dir: connectionsDir })
+            }
+            rotateRequestLog(connectionId, { dir: connectionsDir })
+          } catch {
+            /* non-fatal */
+          }
+        }
+      }
+      return { ok: true, busy: false }
     }
 
     if (connectionId) {
@@ -1232,23 +1417,11 @@ export async function handleMirrorTurn(
           connection_id: connectionId,
           agent_name: agentName,
           status: 'live',
-          busy: turnActive,
+          busy: true,
         },
       })
-      if (!turnActive) {
-        try {
-          await call({
-            mcpUrl,
-            token,
-            name: 'report_complete',
-            arguments: { connection_id: connectionId, reason: 'turn_end' },
-          })
-        } catch {
-          /* non-fatal — the poller's marker-driven backstop still runs */
-        }
-      }
     }
-    return { ok: true, busy: turnActive }
+    return { ok: true, busy: true }
   } catch (e) {
     process.stderr.write(`[devspec-remote] ${e instanceof Error ? e.message : String(e)}\n`)
     return { ok: false, error: e instanceof Error ? e.message : String(e) }

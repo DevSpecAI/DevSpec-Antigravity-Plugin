@@ -64,8 +64,11 @@ Or merge the `devspec` entry directly into Antigravity CLI's user-level MCP conf
 
 - Replace `dvs_YOUR_DEVSPEC_MCP_TOKEN` with a literal `dvs_...` token string (do not use shell variable interpolation like `${TOKEN}`).
 - On first verified connection, the plugin pins your working token and URL at `~/.devspec/auth.json` (`0600`) so stale or placeholder project files never shadow it.
+- **Internal staging / custom endpoint override:** End users default to production (`https://devspec.ai/api/mcp`). For internal testing against staging (`devspecstaging.com`), copy the `agy mcp add` or `mcp_config.json` snippet directly from [staging Agents settings](https://app.devspecstaging.com/settings/agents) (which sets `serverUrl` to `https://api.devspecstaging.com/api/mcp`, or `https://devspecstaging.com/api/mcp`) or set `DEVSPEC_MCP_URL=https://api.devspecstaging.com/api/mcp`. Every hook and background poller resolves `serverUrl` from your MCP config (`resolve-mcp-auth.mjs`) so all traffic stays on staging.
 
-### 2. Clone the plugin globally
+### 2. Clone the plugin globally (Required)
+
+**Installing the plugin is required alongside the MCP server.** Because Antigravity lazy-loads MCP tool schemas on disk and spills tool outputs larger than ~6 KB to step files, the plugin bundles [`rules/AGENTS.md`](rules/AGENTS.md) — which Antigravity automatically loads into `<user_rules>` in every workspace — giving the model the complete DevSpec lazy MCP tool parameter quick-reference, ~6 KB spill & `view_file` handling rules, symmetric session-reply rules, and runtime implementation contract without needing to copy an `AGENTS.md` file into each repository manually. The plugin also provides the lifecycle hooks (`SessionStart`, `PreInvocation`, `PreToolUse`, `PostToolUse`, `PreCompact`, `Stop`) required for local and remote turn admission, request-chain attribution, commit provenance, and two-sided session transcript mirroring.
 
 Clone this repository into `~/.gemini/config/plugins/antigravity-devspec-autopilot-extension`:
 
@@ -85,10 +88,10 @@ git clone https://github.com/DevSpecAI/DevSpec-Antigravity-Plugin.git "$HOME\.ge
 ### 3. Start `agy`
 
 Start `agy` in any project directory. On startup, the plugin automatically:
-- Loads `rules/AGENTS.md` so Antigravity knows the DevSpec remote-control, local room-context, and implementation-contract rules whenever the plugin is enabled.
+- Loads `rules/AGENTS.md` into `<user_rules>` so Antigravity has the complete DevSpec lazy MCP tool schemas, ~6 KB spill handling, symmetric session-reply rules, local room-context rules, and implementation-contract rules in every project.
 - Configures the DevSpec status bar (`statusLine`) in `~/.gemini/antigravity-cli/settings.json` (if no custom `statusLine` is already set).
 - Verifies your `dvs_` token against DevSpec, registers this `agy` session on the **Agents page**, caches your personal and project instruction rules (`<connectionId>.rules.md`), and starts the background poller (`DEVSPEC_CONNECT_AT_STARTUP=0` to opt out).
-- Injects initial project grounding when the repository matches a DevSpec project.
+- Injects initial project grounding and the four DevSpec instruction tiers (`owner_agent_rules`, `custom_instructions`, `agent_rules`, `workflow_guidance`) when the repository matches a DevSpec project.
 
 > **Updating:** When the Agents page in DevSpec shows an **Update** badge on your Antigravity connection, run `git -C ~/.gemini/config/plugins/antigravity-devspec-autopilot-extension pull` and start a new `agy` session.
 
@@ -178,19 +181,19 @@ You rarely need to pass a project ID manually:
 
 ---
 
-## Plugin architecture & hooks (`v0.15.1`)
+## Plugin architecture & hooks (`v0.15.6`)
 
 All hooks are declared in `hooks.json` (mirrored in `hooks/hooks.json`), validated against Antigravity's strict hook JSON schemas (`scripts/hook-output.mjs`), and executed via dependency-free Node.js ESM scripts in `scripts/`:
 
 | Surface / Hook Event | File / Script | Role |
 |---|---|---|
-| Plugin Rules | `rules/AGENTS.md` | Automatically loaded when the plugin is enabled so `agy` follows the DevSpec remote-control, local room-context, and implementation-contract rules. |
+| Plugin Rules | `rules/AGENTS.md` | Automatically loaded into `<user_rules>` when the plugin is installed so `agy` has the complete DevSpec lazy MCP tool parameter quick-reference, ~6 KB spill & `view_file` rules, symmetric session-reply rules, local room-context rules, and implementation-contract rules in every project. |
 | `SessionStart` | `scripts/session-start-context.mjs` → `scripts/session-start.mjs` | Auto-configures `statusLine` in `~/.gemini/antigravity-cli/settings.json`, verifies and pins MCP auth (`~/.devspec/auth.json`), auto-registers a standby connection, caches instruction rules (`scripts/instruction-rules.mjs`), starts the background poller, injects initial project grounding (`devspec-scope.mjs`), and restores active session plan instructions (`session-plan-prompts.mjs`). |
-| `PreInvocation` (`UserPromptSubmit`) | `scripts/pre-invocation.mjs` → `scripts/mirror-turn.mjs` | Mirrors the user's prompt to the attached DevSpec session once per turn, surfaces lightweight unread room count / room state changes (`scripts/room-unread.mjs`), and reports connection activity (`report_pickup` / `report_keepalive`). |
-| `PreToolUse` | `scripts/pre-tool-dispatch.mjs` → `scripts/implementation-guard.mjs` | Normalizes Antigravity native (`call_mcp_tool`, `run_command`) and standard MCP tool calls (`scripts/hook-output.mjs`), verifies git commit provenance (`[devspec:<id>]` trailers and repository ancestry) before `record_implementation` or `add_commit_reference` calls, and records active subagent launches (`active-subagents.mjs`). |
+| `PreInvocation` (`UserPromptSubmit`) | `scripts/pre-invocation.mjs` → `scripts/mirror-turn.mjs` | Admits local terminal turns (`scripts/local-turn.mjs`), opens a `typed_prompt` request in `<connectionId>.requests.jsonl` (`scripts/requests.mjs`) for request-chain attribution, mirrors the user's prompt to the attached DevSpec session once per turn, surfaces lightweight unread room count / room state changes (`scripts/room-unread.mjs`), and reports connection activity (`report_pickup` / `report_keepalive`). |
+| `PreToolUse` | `scripts/pre-tool-dispatch.mjs` → `scripts/devspec-tool-input.mjs` + `scripts/implementation-guard.mjs` | Mechanically stamps `connection_id`, `project_id`, `local_session_id`, `agent_name`, `provenance_ref` / `request_ref`, and local-turn `post_session_message` flags (`local_turn: true, command_turn_unbound: true`), guards multi-requester launches (`launch-guard.mjs`), verifies git commit provenance (`[devspec:<id>]` trailers and repository ancestry), and records active subagent launches (`active-subagents.mjs`). |
 | `PostToolUse` | `scripts/post-tool-dispatch.mjs` | Tracks `claim_work_item` / `release_work_item` / `record_implementation` and `claim_automation_run` / `record_automation_run` state (`commit-provenance.mjs`), observes new git commits after `run_command` (`commit-observation.mjs`), validates `.devspec/project.json` edits (`pin-check.mjs`), nudges on unlinked git remotes (`repo-link-nudge.mjs`), surfaces unread room count (`room-unread.mjs`), and marks explicit session replies (`mirror-turn.mjs`). |
 | `PreCompact` | `scripts/pre-compact.mjs` | Injects active connection continuity, local `.transcript.jsonl` / `.room.json` / `.rules.md` pointers, and active session plan state before context compaction. |
-| `Stop` | `scripts/mirror-turn.mjs` | Holds the turn open (`decision: "block"`) if background subagents are still active or an interaction continuation is pending; otherwise mirrors the final assistant response from `transcript.jsonl` and closes the activity turn (`report_complete`). |
+| `Stop` | `scripts/mirror-turn.mjs` | Holds the turn open (`decision: "block"`) if background subagents are still active or an interaction continuation is pending; otherwise symmetrically mirrors the final assistant response + work trail from `transcript.jsonl` on both remote turns and mirrored local terminal turns, completes the local turn (`local-turn.mjs`), and closes finished requests (`requests.mjs`). |
 | `statusLine` | `scripts/statusline.mjs` | Renders the single-line DevSpec status bar (`DevSpec: <Codename> · <Project> · “<Session>” · automation “<name>” · working on “<title>” (<code>) · <model> (<context%>%)`) and records normalized model, effort, token, and context-window telemetry (`<connectionId>.telemetry.json`) for `heartbeat_connection`. |
 
 ### Running the test suite

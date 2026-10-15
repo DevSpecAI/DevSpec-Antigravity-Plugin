@@ -228,14 +228,26 @@ export function resolveDevspecMcpAuth(cwd = process.cwd(), opts = {}) {
   const rawEnvToken = env.DEVSPEC_MCP_TOKEN || env.DEVSPEC_TOKEN || null
   const envToken = isNonPlaceholderToken(rawEnvToken) ? rawEnvToken.trim() : null
   const envUrl = env.DEVSPEC_MCP_URL || null
-  if (envToken) {
-    return { ok: true, token: envToken, mcp_url: envUrl || DEFAULT_PROD_URL, source: 'env' }
-  }
 
   const ag = antigravityConfigAuth(cwd, { home })
   const fromProject = walkMcpJson(cwd)
   const pinned = readPinnedAuth({ home })
   const piAuth = readPiAuth({ home })
+
+  if (envToken) {
+    return {
+      ok: true,
+      token: envToken,
+      mcp_url:
+        envUrl ||
+        ag?.mcp_url ||
+        fromProject?.mcp_url ||
+        pinned?.mcp_url ||
+        piAuth?.mcp_url ||
+        DEFAULT_PROD_URL,
+      source: 'env',
+    }
+  }
 
   const hostToken = isNonPlaceholderToken(opts.hostToken) ? opts.hostToken.trim() : null
   if (hostToken) {

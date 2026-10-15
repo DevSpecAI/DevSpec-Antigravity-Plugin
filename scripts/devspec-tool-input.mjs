@@ -32,6 +32,7 @@ import {
 } from './mirror-turn.mjs'
 import { inferAntigravityTranscriptPath, readStateFile } from './remote-control-state.mjs'
 import { stampRequest } from './request-ref.mjs'
+import { readRequestState } from './requests.mjs'
 import { prePostHoldObject } from './room-unread.mjs'
 import { readConnectionTelemetry } from './statusline.mjs'
 
@@ -179,6 +180,9 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
   const connState = connectionId ? readStateFile(connectionId, connDir) : null
 
   let next = { ...toolInput }
+  if (verb === 'post_session_message' && next.provenance_ref !== undefined) {
+    delete next.provenance_ref
+  }
   const effectiveCwd =
     (Array.isArray(input.workspacePaths) && input.workspacePaths[0]) ||
     input.cwd ||
@@ -254,8 +258,9 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
   next = versionedConnectionArguments(verb, request.args)
 
   // 8. For explicit session replies (non-trail, non-needs_input, non-local_prompt):
-  //    record the explicit reply marker, stamp live mechanical telemetry (`agent_stats`
-  //    and `model`) so LLM-guessed model names never override the host-reported model,
+  //    record the explicit reply marker, stamp local-turn unbound flags when answering
+  //    a local terminal prompt, stamp live mechanical telemetry (`agent_stats` and
+  //    `model`) so LLM-guessed model names never override the host-reported model,
   //    and automatically attach `work_trail` + `trail_events` from the current turn's
   //    Antigravity transcript if not already supplied.
   if (
@@ -265,6 +270,31 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
     next.turn_kind !== 'local_prompt'
   ) {
     const targetConnId = next.connection_id || connectionId
+    const turnMarker = targetConnId ? readTurnMarker(targetConnId, connDir) : null
+    if (
+      targetConnId &&
+      !next.command_turn_id &&
+      next.command_turn_unbound === undefined &&
+      !next.interaction_event_id &&
+      !next.question_dismissal_event_id
+    ) {
+      const reqState = readRequestState(targetConnId, { dir: connDir })
+      const currentReq = reqState?.current ? reqState.open.get(reqState.current) : null
+      const isLocalTurn = Boolean(
+        connState?.local_turn ||
+          (turnMarker &&
+            !turnMarker.remoteTurn &&
+            (turnMarker.localPromptMirrored || turnMarker.localTurn)) ||
+          currentReq?.kind === 'typed_prompt',
+      )
+      if (isLocalTurn) {
+        next = {
+          ...next,
+          command_turn_unbound: true,
+          local_turn: true,
+        }
+      }
+    }
     if (targetConnId) {
       writeExplicitReplyMarker(targetConnId, connDir)
       const telemetry = readConnectionTelemetry(targetConnId, { home })
@@ -290,7 +320,6 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
         inferAntigravityTranscriptPath(conversationId || connState?.local_id)
       if (tPath && fs.existsSync(tPath)) {
         try {
-          const turnMarker = targetConnId ? readTurnMarker(targetConnId, connDir) : null
           const { events, markdown } = extractAntigravityTrailFromTranscript(
             fs.readFileSync(tPath, 'utf8'),
             { sinceMs: turnMarker?.startedAt ?? null, stopAtReply: true },

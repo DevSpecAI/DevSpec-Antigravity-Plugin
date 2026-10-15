@@ -553,4 +553,182 @@ describe('Antigravity native hook payload & transcript handling', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true })
     }
   })
+
+  it('admits local terminal turns (startLocalTurn + openRequest typed_prompt), posts symmetric fallback reply on Stop with local_turn + command_turn_unbound, and closes the local turn and request', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-local-turn-symmetry-'))
+    try {
+      const { readRequestState, recordDeliveredBatchRequests } = await import('./requests.mjs')
+      const connId = '55555555-6666-4777-8888-999999999999'
+      const convId = 'conv-local-symmetry-1'
+      const sessId = '66666666-7777-4888-8999-aaaaaaaaaaaa'
+      const attachId = '77777777-8888-4999-8aaa-bbbbbbbbbbbb'
+      const attachedAt = '2026-10-15T12:00:00.000Z'
+      const transcriptPath = path.join(tmpDir, 'transcript.jsonl')
+
+      fs.writeFileSync(
+        path.join(tmpDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          session_id: sessId,
+          local_id: convId,
+          agent_name: 'Antigravity',
+          token: 'dvs_test_tok',
+          mcp_url: 'https://api.devspec.ai/api/mcp',
+          connection_capability: 'cap_secret_v1',
+          speech_attachment_id: attachId,
+          attached_at: attachedAt,
+          transcript_path: transcriptPath,
+        }),
+      )
+
+      fs.writeFileSync(
+        transcriptPath,
+        [
+          JSON.stringify({
+            step_index: 1,
+            type: 'USER_INPUT',
+            source: 'USER_EXPLICIT',
+            created_at: '2026-10-15T12:00:01.000Z',
+            content: '<USER_REQUEST>\nUpdate the memory from the terminal\n</USER_REQUEST>',
+          }),
+        ].join('\n') + '\n',
+      )
+
+      let admittedAttemptId = null
+      let openedRequestId = null
+      const calls = []
+      const mockCall = async (req) => {
+        calls.push(req)
+        if (req.name === 'report_pickup') {
+          admittedAttemptId = req.arguments.attempt_id
+          return {
+            connection_id: connId,
+            attempt_id: req.arguments.attempt_id,
+            expected_session_id: sessId,
+            status: 'working',
+          }
+        }
+        if (req.name === 'report_request') {
+          if (req.arguments.action === 'open') {
+            openedRequestId = req.arguments.request_id
+            return {
+              request_id: req.arguments.request_id,
+              status: 'open',
+              requested_by_user_id: 'a1111111-1111-4111-8111-111111111111',
+            }
+          }
+          if (req.arguments.action === 'close') {
+            return { status: 'closed' }
+          }
+        }
+        return { ok: true }
+      }
+
+      // 1. PreInvocation on local terminal prompt: admits local turn, opens typed_prompt request, mirrors prompt
+      const preRes = await handleMirrorTurn(
+        'user_prompt',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        {
+          env: {},
+          connectionsDir: tmpDir,
+          legacyPath: path.join(tmpDir, 'legacy.json'),
+          call: mockCall,
+        },
+      )
+      assert.equal(preRes.ok, true)
+      const pickupCall = calls.find((c) => c.name === 'report_pickup')
+      assert.ok(pickupCall, 'calls report_pickup for local turn admission')
+      assert.equal(pickupCall.arguments.local_turn, true)
+      assert.equal(pickupCall.arguments.local_activity_version, 1)
+      assert.equal(pickupCall.connectionCapability, 'cap_secret_v1')
+
+      const reqCall = calls.find((c) => c.name === 'report_request')
+      assert.ok(reqCall, 'calls report_request to open typed_prompt request')
+      assert.equal(reqCall.arguments.kind, 'typed_prompt')
+
+      const promptMirrorCall = calls.find(
+        (c) => c.name === 'post_session_message' && c.arguments.turn_kind === 'local_prompt',
+      )
+      assert.ok(promptMirrorCall, 'mirrors local user prompt to session')
+      assert.equal(promptMirrorCall.arguments.message, 'Update the memory from the terminal')
+
+      const reqStateDuringTurn = readRequestState(connId, { dir: tmpDir })
+      assert.equal(reqStateDuringTurn.current, openedRequestId)
+      assert.equal(reqStateDuringTurn.open.get(openedRequestId)?.kind, 'typed_prompt')
+
+      // 2. Append assistant reply in transcript without explicit post_session_message -> Stop mirrors fallback reply symmetrically
+      fs.appendFileSync(
+        transcriptPath,
+        JSON.stringify({
+          step_index: 2,
+          type: 'PLANNER_RESPONSE',
+          source: 'MODEL',
+          created_at: new Date(Date.now() + 1000).toISOString(),
+          content: 'I updated the memory as requested from the terminal.',
+        }) + '\n',
+      )
+
+      calls.length = 0
+      const stopRes = await handleMirrorTurn(
+        'stop',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        {
+          env: {},
+          connectionsDir: tmpDir,
+          legacyPath: path.join(tmpDir, 'legacy.json'),
+          call: mockCall,
+        },
+      )
+      assert.equal(stopRes.ok, true)
+      const fallbackReply = calls.find((c) => c.name === 'post_session_message')
+      assert.ok(fallbackReply, 'posts symmetric fallback reply on Stop for mirrored local terminal turn')
+      assert.equal(fallbackReply.arguments.connection_id, connId)
+      assert.equal(fallbackReply.arguments.session_id, sessId)
+      assert.equal(fallbackReply.arguments.command_turn_unbound, true)
+      assert.equal(fallbackReply.arguments.local_turn, true)
+      assert.equal(fallbackReply.arguments.complete_turn, true)
+      assert.equal(
+        fallbackReply.arguments.message,
+        'I updated the memory as requested from the terminal.',
+      )
+
+      const completeCall = calls.find((c) => c.name === 'report_complete')
+      assert.ok(completeCall, 'completes the local turn attempt via report_complete')
+      assert.equal(completeCall.arguments.attempt_id, admittedAttemptId)
+
+      const reqStateAfterStop = readRequestState(connId, { dir: tmpDir })
+      assert.equal(reqStateAfterStop.open.size, 0, 'closes the typed_prompt request on Stop')
+
+      // 3. Verify recordDeliveredBatchRequests sets op: 'current' when devspec-remote-wait delivers a command batch
+      const cmdReqId = '99999999-aaaa-4bbb-8ccc-dddddddddddd'
+      const cmdMsgId = 'aaaaaaaa-bbbb-4ccc-8ddd-ffffffffffff'
+      const cmdProvRef = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff'
+      fs.appendFileSync(
+        path.join(tmpDir, `${connId}.requests.jsonl`),
+        JSON.stringify({
+          op: 'open',
+          id: cmdReqId,
+          kind: 'command',
+          message_id: cmdMsgId,
+          provenance_ref: cmdProvRef,
+          requested_by: 'a1111111-1111-4111-8111-111111111111',
+        }) + '\n',
+      )
+      recordDeliveredBatchRequests(
+        connId,
+        [
+          {
+            type: 'owner_message',
+            message: { id: cmdMsgId, provenance_ref: cmdProvRef },
+          },
+        ],
+        { dir: tmpDir },
+      )
+      const reqStateAfterWake = readRequestState(connId, { dir: tmpDir })
+      assert.equal(reqStateAfterWake.current, cmdReqId)
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
 })

@@ -29,6 +29,7 @@ import {
   resolveOwnerPid,
   writeStateFile,
 } from './remote-control-state.mjs'
+import { recordDeliveredBatchRequests } from './requests.mjs'
 import { autoConnectAtStartup, connectAtStartupEnabled } from './session-start.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
@@ -438,11 +439,22 @@ async function main() {
           if (res.ok) {
             deliveredVia = 'agentapi'
             writeTurnMarker(connectionId, { remoteTurn: true })
+            try {
+              recordDeliveredBatchRequests(connectionId, entry, { dir: CONNECTIONS_DIR })
+            } catch {
+              /* non-fatal */
+            }
           } else if (!args.once) {
             // Do not advance offset if agentapi delivery failed in daemon mode,
             // so devspec-remote-wait.mjs or a later tick can deliver it.
             allDeliveredOrNonCommand = false
             break
+          }
+        } else {
+          try {
+            recordDeliveredBatchRequests(connectionId, entry, { dir: CONNECTIONS_DIR })
+          } catch {
+            /* non-fatal */
           }
         }
         process.stdout.write(
