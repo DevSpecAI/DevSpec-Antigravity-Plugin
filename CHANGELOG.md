@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.15.9
+
+### Zombie resurrection prevention on window close, accurate `Working` status upon wake delivery, HTTP LS port discovery, and `PreToolUse` >64 KB trail cap
+
+- **Prevent zombie connection resurrection when closing an ended or disconnected Antigravity window (`scripts/statusline.mjs`, `scripts/session-start.mjs`, `scripts/devspec-remote-poll.mjs`, `scripts/devspec-remote-listen.mjs`):** `readConnectionView` in `scripts/statusline.mjs` now matches an existing `owner_pid` connection even when `enabled === false` or `ended_from_ui === true` (and supports `agy-window:<pid>` standby `local_id` values), so `renderStatusLine` renders the ended/disconnected status instead of falling back to `state: 'local'` and re-triggering `maybeSpawnWindowAutoConnect` during window teardown. `maybeSpawnWindowAutoConnect` never re-spawns when a connection state file already exists for `owner_pid` or while `ownerAlive(ownerPid)` is true, `autoConnectAtStartup` aborts before and after `register_connection` if `ownerPid` has already exited, and `devspec-remote-poll.mjs` / `devspec-remote-listen.mjs` exit immediately at startup when an explicit `--owner-pid` is already dead instead of running forever without an owner anchor.
+- **Assert `Working` (`busy: true` / `report_pickup`) only when the wake is actually delivered (`scripts/devspec-remote-poll.mjs`, `scripts/devspec-remote-listen.mjs`, `scripts/devspec-remote-wait.mjs`):** Added `shouldAssertTurnOnPollerInboxWrite` in `scripts/devspec-remote-poll.mjs` so writing an inbound command or event to `.inbox.jsonl` only writes `.turn` immediately when an in-conversation `devspec-remote-wait.mjs` process (`.wait.pid`) is actively armed on a bound conversation. When `devspec-remote-listen.mjs` handles wakes via `agentapi`, `.turn` and `report_pickup` are asserted only after `deliverWakeViaAgentApi` succeeds (`res.ok`), preventing unbonded standby windows or undelivered wakes from getting stuck on `Working`.
+- **Match the HTTP language-server port (`HTTP(?!S)`) and cap `PreToolUse` trail size (`scripts/remote-control-state.mjs`, `scripts/devspec-tool-input.mjs`):** Fixed `discoverAntigravityLsAddress` to skip the earlier `for HTTPS` log line and match `for HTTP(?!S)`, and added `capTrailForPreToolHook` in `scripts/devspec-tool-input.mjs` so auto-attached `trail_events` and `work_trail` on `post_session_message` never push `PreToolUse` stdout past Antigravity's 64 KB `bufio.Scanner` token limit.
+
 ## 0.15.8
 
 ### Window-open standby auto-connect (`agy-window:<owner_pid>`), `SessionStart` capability capture & 3-line instruction pointer, `/devspec-project` skill, and Pi-style live mid-turn trail streaming

@@ -325,10 +325,11 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
             { sinceMs: turnMarker?.startedAt ?? null, stopAtReply: true },
           )
           if (markdown && events.length > 0) {
+            const capped = capTrailForPreToolHook(events, markdown)
             next = {
               ...next,
-              work_trail: markdown,
-              trail_events: events,
+              ...(capped.markdown ? { work_trail: capped.markdown } : {}),
+              ...(capped.events.length > 0 ? { trail_events: capped.events } : {}),
             }
           }
         } catch {
@@ -345,12 +346,39 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
     JSON.stringify(next) !== JSON.stringify(toolInput)
   if (!changed) return {}
 
-  const finalOverwrite = wrapped
+  let finalOverwrite = wrapped
     ? {
         ...rawToolInput,
         [argumentsKey || 'Arguments']: argumentsWasString ? JSON.stringify(next) : next,
       }
     : next
+
+  // Antigravity reads PreToolUse stdout with Go's bufio.Scanner (64 KB MaxScanTokenSize).
+  // If auto-attached trail fields push the serialized hook output past 48 KB, trim them
+  // so the hook never fails with `bufio.Scanner: token too long`.
+  if (
+    verb === 'post_session_message' &&
+    !toolInput.work_trail &&
+    !toolInput.trail_events &&
+    (next.work_trail || next.trail_events) &&
+    Buffer.byteLength(JSON.stringify(finalOverwrite), 'utf8') > 48_000
+  ) {
+    const trimmedNext = { ...next }
+    delete trimmedNext.trail_events
+    if (
+      trimmedNext.work_trail &&
+      Buffer.byteLength(JSON.stringify(trimmedNext), 'utf8') > 44_000
+    ) {
+      delete trimmedNext.work_trail
+    }
+    next = trimmedNext
+    finalOverwrite = wrapped
+      ? {
+          ...rawToolInput,
+          [argumentsKey || 'Arguments']: argumentsWasString ? JSON.stringify(next) : next,
+        }
+      : next
+  }
 
   return {
     decision: 'allow',
@@ -360,6 +388,49 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
       updatedInput: finalOverwrite,
     },
   }
+}
+
+/**
+ * Cap `trail_events` and `work_trail` attached during `PreToolUse` so serialized
+ * hook stdout stays well under Antigravity's 64 KB `bufio.Scanner` token limit.
+ */
+export function capTrailForPreToolHook(
+  events = [],
+  markdown = '',
+  { maxTrailBytes = 24_000, maxEvents = 40 } = {},
+) {
+  const compactEvents = (Array.isArray(events) ? events : []).map((ev) => {
+    if (!ev || typeof ev !== 'object') return ev
+    if (ev.kind === 'thinking' && typeof ev.text === 'string' && ev.text.length > 500) {
+      return { ...ev, text: `${ev.text.slice(0, 499)}…` }
+    }
+    if (typeof ev.args === 'string' && ev.args.length > 200) {
+      return { ...ev, args: `${ev.args.slice(0, 199)}…` }
+    }
+    return ev
+  })
+  let keptEvents =
+    compactEvents.length > maxEvents ? compactEvents.slice(-maxEvents) : compactEvents
+  let keptMarkdown = String(markdown || '')
+  if (keptMarkdown.length > 8_000) {
+    const lines = keptMarkdown.split('\n')
+    const tail = []
+    let chars = 0
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (chars + lines[i].length + 1 > 7_500 && tail.length > 0) break
+      tail.unshift(lines[i])
+      chars += lines[i].length + 1
+    }
+    keptMarkdown = `> … (${lines.length - tail.length} earlier steps)\n${tail.join('\n')}`
+  }
+  while (
+    keptEvents.length > 1 &&
+    Buffer.byteLength(JSON.stringify({ work_trail: keptMarkdown, trail_events: keptEvents }), 'utf8') >
+      maxTrailBytes
+  ) {
+    keptEvents = keptEvents.slice(Math.ceil(keptEvents.length / 3))
+  }
+  return { events: keptEvents, markdown: keptMarkdown }
 }
 
 export async function runDevspecToolInput(raw = '', options = {}) {

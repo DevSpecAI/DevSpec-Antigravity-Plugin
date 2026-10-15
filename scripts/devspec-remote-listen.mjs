@@ -20,6 +20,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { formatInboxEntryForStream, formatSystemNoticeContent } from './devspec-remote-wait.mjs'
+import { mcpToolsCall } from './mcp-call.mjs'
 import { loadState, writeTurnMarker } from './mirror-turn.mjs'
 import {
   ensurePollerForConnection,
@@ -403,6 +404,14 @@ async function main() {
     conversationId = state.local_id
   }
 
+  const explicitOwnerPid = Number.parseInt(String(args.ownerPid ?? state?.owner_pid ?? ''), 10)
+  const hasExplicitOwnerPid = Number.isInteger(explicitOwnerPid) && explicitOwnerPid > 1
+  if (!args.once && hasExplicitOwnerPid && !ownerAlive(explicitOwnerPid)) {
+    process.stderr.write(
+      `devspec-remote-listen: owner-pid ${explicitOwnerPid} not alive at startup — exiting\n`,
+    )
+    process.exit(0)
+  }
   const ownerPid = resolveOwnerPid(args.ownerPid || 'auto', state?.owner_pid)
   const ownerAnchor = ownerPid && ownerAlive(ownerPid) ? ownerPid : null
 
@@ -490,7 +499,7 @@ async function main() {
     // If an in-conversation devspec-remote-wait.mjs is armed, let it consume the inbox
     // so we never race or double-deliver wakes.
     if (!args.once && isWaitProcessArmed(connectionId)) {
-      await sleep(1_500)
+      await sleep(500)
       continue
     }
 
@@ -514,6 +523,18 @@ async function main() {
           if (res.ok) {
             deliveredVia = 'agentapi'
             writeTurnMarker(connectionId, { remoteTurn: true })
+            if (live?.token && live?.mcp_url) {
+              mcpToolsCall({
+                mcpUrl: live.mcp_url,
+                token: live.token,
+                ...(live.connection_capability
+                  ? { connectionCapability: live.connection_capability }
+                  : {}),
+                name: 'report_pickup',
+                arguments: { connection_id: connectionId },
+                timeoutMs: 5_000,
+              }).catch(() => {})
+            }
             try {
               recordDeliveredBatchRequests(connectionId, entry, { dir: CONNECTIONS_DIR })
             } catch {
@@ -526,6 +547,7 @@ async function main() {
             break
           }
         } else {
+          writeTurnMarker(connectionId, { remoteTurn: true })
           try {
             recordDeliveredBatchRequests(connectionId, entry, { dir: CONNECTIONS_DIR })
           } catch {
@@ -555,7 +577,7 @@ async function main() {
     }
 
     if (args.once) break
-    await sleep(1_500)
+    await sleep(500)
   }
 }
 

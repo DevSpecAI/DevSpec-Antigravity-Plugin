@@ -31,6 +31,7 @@ import {
   QUEUED,
   validateInteractionAnswerRecord,
 } from './interaction-events.mjs'
+import { writeTurnMarker } from './mirror-turn.mjs'
 import {
   STATE_ABSENT,
   STATE_OK,
@@ -1097,6 +1098,7 @@ async function main() {
         continue
       }
       if (delivered > 0) {
+        writeTurnMarker(connectionId, { remoteTurn: true }, CONNECTIONS_DIR)
         if (!args.stream) {
           process.stderr.write(`devspec-remote-wait: wake (${delivered} msg) — exit 0\n`)
           process.exit(EXIT_WAKE)

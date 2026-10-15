@@ -198,6 +198,32 @@ export function readListenerArmed(connectionId, state, dir = CONNECTIONS_DIR) {
 }
 
 /**
+ * Should `devspec-remote-poll.mjs` immediately write `.turn` when persisting an
+ * inbound command/event to `.inbox.jsonl`?
+ *
+ * Only when an in-conversation `devspec-remote-wait.mjs` process (`.wait.pid`) is
+ * actively armed AND the connection is bonded to a real conversation (`local_id`
+ * is present and not an `agy-window:<pid>` standby). When `devspec-remote-listen.mjs`
+ * is handling wakes via `agentapi` (or no listener is armed yet), `.turn` must only
+ * be written once the wake is actually delivered to the agent.
+ */
+export function shouldAssertTurnOnPollerInboxWrite(connectionId, state, dir = CONNECTIONS_DIR) {
+  if (!connectionId) return false
+  const localId = state?.local_id
+  if (!localId || String(localId).startsWith('agy-window:')) return false
+  try {
+    const pid = Number.parseInt(
+      fs.readFileSync(path.join(dir, `${connectionId}.wait.pid`), 'utf8').trim(),
+      10,
+    )
+    if (pidIsAlive(pid)) return true
+  } catch {
+    /* no in-conversation wait process armed */
+  }
+  return false
+}
+
+/**
  * Count commands/controls/dispatches/delivered-answers in `.inbox.jsonl` past `inboxOffset`.
  */
 export function countUnconsumedCommands(connectionId, inboxOffset, dir = CONNECTIONS_DIR) {
@@ -1418,8 +1444,10 @@ async function main() {
   const ownerAnchor = ownerPid && ownerAlive(ownerPid) ? ownerPid : null
   if (ownerPid && !ownerAnchor) {
     process.stderr.write(
-      `devspec-remote-poll: owner-pid ${ownerPid} not alive at startup — ignoring anchor\n`,
+      `devspec-remote-poll: owner-pid ${ownerPid} not alive at startup — stopping\n`,
     )
+    disableLocalState({ connectionId, reason: 'owner_gone' })
+    process.exit(0)
   } else if (ownerAnchor) {
     process.stderr.write(`devspec-remote-poll: owner-pid anchor ${ownerAnchor} adopted\n`)
     try {
@@ -1828,7 +1856,9 @@ async function main() {
     }
     patchState({ interaction_continuation: interactionContinuation })
     pendingInteractionAck = questionEventAck(event)
-    writeTurnMarker(connectionId, { remoteTurn: true })
+    if (shouldAssertTurnOnPollerInboxWrite(connectionId, readState(connectionId))) {
+      writeTurnMarker(connectionId, { remoteTurn: true })
+    }
     process.stdout.write(
       JSON.stringify({
         type: 'wake',
@@ -2141,7 +2171,9 @@ async function main() {
           executable: false,
         }) + '\n',
       )
-      writeTurnMarker(connectionId, { remoteTurn: true })
+      if (shouldAssertTurnOnPollerInboxWrite(connectionId, readState(connectionId))) {
+        writeTurnMarker(connectionId, { remoteTurn: true })
+      }
       patchState({ last_owner_wake_at: new Date().toISOString() })
       if (persisted.handedOff) {
         clearInteractionContinuation('command_handoff')
@@ -2209,7 +2241,9 @@ async function main() {
           executable: false,
         }) + '\n',
       )
-      writeTurnMarker(connectionId, { remoteTurn: true })
+      if (shouldAssertTurnOnPollerInboxWrite(connectionId, readState(connectionId))) {
+        writeTurnMarker(connectionId, { remoteTurn: true })
+      }
     }
     return { ok: true, delivered: persisted.appended > 0 }
   }

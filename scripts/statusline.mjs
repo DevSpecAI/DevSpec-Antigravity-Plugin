@@ -33,7 +33,7 @@ import { findProjectPin, gitRemoteOrigin } from './devspec-scope.mjs'
 import { resolveOwnConnectionId } from './launch-guard.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveHookConversationId } from './mirror-turn.mjs'
-import { resolveOwnerPid } from './remote-control-state.mjs'
+import { ownerAlive, resolveOwnerPid } from './remote-control-state.mjs'
 import { DEFAULT_PROD_URL, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { connectAtStartupEnabled } from './session-start.mjs'
 
@@ -405,28 +405,54 @@ export function readConnectionView({
     }
   }
 
-  // If no conversation bond exists yet (e.g. newly opened Antigravity window before first prompt),
-  // match a live connection anchored to this Antigravity window's owner_pid.
+  // If no conversation bond exists yet (e.g. newly opened Antigravity window before first prompt,
+  // or a window whose connection was ended from DevSpec UI), match a connection anchored to
+  // this Antigravity window's owner_pid (preferring an active connection, or falling back to
+  // an ended/disconnected connection for the same owner_pid so statusLine renders the ended
+  // state instead of re-triggering maybeSpawnWindowAutoConnect).
   if (!connection) {
     const ownerPid = resolveOwnerPid('auto', null)
     if (ownerPid) {
       const connDir = path.join(home, REMOTE_DIR, 'connections')
       try {
+        let fallbackEnded = null
+        let fallbackEndedMtime = -1
         for (const f of fs.readdirSync(connDir)) {
           if (!/^[0-9a-f-]{36}\.json$/i.test(f)) continue
-          const parsed = parseJson(fs.readFileSync(path.join(connDir, f), 'utf8'))
+          const fullPath = path.join(connDir, f)
+          const parsed = parseJson(fs.readFileSync(fullPath, 'utf8'))
           if (
-            parsed &&
-            parsed.enabled !== false &&
-            !parsed.ended_from_ui &&
-            String(parsed.agent_name || '').toLowerCase() === AGENT_NAME.toLowerCase() &&
-            Number(parsed.owner_pid) === Number(ownerPid) &&
-            (!conversationId || !parsed.local_id || parsed.local_id === conversationId)
+            !parsed ||
+            String(parsed.agent_name || '').toLowerCase() !== AGENT_NAME.toLowerCase() ||
+            Number(parsed.owner_pid) !== Number(ownerPid)
           ) {
+            continue
+          }
+          const localIdOk =
+            !conversationId ||
+            !parsed.local_id ||
+            String(parsed.local_id).startsWith('agy-window:') ||
+            parsed.local_id === conversationId
+          if (!localIdOk) continue
+          if (parsed.enabled !== false && !parsed.ended_from_ui) {
             connection = parsed
             connectionId = parsed.connection_id
             break
           }
+          let mtime = 0
+          try {
+            mtime = fs.statSync(fullPath).mtimeMs
+          } catch {
+            mtime = 0
+          }
+          if (mtime >= fallbackEndedMtime) {
+            fallbackEnded = parsed
+            fallbackEndedMtime = mtime
+          }
+        }
+        if (!connection && fallbackEnded) {
+          connection = fallbackEnded
+          connectionId = fallbackEnded.connection_id
         }
       } catch {
         /* ignore */
@@ -617,11 +643,30 @@ export function maybeSpawnWindowAutoConnect({
   if (!hasScope) return { spawned: false, reason: 'no_folder_scope' }
 
   const lockDir = path.join(home, REMOTE_DIR)
+  const connDir = path.join(lockDir, 'connections')
+  try {
+    if (fs.existsSync(connDir)) {
+      for (const f of fs.readdirSync(connDir)) {
+        if (!/^[0-9a-f-]{36}\.json$/i.test(f)) continue
+        const parsed = parseJson(fs.readFileSync(path.join(connDir, f), 'utf8'))
+        if (
+          parsed &&
+          String(parsed.agent_name || '').toLowerCase() === AGENT_NAME.toLowerCase() &&
+          Number(parsed.owner_pid) === Number(ownerPid)
+        ) {
+          return { spawned: false, reason: 'already_attempted' }
+        }
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+
   const lockFile = path.join(lockDir, `autoconnect-${ownerPid}.lock`)
   try {
     if (fs.existsSync(lockFile)) {
       const stat = fs.statSync(lockFile)
-      if (Date.now() - stat.mtimeMs < 60_000) {
+      if (ownerAlive(Number(ownerPid)) || Date.now() - stat.mtimeMs < 60_000) {
         return { spawned: false, reason: 'already_attempted' }
       }
     }

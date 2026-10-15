@@ -37,6 +37,7 @@ import {
   ensureListenerForConnection,
   ensurePollerForConnection,
   inferAntigravityTranscriptPath,
+  ownerAlive,
   reapDeadPollers,
   rebondConnectionToConversation,
   resolveOwnerPid,
@@ -277,6 +278,34 @@ export async function autoConnectAtStartup({
   if (!auth?.token) return null
   let mcpUrl = auth.mcp_url || DEFAULT_PROD_URL
   const ownerPid = resolveOwnerPid(explicitOwnerPid || 'auto', null)
+  const checkOwnerAlive =
+    explicitOwnerPid !== null && explicitOwnerPid !== undefined
+      ? Boolean(ownerPid && ownerAlive(Number(ownerPid)))
+      : !ownerPid || ownerAlive(Number(ownerPid))
+  if (!checkOwnerAlive) return null
+
+  const connDir = path.join(effectiveHome, '.devspec', 'remote-control', 'connections')
+  if (ownerPid) {
+    try {
+      if (fs.existsSync(connDir)) {
+        for (const f of fs.readdirSync(connDir)) {
+          if (!/^[0-9a-f-]{36}\.json$/i.test(f)) continue
+          const parsed = JSON.parse(fs.readFileSync(path.join(connDir, f), 'utf8'))
+          if (
+            parsed &&
+            String(parsed.agent_name || '').toLowerCase() === AGENT_NAME.toLowerCase() &&
+            Number(parsed.owner_pid) === Number(ownerPid) &&
+            (parsed.ended_from_ui === true || parsed.end_reason === 'ui' || parsed.enabled === false)
+          ) {
+            return null
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
   const windowStandbyLocalId =
     !conversationId && Number.isInteger(Number(ownerPid)) && Number(ownerPid) > 1
       ? `agy-window:${ownerPid}`
@@ -334,7 +363,25 @@ export async function autoConnectAtStartup({
   const connectionId = reg?.connection_id || reg?.connection?.id || null
   if (!connectionId) return null
 
-  const connDir = path.join(effectiveHome, '.devspec', 'remote-control', 'connections')
+  if (ownerPid && !ownerAlive(Number(ownerPid))) {
+    try {
+      await callMcp({
+        mcpUrl,
+        token: auth.token,
+        name: 'heartbeat_connection',
+        arguments: {
+          connection_id: connectionId,
+          agent_name: AGENT_NAME,
+          status: 'offline',
+          end_reason: 'owner_gone',
+        },
+      })
+    } catch {
+      /* non-fatal */
+    }
+    return null
+  }
+
   storeTiers(connectionId, reg, { home: effectiveHome, dir: connDir })
   storeRepositoryContext(connectionId, reg, { dir: connDir })
 

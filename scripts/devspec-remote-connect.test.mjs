@@ -21,9 +21,15 @@ import {
   renderStatusBlock,
 } from './devspec-remote-connect.mjs'
 import { buildWakeDeliveryMessage, deliverWakeViaAgentApi } from './devspec-remote-listen.mjs'
-import { formatRoomStateJson } from './devspec-remote-poll.mjs'
+import { formatRoomStateJson, shouldAssertTurnOnPollerInboxWrite } from './devspec-remote-poll.mjs'
+import { capTrailForPreToolHook } from './devspec-tool-input.mjs'
 import { formatTiersForStartup, readTiersFor, storeTiers } from './instruction-tiers.mjs'
-import { resolveLocalAction, writeLocalBond, writeStateFile } from './remote-control-state.mjs'
+import {
+  discoverAntigravityLsAddress,
+  resolveLocalAction,
+  writeLocalBond,
+  writeStateFile,
+} from './remote-control-state.mjs'
 import {
   invocationNotice,
   prePostHold,
@@ -34,6 +40,7 @@ import {
   transcriptPaths,
   wakeNotice,
 } from './room-unread.mjs'
+import { autoConnectAtStartup } from './session-start.mjs'
 import { maybeSpawnWindowAutoConnect, readConnectionView } from './statusline.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -844,3 +851,197 @@ describe('PreToolUse pass-through empty stdout contract (compaction regression g
     assert.equal(res.stdout, '', 'pass-through PreToolUse must emit empty stdout, never {}')
   })
 })
+
+describe('Wandering Otter zombie & Working status regression guards (item bbf7b679)', () => {
+  it('readConnectionView matches UI-ended/disconnected owner_pid connections and maybeSpawnWindowAutoConnect refuses to re-spawn for an existing owner_pid', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-otter-home-'))
+    const connDir = path.join(home, '.devspec', 'remote-control', 'connections')
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-otter-cwd-'))
+    fs.mkdirSync(connDir, { recursive: true })
+    fs.mkdirSync(path.join(cwd, '.devspec'), { recursive: true })
+    fs.writeFileSync(
+      path.join(cwd, '.devspec', 'project.json'),
+      JSON.stringify({ project_id: PROJ_ID }),
+    )
+    try {
+      writeStateFile(
+        CONN_ID,
+        {
+          enabled: false,
+          ended_from_ui: true,
+          end_reason: 'ui',
+          connection_id: CONN_ID,
+          session_codename: 'Wandering Otter',
+          project_id: PROJ_ID,
+          project_name: 'DevSpec',
+          agent_name: 'Antigravity',
+          local_id: `agy-window:${process.pid}`,
+          owner_pid: process.pid,
+        },
+        connDir,
+      )
+
+      const view = readConnectionView({
+        home,
+        connectionId: CONN_ID,
+        conversationId: CONV_ID,
+      })
+      assert.ok(view)
+      assert.equal(view.state, 'ended_from_devspec')
+      assert.equal(view.codename, 'Wandering Otter')
+
+      const spawnAttempt = maybeSpawnWindowAutoConnect({
+        cwd,
+        ownerPid: process.pid,
+        home,
+        env: { DEVSPEC_MCP_TOKEN: 'dvs_valid_test_token_123456' },
+        spawnImpl: () => {
+          throw new Error('must not spawn when owner_pid already has a connection file')
+        },
+      })
+      assert.equal(spawnAttempt.spawned, false)
+      assert.equal(spawnAttempt.reason, 'already_attempted')
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('autoConnectAtStartup aborts when explicit ownerPid is dead or connection was already ended', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-autoconn-dead-'))
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-autoconn-cwd-'))
+    try {
+      let calledMcp = false
+      const res = await autoConnectAtStartup({
+        cwd,
+        ownerPid: 99999999,
+        home,
+        env: { HOME: home, DEVSPEC_MCP_TOKEN: 'dvs_valid_test_token_123456' },
+        callMcp: async () => {
+          calledMcp = true
+          return { connection_id: CONN_ID }
+        },
+      })
+      assert.equal(res, null)
+      assert.equal(calledMcp, false)
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('devspec-remote-poll.mjs and devspec-remote-listen.mjs exit immediately at startup when explicit --owner-pid is already dead', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-dead-daemon-'))
+    const connDir = path.join(home, '.devspec', 'remote-control', 'connections')
+    fs.mkdirSync(connDir, { recursive: true })
+    try {
+      writeStateFile(
+        CONN_ID,
+        {
+          enabled: true,
+          connection_id: CONN_ID,
+          agent_name: 'Antigravity',
+          owner_pid: 99999999,
+          token: 'dvs_test_tok_123456',
+          mcp_url: 'http://127.0.0.1:9/api/mcp',
+        },
+        connDir,
+      )
+
+      const pollRes = spawnSync(
+        process.execPath,
+        [path.join(HERE, 'devspec-remote-poll.mjs'), '--connection-id', CONN_ID, '--owner-pid', '99999999'],
+        { env: { ...process.env, HOME: home }, encoding: 'utf8', timeout: 5000 },
+      )
+      assert.equal(pollRes.status, 0)
+      assert.match(pollRes.stderr, /not alive at startup — stopping/)
+
+      // Re-enable to test listener startup guard independently
+      writeStateFile(
+        CONN_ID,
+        {
+          enabled: true,
+          connection_id: CONN_ID,
+          agent_name: 'Antigravity',
+          owner_pid: 99999999,
+          token: 'dvs_test_tok_123456',
+          mcp_url: 'http://127.0.0.1:9/api/mcp',
+        },
+        connDir,
+      )
+      const listenRes = spawnSync(
+        process.execPath,
+        [path.join(HERE, 'devspec-remote-listen.mjs'), '--connection-id', CONN_ID, '--owner-pid', '99999999'],
+        { env: { ...process.env, HOME: home }, encoding: 'utf8', timeout: 5000 },
+      )
+      assert.equal(listenRes.status, 0)
+      assert.match(listenRes.stderr, /not alive at startup — exiting/)
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('shouldAssertTurnOnPollerInboxWrite is false for unbonded standby or listener-only connections and true only when wait.pid is armed on a bound conversation', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-turn-guard-'))
+    try {
+      // 1. Unbonded window standby (agy-window:<pid>) -> false
+      assert.equal(
+        shouldAssertTurnOnPollerInboxWrite(CONN_ID, { local_id: `agy-window:${process.pid}` }, dir),
+        false,
+      )
+      // 2. Bound conversation, but only listener.json (no wait.pid) -> false (listener asserts .turn on agentapi delivery)
+      fs.writeFileSync(
+        path.join(dir, `${CONN_ID}.listener.json`),
+        JSON.stringify({ pid: process.pid }),
+      )
+      assert.equal(
+        shouldAssertTurnOnPollerInboxWrite(CONN_ID, { local_id: CONV_ID }, dir),
+        false,
+      )
+      // 3. Bound conversation with live wait.pid -> true
+      fs.writeFileSync(path.join(dir, `${CONN_ID}.wait.pid`), `${process.pid}\n`)
+      assert.equal(
+        shouldAssertTurnOnPollerInboxWrite(CONN_ID, { local_id: CONV_ID }, dir),
+        true,
+      )
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('discoverAntigravityLsAddress matches the HTTP port and skips the earlier HTTPS port in cli-*.log, and capTrailForPreToolHook keeps trail under 24KB', () => {
+    const procRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-proc-'))
+    const fdDir = path.join(procRoot, '4242', 'fd')
+    fs.mkdirSync(fdDir, { recursive: true })
+    const logFile = path.join(procRoot, 'cli-test.log')
+    fs.writeFileSync(
+      logFile,
+      [
+        '2026/10/15 20:42:19 Language server listening on random port at 36783 for HTTPS',
+        '2026/10/15 20:42:19 Language server listening on random port at 45663 for HTTP',
+      ].join('\n') + '\n',
+    )
+    fs.symlinkSync(logFile, path.join(fdDir, '1'))
+    try {
+      const addr = discoverAntigravityLsAddress(4242, {}, { procRoot })
+      assert.equal(addr, 'localhost:45663')
+    } finally {
+      fs.rmSync(procRoot, { recursive: true, force: true })
+    }
+
+    const hugeEvents = Array.from({ length: 80 }, (_, idx) => ({
+      seq: idx + 1,
+      kind: 'thinking',
+      text: 'Thinking step '.repeat(250),
+      label: `Step ${idx + 1}`,
+    }))
+    const hugeMarkdown = Array.from({ length: 80 }, (_, idx) => `> 💭 Step ${idx + 1} ${'x'.repeat(120)}`).join('\n')
+    const capped = capTrailForPreToolHook(hugeEvents, hugeMarkdown)
+    const serializedBytes = Buffer.byteLength(
+      JSON.stringify({ work_trail: capped.markdown, trail_events: capped.events }),
+      'utf8',
+    )
+    assert.ok(serializedBytes <= 24_000, `expected <= 24000 bytes, got ${serializedBytes}`)
+  })
+})
+

@@ -401,7 +401,7 @@ export function discoverAntigravityLsAddress(
         const buf = Buffer.alloc(16384)
         const bytes = fs.readSync(fdNum, buf, 0, buf.length, 0)
         const text = buf.subarray(0, bytes).toString('utf8')
-        const m = text.match(/Language server listening on (?:random )?port at (\d+) for HTTP/i)
+        const m = text.match(/Language server listening on (?:random )?port at (\d+) for HTTP(?!S)\b/i)
         if (m && m[1]) return `localhost:${m[1]}`
       } finally {
         fs.closeSync(fdNum)
