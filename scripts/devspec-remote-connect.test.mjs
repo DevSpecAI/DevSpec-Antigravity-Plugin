@@ -24,7 +24,16 @@ import { buildWakeDeliveryMessage, deliverWakeViaAgentApi } from './devspec-remo
 import { formatRoomStateJson } from './devspec-remote-poll.mjs'
 import { formatTiersForStartup, readTiersFor, storeTiers } from './instruction-tiers.mjs'
 import { resolveLocalAction, writeLocalBond, writeStateFile } from './remote-control-state.mjs'
-import { READER_PAGE_CHARS, readerOutput, readPage, transcriptPaths } from './room-unread.mjs'
+import {
+  invocationNotice,
+  prePostHold,
+  READER_PAGE_CHARS,
+  readerOutput,
+  readPage,
+  recordMirroredLocalPrompt,
+  transcriptPaths,
+  wakeNotice,
+} from './room-unread.mjs'
 import { maybeSpawnWindowAutoConnect, readConnectionView } from './statusline.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -359,7 +368,7 @@ describe('Window-open auto-connect & owner_pid startup connection rebonding', ()
 })
 
 describe('devspec-remote-listen.mjs — canonical & legacy wake formatting', () => {
-  it('formats canonical_commands, automation_run, interaction_answer, question_dismissal, and owner_messages', async () => {
+  it('formats canonical_commands with full formatInboxEntryForStream JSON lines (provenance_ref, sender_response_style, rearm: already_armed)', async () => {
     const canonicalWake = buildWakeDeliveryMessage({
       type: 'canonical_commands',
       session_id: SESS_ID,
@@ -370,15 +379,27 @@ describe('devspec-remote-listen.mjs — canonical & legacy wake formatting', () 
         commands: [
           {
             message_id: 'msg-1',
-            requester: { display_name: 'Ali Price' },
-            authority: { kind: 'owner' },
+            requester: { display_name: 'Ali Price', user_id: 'u-1', kind: 'human' },
+            authority: { kind: 'owner', target_match: 'exact', executable: true },
             content: { body: 'Please continue.' },
+            sender_response_style: ['Use numbered sections and clickable file links.'],
+            delivery: {
+              provenance_ref: {
+                kind: 'session_command',
+                session_id: SESS_ID,
+                message_id: 'msg-1',
+              },
+            },
           },
         ],
       },
     })
     assert.match(canonicalWake, /Ali Price \(owner\): Please continue\./)
     assert.match(canonicalWake, /Room transcript: \/tmp\/t\.jsonl/)
+    assert.match(canonicalWake, /"type":"owner_message"/)
+    assert.match(canonicalWake, /"provenance_ref":\{"kind":"session_command","session_id":"7069bedd-878d-4c5a-b52c-b5cfc1bcd544","message_id":"msg-1"\}/)
+    assert.match(canonicalWake, /"sender_response_style":\["Use numbered sections and clickable file links\."\]/)
+    assert.match(canonicalWake, /"rearm":"already_armed"/)
 
     const autoWake = buildWakeDeliveryMessage({
       type: 'automation_run',
@@ -389,6 +410,7 @@ describe('devspec-remote-listen.mjs — canonical & legacy wake formatting', () 
       },
     })
     assert.match(autoWake, /Nightly Check/)
+    assert.match(autoWake, /"type":"automation_run"/)
 
     const newConvCalls = []
     const res = await deliverWakeViaAgentApi({
@@ -405,6 +427,196 @@ describe('devspec-remote-listen.mjs — canonical & legacy wake formatting', () 
     })
     assert.equal(res.ok, true)
     assert.equal(newConvCalls[0].args[0], 'new-conversation')
+  })
+
+  it('uses ANTIGRAVITY_AGENTAPI_EXE when available and treats JSON stdout with an error field as failed delivery', async () => {
+    const exeCalls = []
+    const okRes = await deliverWakeViaAgentApi({
+      conversationId: CONV_ID,
+      message: 'wake payload',
+      env: {
+        ANTIGRAVITY_AGENTAPI_EXE: '/opt/antigravity/bin/agy',
+        ANTIGRAVITY_LS_ADDRESS: 'localhost:46803',
+        ANTIGRAVITY_CSRF_TOKEN: 'csrf-123',
+      },
+      execFileImpl: (bin, args, _opts, cb) => {
+        exeCalls.push({ bin, args })
+        cb(null, '{"status":"ok"}', '')
+      },
+    })
+    assert.equal(okRes.ok, true)
+    assert.equal(exeCalls[0].bin, '/opt/antigravity/bin/agy')
+    assert.deepEqual(exeCalls[0].args.slice(0, 3), ['agentapi', 'send-message', CONV_ID])
+
+    const errRes = await deliverWakeViaAgentApi({
+      conversationId: CONV_ID,
+      message: 'wake payload',
+      env: {
+        ANTIGRAVITY_AGENTAPI_EXE: '/opt/antigravity/bin/agy',
+        ANTIGRAVITY_LS_ADDRESS: 'localhost:46803',
+        ANTIGRAVITY_CSRF_TOKEN: 'csrf-123',
+      },
+      execFileImpl: (_bin, _args, _opts, cb) => {
+        cb(null, '{"error":"language server unreachable"}', '')
+      },
+    })
+    assert.equal(errRes.ok, false)
+    assert.match(errRes.error, /language server unreachable/)
+  })
+
+  it('renders wake: ALREADY ARMED when wake_armed is true and ARM THE BACKGROUND WAIT NOW when false', () => {
+    const armedBlock = renderStatusBlock({
+      status: 'connected',
+      connection_id: CONN_ID,
+      agent_name: 'Steady Jackal',
+      project_id: PROJ_ID,
+      project_name: 'DevSpec',
+      session_id: SESS_ID,
+      reconnected: false,
+      poller_pid: 1234,
+      listener_pid: 5678,
+      wake_armed: true,
+      wait_mode: '--from-end',
+      wait_script: '/path/to/devspec-remote-wait.mjs',
+    })
+    assert.match(armedBlock, /wake: ALREADY ARMED \(listener pid 5678\)/)
+    assert.doesNotMatch(armedBlock, /ARM THE BACKGROUND WAIT NOW/)
+
+    const unarmedBlock = renderStatusBlock({
+      status: 'connected',
+      connection_id: CONN_ID,
+      agent_name: 'Steady Jackal',
+      project_id: PROJ_ID,
+      project_name: 'DevSpec',
+      session_id: SESS_ID,
+      reconnected: false,
+      poller_pid: 1234,
+      listener_pid: null,
+      wake_armed: false,
+      wait_mode: '--from-end',
+      wait_script: '/path/to/devspec-remote-wait.mjs',
+    })
+    assert.match(unarmedBlock, /ARM THE BACKGROUND WAIT NOW/)
+  })
+})
+
+describe('room-unread.mjs — mirrored local prompt & single-command wake watermark suppression', () => {
+  it('suppresses redundant room-unread notices for mirrored local prompts and already-delivered wake commands', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-room-watermark-'))
+    try {
+      const paths = transcriptPaths(CONN_ID, SESS_ID, dir)
+      fs.writeFileSync(paths.state, JSON.stringify({ self_label: 'Steady Jackal' }))
+
+      // 1. User types a local terminal prompt that mirror-turn.mjs mirrors to the session
+      const localPromptText = 'What do you think about our setup?'
+      recordMirroredLocalPrompt(CONN_ID, SESS_ID, {
+        messageId: 'msg-local-1',
+        text: localPromptText,
+        dir,
+      })
+
+      // Poller later syncs that mirrored message into .transcript.jsonl
+      const mirroredLine = {
+        seq: 1,
+        at: '2026-10-15T10:00:00Z',
+        message_id: 'msg-local-1',
+        from: { label: 'Ali Price', kind: 'human' },
+        to: 'Steady Jackal',
+        state: 'active',
+        text: localPromptText,
+      }
+      fs.writeFileSync(paths.transcript, JSON.stringify(mirroredLine) + '\n')
+
+      assert.equal(
+        invocationNotice({ connectionId: CONN_ID, sessionId: SESS_ID, dir }),
+        null,
+        'mirrored local prompt must not trigger PostInvocation unread notice',
+      )
+      assert.equal(
+        prePostHold({ connectionId: CONN_ID, sessionId: SESS_ID, dir }),
+        null,
+        'mirrored local prompt must not block post_session_message in prePostHold',
+      )
+
+      // 2. Single-command wake arrives where the delivered command is the only new message in the room
+      const remoteCmdLine = {
+        seq: 2,
+        at: '2026-10-15T10:01:00Z',
+        message_id: 'msg-remote-2',
+        from: { label: 'Ali Price', kind: 'human' },
+        to: 'Steady Jackal',
+        state: 'active',
+        text: 'Please check the action items.',
+      }
+      fs.writeFileSync(
+        paths.transcript,
+        [JSON.stringify(mirroredLine), JSON.stringify(remoteCmdLine)].join('\n') + '\n',
+      )
+
+      const singleWake = wakeNotice({
+        connectionId: CONN_ID,
+        sessionId: SESS_ID,
+        deliveredCommandIds: ['msg-remote-2'],
+        deliveredCommands: [
+          {
+            message_id: 'msg-remote-2',
+            content: { body: 'Please check the action items.' },
+          },
+        ],
+        dir,
+      })
+      assert.equal(
+        singleWake,
+        null,
+        'wakeNotice should return null when the delivered command is the only unread message in the room',
+      )
+      assert.equal(
+        invocationNotice({ connectionId: CONN_ID, sessionId: SESS_ID, dir }),
+        null,
+        'delivered wake command should also be marked read for subsequent PostInvocation checks',
+      )
+
+      // 3. Another room participant posts an advisory message alongside a command -> wakeNotice should report 1 unread
+      const peerLine = {
+        seq: 3,
+        at: '2026-10-15T10:02:00Z',
+        message_id: 'msg-peer-3',
+        from: { label: 'Other Agent', kind: 'agent_session' },
+        to: 'room',
+        state: 'active',
+        text: 'FYI I updated the schema.',
+      }
+      const nextCmdLine = {
+        seq: 4,
+        at: '2026-10-15T10:02:05Z',
+        message_id: 'msg-remote-4',
+        from: { label: 'Ali Price', kind: 'human' },
+        to: 'Steady Jackal',
+        state: 'active',
+        text: 'Take a look at what Other Agent posted.',
+      }
+      fs.writeFileSync(
+        paths.transcript,
+        [mirroredLine, remoteCmdLine, peerLine, nextCmdLine].map((l) => JSON.stringify(l)).join('\n') + '\n',
+      )
+
+      const multiWake = wakeNotice({
+        connectionId: CONN_ID,
+        sessionId: SESS_ID,
+        deliveredCommandIds: ['msg-remote-4'],
+        deliveredCommands: [
+          {
+            message_id: 'msg-remote-4',
+            content: { body: 'Take a look at what Other Agent posted.' },
+          },
+        ],
+        dir,
+      })
+      assert.ok(multiWake, 'wakeNotice should return an unread summary when other room messages are unread')
+      assert.equal(multiWake.unread, 1)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
 

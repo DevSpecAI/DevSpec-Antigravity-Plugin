@@ -41,6 +41,7 @@ import {
   requestsWithWorkPending,
   rotateRequestLog,
 } from './requests.mjs'
+import { recordMirroredLocalPrompt } from './room-unread.mjs'
 import { readConnectionTelemetry } from './statusline.mjs'
 
 const MODES = new Set(['user_prompt', 'stop', 'background_launch', 'subagent_stop'])
@@ -1245,13 +1246,25 @@ export async function handleMirrorTurn(
         }
         if (connectionId) postArgs.connection_id = connectionId
         else postArgs.session_id = sessionId
-        await call({
+        const mirrorRes = await call({
           mcpUrl,
           token,
           name: 'post_session_message',
           arguments: postArgs,
         })
         localPromptMirrored = true
+        if (connectionId && sessionId) {
+          recordMirroredLocalPrompt(connectionId, sessionId, {
+            messageId:
+              mirrorRes?.message_id ||
+              mirrorRes?.id ||
+              mirrorRes?.message?.id ||
+              mirrorRes?.data?.message_id ||
+              null,
+            text: cleaned,
+            dir: connectionsDir,
+          })
+        }
       }
     }
 

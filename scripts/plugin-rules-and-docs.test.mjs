@@ -25,13 +25,15 @@ describe('Item 5 parity: rules/AGENTS.md, package version 0.15.0, and documentat
     assert.match(content, /manage_discussion_point/)
     assert.match(content, /complete_turn:\s*true/)
     assert.match(content, /never pass `provenance_ref`/)
+    assert.match(content, /wake: ALREADY ARMED/)
+    assert.match(content, /rearm:\s*"already_armed"/)
   })
 
-  it('bumps package.json and CHANGELOG.md to 0.15.6', () => {
+  it('bumps package.json and CHANGELOG.md to 0.15.7', () => {
     const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'))
-    assert.equal(pkg.version, '0.15.6')
+    assert.equal(pkg.version, '0.15.7')
     const changelog = fs.readFileSync(path.join(ROOT, 'CHANGELOG.md'), 'utf8')
-    assert.match(changelog, /^## 0\.15\.6\b/m)
+    assert.match(changelog, /^## 0\.15\.7\b/m)
   })
 
   it('documents ~/.gemini/config/mcp_config.json, agy mcp add, and why the plugin is required in README.md and has no non-existent agy flags', () => {

@@ -1406,6 +1406,7 @@ export async function writeConnectionState({
     bond_path: bond ? localBondPath(agentName, localId, rcDir) : null,
     project_id: projectId,
     project_name: projectName,
+    agentapi_ready: Boolean(state.ls_address && state.csrf_token),
     plan_capability: {
       ok: capability.ok,
       version: capability.ok ? capability.version : null,

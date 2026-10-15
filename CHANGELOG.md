@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.15.7
+
+### Background listener `agentapi` wake delivery (`wake: ALREADY ARMED`) and unread-watermark deduplication
+
+- **Zero-model-management `agentapi` wake delivery (`scripts/devspec-remote-listen.mjs`, `scripts/devspec-remote-wait.mjs`, `scripts/devspec-remote-connect.mjs`, `scripts/remote-control-state.mjs`):** `deliverWakeViaAgentApi` now invokes `ANTIGRAVITY_AGENTAPI_EXE` (`agy agentapi send-message <conversationId> <message>`) when present, falls back to `~/.gemini/antigravity-cli/bin/agentapi` or `agentapi`, and checks JSON stdout for an `error` field (since `agy agentapi` exits `0` even on error). `buildWakeDeliveryMessage` now embeds the full canonical wake JSON lines (`formatInboxEntryForStream` with `rearm: "already_armed"`), and `devspec-remote-connect.mjs` reports `wake: ALREADY ARMED (listener pid <pid>)` when the background listener and `agentapi` credentials (`ls_address` + `csrf_token`) are active so the model no longer spawns or re-arms `devspec-remote-wait.mjs` on every turn.
+- **Unread-watermark deduplication for mirrored local terminal prompts and delivered command wakes (`scripts/room-unread.mjs`, `scripts/mirror-turn.mjs`, `scripts/devspec-remote-wait.mjs`):** Added `recordMirroredLocalPrompt` in `scripts/room-unread.mjs` and called it from `handleMirrorTurn` (`PreInvocation`) when mirroring a local terminal prompt to an attached session so `PostInvocation`, `PostToolUse`, and `prePostHold` do not self-nudge on the user's own terminal prompt. Updated `wakeNotice` to mark delivered command messages read in `<conn>.<session>.read.json` and return `null` when no other unread room messages exist, preventing redundant `room-unread.mjs read` calls on single-command wakes.
+
 ## 0.15.6
 
 ### Local terminal turn admission, request-chain attribution, symmetric session reply mirroring, and complete lazy MCP tool schemas

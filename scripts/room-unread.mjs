@@ -135,7 +135,54 @@ function versionMap(value) {
 
 export function loadReadState(file) {
   const raw = readJsonSafe(file)
-  return { read: raw?.version === READ_STATE_VERSION ? versionMap(raw.read) : {} }
+  const mirrored =
+    raw?.version === READ_STATE_VERSION &&
+    raw?.mirrored &&
+    typeof raw.mirrored === 'object' &&
+    !Array.isArray(raw.mirrored)
+      ? Object.fromEntries(
+          Object.entries(raw.mirrored).filter(
+            ([ver, ts]) => typeof ver === 'string' && typeof ts === 'number',
+          ),
+        )
+      : {}
+  return {
+    read: raw?.version === READ_STATE_VERSION ? versionMap(raw.read) : {},
+    mirrored,
+  }
+}
+
+export function recordMirroredLocalPrompt(
+  connectionId,
+  sessionId,
+  { messageId = null, text = '', dir = connectionsDir() } = {},
+) {
+  if (!SAFE_ID.test(connectionId ?? '') || !SAFE_ID.test(sessionId ?? '')) return false
+  const trimmed = String(text ?? '').trim()
+  if (!trimmed) return false
+  const file = readStatePath(connectionId, sessionId, dir)
+  const { read, mirrored } = loadReadState(file)
+  const version = messageVersion({ text: trimmed, attachments: [] })
+  if (typeof messageId === 'string' && SAFE_ID.test(messageId)) {
+    read[messageId] = version
+  }
+  const now = Date.now()
+  const nextMirrored = {}
+  for (const [ver, ts] of Object.entries(mirrored)) {
+    if (now - ts < 10 * 60 * 1000) nextMirrored[ver] = ts
+  }
+  nextMirrored[version] = now
+  try {
+    writeJsonSafe(file, {
+      version: READ_STATE_VERSION,
+      read,
+      mirrored: nextMirrored,
+      updated_at: new Date(now).toISOString(),
+    })
+    return true
+  } catch {
+    return false
+  }
 }
 
 export function loadPresentedState(file) {
@@ -147,13 +194,17 @@ export function loadPresentedState(file) {
   }
 }
 
-export function unreadOf(lines, read) {
+export function unreadOf(lines, read, mirrored = {}) {
   const unread = []
   const updated = []
   for (const line of lines) {
     if (!isRealMessage(line)) continue
     const version = messageVersion(line)
     const seen = read[line.message_id]
+    if (seen === undefined && !line.delivered_as_command && mirrored && mirrored[version]) {
+      read[line.message_id] = version
+      continue
+    }
     if (seen === undefined) unread.push({ line, version })
     else if (seen !== version) updated.push({ line, version })
   }
@@ -247,8 +298,22 @@ function currentView(room, scriptPath) {
   const paths = transcriptPaths(room.connectionId, room.sessionId, room.dir)
   const copy = readTranscript(paths)
   if (!copy) return null
-  const { read } = loadReadState(readStatePath(room.connectionId, room.sessionId, room.dir))
-  const entries = unreadOf(copy.lines, read)
+  const readFile = readStatePath(room.connectionId, room.sessionId, room.dir)
+  const { read, mirrored } = loadReadState(readFile)
+  const prevReadSize = Object.keys(read).length
+  const entries = unreadOf(copy.lines, read, mirrored)
+  if (Object.keys(read).length !== prevReadSize) {
+    try {
+      writeJsonSafe(readFile, {
+        version: READ_STATE_VERSION,
+        read,
+        ...(Object.keys(mirrored).length > 0 ? { mirrored } : {}),
+        updated_at: new Date().toISOString(),
+      })
+    } catch {
+      /* non-fatal */
+    }
+  }
   const notice = buildNotice(entries, { selfLabel: copy.selfLabel, readWith: readCommand(room.connectionId, scriptPath) })
   return { paths, copy, read, entries, notice }
 }
@@ -377,17 +442,91 @@ export function prePostHold(opts = {}) {
   return obj ? JSON.stringify(obj) : null
 }
 
-export function wakeNotice({ connectionId, sessionId, home = os.homedir(), scriptPath = SCRIPT_PATH } = {}) {
+export function wakeNotice({
+  connectionId,
+  sessionId,
+  deliveredCommandIds = [],
+  deliveredCommands = [],
+  home = os.homedir(),
+  dir,
+  scriptPath = SCRIPT_PATH,
+} = {}) {
   if (!SAFE_ID.test(connectionId ?? '') || !SAFE_ID.test(sessionId ?? '')) return null
-  const room = { connectionId, sessionId, dir: connectionsDir(home) }
-  const view = currentView(room, scriptPath)
-  if (!view) return null
+  const room = { connectionId, sessionId, dir: dir || connectionsDir(home) }
+  const paths = transcriptPaths(room.connectionId, room.sessionId, room.dir)
+  const copy = readTranscript(paths)
+  const readFile = readStatePath(room.connectionId, room.sessionId, room.dir)
+  const { read, mirrored } = loadReadState(readFile)
+
+  const cmdIdSet = new Set(
+    (Array.isArray(deliveredCommandIds) ? deliveredCommandIds : []).filter(
+      (id) => typeof id === 'string' && SAFE_ID.test(id),
+    ),
+  )
+  const cmdList = Array.isArray(deliveredCommands) ? deliveredCommands : []
+  for (const cmd of cmdList) {
+    const id = cmd?.message_id || cmd?.id
+    if (typeof id === 'string' && SAFE_ID.test(id)) cmdIdSet.add(id)
+  }
+
+  let readChanged = false
+  if (cmdIdSet.size > 0) {
+    if (copy) {
+      for (const line of copy.lines) {
+        if (cmdIdSet.has(line?.message_id)) {
+          const ver = messageVersion(line)
+          if (read[line.message_id] !== ver) {
+            read[line.message_id] = ver
+            readChanged = true
+          }
+        }
+      }
+    }
+    for (const cmd of cmdList) {
+      const id = cmd?.message_id || cmd?.id
+      if (!id || !SAFE_ID.test(id) || read[id]) continue
+      const text =
+        typeof cmd?.content?.body === 'string'
+          ? cmd.content.body
+          : typeof cmd?.content === 'string'
+            ? cmd.content
+            : ''
+      const attachments = Array.isArray(cmd?.content?.attachments)
+        ? cmd.content.attachments
+        : Array.isArray(cmd?.attachments)
+          ? cmd.attachments
+          : []
+      read[id] = messageVersion({ text, attachments })
+      readChanged = true
+    }
+    if (readChanged) {
+      try {
+        writeJsonSafe(readFile, {
+          version: READ_STATE_VERSION,
+          read,
+          ...(Object.keys(mirrored).length > 0 ? { mirrored } : {}),
+          updated_at: new Date().toISOString(),
+        })
+      } catch {
+        /* non-fatal */
+      }
+    }
+  }
+
+  if (!copy) return null
+  const entries = unreadOf(copy.lines, read, mirrored)
   savePresented(
     room,
-    presentedMapOf([...view.entries.unread, ...view.entries.updated]),
-    transcriptFingerprint(view.paths.transcript)
+    presentedMapOf([...entries.unread, ...entries.updated]),
+    transcriptFingerprint(paths.transcript),
   )
-  return view.notice
+  if (entries.unread.length === 0 && entries.updated.length === 0) {
+    return null
+  }
+  return buildNotice(entries, {
+    selfLabel: copy.selfLabel,
+    readWith: readCommand(room.connectionId, scriptPath),
+  })
 }
 
 function renderEntry({ line }, { updated, selfLabel }) {
@@ -407,8 +546,8 @@ function renderEntry({ line }, { updated, selfLabel }) {
   }
 }
 
-export function readPage({ lines, read, selfLabel, budget = READER_PAGE_CHARS, writeOverflow }) {
-  const { unread, updated } = unreadOf(lines, read)
+export function readPage({ lines, read, mirrored = {}, selfLabel, budget = READER_PAGE_CHARS, writeOverflow }) {
+  const { unread, updated } = unreadOf(lines, read, mirrored)
   const pending = [
     ...unread.map((entry) => ({ ...entry, updated: false })),
     ...updated.map((entry) => ({ ...entry, updated: true })),
@@ -492,10 +631,11 @@ export function readerOutput(room, { scriptPath = SCRIPT_PATH } = {}) {
     return { ok: false, text: 'This room has no local copy yet. Try again in a moment.\n' }
   }
   const readFile = readStatePath(room.connectionId, room.sessionId, room.dir)
-  const { read } = loadReadState(readFile)
+  const { read, mirrored } = loadReadState(readFile)
   const page = readPage({
     lines: copy.lines,
     read,
+    mirrored,
     selfLabel: copy.selfLabel,
     budget: READER_PAGE_CHARS,
     writeOverflow: (line) => {
@@ -522,6 +662,7 @@ export function readerOutput(room, { scriptPath = SCRIPT_PATH } = {}) {
     writeJsonSafe(readFile, {
       version: READ_STATE_VERSION,
       read: page.read,
+      ...(Object.keys(mirrored).length > 0 ? { mirrored } : {}),
       updated_at: new Date().toISOString(),
     })
   }

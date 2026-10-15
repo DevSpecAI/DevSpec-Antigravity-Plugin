@@ -19,7 +19,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { formatSystemNoticeContent } from './devspec-remote-wait.mjs'
+import { formatInboxEntryForStream, formatSystemNoticeContent } from './devspec-remote-wait.mjs'
 import { loadState, writeTurnMarker } from './mirror-turn.mjs'
 import {
   ensurePollerForConnection,
@@ -89,9 +89,16 @@ export function parseListenArgs(argv = []) {
  * Format an inbox entry (`owner_messages`, `canonical_commands`, `canonical_system_notices`,
  * `automation_run`, `interaction_answer`, or `question_dismissal`) into a wake prompt
  * suitable for `agentapi send-message` / `agentapi new-conversation`.
+ * Includes both the `[DevSpec Remote Wake]` summary header and the full canonical
+ * JSON lines from `formatInboxEntryForStream` (`rearm: "already_armed"`).
  */
-export function buildWakeDeliveryMessage(entry) {
+export function buildWakeDeliveryMessage(entry, opts = {}) {
   if (!entry || typeof entry !== 'object') return null
+
+  const streamOpts = {
+    ...opts,
+    rearm: opts.rearm ?? 'already_armed',
+  }
 
   if (entry.type === 'canonical_commands') {
     const ingress = entry.ingress
@@ -116,6 +123,8 @@ export function buildWakeDeliveryMessage(entry) {
       const body = typeof c?.content?.body === 'string' ? c.content.body.trim() : ''
       if (body) lines.push(`${sender} (${c?.authority?.kind || 'owner'}): ${body}`)
     }
+    const streamJson = formatInboxEntryForStream(entry, streamOpts)
+    if (streamJson) lines.push(streamJson)
     return lines.join('\n\n')
   }
 
@@ -138,20 +147,40 @@ export function buildWakeDeliveryMessage(entry) {
       const formatted = formatSystemNoticeContent(notice)
       if (formatted) lines.push(formatted)
     }
+    const streamJson = formatInboxEntryForStream(entry, streamOpts)
+    if (streamJson) lines.push(streamJson)
     return lines.join('\n\n')
   }
 
   if (entry.type === 'automation_run' && entry.dispatch) {
     const d = entry.dispatch
-    return `[DevSpec Remote Wake]\n\nAutomation run dispatched: "${d.automation_name}" (run_id=${d.run_id}, connection_id=${d.delivery_connection_id})`
+    const lines = [
+      '[DevSpec Remote Wake]',
+      `Automation run dispatched: "${d.automation_name}" (run_id=${d.run_id}, connection_id=${d.delivery_connection_id})`,
+    ]
+    const streamJson = formatInboxEntryForStream(entry, streamOpts)
+    if (streamJson) lines.push(streamJson)
+    return lines.join('\n\n')
   }
 
   if (entry.type === 'interaction_answer' && entry.event) {
-    return `[DevSpec Remote Wake]\n\nDirected question ${entry.event.question_id} answered: ${JSON.stringify(entry.event.answer)}`
+    const lines = [
+      '[DevSpec Remote Wake]',
+      `Directed question ${entry.event.question_id} answered: ${JSON.stringify(entry.event.answer)}`,
+    ]
+    const streamJson = formatInboxEntryForStream(entry, streamOpts)
+    if (streamJson) lines.push(streamJson)
+    return lines.join('\n\n')
   }
 
   if (entry.type === 'question_dismissal' && entry.event) {
-    return `[DevSpec Remote Wake]\n\nDirected question ${entry.event.question_id} was dismissed.`
+    const lines = [
+      '[DevSpec Remote Wake]',
+      `Directed question ${entry.event.question_id} was dismissed.`,
+    ]
+    const streamJson = formatInboxEntryForStream(entry, streamOpts)
+    if (streamJson) lines.push(streamJson)
+    return lines.join('\n\n')
   }
 
   if (entry.type !== 'owner_messages') return null
@@ -178,7 +207,56 @@ export function buildWakeDeliveryMessage(entry) {
       lines.push(`${sender}: ${content}`)
     }
   }
+  const streamJson = formatInboxEntryForStream(entry, streamOpts)
+  if (streamJson) lines.push(streamJson)
   return lines.join('\n\n')
+}
+
+function resolveAgentApiCommand(mergedEnv, execFileImpl, explicitEnv, state) {
+  const allowAgentApiExe =
+    execFileImpl === execFile ||
+    Boolean(explicitEnv && 'ANTIGRAVITY_AGENTAPI_EXE' in explicitEnv) ||
+    Boolean(state?.agentapi_exe)
+  const explicitExe =
+    allowAgentApiExe &&
+    typeof mergedEnv?.ANTIGRAVITY_AGENTAPI_EXE === 'string' &&
+    mergedEnv.ANTIGRAVITY_AGENTAPI_EXE.trim()
+      ? mergedEnv.ANTIGRAVITY_AGENTAPI_EXE.trim()
+      : null
+  if (explicitExe) {
+    return { bin: explicitExe, prefixArgs: ['agentapi'] }
+  }
+  const wrapperPath = path.join(os.homedir(), '.gemini', 'antigravity-cli', 'bin', 'agentapi')
+  if (execFileImpl === execFile && fs.existsSync(wrapperPath)) {
+    return { bin: wrapperPath, prefixArgs: [] }
+  }
+  return { bin: 'agentapi', prefixArgs: [] }
+}
+
+function parseAgentApiCallbackResult(err, stdout, stderr) {
+  const outText = (stdout || '').toString().trim()
+  const errText = (stderr || '').toString().trim()
+  if (err) {
+    return {
+      ok: false,
+      error: errText || outText || err.message || 'agentapi_failed',
+    }
+  }
+  if (outText.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(outText)
+      if (typeof parsed?.error === 'string' && parsed.error.trim()) {
+        return {
+          ok: false,
+          error: parsed.error.trim(),
+          stdout: outText,
+        }
+      }
+    } catch {
+      /* non-JSON stdout */
+    }
+  }
+  return { ok: true, stdout: outText }
 }
 
 /**
@@ -188,16 +266,22 @@ export function buildWakeDeliveryMessage(entry) {
 export function deliverWakeViaAgentApi({
   conversationId = null,
   message,
-  env = process.env,
+  env: explicitEnv,
   state = null,
   execFileImpl = execFile,
   timeoutMs = 5_000,
 } = {}) {
+  const env = explicitEnv || process.env
   if (!message) {
     return Promise.resolve({ ok: false, error: 'missing_conversation_or_message' })
   }
+  const defaultBinDir = path.join(os.homedir(), '.gemini', 'antigravity-cli', 'bin')
+  const basePath = env.PATH || process.env.PATH || ''
   const mergedEnv = {
     ...env,
+    PATH: basePath.includes(defaultBinDir)
+      ? basePath
+      : `${defaultBinDir}${path.delimiter}${basePath}`,
     ...(state?.ls_address && !env.ANTIGRAVITY_LS_ADDRESS
       ? { ANTIGRAVITY_LS_ADDRESS: state.ls_address }
       : {}),
@@ -209,24 +293,19 @@ export function deliverWakeViaAgentApi({
       : {}),
   }
 
+  const { bin, prefixArgs } = resolveAgentApiCommand(mergedEnv, execFileImpl, explicitEnv, state)
+
   // Backward-compatible signature: in unit tests or explicit calls with conversationId,
-  // invoke `agentapi send-message <conversationId> <message>`.
+  // invoke `agentapi send-message <conversationId> <message>` (or `<ANTIGRAVITY_AGENTAPI_EXE> agentapi send-message ...`).
   if (conversationId) {
     return new Promise((resolve) => {
       try {
         execFileImpl(
-          'agentapi',
-          ['send-message', String(conversationId), String(message)],
+          bin,
+          [...prefixArgs, 'send-message', String(conversationId), String(message)],
           { timeout: timeoutMs, env: mergedEnv },
           (err, stdout, stderr) => {
-            if (err) {
-              resolve({
-                ok: false,
-                error: (stderr || err.message || 'agentapi_failed').toString().trim(),
-              })
-              return
-            }
-            resolve({ ok: true, stdout: (stdout || '').toString().trim() })
+            resolve(parseAgentApiCallbackResult(err, stdout, stderr))
           },
         )
       } catch (err) {
@@ -242,18 +321,11 @@ export function deliverWakeViaAgentApi({
   return new Promise((resolve) => {
     try {
       execFileImpl(
-        'agentapi',
-        ['new-conversation', String(message)],
+        bin,
+        [...prefixArgs, 'new-conversation', String(message)],
         { timeout: timeoutMs, env: mergedEnv },
         (err, stdout, stderr) => {
-          if (err) {
-            resolve({
-              ok: false,
-              error: (stderr || err.message || 'agentapi_failed').toString().trim(),
-            })
-            return
-          }
-          resolve({ ok: true, stdout: (stdout || '').toString().trim() })
+          resolve(parseAgentApiCallbackResult(err, stdout, stderr))
         },
       )
     } catch (err) {
@@ -426,7 +498,10 @@ async function main() {
     if (entries.length > 0) {
       let allDeliveredOrNonCommand = true
       for (const entry of entries) {
-        const message = buildWakeDeliveryMessage(entry)
+        const message = buildWakeDeliveryMessage(entry, {
+          connectionId,
+          inboxFile: inboxPath,
+        })
         if (!message) continue
         let deliveredVia = 'stdout'
         if (args.useAgentApi) {

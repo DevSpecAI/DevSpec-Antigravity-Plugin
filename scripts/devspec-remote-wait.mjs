@@ -531,11 +531,14 @@ export function formatSystemNoticeContent(notice) {
   ].join('\n')
 }
 
-export function buildCanonicalSystemNoticeEvents(batch, { inboxFile } = {}) {
+export function buildCanonicalSystemNoticeEvents(
+  batch,
+  { inboxFile, rearm = 'devspec-remote-wait' } = {},
+) {
   const ingress = batch?.ingress
   const executeIds = new Set(Array.isArray(batch?.execute_notice_ids) ? batch.execute_notice_ids : [])
   const notices = Array.isArray(ingress?.system_notices)
-    ? ingress.system_notices.filter((notice) => executeIds.has(notice.notice_id))
+    ? ingress.system_notices.filter((notice) => executeIds.size === 0 || executeIds.has(notice.notice_id))
     : []
   const sessionId = batch?.session_id ?? null
   const pointers = batch?.wake_context ?? null
@@ -590,7 +593,7 @@ export function buildCanonicalSystemNoticeEvents(batch, { inboxFile } = {}) {
     authoritative: false,
     executable: false,
     continuous_poller: true,
-    rearm: 'devspec-remote-wait',
+    rearm,
   })
   return events
 }
@@ -599,39 +602,50 @@ export function buildCanonicalSystemNoticeEvents(batch, { inboxFile } = {}) {
  * Convert one durable canonical command record into wake events:
  * one `owner_message` per command, an optional `room_unread` count summary, and one `wake`.
  */
-export function buildCanonicalCommandEvents(batch, { inboxFile, unread = null } = {}) {
+export function buildCanonicalCommandEvents(
+  batch,
+  { inboxFile, unread = null, rearm = 'devspec-remote-wait' } = {},
+) {
   const ingress = batch?.ingress
-  const executeIds = new Set(Array.isArray(batch?.execute_message_ids) ? batch.execute_message_ids : [])
+  const executeIds = new Set(
+    Array.isArray(batch?.execute_message_ids)
+      ? batch.execute_message_ids
+      : Array.isArray(ingress?.command_message_ids)
+        ? ingress.command_message_ids
+        : [],
+  )
   const commands = Array.isArray(ingress?.commands)
-    ? ingress.commands.filter((command) => executeIds.has(command.message_id))
+    ? ingress.commands.filter((command) => executeIds.size === 0 || executeIds.has(command.message_id))
     : []
   const sessionId = batch?.session_id ?? null
   const pointers = batch?.wake_context ?? null
   const events = []
 
   for (const command of commands) {
-    const scopeAware = Object.hasOwn(command, 'project_scope')
-    const delegated = command.authority.kind === 'delegated'
-    const senderStyle = Array.isArray(ingress.sender_response_styles)
+    const scopeAware = Boolean(command && typeof command === 'object' && Object.hasOwn(command, 'project_scope'))
+    const authorityKind = command?.authority?.kind ?? 'owner'
+    const delegated = authorityKind === 'delegated'
+    const senderStyle = Array.isArray(ingress?.sender_response_styles)
       ? (ingress.sender_response_styles.find((style) => style.message_id === command.message_id)?.notes ?? [])
       : []
     const body = typeof command.content?.body === 'string' ? command.content.body : ''
     if (batch.question_handoff?.source_message_id === command.message_id) {
       events.push(questionHandoffEvent(batch.question_handoff, { sessionId }))
     }
+    const unreadTotal = unread ? (Number(unread.unread) || 0) + (Number(unread.updated) || 0) : null
     events.push({
       type: 'owner_message',
       from: command.requester?.display_name ?? null,
-      authority: command.authority.kind,
+      authority: authorityKind,
       ...(typeof batch.instruction_context_file === 'string'
         ? { instruction_context_file: batch.instruction_context_file }
         : {}),
       ...(senderStyle.length > 0 ? { style: true } : {}),
       message_id: command.message_id,
-      unread: unread ? unread.unread + unread.updated : null,
+      unread: unreadTotal,
       body_chars: body.length,
       body,
-      envelope_id: ingress.envelope_id,
+      envelope_id: ingress?.envelope_id ?? null,
       session_id: sessionId,
       authoritative: true,
       executable: true,
@@ -639,7 +653,7 @@ export function buildCanonicalCommandEvents(batch, { inboxFile, unread = null } 
       message: command,
       ...(senderStyle.length > 0 ? { sender_response_style: senderStyle } : {}),
       ...(scopeAware ? { project_scope: command.project_scope } : {}),
-      ...(delegated && scopeAware
+      ...(delegated && scopeAware && command.project_scope?.instruction
         ? { project_scope_instruction: command.project_scope.instruction }
         : {}),
       notification_preview: {
@@ -651,7 +665,7 @@ export function buildCanonicalCommandEvents(batch, { inboxFile, unread = null } 
     })
   }
 
-  if (commands.length > 0 && unread) {
+  if (commands.length > 0 && unread && (Number(unread.unread) || 0) + (Number(unread.updated) || 0) > 0) {
     events.push({ type: 'room_unread', session_id: sessionId, advisory: true, executable: false, ...unread })
   }
 
@@ -664,12 +678,15 @@ export function buildCanonicalCommandEvents(batch, { inboxFile, unread = null } 
     session_id: sessionId,
     count: commands.length,
     envelope_id: ingress?.envelope_id ?? null,
-    command_message_ids: ingress?.command_message_ids ?? [],
+    command_message_ids:
+      Array.isArray(ingress?.command_message_ids) && ingress.command_message_ids.length > 0
+        ? ingress.command_message_ids
+        : commands.map((c) => c.message_id).filter(Boolean),
     inbox: inboxFile ?? null,
     authoritative: false,
     executable: false,
     continuous_poller: true,
-    rearm: 'devspec-remote-wait',
+    rearm,
   })
   return events
 }
@@ -742,7 +759,10 @@ export async function writeEventSequence(events, writeLine = stdoutLine) {
 /**
  * Legacy `owner_messages` event builder (retained for backward compatibility and tests).
  */
-export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, writeFile } = {}) {
+export function buildOwnerMessageEvents(
+  batch,
+  { inboxFile, attachmentDir, writeFile, rearm = 'devspec-remote-wait' } = {},
+) {
   const sessionId = batch?.session_id ?? null
   const messages = Array.isArray(batch?.messages) ? batch.messages : []
   const ownerAmbient = Array.isArray(batch?.context?.owner_ambient) ? batch.context.owner_ambient : []
@@ -800,9 +820,77 @@ export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, write
     next_after_message_id: batch?.next_after_message_id ?? null,
     inbox: inboxFile ?? null,
     continuous_poller: true,
-    rearm: 'devspec-remote-wait',
+    rearm,
   })
   return events
+}
+
+/**
+ * Format any inbox entry (`canonical_commands`, `canonical_system_notices`, `automation_run`,
+ * `interaction_answer`, `question_dismissal`, or legacy `owner_messages`) into canonical
+ * wake JSON lines. Used by both `devspec-remote-wait.mjs` and `devspec-remote-listen.mjs`.
+ */
+export function formatInboxEntryForStream(
+  batch,
+  {
+    connectionId = null,
+    inboxFile = null,
+    unread = undefined,
+    rearm = 'devspec-remote-wait',
+    home = os.homedir(),
+    attachmentDir = null,
+    writeFile = undefined,
+  } = {},
+) {
+  if (!batch || typeof batch !== 'object') return ''
+  const effectiveConnId = connectionId || batch.connection_id || batch.dispatch?.delivery_connection_id || null
+  let events = []
+  if (batch.type === 'canonical_commands') {
+    const executeIds = Array.isArray(batch.execute_message_ids)
+      ? batch.execute_message_ids
+      : Array.isArray(batch.ingress?.command_message_ids)
+        ? batch.ingress.command_message_ids
+        : []
+    const deliveredCommands = Array.isArray(batch.ingress?.commands)
+      ? batch.ingress.commands.filter((c) => executeIds.length === 0 || executeIds.includes(c?.message_id))
+      : []
+    const computedUnread =
+      unread !== undefined
+        ? unread
+        : effectiveConnId && batch.session_id
+          ? wakeNotice({
+              connectionId: effectiveConnId,
+              sessionId: batch.session_id,
+              deliveredCommandIds: executeIds,
+              deliveredCommands,
+              home,
+            })
+          : null
+    events = buildCanonicalCommandEvents(batch, {
+      inboxFile,
+      unread: computedUnread,
+      rearm,
+    })
+  } else if (batch.type === 'canonical_control') {
+    events = buildCanonicalControlEvents(batch, { inboxFile })
+  } else if (batch.type === 'canonical_system_notices') {
+    events = buildCanonicalSystemNoticeEvents(batch, { inboxFile, rearm })
+  } else if (batch.type === INTERACTION_ANSWER_RECORD_TYPE || batch.type === DISMISSAL_RECORD_TYPE) {
+    events =
+      batch.disposition === QUEUED
+        ? buildQueuedAnswerEvents(batch, { inboxFile })
+        : buildInteractionAnswerEvents(batch, { inboxFile })
+  } else if (batch.type === 'automation_run' && batch.dispatch) {
+    events = buildAutomationRunEvents(batch, { inboxFile })
+  } else if (batch.type === 'owner_messages') {
+    events = buildOwnerMessageEvents(batch, {
+      inboxFile,
+      attachmentDir: attachmentDir || (effectiveConnId ? attachmentDirFor(effectiveConnId) : null),
+      writeFile,
+      rearm,
+    })
+  }
+  return events.map((event) => JSON.stringify(event)).join('\n')
 }
 
 export async function emitOwnerMessageBatches(
@@ -941,7 +1029,16 @@ async function main() {
             batch.type === 'canonical_commands'
               ? buildCanonicalCommandEvents(batch, {
                   inboxFile: file,
-                  unread: wakeNotice({ connectionId, sessionId: batch.session_id }),
+                  unread: wakeNotice({
+                    connectionId,
+                    sessionId: batch.session_id,
+                    deliveredCommandIds: batch.execute_message_ids,
+                    deliveredCommands: Array.isArray(batch.ingress?.commands)
+                      ? batch.ingress.commands.filter((c) =>
+                          batch.execute_message_ids.includes(c.message_id),
+                        )
+                      : [],
+                  }),
                 })
               : batch.type === 'canonical_control'
                 ? buildCanonicalControlEvents(batch, { inboxFile: file })

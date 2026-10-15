@@ -547,6 +547,12 @@ export async function connect(options = {}, deps = {}) {
   const armCommand =
     `node ${JSON.stringify(WAIT_SCRIPT)} --connection-id ${connectionId}` +
     `${resolvedOwnerPid ? ` --owner-pid ${resolvedOwnerPid}` : ''} ${cursorFlag}`
+  const wakeArmed = Boolean(
+    !noPoller &&
+      written.listener?.ok &&
+      (written.agentapi_ready ||
+        (env?.ANTIGRAVITY_LS_ADDRESS && env?.ANTIGRAVITY_CSRF_TOKEN)),
+  )
 
   return {
     ok: true,
@@ -576,6 +582,7 @@ export async function connect(options = {}, deps = {}) {
     warning_local: written.warning_local || null,
     poller: written.poller || null,
     listener: written.listener || null,
+    wake_armed: wakeArmed,
     bond_action: bond.action,
     state_path: written.path,
     owner_pid: resolvedOwnerPid,
@@ -632,8 +639,16 @@ export function renderStatusBlock(
   }
 
   lines.push('')
-  lines.push('ARM THE BACKGROUND WAIT NOW (run_command with WaitMsBeforeAsync: 500):')
-  lines.push(summary.arm_command)
+  if (summary.wake_armed) {
+    const pid = summary.listener?.pid || summary.listener_pid || null
+    const listenerPid = pid ? ` (listener pid ${pid})` : ''
+    lines.push(
+      `wake: ALREADY ARMED${listenerPid} — background listener delivers wakes automatically via agentapi; do NOT run devspec-remote-wait.mjs.`,
+    )
+  } else {
+    lines.push('ARM THE BACKGROUND WAIT NOW (run_command with WaitMsBeforeAsync: 500):')
+    lines.push(summary.arm_command)
+  }
 
   if (summary.transcript) {
     lines.push('')
