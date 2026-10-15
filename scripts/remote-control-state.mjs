@@ -338,6 +338,7 @@ export function resolveOwnerPidAutoLinux(
   if (process.platform !== 'linux' && procRoot === '/proc') return null
   let pid = Number.parseInt(String(startPid), 10)
   if (!Number.isInteger(pid) || pid <= 1) return null
+  let fallbackLsPid = null
   for (let i = 0; i < maxHops && pid > 1; i++) {
     let statusText = ''
     try {
@@ -358,14 +359,56 @@ export function resolveOwnerPidAutoLinux(
       /* ignore */
     }
     if (
-      /^(agy|antigravity|language_server_[a-z0-9_.-]+)$/i.test(comm) ||
-      /(^|[\s/])(agy|antigravity|language_server_[a-z0-9_.-]+)(\s|$)/i.test(cmdline)
+      /^(agy|antigravity)$/i.test(comm) ||
+      /(^|[\s/])(agy|antigravity)(\s|$)/i.test(cmdline)
     ) {
       return pid
+    }
+    if (
+      /^language_server_[a-z0-9_.-]+$/i.test(comm) ||
+      /(^|[\s/])language_server_[a-z0-9_.-]+(\s|$)/i.test(cmdline)
+    ) {
+      fallbackLsPid = pid
     }
     const nextPid = Number.parseInt(ppidMatch?.[1] || '', 10)
     if (!Number.isInteger(nextPid) || nextPid <= 1 || nextPid === pid) break
     pid = nextPid
+  }
+  return fallbackLsPid
+}
+
+/**
+ * Discover Antigravity's local language server HTTP address (`localhost:<port>`)
+ * from `env.ANTIGRAVITY_LS_ADDRESS` or by inspecting the `cli-*.log` file open on
+ * `ownerPid`'s stdout/stderr file descriptors (`/proc/<ownerPid>/fd/1` or `fd/2`).
+ */
+export function discoverAntigravityLsAddress(
+  ownerPid,
+  env = process.env,
+  { procRoot = '/proc' } = {},
+) {
+  if (typeof env?.ANTIGRAVITY_LS_ADDRESS === 'string' && env.ANTIGRAVITY_LS_ADDRESS.trim()) {
+    return env.ANTIGRAVITY_LS_ADDRESS.trim()
+  }
+  const pid = Number.parseInt(String(ownerPid ?? ''), 10)
+  if (!Number.isInteger(pid) || pid <= 1) return null
+  for (const fd of ['1', '2']) {
+    try {
+      const target = fs.readlinkSync(path.join(procRoot, String(pid), 'fd', fd))
+      if (!target || !target.endsWith('.log') || !fs.existsSync(target)) continue
+      const fdNum = fs.openSync(target, 'r')
+      try {
+        const buf = Buffer.alloc(16384)
+        const bytes = fs.readSync(fdNum, buf, 0, buf.length, 0)
+        const text = buf.subarray(0, bytes).toString('utf8')
+        const m = text.match(/Language server listening on (?:random )?port at (\d+) for HTTP/i)
+        if (m && m[1]) return `localhost:${m[1]}`
+      } finally {
+        fs.closeSync(fdNum)
+      }
+    } catch {
+      /* ignore */
+    }
   }
   return null
 }
@@ -411,12 +454,28 @@ export function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 1
 
 /**
  * Resolve the effective owner-pid for this call: an explicit, valid `--owner-pid`
- * always wins (any platform); otherwise attempt Linux `/proc` or Windows ancestry
- * self-resolution above; otherwise fall back to a previously-recorded value.
+ * always wins (any platform), except when `$PPID` inside Antigravity's `run_command`
+ * tool is `language_server_*` or an intermediate shell (`bash`/`sh`/`zsh`/`dash`),
+ * in which case we walk up to the owning `agy` process so `statusLine`, hooks, and
+ * `run_command` all share the exact same window `owner_pid`.
  */
 export function resolveOwnerPid(explicitArg, prevValue) {
   const explicit = Number.parseInt(String(explicitArg ?? ''), 10)
-  if (Number.isInteger(explicit) && explicit > 1) return explicit
+  if (Number.isInteger(explicit) && explicit > 1) {
+    if (process.platform === 'linux') {
+      try {
+        const statusText = fs.readFileSync(`/proc/${explicit}/status`, 'utf8')
+        const comm = (statusText.match(/^Name:\s*(.+)$/m)?.[1] || '').trim()
+        if (/^(language_server_[a-z0-9_.-]+|bash|sh|dash|zsh)$/i.test(comm)) {
+          const normalized = resolveOwnerPidAutoLinux(explicit)
+          if (normalized) return normalized
+        }
+      } catch {
+        /* explicit pid not in /proc (e.g. synthetic test pid) — keep explicit */
+      }
+    }
+    return explicit
+  }
   const autoLinux = resolveOwnerPidAutoLinux()
   if (autoLinux) return autoLinux
   const autoWin = resolveOwnerPidAutoWindows()
@@ -630,13 +689,13 @@ export function ownerAlive(pid) {
 }
 
 /** Every per-connection state object on disk (raw). */
-function scanConnectionStates() {
+export function scanConnectionStates(dir = CONNECTIONS_DIR) {
   const out = []
   try {
-    if (!fs.existsSync(CONNECTIONS_DIR)) return out
-    for (const f of fs.readdirSync(CONNECTIONS_DIR)) {
+    if (!fs.existsSync(dir)) return out
+    for (const f of fs.readdirSync(dir)) {
       if (!f.endsWith('.json')) continue
-      const s = readJson(path.join(CONNECTIONS_DIR, f))
+      const s = readJson(path.join(dir, f))
       if (s && s.connection_id) out.push(s)
     }
   } catch {
@@ -945,6 +1004,7 @@ export function resolveLocalAction({
   readBond = readLocalBond,
   readConnection = (id) => readJson(connectionPath(id)),
   listStates = scanConnectionStates,
+  rebond = rebondConnectionToConversation,
 } = {}) {
   const agentName = agent || AGENT_NAME
   const maxAgeMs =
@@ -974,7 +1034,7 @@ export function resolveLocalAction({
   let effectiveLocalId = localId
   let bond = effectiveLocalId ? readBond(agentName, effectiveLocalId) : null
   // If this conversation has no bond yet, check if this exact Antigravity window
-  // (owner_pid) already auto-connected at startup with local_id === null.
+  // (owner_pid) already auto-connected at startup with local_id === null (or agy-window:<pid>).
   if (
     effectiveLocalId &&
     (!bond || !bond.connection_id) &&
@@ -986,17 +1046,37 @@ export function resolveLocalAction({
         s &&
         s.enabled !== false &&
         !s.ended_from_ui &&
-        !s.local_id &&
+        (!s.local_id || String(s.local_id).startsWith('agy-window:')) &&
         String(s.agent_name || '').toLowerCase() === String(agentName).toLowerCase() &&
         Number(s.owner_pid) === Number(ownerPid),
     )
     if (matchingStartup?.connection_id) {
-      rebondConnectionToConversation({
+      const pendingLocalId =
+        matchingStartup.pending_local_id ||
+        (String(matchingStartup.local_id || '').startsWith('agy-window:')
+          ? matchingStartup.local_id
+          : null)
+      rebond({
         agent: agentName,
         connectionId: matchingStartup.connection_id,
         localId: effectiveLocalId,
+        keepPendingLocalId: Boolean(pendingLocalId),
       })
       bond = readBond(agentName, effectiveLocalId)
+      if (!bond || !bond.connection_id) {
+        bond = {
+          status: matchingStartup.enabled === false ? 'stopped' : 'live',
+          connection_id: matchingStartup.connection_id,
+          agent_name: matchingStartup.agent_name || agentName,
+          local_id: effectiveLocalId,
+          session_id: matchingStartup.session_id || null,
+          session_codename:
+            matchingStartup.session_codename || matchingStartup.codename || null,
+          title: matchingStartup.title || null,
+          end_reason: matchingStartup.end_reason || null,
+          updated_at: matchingStartup.updated_at || null,
+        }
+      }
     }
   } else if (
     !effectiveLocalId &&
@@ -1018,7 +1098,7 @@ export function resolveLocalAction({
       candidates.find((s) => s.local_id) ||
       null
     if (matchingOwnerConn?.connection_id) {
-      if (matchingOwnerConn.local_id) {
+      if (matchingOwnerConn.local_id && !String(matchingOwnerConn.local_id).startsWith('agy-window:')) {
         effectiveLocalId = matchingOwnerConn.local_id
         bond = readBond(agentName, effectiveLocalId)
       }
@@ -1027,7 +1107,7 @@ export function resolveLocalAction({
           status: matchingOwnerConn.enabled === false ? 'stopped' : 'live',
           connection_id: matchingOwnerConn.connection_id,
           agent_name: matchingOwnerConn.agent_name || agentName,
-          local_id: effectiveLocalId || null,
+          local_id: effectiveLocalId || matchingOwnerConn.pending_local_id || null,
           session_id: matchingOwnerConn.session_id || null,
           session_codename:
             matchingOwnerConn.session_codename || matchingOwnerConn.codename || null,
@@ -1138,6 +1218,7 @@ export async function negotiateConnectionCapability({
   gitRemote = null,
   localId,
   connectionId,
+  connectionCapability = null,
   agentName = AGENT_NAME,
   cwd = process.cwd(),
   call = mcpToolsCall,
@@ -1147,10 +1228,12 @@ export async function negotiateConnectionCapability({
     return { ok: false, error: 'capability negotiation requires MCP auth, project-id, local-id, and connection-id' }
   }
   try {
+    let callbackMeta = null
     const result = await call({
       mcpUrl,
       token,
       name: 'register_connection',
+      ...(connectionCapability ? { connectionCapability } : {}),
       arguments: {
         ...(projectId ? { project_id: projectId } : {}),
         ...(gitRemote ? { git_remote: gitRemote } : {}),
@@ -1160,15 +1243,19 @@ export async function negotiateConnectionCapability({
         connection_capability_version: 1,
       },
       includeMeta: true,
+      onResultMeta: (meta) => {
+        callbackMeta = meta
+      },
       timeoutMs: 15_000,
     })
-    if (result?.data?.connection_id !== connectionId) {
+    const data = result?.data && typeof result.data === 'object' ? result.data : result
+    if (data?.connection_id !== connectionId) {
       return { ok: false, error: 'capability negotiation returned a different connection bond' }
     }
-    if (typeof onProjectId === 'function' && typeof result?.data?.project_id === 'string' && result.data.project_id) {
-      onProjectId(result.data.project_id)
+    if (typeof onProjectId === 'function' && typeof data?.project_id === 'string' && data.project_id) {
+      onProjectId(data.project_id)
     }
-    const capability = result?.meta?.devspec?.connection_capability
+    const capability = (callbackMeta || result?.meta)?.devspec?.connection_capability
     if (capability?.version !== 1 || typeof capability.value !== 'string' || !capability.value.startsWith('dvsc_')) {
       return { ok: false, error: 'server did not return connection capability version 1 in MCP result _meta' }
     }
@@ -1187,31 +1274,41 @@ export function rebondConnectionToConversation({
   connectionId,
   localId,
   transcriptPath = null,
+  env = process.env,
+  connDir = CONNECTIONS_DIR,
+  rcDir = LOCAL_DIR,
+  home = os.homedir(),
+  keepPendingLocalId = false,
 } = {}) {
   const id = sanitizeLocalId(localId)
   if (!connectionId || !id) return { ok: false, reason: 'missing_ids' }
-  const perPath = connectionPath(connectionId)
+  const perPath = connectionPath(connectionId, connDir)
   const state = readJson(perPath)
   if (!state || state.enabled === false) return { ok: false, reason: 'connection_not_live' }
   const agentName = agent || state.agent_name || AGENT_NAME
   const resolvedTranscriptPath =
     (typeof transcriptPath === 'string' && transcriptPath.trim() ? transcriptPath.trim() : null) ||
-    inferAntigravityTranscriptPath(id) ||
+    inferAntigravityTranscriptPath(id, env) ||
     state.transcript_path ||
     null
-  const bond = writeLocalBond(agentName, id, {
-    status: 'live',
-    connection_id: connectionId,
-    session_id: state.session_id ?? null,
-    session_codename: state.session_codename ?? null,
-    title: state.title ?? null,
-    project_id: state.project_id ?? null,
-    ...(state.project_name ? { project_name: state.project_name } : {}),
-    cwd: state.cwd ?? null,
-    end_reason: null,
-    cursor_after_message_id: state.cursor_after_message_id || null,
-    transcript_path: resolvedTranscriptPath,
-  })
+  const bond = writeLocalBond(
+    agentName,
+    id,
+    {
+      status: 'live',
+      connection_id: connectionId,
+      session_id: state.session_id ?? null,
+      session_codename: state.session_codename ?? null,
+      title: state.title ?? null,
+      project_id: state.project_id ?? null,
+      ...(state.project_name ? { project_name: state.project_name } : {}),
+      cwd: state.cwd ?? null,
+      end_reason: null,
+      cursor_after_message_id: state.cursor_after_message_id || null,
+      transcript_path: resolvedTranscriptPath,
+    },
+    rcDir,
+  )
   if (state.project_id && state.project_name && state.mcp_url) {
     try {
       saveConversationProject(
@@ -1219,23 +1316,39 @@ export function rebondConnectionToConversation({
         state.mcp_url,
         { id: state.project_id, name: state.project_name },
         'folder',
+        { home },
       )
     } catch {
       /* non-fatal */
     }
   }
-  writeJson(perPath, {
+  const lsAddress =
+    env?.ANTIGRAVITY_LS_ADDRESS ||
+    state.ls_address ||
+    discoverAntigravityLsAddress(state.owner_pid, env) ||
+    null
+  const pendingLocalId = keepPendingLocalId
+    ? state.pending_local_id ||
+      (String(state.local_id || '').startsWith('agy-window:') ? state.local_id : null)
+    : null
+  const nextState = {
     ...state,
     local_id: id,
+    ...(pendingLocalId ? { pending_local_id: pendingLocalId } : {}),
     transcript_path: resolvedTranscriptPath,
+    ...(lsAddress ? { ls_address: lsAddress } : {}),
+    ...(env?.ANTIGRAVITY_CSRF_TOKEN ? { csrf_token: env.ANTIGRAVITY_CSRF_TOKEN } : {}),
+    ...(env?.ANTIGRAVITY_AGENTAPI_EXE ? { agentapi_exe: env.ANTIGRAVITY_AGENTAPI_EXE } : {}),
     updated_at: new Date().toISOString(),
-  })
+  }
+  if (!pendingLocalId) delete nextState.pending_local_id
+  writeJson(perPath, nextState)
   return {
     ok: true,
     connection_id: connectionId,
     local_id: id,
     transcript_path: resolvedTranscriptPath,
-    bond_path: localBondPath(agentName, id),
+    bond_path: localBondPath(agentName, id, rcDir),
     bond,
   }
 }
@@ -1297,6 +1410,11 @@ export async function writeConnectionState({
       gitRemote,
       localId,
       connectionId,
+      connectionCapability:
+        typeof prev.connection_capability === 'string' &&
+        prev.connection_capability.startsWith('dvsc_')
+          ? prev.connection_capability
+          : null,
       agentName,
       cwd,
       onProjectId: (resolvedId) => {
@@ -1313,13 +1431,21 @@ export async function writeConnectionState({
     capability = { ok: false, error: auth.error || 'MCP auth or local_id unavailable' }
   }
 
+  const lsAddress =
+    env.ANTIGRAVITY_LS_ADDRESS ||
+    prev.ls_address ||
+    discoverAntigravityLsAddress(ownerPid, env) ||
+    null
+
   const state = {
     ...applyConnectionCapabilityRotation(prev, capability),
     enabled: true,
     connection_id: connectionId,
     session_id: sessionId,
     agent_name: agentName,
-    local_id: localId,
+    local_id: localId && !String(localId).startsWith('agy-window:') ? localId : null,
+    pending_local_id:
+      localId && String(localId).startsWith('agy-window:') ? localId : null,
     transcript_path: transcriptPath,
     owner_pid: ownerPid,
     project_id: projectId,
@@ -1341,13 +1467,14 @@ export async function writeConnectionState({
           instruction_tiers_hash: instructionTiers.hash,
         }
       : {}),
-    ...(env.ANTIGRAVITY_LS_ADDRESS ? { ls_address: env.ANTIGRAVITY_LS_ADDRESS } : {}),
+    ...(lsAddress ? { ls_address: lsAddress } : {}),
     ...(env.ANTIGRAVITY_CSRF_TOKEN ? { csrf_token: env.ANTIGRAVITY_CSRF_TOKEN } : {}),
     ...(env.ANTIGRAVITY_AGENTAPI_EXE ? { agentapi_exe: env.ANTIGRAVITY_AGENTAPI_EXE } : {}),
     ended_from_ui: false,
     end_reason: null,
     updated_at: new Date().toISOString(),
   }
+  if (!state.pending_local_id) delete state.pending_local_id
 
   const perPath = connectionPath(connectionId, connDir)
   writeJson(perPath, state)

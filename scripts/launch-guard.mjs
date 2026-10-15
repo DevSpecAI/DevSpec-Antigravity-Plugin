@@ -20,9 +20,12 @@ import {
   undecidedTurnMessage,
 } from './requests.mjs'
 import { resolveHookConversationId } from './mirror-turn.mjs'
-import { readLocalBond, readStateFile } from './remote-control-state.mjs'
+import { readLocalBond, readStateFile, resolveOwnerPid } from './remote-control-state.mjs'
 
-export function resolveOwnConnectionId(conversationId, { home = os.homedir() } = {}) {
+export function resolveOwnConnectionId(
+  conversationId,
+  { home = os.homedir(), ownerPid = resolveOwnerPid({}) } = {},
+) {
   const dir = path.join(home, '.devspec', 'remote-control')
   if (conversationId) {
     const bond = readLocalBond(conversationId, dir)
@@ -39,6 +42,7 @@ export function resolveOwnConnectionId(conversationId, { home = os.homedir() } =
     return null
   }
   const matches = []
+  const pidMatches = []
   for (const f of files) {
     const st = readStateFile(f.slice(0, -5), connDir)
     if (!st || st.enabled === false) continue
@@ -46,8 +50,16 @@ export function resolveOwnConnectionId(conversationId, { home = os.homedir() } =
     if (conversationId && st.local_id === conversationId) {
       return st.connection_id
     }
+    if (
+      ownerPid &&
+      Number(st.owner_pid) === Number(ownerPid) &&
+      (!st.local_id || String(st.local_id).startsWith('agy-window:'))
+    ) {
+      pidMatches.push(st.connection_id)
+    }
     matches.push(st.connection_id)
   }
+  if (pidMatches.length === 1) return pidMatches[0]
   return !conversationId && matches.length === 1 ? matches[0] : null
 }
 

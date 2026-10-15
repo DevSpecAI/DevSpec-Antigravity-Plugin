@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.15.8
+
+### Window-open standby auto-connect (`agy-window:<owner_pid>`), `SessionStart` capability capture & 3-line instruction pointer, `/devspec-project` skill, and Pi-style live mid-turn trail streaming
+
+- **Window-open standby auto-connect and in-place conversation `local_id` upgrade (`scripts/launch-guard.mjs`, `scripts/remote-control-state.mjs`, `scripts/session-start.mjs`, `scripts/devspec-remote-connect.mjs`):** `statusLine` now auto-connects at window open even before a conversation `session_id` exists by synthesizing a deterministic window standby bond `agy-window:<owner_pid>`. When the first conversation hook (`SessionStart`, `PreInvocation`) or `/devspec-remote` runs in that window with a real conversation ID, `findStandbyWindowStateForPid`, `upgradeStandbyStateLocalId`, and `resolveLocalAction` upgrade the existing connection in place without minting a second connection row.
+- **`SessionStart` `connection_capability` capture via `onResultMeta` and compact 3-line instruction pointer (`scripts/session-start.mjs`, `scripts/instruction-tiers.mjs`, `scripts/devspec-remote-connect.mjs`):** `autoConnectAtStartup` in `scripts/session-start.mjs` now captures `_meta.devspec.connection_capability` via `onResultMeta` and persists `connection_capability` to `<connectionId>.json` so `/devspec-remote` reuses the startup connection directly. `formatTiersForStartup` now emits the compact 3-line instruction-tier pointer to `~/.devspec/remote-control/connections/.tiers-<hash>.txt` instead of injecting ~23 KB of inline markdown on `SessionStart`.
+- **`/devspec-project` skill and `scripts/devspec-project.mjs` parity (`scripts/devspec-project.mjs`, `skills/devspec-project/SKILL.md`, `scripts/conversation-project.mjs`):** Added `scripts/devspec-project.mjs` (`status`, `choose`, `remember`, `forget`) and `skills/devspec-project/SKILL.md` matching Claude Code, plus `inheritConversationProject` in `scripts/conversation-project.mjs` to carry a pre-conversation window project selection (`agy-window:<owner_pid>`) over to the real conversation ID on upgrade.
+- **Pi-style mid-turn thinking and tool trail streaming (`phase: "trail"`) without command obfuscation (`scripts/mirror-turn.mjs`, `scripts/post-tool-dispatch.mjs`):** `extractAntigravityTrailFromTranscript` now produces `@devspec/core/messages/trail-events`-compliant `thinking` (`.text`), `tool` (`.name`, `.status`, `.args`, `.result`), `domain` (`.domain`, `.action`, `.name`, `.status`), and `subagent` (`.name`, `.status`, `.children`) events and `work_trail` markdown without command obfuscation (applying only secret token redaction). `PostToolUse` streams `phase: "trail"` mid-turn via `streamTurnTrailIfChanged`, and `Stop` finalizes any streamed trail cleanly (`complete_turn: true`) so turns never leave `"No response"` bubbles.
+
 ## 0.15.7
 
 ### Background listener `agentapi` wake delivery (`wake: ALREADY ARMED`) and unread-watermark deduplication

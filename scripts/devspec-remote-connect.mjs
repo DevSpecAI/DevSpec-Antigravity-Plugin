@@ -49,8 +49,10 @@ import {
   knownInstructionTiersFor,
   readLocalBond,
   readStateFile,
+  rebondConnectionToConversation,
   resolveLocalAction,
   resolveOwnerPid,
+  scanConnectionStates,
   writeConnectionState,
 } from './remote-control-state.mjs'
 import {
@@ -206,6 +208,14 @@ export async function connect(options = {}, deps = {}) {
     maxAgeMinutes: 30,
     readBond: (ag, id) => readLocalBond(ag, id, rcDir),
     readConnection: (id) => readStateFile(id, tierDir),
+    listStates: () => scanConnectionStates(tierDir),
+    rebond: (opts) =>
+      rebondConnectionToConversation({
+        ...opts,
+        connDir: tierDir,
+        rcDir,
+        home: projectHome,
+      }),
   })
   const localId = detected.local_id || bond?.local_id || null
   const localIdSource = detected.source || (bond?.local_id ? 'owner_pid_bond' : null)
@@ -322,6 +332,7 @@ export async function connect(options = {}, deps = {}) {
 
   let registration = null
   let connectionCapability = null
+  const existingBondConn = bond?.connection_id ? readStateFile(bond.connection_id, tierDir) : null
   if (
     !startup &&
     !createNew &&
@@ -330,21 +341,25 @@ export async function connect(options = {}, deps = {}) {
     !name &&
     !forceNew &&
     bond?.action === 'already_live' &&
-    bond?.connection_id
+    bond?.connection_id &&
+    existingBondConn
   ) {
-    const existing = readStateFile(bond.connection_id, tierDir)
+    const existing = existingBondConn
     const ageMs = existing?.updated_at ? Date.now() - Date.parse(existing.updated_at) : Infinity
     if (
       existing &&
       existing.enabled !== false &&
       !existing.session_id &&
       existing.project_id &&
+      existing.local_id &&
+      (!localId || existing.local_id === localId) &&
+      !existing.pending_local_id &&
       typeof existing.connection_capability === 'string' &&
       existing.connection_capability.startsWith('dvsc_') &&
       existing.cwd === cwd &&
       Number.isFinite(ageMs) &&
       ageMs >= 0 &&
-      ageMs < 60_000
+      ageMs < 30 * 60_000
     ) {
       connectionCapability = existing.connection_capability
       registration = {
@@ -374,11 +389,21 @@ export async function connect(options = {}, deps = {}) {
   }
 
   if (!registration) {
+    const upgradeCapability =
+      typeof existingBondConn?.connection_capability === 'string' &&
+      existingBondConn.connection_capability.startsWith('dvsc_')
+        ? existingBondConn.connection_capability
+        : null
+    const effectiveRegisterLocalId =
+      localId ||
+      (startup && Number.isInteger(Number(effectiveOwnerPid)) && Number(effectiveOwnerPid) > 1
+        ? `agy-window:${effectiveOwnerPid}`
+        : null)
     try {
       registration = await call(
         'register_connection',
         {
-          ...(localId ? { local_id: localId } : {}),
+          ...(effectiveRegisterLocalId ? { local_id: effectiveRegisterLocalId } : {}),
           agent_name: agentName,
           agent_version: LOADED_PLUGIN_VERSION,
           cwd,
@@ -398,6 +423,7 @@ export async function connect(options = {}, deps = {}) {
             : {}),
         },
         {
+          ...(upgradeCapability ? { connectionCapability: upgradeCapability } : {}),
           onResultMeta: (meta) => {
             const negotiated = meta?.devspec?.connection_capability
             if (negotiated?.version === 1 && typeof negotiated.value === 'string') {

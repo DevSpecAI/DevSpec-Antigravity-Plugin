@@ -191,8 +191,8 @@ describe('devspec-remote-connect.mjs — one-shot mechanical connect', () => {
       const startupTiers = readTiersFor(CONN_ID, { home, dir: connDir })
       const startupContext = formatTiersForStartup(startupTiers)
       assert.match(startupContext, /## Instructions in force for this run/)
-      assert.match(startupContext, /VERIFY AT THE RIGHT LAYER\./)
-      assert.match(startupContext, /already loaded above in full; do not call view_file/)
+      assert.match(startupContext, /\.tiers-[a-f0-9]{64}\.txt/)
+      assert.doesNotMatch(startupContext, /VERIFY AT THE RIGHT LAYER\./)
 
       writeStateFile(
         CONN_ID,
@@ -270,6 +270,95 @@ describe('devspec-remote-connect.mjs — one-shot mechanical connect', () => {
       assert.equal(summary.codename, 'Curious Badger')
       assert.equal(summary.created, true)
       assert.equal(summary.cursor_flag, '--from-end')
+    } finally {
+      if (origHome === undefined) delete process.env.HOME
+      else process.env.HOME = origHome
+      fs.rmSync(home, { recursive: true, force: true })
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('upgrades a window-standby connection (agy-window:<pid>) in place with connectionCapability on /devspec-remote without minting a second connection', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-upgrade-window-'))
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-upgrade-cwd-'))
+    const connDir = path.join(home, '.devspec', 'remote-control', 'connections')
+    fs.mkdirSync(connDir, { recursive: true })
+    const origHome = process.env.HOME
+    try {
+      process.env.HOME = home
+      writeStateFile(
+        CONN_ID,
+        {
+          enabled: true,
+          connection_id: CONN_ID,
+          session_id: null,
+          session_codename: 'Swift Otter',
+          project_id: PROJ_ID,
+          project_name: 'DevSpec',
+          created_by_session_start: true,
+          agent_name: 'Antigravity',
+          local_id: `agy-window:${process.pid}`,
+          pending_local_id: `agy-window:${process.pid}`,
+          cwd,
+          owner_pid: process.pid,
+          connection_capability: 'dvsc_window_standby_cap_999',
+          connection_capability_version: 1,
+          updated_at: new Date().toISOString(),
+        },
+        connDir,
+      )
+
+      const registerCalls = []
+      const summary = await connect(
+        {
+          cwd,
+          localId: CONV_ID,
+          ownerPid: process.pid,
+          noPoller: true,
+          env: { HOME: home, DEVSPEC_MCP_TOKEN: 'dvs_test_token_123456' },
+        },
+        {
+          projectHome: home,
+          resolveAuth: () => ({
+            ok: true,
+            token: 'dvs_test_token_123456',
+            mcp_url: 'https://api.devspecstaging.com/api/mcp',
+            source: 'test',
+          }),
+          writeState: async (opts) => ({
+            path: path.join(connDir, `${opts.connectionId}.json`),
+            session_id: opts.sessionId,
+            owner_pid: opts.ownerPid,
+            mcp_url: 'https://api.devspecstaging.com/api/mcp',
+            auth_ok: true,
+            auth_source: 'test',
+            poller: { skipped: true },
+          }),
+          callTool: async (req) => {
+            if (req.name === 'register_connection') {
+              registerCalls.push(req)
+              return {
+                connection_id: CONN_ID,
+                codename: 'Swift Otter',
+                created: false,
+                project_id: PROJ_ID,
+                project_name: 'DevSpec',
+              }
+            }
+            return {}
+          },
+        },
+      )
+
+      assert.equal(registerCalls.length, 1, 'should call register_connection once to upgrade local_id')
+      assert.equal(
+        registerCalls[0].connectionCapability,
+        'dvsc_window_standby_cap_999',
+        'must present window standby capability header when upgrading local_id',
+      )
+      assert.equal(registerCalls[0].arguments.local_id, CONV_ID)
+      assert.equal(summary.connection_id, CONN_ID)
+      assert.equal(summary.codename, 'Swift Otter')
     } finally {
       if (origHome === undefined) delete process.env.HOME
       else process.env.HOME = origHome

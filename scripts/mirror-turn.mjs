@@ -25,6 +25,8 @@ import {
   detectLocalId,
   inferAntigravityTranscriptPath,
   localBondPath,
+  resolveOwnerPid,
+  writeLocalBond,
 } from './remote-control-state.mjs'
 import {
   localTurnScope,
@@ -68,6 +70,10 @@ export function readTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
   }
 }
 
+export function trailStatePath(connectionId, dir = CONNECTIONS_DIR) {
+  return path.join(dir, `${connectionId}.trail-state.json`)
+}
+
 export function writeTurnMarker(connectionId, extra = {}, dir = CONNECTIONS_DIR) {
   if (!connectionId) return null
   const existing = readTurnMarker(connectionId, dir)
@@ -82,6 +88,7 @@ export function writeTurnMarker(connectionId, extra = {}, dir = CONNECTIONS_DIR)
     fs.mkdirSync(dir, { recursive: true })
     if (!existing && !preserveExplicitReply) {
       fs.rmSync(path.join(dir, `${connectionId}.explicit-reply`), { force: true })
+      fs.rmSync(trailStatePath(connectionId, dir), { force: true })
     }
     fs.writeFileSync(turnMarkerPath(connectionId, dir), JSON.stringify(payload), {
       mode: 0o600,
@@ -101,6 +108,7 @@ export function clearTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
   try {
     fs.rmSync(turnMarkerPath(connectionId, dir), { force: true })
     fs.rmSync(ownedWorkPath(connectionId, dir), { force: true })
+    fs.rmSync(trailStatePath(connectionId, dir), { force: true })
   } catch {
     /* ignore */
   }
@@ -356,40 +364,91 @@ export function syncStateTranscriptPath(
   state,
   transcriptPath,
   conversationId = null,
-  { connectionsDir = CONNECTIONS_DIR } = {},
+  { connectionsDir = CONNECTIONS_DIR, env = process.env } = {},
 ) {
   if (!state?.connection_id) return false
   const resolvedPath =
     normalizeTranscriptPath(transcriptPath) ||
     normalizeTranscriptPath(state.transcript_path) ||
     inferAntigravityTranscriptPath(conversationId || state.local_id)
-  if (!resolvedPath) return false
-  if (state.transcript_path === resolvedPath && (!conversationId || state.local_id === conversationId)) {
+  const lsAddress = env?.ANTIGRAVITY_LS_ADDRESS || state.ls_address || null
+  const csrfToken = env?.ANTIGRAVITY_CSRF_TOKEN || state.csrf_token || null
+  const agentapiExe = env?.ANTIGRAVITY_AGENTAPI_EXE || state.agentapi_exe || null
+  const wasWindowStandby =
+    !state.local_id || String(state.local_id).startsWith('agy-window:')
+  const shouldUpgradeLocalId = Boolean(conversationId && wasWindowStandby)
+
+  if (
+    !resolvedPath &&
+    !shouldUpgradeLocalId &&
+    (!lsAddress || state.ls_address === lsAddress) &&
+    (!csrfToken || state.csrf_token === csrfToken)
+  ) {
+    return false
+  }
+  if (
+    state.transcript_path === resolvedPath &&
+    !shouldUpgradeLocalId &&
+    (!conversationId || state.local_id === conversationId) &&
+    (!lsAddress || state.ls_address === lsAddress) &&
+    (!csrfToken || state.csrf_token === csrfToken)
+  ) {
     return false
   }
   const file = path.join(connectionsDir, `${state.connection_id}.json`)
   try {
     if (fs.existsSync(file)) {
       const current = JSON.parse(fs.readFileSync(file, 'utf8'))
+      const currentIsStandby =
+        !current.local_id || String(current.local_id).startsWith('agy-window:')
+      const nextLocalId =
+        currentIsStandby && conversationId ? conversationId : current.local_id || conversationId || null
       const updated = {
         ...current,
-        transcript_path: resolvedPath,
-        local_id: current.local_id || conversationId || null,
+        ...(resolvedPath ? { transcript_path: resolvedPath } : {}),
+        local_id: nextLocalId,
+        ...(currentIsStandby && conversationId ? { pending_local_id: null } : {}),
+        ...(lsAddress ? { ls_address: lsAddress } : {}),
+        ...(csrfToken ? { csrf_token: csrfToken } : {}),
+        ...(agentapiExe ? { agentapi_exe: agentapiExe } : {}),
         updated_at: new Date().toISOString(),
       }
       fs.writeFileSync(file, JSON.stringify(updated, null, 2), { mode: 0o600 })
-      state.transcript_path = resolvedPath
-      if (!state.local_id && conversationId) state.local_id = conversationId
+      if (resolvedPath) state.transcript_path = resolvedPath
+      if (nextLocalId) state.local_id = nextLocalId
+      if (currentIsStandby && conversationId) state.pending_local_id = null
+      if (lsAddress) state.ls_address = lsAddress
+      if (csrfToken) state.csrf_token = csrfToken
+      if (agentapiExe) state.agentapi_exe = agentapiExe
     }
-    const localId = state.local_id || conversationId
-    if (localId) {
-      const bondFile = localBondPath(state.agent_name || AGENT_NAME, localId)
+    const localId =
+      conversationId && wasWindowStandby ? conversationId : state.local_id || conversationId
+    if (localId && !String(localId).startsWith('agy-window:')) {
+      const rcDir = path.dirname(connectionsDir)
+      const bondFile = localBondPath(state.agent_name || AGENT_NAME, localId, rcDir)
       if (fs.existsSync(bondFile)) {
         const bond = JSON.parse(fs.readFileSync(bondFile, 'utf8'))
-        if (bond.transcript_path !== resolvedPath) {
+        if (resolvedPath && bond.transcript_path !== resolvedPath) {
           bond.transcript_path = resolvedPath
           fs.writeFileSync(bondFile, JSON.stringify(bond, null, 2), { mode: 0o600 })
         }
+      } else if (shouldUpgradeLocalId) {
+        writeLocalBond(
+          state.agent_name || AGENT_NAME,
+          localId,
+          {
+            status: 'live',
+            connection_id: state.connection_id,
+            session_id: state.session_id || null,
+            session_codename: state.session_codename || null,
+            session_title: state.session_title || null,
+            cwd: state.cwd || process.cwd(),
+            transcript_path: resolvedPath || null,
+            enabled: true,
+            updated_at: new Date().toISOString(),
+          },
+          rcDir,
+        )
       }
     }
     return true
@@ -436,12 +495,20 @@ export function resolveHookConversationId(hookInput, env = process.env) {
  * select the state whose local_id matches. A machine-newer connection for a
  * DIFFERENT conversation is never picked.
  *
+ * Secondary — a window-standby bond (`local_id: null` or `agy-window:<pid>`) owned by
+ * this Antigravity window's `owner_pid`.
+ *
  * Fallback — for tools that expose NO per-conversation id to their hooks, or when a
  * connection was registered before `local_id` was known: the single enabled
  * connection for THIS agent. Safe ONLY because "exactly one" means nothing to
  * disambiguate; two+ concurrent connections of the same agent fail closed.
  */
-export function selectBoundState(candidates, conversationId, agentName = null) {
+export function selectBoundState(
+  candidates,
+  conversationId,
+  agentName = null,
+  { ownerPid = null } = {},
+) {
   const enabled = candidates
     .filter(Boolean)
     .filter(({ raw }) => raw?.enabled === true && raw?.connection_id)
@@ -453,16 +520,42 @@ export function selectBoundState(candidates, conversationId, agentName = null) {
     if (bound) return bound
   }
 
+  if (ownerPid && Number.isInteger(Number(ownerPid)) && Number(ownerPid) > 1) {
+    const pidMatches = enabled
+      .filter(({ raw }) => {
+        if (
+          agentName &&
+          String(raw.agent_name || '').toLowerCase() !== String(agentName).toLowerCase()
+        ) {
+          return false
+        }
+        if (Number(raw.owner_pid) !== Number(ownerPid)) return false
+        return (
+          !conversationId ||
+          !raw.local_id ||
+          String(raw.local_id).startsWith('agy-window:') ||
+          raw.local_id === conversationId
+        )
+      })
+      .sort((a, b) => b.mtime - a.mtime)
+    if (pidMatches.length > 0) return pidMatches[0].raw
+  }
+
   if (agentName) {
     const mine = enabled.filter(
       ({ raw }) => String(raw.agent_name || '').toLowerCase() === String(agentName).toLowerCase(),
     )
     if (mine.length === 1) {
-      // Only fall back to the single connection if it is either unbound (local_id: null)
+      // Only fall back to the single connection if it is either unbound (local_id: null / agy-window:*),
       // or we have no conversationId to check against. If the single connection is
       // explicitly bound to a DIFFERENT conversationId, fail closed!
       const candidate = mine[0].raw
-      if (!conversationId || !candidate.local_id || candidate.local_id === conversationId) {
+      if (
+        !conversationId ||
+        !candidate.local_id ||
+        String(candidate.local_id).startsWith('agy-window:') ||
+        candidate.local_id === conversationId
+      ) {
         return candidate
       }
     }
@@ -507,7 +600,14 @@ export function consumeExplicitReplyMarker(connectionId, dir = CONNECTIONS_DIR) 
   }
 }
 
-export function loadState(conversationId, { connectionsDir = CONNECTIONS_DIR, legacyPath = LEGACY_STATE_PATH } = {}) {
+export function loadState(
+  conversationId,
+  {
+    connectionsDir = CONNECTIONS_DIR,
+    legacyPath = LEGACY_STATE_PATH,
+    ownerPid = resolveOwnerPid({}),
+  } = {},
+) {
   // Gather every candidate (legacy singleton + per-connection files) but NEVER
   // trust "most recent" — selectBoundState keeps only THIS conversation's state.
   const candidates = []
@@ -521,7 +621,7 @@ export function loadState(conversationId, { connectionsDir = CONNECTIONS_DIR, le
   }
   try {
     if (fs.existsSync(connectionsDir)) {
-      for (const file of fs.readdirSync(connectionsDir).filter((f) => f.endsWith('.json') && !f.endsWith('.turn-trail.json') && !f.endsWith('.room.json'))) {
+      for (const file of fs.readdirSync(connectionsDir).filter((f) => f.endsWith('.json') && !f.endsWith('.turn-trail.json') && !f.endsWith('.trail-state.json') && !f.endsWith('.room.json'))) {
         try {
           const p = path.join(connectionsDir, file)
           const raw = JSON.parse(fs.readFileSync(p, 'utf8'))
@@ -534,7 +634,7 @@ export function loadState(conversationId, { connectionsDir = CONNECTIONS_DIR, le
   } catch {
     /* selection below fails closed when no readable matching state exists */
   }
-  return selectBoundState(candidates, conversationId, AGENT_NAME)
+  return selectBoundState(candidates, conversationId, AGENT_NAME, { ownerPid })
 }
 
 /**
@@ -761,9 +861,135 @@ export function isRemotePlumbingToolCall(toolName, args = {}) {
   return false
 }
 
+export function redactSecretsFromText(text) {
+  if (typeof text !== 'string') return ''
+  return text
+    .replace(/\b(dvsc?_[A-Za-z0-9_-]{8,})\b/g, '[REDACTED]')
+    .replace(/\b(sk-[A-Za-z0-9_-]{12,})\b/g, '[REDACTED]')
+    .replace(/\b(gh[pousr]_[A-Za-z0-9]{12,})\b/g, '[REDACTED]')
+    .replace(/(Bearer\s+)[A-Za-z0-9._-]{8,}/gi, '$1[REDACTED]')
+    .replace(/(DEVSPEC_MCP_TOKEN\s*=\s*)[^\s"']+/g, '$1[REDACTED]')
+    .replace(/(ANTIGRAVITY_CSRF_TOKEN\s*=\s*)[^\s"']+/g, '$1[REDACTED]')
+}
+
+function classifyDevspecDomainTool(toolName, args = {}) {
+  const { effectiveName, effectiveArgs } = unwrapMcpCallArgs(toolName, args)
+  const match = /^(?:mcp__(?:plugin_devspec_)?devspec__|mcp_devspec_|devspec__)([a-z0-9_]+)$/.exec(
+    effectiveName,
+  )
+  if (!match) return null
+  const verb = match[1]
+  const id = unquoteTranscriptString(
+    effectiveArgs?.action_item_id || effectiveArgs?.id || effectiveArgs?.resource_id || '',
+  )
+  const title = unquoteTranscriptString(
+    effectiveArgs?.title ||
+      effectiveArgs?.summary ||
+      effectiveArgs?.query ||
+      effectiveArgs?.agent_branch ||
+      id ||
+      '',
+  )
+
+  const domainMap = {
+    create_action_item: { domain: 'action_item', action: 'created' },
+    update_action_item: { domain: 'action_item', action: 'updated' },
+    claim_work_item: { domain: 'action_item', action: 'claimed' },
+    reserve_work_items: { domain: 'action_item', action: 'reserved' },
+    verify_action_item: { domain: 'action_item', action: 'verified' },
+    get_action_item: { domain: 'action_item', action: 'inspected' },
+    get_action_items: { domain: 'action_item', action: 'listed' },
+    search_action_items: { domain: 'action_item', action: 'searched' },
+    record_implementation: { domain: 'implementation', action: 'recorded' },
+    record_criterion_verdicts: { domain: 'criterion', action: 'recorded verdicts' },
+    record_memory: { domain: 'memory', action: 'recorded' },
+    supersede_memory: { domain: 'memory', action: 'superseded' },
+    update_memory: { domain: 'memory', action: 'updated' },
+    retract_memory: { domain: 'memory', action: 'retracted' },
+    get_memory: { domain: 'memory', action: 'read' },
+    search_memories: { domain: 'memory', action: 'searched' },
+    create_resource: { domain: 'resource', action: 'created' },
+    update_resource: { domain: 'resource', action: 'updated' },
+    supersede_resource: { domain: 'resource', action: 'superseded' },
+    get_resource: { domain: 'resource', action: 'read' },
+    search_resources: { domain: 'resource', action: 'searched' },
+  }
+  const mapped = domainMap[verb]
+  if (!mapped) return { verb, domain: null, effectiveArgs }
+  return {
+    verb,
+    domain: mapped.domain,
+    action: mapped.action,
+    ...(title ? { title: String(title).slice(0, 200) } : {}),
+    ...(id ? { id: String(id).slice(0, 80) } : {}),
+    effectiveArgs,
+  }
+}
+
+function normalizeCanonicalToolEvent(toolName, args = {}) {
+  const bare = String(toolName || '').replace(/^default_api:/, '')
+  if (bare === 'view_file') {
+    const filePath = unquoteTranscriptString(args?.AbsolutePath || '')
+    const start = args?.StartLine
+    const end = args?.EndLine
+    const range = start || end ? `:${start || 1}-${end || ''}` : ''
+    return {
+      canonicalName: 'read',
+      argsText: filePath ? `${filePath}${range}` : '',
+    }
+  }
+  if (bare === 'replace_file_content' || bare === 'multi_replace_file_content') {
+    return {
+      canonicalName: 'edit',
+      argsText: unquoteTranscriptString(args?.TargetFile || '') || '',
+    }
+  }
+  if (bare === 'write_to_file') {
+    return {
+      canonicalName: 'write',
+      argsText: unquoteTranscriptString(args?.TargetFile || '') || '',
+    }
+  }
+  if (bare === 'run_command' || bare === 'Bash') {
+    const cmdLine = unquoteTranscriptString(args?.CommandLine || args?.command || '') || ''
+    return {
+      canonicalName: 'bash',
+      argsText: redactSecretsFromText(cmdLine),
+    }
+  }
+  if (bare === 'grep_search' || bare === 'find_by_name' || bare === 'search_web') {
+    const q =
+      unquoteTranscriptString(args?.Query || args?.Pattern || args?.query || args?.SearchPath || '') || ''
+    return {
+      canonicalName: 'search',
+      argsText: q,
+    }
+  }
+  const { effectiveName, effectiveArgs } = unwrapMcpCallArgs(toolName, args)
+  const cleanName = String(effectiveName || bare).replace(/^default_api:/, '')
+  let argsPreview = ''
+  try {
+    const keys = Object.keys(effectiveArgs || {}).filter(
+      (k) => k !== 'toolAction' && k !== 'toolSummary',
+    )
+    if (keys.length > 0) {
+      const compactObj = {}
+      for (const k of keys.slice(0, 4)) compactObj[k] = effectiveArgs[k]
+      argsPreview = redactSecretsFromText(JSON.stringify(compactObj)).slice(0, 300)
+    }
+  } catch {
+    argsPreview = ''
+  }
+  return {
+    canonicalName: cleanName || 'tool',
+    argsText: argsPreview,
+  }
+}
+
 /**
  * Extract structured trail events and cumulative Markdown from an Antigravity
- * `transcript.jsonl` raw string for the active turn.
+ * `transcript.jsonl` raw string for the active turn (Pi-style `work_trail` and
+ * `@devspec/core/messages/trail-events` schema without command obfuscation).
  */
 export function extractAntigravityTrailFromTranscript(
   rawText,
@@ -797,6 +1023,11 @@ export function extractAntigravityTrailFromTranscript(
       if (Number.isFinite(stepMs) && stepMs < cutoffMs) continue
     }
 
+    const occurredAt =
+      typeof step.created_at === 'string' && Number.isFinite(Date.parse(step.created_at))
+        ? new Date(Date.parse(step.created_at)).toISOString()
+        : undefined
+
     const rawToolCalls = Array.isArray(step.tool_calls) ? step.tool_calls : []
     const parsedToolCalls = rawToolCalls.map((tc) => {
       const toolName = tc?.name || tc?.tool_name || tc?.function?.name || 'tool'
@@ -828,16 +1059,19 @@ export function extractAntigravityTrailFromTranscript(
     }
 
     if (typeof step.thinking === 'string' && step.thinking.trim()) {
-      const summary = summarizeThinkingText(step.thinking)
-      if (summary) {
+      const summary = summarizeThinkingText(step.thinking, 220)
+      const fullThinking = redactSecretsFromText(step.thinking.trim()).slice(0, 4000)
+      if (summary && fullThinking) {
         seq++
         events.push({
           seq,
           kind: 'thinking',
+          text: fullThinking,
           label: summary,
+          ...(occurredAt ? { occurredAt } : {}),
           step_index: step.step_index ?? null,
         })
-        bullets.push(`- 💭 *${summary}*`)
+        bullets.push(`> 💭 ${summary}`)
       }
     }
 
@@ -856,24 +1090,37 @@ export function extractAntigravityTrailFromTranscript(
       ) {
         const rawAction = unquoteTranscriptString(args?.toolAction)
         const rawSummary = unquoteTranscriptString(args?.toolSummary)
-        for (const sub of subagentsList) {
+        const summary =
+          (typeof rawAction === 'string' && rawAction.trim()) ||
+          (typeof rawSummary === 'string' && rawSummary.trim()) ||
+          'Delegated subagent work'
+        const children = subagentsList.map((sub, idx) => {
           const role = unquoteTranscriptString(sub?.Role || sub?.TypeName) || 'subagent'
-          const typeName = unquoteTranscriptString(sub?.TypeName) || 'self'
-          const summary =
-            (typeof rawAction === 'string' && rawAction.trim()) ||
-            (typeof rawSummary === 'string' && rawSummary.trim()) ||
-            role
-          seq++
-          events.push({
-            seq,
-            kind: 'subagent',
-            role,
-            type_name: typeName,
-            action: summary,
-            step_index: step.step_index ?? null,
-          })
-          bullets.push(`- 🤖 **Subagent (${role})**: ${summary}`)
-        }
+          const model = unquoteTranscriptString(sub?.Model) || undefined
+          return {
+            key: `${role}:${idx}`,
+            agent: role,
+            status: 'running',
+            ...(model && model !== 'inherit' ? { model } : {}),
+            summary,
+          }
+        })
+        const firstRole = children[0]?.agent || 'subagent'
+        seq++
+        events.push({
+          seq,
+          kind: 'subagent',
+          name: 'invoke_subagent',
+          status: 'ok',
+          summary,
+          children,
+          role: firstRole,
+          action: summary,
+          ...(occurredAt ? { occurredAt } : {}),
+          step_index: step.step_index ?? null,
+        })
+        const rolesLabel = children.map((c) => c.agent).join(', ')
+        bullets.push(`✓ \`invoke_subagent\` — \`${rolesLabel}\` → ${summary}`)
         continue
       }
 
@@ -883,24 +1130,182 @@ export function extractAntigravityTrailFromTranscript(
         (typeof rawAction === 'string' && rawAction.trim()) ||
         (typeof rawSummary === 'string' && rawSummary.trim()) ||
         toolName
-      const summary =
-        (typeof rawSummary === 'string' && rawSummary.trim()) || action
+      const summary = (typeof rawSummary === 'string' && rawSummary.trim()) || action
+
+      const domainInfo = classifyDevspecDomainTool(toolName, args)
+      if (domainInfo?.domain) {
+        seq++
+        events.push({
+          seq,
+          kind: 'domain',
+          domain: domainInfo.domain,
+          action: domainInfo.action,
+          name: domainInfo.verb,
+          status: 'ok',
+          ...(domainInfo.title ? { title: domainInfo.title } : {}),
+          ...(domainInfo.id ? { id: domainInfo.id } : {}),
+          ...(summary ? { result: summary } : {}),
+          ...(occurredAt ? { occurredAt } : {}),
+          step_index: step.step_index ?? null,
+        })
+        const argBit = domainInfo.title ? ` — \`${domainInfo.title}\`` : ''
+        bullets.push(`✓ \`${domainInfo.verb}\`${argBit} → ${action}`)
+        continue
+      }
+
+      const { canonicalName, argsText } = normalizeCanonicalToolEvent(toolName, args)
       seq++
       events.push({
         seq,
         kind: 'tool',
+        name: canonicalName,
         tool_name: toolName,
+        status: 'ok',
+        ...(argsText ? { args: argsText } : {}),
+        ...(action ? { result: action } : {}),
         action,
         summary,
+        ...(occurredAt ? { occurredAt } : {}),
         step_index: step.step_index ?? null,
       })
-      bullets.push(`- 🔧 ${action}`)
+      const shortArgs = argsText ? ` — \`${argsText.replace(/\s+/g, ' ').slice(0, 140)}\`` : ''
+      bullets.push(`✓ \`${canonicalName}\`${shortArgs} → ${action}`)
     }
   }
 
   const markdown = bullets.join('\n')
-  const signature = JSON.stringify(events.map((e) => [e.kind, e.label || e.action || e.role]))
+  const signature = JSON.stringify(
+    events.map((e) => [e.seq, e.kind, e.name || e.text || e.role, e.args || e.title || e.action]),
+  )
   return { events, markdown, signature, replyPosted }
+}
+
+/**
+ * Stream a throttled mid-turn `phase: 'trail'` update from `PostToolUse` while
+ * `.turn` is active and before `.explicit-reply` is set.
+ *
+ * Matches Pi's live work-trail UX without background-poller race conditions or
+ * orphaned `"No response"` bubbles.
+ */
+export async function streamTurnTrailIfChanged(
+  state,
+  {
+    connectionsDir = CONNECTIONS_DIR,
+    call = mcpToolsCall,
+    now = Date.now(),
+    minIntervalMs = 1500,
+    home = os.homedir(),
+  } = {},
+) {
+  if (!state?.connection_id || !state?.session_id) {
+    return { streamed: false, reason: 'not_attached' }
+  }
+  const connectionId = state.connection_id
+  if (fs.existsSync(explicitReplyMarkerPath(connectionId, connectionsDir))) {
+    return { streamed: false, reason: 'explicit_reply_already_sent' }
+  }
+  const marker = readTurnMarker(connectionId, connectionsDir)
+  if (!marker || marker.held) {
+    return { streamed: false, reason: 'no_active_turn' }
+  }
+  const tPath =
+    normalizeTranscriptPath(state.transcript_path) ||
+    inferAntigravityTranscriptPath(state.local_id)
+  if (!tPath || !fs.existsSync(tPath)) {
+    return { streamed: false, reason: 'no_transcript' }
+  }
+
+  let rawTranscript = ''
+  try {
+    rawTranscript = fs.readFileSync(tPath, 'utf8')
+  } catch {
+    return { streamed: false, reason: 'transcript_read_error' }
+  }
+
+  const trail = extractAntigravityTrailFromTranscript(rawTranscript, {
+    sinceMs: marker.startedAt,
+    stopAtReply: true,
+  })
+  if (trail.replyPosted) {
+    return { streamed: false, reason: 'reply_posted_in_transcript' }
+  }
+  if (!trail.markdown || trail.events.length === 0) {
+    return { streamed: false, reason: 'empty_trail' }
+  }
+
+  const stateFile = trailStatePath(connectionId, connectionsDir)
+  let prev = null
+  try {
+    prev = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
+  } catch {
+    prev = null
+  }
+  if (prev && prev.startedAt === marker.startedAt) {
+    if (prev.signature === trail.signature) {
+      return { streamed: false, reason: 'unchanged' }
+    }
+    if (typeof prev.lastSentAt === 'number' && now - prev.lastSentAt < minIntervalMs) {
+      return { streamed: false, reason: 'throttled' }
+    }
+  }
+
+  let token = state.token
+  let mcpUrl = state.mcp_url
+  if (!token || !mcpUrl) {
+    const auth = resolveDevspecMcpAuth(state.cwd || process.cwd())
+    token = token || auth.token
+    mcpUrl = mcpUrl || auth.mcp_url
+  }
+  if (!token) return { streamed: false, reason: 'no_auth_token' }
+  mcpUrl = mcpUrl || 'https://devspec.ai/api/mcp'
+
+  const isLocalMirroredTurn = Boolean(
+    !marker.remoteTurn &&
+      (marker.localPromptMirrored || marker.localTurn || state.local_turn),
+  )
+  const telemetry = readConnectionTelemetry(connectionId, { home })
+  const postArgs = {
+    connection_id: connectionId,
+    session_id: state.session_id,
+    agent_name: AGENT_NAME,
+    phase: 'trail',
+    message: trail.markdown,
+    work_trail: trail.markdown,
+    trail_events: trail.events,
+    ...(isLocalMirroredTurn ? { command_turn_unbound: true, local_turn: true } : {}),
+    ...(telemetry?.model?.id
+      ? {
+          model: {
+            providerID: telemetry.model.provider || 'google',
+            modelID: telemetry.model.id,
+          },
+        }
+      : {}),
+  }
+
+  try {
+    fs.mkdirSync(connectionsDir, { recursive: true })
+    fs.writeFileSync(
+      stateFile,
+      JSON.stringify({
+        startedAt: marker.startedAt,
+        signature: trail.signature,
+        lastSentAt: now,
+        eventCount: trail.events.length,
+      }),
+      { mode: 0o600 },
+    )
+  } catch {
+    /* non-fatal */
+  }
+
+  await call({
+    mcpUrl,
+    token,
+    name: 'post_session_message',
+    arguments: postArgs,
+  })
+  return { streamed: true, eventCount: trail.events.length, signature: trail.signature }
 }
 
 /**
@@ -1081,7 +1486,7 @@ export async function handleMirrorTurn(
   if (!state) return { ok: true, skipped: 'no_bound_state' }
 
   const hookTranscriptPath = parseTranscriptPath(raw)
-  syncStateTranscriptPath(state, hookTranscriptPath, conversationId, { connectionsDir })
+  syncStateTranscriptPath(state, hookTranscriptPath, conversationId, { connectionsDir, env })
 
   let token = state.token
   let mcpUrl = state.mcp_url
@@ -1290,47 +1695,63 @@ export async function handleMirrorTurn(
         return { ok: true, held: true, outstanding: outstandingIds }
       }
 
+      let hadStreamedTrail = false
+      try {
+        const tsRaw = JSON.parse(
+          fs.readFileSync(trailStatePath(connectionId, connectionsDir), 'utf8'),
+        )
+        hadStreamedTrail = Boolean(
+          tsRaw && typeof marker?.startedAt === 'number' && tsRaw.startedAt === marker.startedAt,
+        )
+      } catch {
+        hadStreamedTrail = false
+      }
+
       const hadExplicitReply = consumeExplicitReplyMarker(connectionId, connectionsDir)
       clearTurnMarker(connectionId, connectionsDir)
 
       // Session fallback reply: if this turn ran on an attached session (either a remote wake
       // OR a local terminal prompt mirrored to the session) and the agent ended the turn
       // without calling post_session_message, extract the assistant's final response +
-      // work_trail from the transcript and post it so the session room never misses the reply.
+      // work_trail from the transcript and post it so the session room never misses the reply
+      // or leaves an open streaming trail bubble as "No response".
       const isRemoteTurn = Boolean(marker?.remoteTurn || parsedHookInput?.remote_turn === true)
       const isLocalMirroredTurn = Boolean(
         !isRemoteTurn &&
           (marker?.localPromptMirrored || marker?.localTurn || state?.local_turn),
       )
-      if (!hadExplicitReply && sessionId && (isRemoteTurn || isLocalMirroredTurn)) {
+      if (!hadExplicitReply && sessionId && (isRemoteTurn || isLocalMirroredTurn || hadStreamedTrail)) {
+        let trail = { markdown: '', events: [] }
+        if (effectiveTranscriptPath && fs.existsSync(effectiveTranscriptPath)) {
+          try {
+            trail = extractAntigravityTrailFromTranscript(
+              fs.readFileSync(effectiveTranscriptPath, 'utf8'),
+              { sinceMs: marker?.startedAt ?? null, stopAtReply: false },
+            )
+          } catch {
+            /* ignore */
+          }
+        }
         const rawStopText =
           (text ? prepareAgentMirrorText(text) : null) ||
           extractLatestAssistantReplyFromTranscript(effectiveTranscriptPath, {
             sinceMs: marker?.startedAt ?? null,
-          })
+          }) ||
+          (hadStreamedTrail && trail.events.length > 0
+            ? `Completed ${trail.events.length} step${trail.events.length === 1 ? '' : 's'}.`
+            : null)
         if (rawStopText) {
-          let trail = { markdown: '', events: [] }
-          if (effectiveTranscriptPath && fs.existsSync(effectiveTranscriptPath)) {
-            try {
-              trail = extractAntigravityTrailFromTranscript(
-                fs.readFileSync(effectiveTranscriptPath, 'utf8'),
-                { sinceMs: marker?.startedAt ?? null, stopAtReply: false },
-              )
-            } catch {
-              /* ignore */
-            }
-          }
           const telemetry = connectionId ? readConnectionTelemetry(connectionId) : null
           const fallbackArgs = {
             connection_id: connectionId,
             session_id: sessionId,
             agent_name: agentName,
             message: rawStopText,
+            complete_turn: true,
             ...(isLocalMirroredTurn
               ? {
                   command_turn_unbound: true,
                   local_turn: true,
-                  complete_turn: true,
                 }
               : {}),
             ...(trail.markdown ? { work_trail: trail.markdown } : {}),

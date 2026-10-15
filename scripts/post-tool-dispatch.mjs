@@ -27,6 +27,7 @@ import {
   readTurnMarker,
   recordBackgroundLaunch,
   resolveHookConversationId,
+  streamTurnTrailIfChanged,
   syncStateTranscriptPath,
   writeTurnMarker,
 } from './mirror-turn.mjs'
@@ -64,12 +65,18 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
   const toolResponse =
     payload.tool_response ?? payload.toolResponse ?? payload.result
   const conversationId = resolveHookConversationId(raw, env)
-  const state = loadState(conversationId)
+  const connectionsDir = path.join(home, '.devspec', 'remote-control', 'connections')
+  const state = loadState(conversationId, {
+    connectionsDir,
+    legacyPath: path.join(home, '.devspec', 'remote-control.json'),
+  })
   if (state) {
-    syncStateTranscriptPath(state, parseTranscriptPath(raw), conversationId)
+    syncStateTranscriptPath(state, parseTranscriptPath(raw), conversationId, {
+      connectionsDir,
+      env,
+    })
   }
   const connectionId = state?.connection_id || resolveOwnConnectionId(conversationId, { home })
-  const connectionsDir = path.join(home, '.devspec', 'remote-control', 'connections')
   const notices = []
 
   // 0. Commit provenance claim/release tracking & unclaimed edit nudge staging
@@ -90,8 +97,8 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
   }
 
   // 1. Explicit reply marker when the agent calls post_session_message (non-trail),
-  //    or refresh/re-assert .turn on non-plumbing work tools so mid-turn acknowledgments
-  //    ("On it...") and >10m turns continue showing Working in the UI.
+  //    or refresh/re-assert .turn on non-plumbing work tools and stream live mid-turn
+  //    progress trail (`phase: 'trail'`) when attached to a session.
   const now = Date.now()
   if (connectionId && isSessionReplyToolCall(toolName, toolInput)) {
     try {
@@ -122,6 +129,18 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
       )
     } catch {
       /* ignore */
+    }
+    if (state?.session_id) {
+      try {
+        await streamTurnTrailIfChanged(state, {
+          connectionsDir,
+          home,
+          now,
+          ...(call ? { call } : {}),
+        })
+      } catch {
+        /* non-fatal */
+      }
     }
   }
 

@@ -810,9 +810,9 @@ describe('extractAntigravityTrailFromTranscript & streamTurnTrailIfChanged', () 
     assert.equal(events[1].action, 'Viewing devspec-remote-poll.mjs')
     assert.equal(events[2].kind, 'subagent')
     assert.equal(events[2].role, 'Plugin Architecture Researcher')
-    assert.match(markdown, /💭 \*Let us inspect the remote poller script/)
-    assert.match(markdown, /🔧 Viewing devspec-remote-poll\.mjs/)
-    assert.match(markdown, /🤖 \*\*Subagent \(Plugin Architecture Researcher\)\*\*/)
+    assert.match(markdown, /> 💭 Let us inspect the remote poller script/)
+    assert.match(markdown, /✓ `read` — `\/tmp\/foo\.mjs` → Viewing devspec-remote-poll\.mjs/)
+    assert.match(markdown, /✓ `invoke_subagent` — `Plugin Architecture Researcher`/)
   })
 
   it('posts debounced phase: trail updates via post_session_message only when changed', async () => {

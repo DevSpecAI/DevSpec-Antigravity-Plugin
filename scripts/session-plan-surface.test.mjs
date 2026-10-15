@@ -8,9 +8,9 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const read = (file) => fs.readFileSync(path.join(ROOT, file), 'utf8')
 
 describe('bounded Antigravity plan discovery and prompts', () => {
-  it('keeps only the two connection skills and discovers plan mechanics on demand', () => {
+  it('keeps only the connection and project skills and discovers plan mechanics on demand', () => {
     const skills = fs.readdirSync(path.join(ROOT, 'skills')).sort()
-    assert.deepEqual(skills, ['devspec-remote', 'devspec-remote-stop'])
+    assert.deepEqual(skills, ['devspec-project', 'devspec-remote', 'devspec-remote-stop'])
     const remote = read('skills/devspec-remote/SKILL.md')
     assert.match(remote, /devspec-plan\.mjs" --schema/)
     assert.match(remote, /do not keep a local plan skill or broad static MCP allowlist hot/i)

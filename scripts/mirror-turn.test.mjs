@@ -30,6 +30,8 @@ import {
   recordOwnedLaunch,
   writeTurnMarker,
   readTurnMarker,
+  extractAntigravityTrailFromTranscript,
+  streamTurnTrailIfChanged,
 } from './mirror-turn.mjs'
 
 describe('resolveHookConversationId', () => {
@@ -433,12 +435,12 @@ describe('Antigravity native hook payload & transcript handling', () => {
 
       // PreInvocation passes transcript_full.jsonl -> normalizes to compactPath, no rewrite needed
       assert.equal(
-        syncStateTranscriptPath(state, fullPath, convId, { connectionsDir: tmpDir }),
+        syncStateTranscriptPath(state, fullPath, convId, { connectionsDir: tmpDir, env: {} }),
         false,
       )
       // PostInvocation passes null transcriptPath -> preserves existing compactPath, no rewrite needed
       assert.equal(
-        syncStateTranscriptPath(state, null, convId, { connectionsDir: tmpDir }),
+        syncStateTranscriptPath(state, null, convId, { connectionsDir: tmpDir, env: {} }),
         false,
       )
     } finally {
@@ -731,4 +733,169 @@ describe('Antigravity native hook payload & transcript handling', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true })
     }
   })
+
+  it('extracts Pi-style thinking/tool/domain/subagent trail events without command obfuscation, streams mid-turn phase:trail, and finalizes cleanly on Stop', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-pi-trail-'))
+    try {
+      const connId = '88888888-9999-4aaa-8bbb-cccccccccccc'
+      const convId = 'conv-pi-trail-1'
+      const sessId = '99999999-aaaa-4bbb-8ccc-dddddddddddd'
+      const transcriptPath = path.join(tmpDir, 'transcript.jsonl')
+
+      const state = {
+        enabled: true,
+        connection_id: connId,
+        session_id: sessId,
+        local_id: convId,
+        agent_name: 'Antigravity',
+        token: 'dvs_test_tok',
+        mcp_url: 'https://api.devspec.ai/api/mcp',
+        transcript_path: transcriptPath,
+      }
+      fs.writeFileSync(path.join(tmpDir, `${connId}.json`), JSON.stringify(state))
+
+      const startedAt = Date.parse('2026-10-15T20:00:00.000Z')
+      fs.writeFileSync(
+        transcriptPath,
+        [
+          JSON.stringify({
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            created_at: '2026-10-15T20:00:02.000Z',
+            thinking: 'First paragraph of reasoning.\n\nSecond paragraph checking git status and token dvs_secret123456789.',
+            tool_calls: [
+              {
+                name: 'default_api:run_command',
+                args: {
+                  CommandLine: 'git status --short && echo dvs_secret123456789',
+                  Cwd: '/repo',
+                  toolAction: 'Checking git status',
+                },
+              },
+              {
+                name: 'default_api:call_mcp_tool',
+                args: {
+                  ServerName: 'devspec',
+                  ToolName: 'claim_work_item',
+                  Arguments: {
+                    action_item_id: '4cbd20e0-1417-4c5f-9d99-28f5607bf296',
+                    agent_branch: 'agent/4cbd20e0-trail',
+                  },
+                },
+              },
+              {
+                name: 'default_api:invoke_subagent',
+                args: {
+                  Subagents: [
+                    {
+                      Role: 'Test Runner',
+                      TypeName: 'self',
+                      Model: 'inherit',
+                      Prompt: 'Run the test suite and verify exit code.',
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+        ].join('\n') + '\n',
+      )
+
+      const extracted = extractAntigravityTrailFromTranscript(
+        fs.readFileSync(transcriptPath, 'utf8'),
+        { sinceMs: startedAt },
+      )
+      // 1 thinking event (containing full redacted text) + 1 bash tool + 1 domain (claim_work_item) + 1 subagent = 4 trail events
+      assert.equal(extracted.events.length, 4)
+      assert.equal(extracted.events[0].kind, 'thinking')
+      assert.match(extracted.events[0].text, /First paragraph of reasoning\./)
+      assert.match(extracted.events[0].text, /token \[REDACTED\]\./)
+
+      const bashEv = extracted.events[1]
+      assert.equal(bashEv.kind, 'tool')
+      assert.equal(bashEv.name, 'bash')
+      assert.equal(bashEv.status, 'ok')
+      // Command is NOT obfuscated, only the secret token is redacted
+      assert.equal(bashEv.args, 'git status --short && echo [REDACTED]')
+      assert.equal(bashEv.result, 'Checking git status')
+
+      const domainEv = extracted.events[2]
+      assert.equal(domainEv.kind, 'domain')
+      assert.equal(domainEv.domain, 'action_item')
+      assert.equal(domainEv.action, 'claimed')
+      assert.equal(domainEv.name, 'claim_work_item')
+      assert.equal(domainEv.status, 'ok')
+      assert.equal(domainEv.id, '4cbd20e0-1417-4c5f-9d99-28f5607bf296')
+
+      const subEv = extracted.events[3]
+      assert.equal(subEv.kind, 'subagent')
+      assert.equal(subEv.name, 'invoke_subagent')
+      assert.equal(subEv.status, 'ok')
+      assert.equal(subEv.children.length, 1)
+      assert.equal(subEv.children[0].agent, 'Test Runner')
+      assert.equal(subEv.children[0].status, 'running')
+
+      assert.match(extracted.markdown, /git status --short && echo \[REDACTED\]/)
+
+      // Stream mid-turn trail via streamTurnTrailIfChanged
+      writeTurnMarker(connId, { startedAt, remoteTurn: true, held: false }, tmpDir)
+      const calls = []
+      const mockCall = async (req) => {
+        calls.push(req)
+        return { ok: true }
+      }
+
+      const firstStream = await streamTurnTrailIfChanged(state, {
+        connectionsDir: tmpDir,
+        call: mockCall,
+      })
+      assert.equal(firstStream.streamed, true)
+      assert.equal(calls.length, 1)
+      assert.equal(calls[0].name, 'post_session_message')
+      assert.equal(calls[0].arguments.phase, 'trail')
+      assert.equal(calls[0].arguments.message, extracted.markdown)
+      assert.equal(calls[0].arguments.trail_events.length, 4)
+
+      // Immediate second call with unchanged transcript is skipped
+      const duplicateStream = await streamTurnTrailIfChanged(state, {
+        connectionsDir: tmpDir,
+        call: mockCall,
+      })
+      assert.equal(duplicateStream.streamed, false)
+      assert.equal(duplicateStream.reason, 'unchanged')
+      assert.equal(calls.length, 1)
+
+      // Append final assistant answer and run Stop -> finalizes turn with complete_turn: true + work_trail + trail_events
+      fs.appendFileSync(
+        transcriptPath,
+        JSON.stringify({
+          step_index: 2,
+          type: 'PLANNER_RESPONSE',
+          created_at: '2026-10-15T20:00:05.000Z',
+          content: 'All checks passed and work item is claimed.',
+        }) + '\n',
+      )
+
+      calls.length = 0
+      const stopRes = await handleMirrorTurn(
+        'stop',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        {
+          env: {},
+          connectionsDir: tmpDir,
+          legacyPath: path.join(tmpDir, 'legacy.json'),
+          call: mockCall,
+        },
+      )
+      assert.equal(stopRes.ok, true)
+      const finalPost = calls.find((c) => c.name === 'post_session_message')
+      assert.ok(finalPost, 'finalizes streamed trail on Stop')
+      assert.equal(finalPost.arguments.complete_turn, true)
+      assert.equal(finalPost.arguments.message, 'All checks passed and work item is claimed.')
+      assert.equal(finalPost.arguments.trail_events.length, 4)
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
 })
+

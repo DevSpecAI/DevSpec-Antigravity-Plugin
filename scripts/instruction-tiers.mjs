@@ -288,11 +288,11 @@ export function takeTiersFor(connectionId, localIdOrOpts = {}, maybeOpts = {}) {
 
 export function formatTiersForStartup(tiers) {
   if (!tiers || typeof tiers !== 'object') return ''
+  if (typeof tiers.file === 'string' && tiers.file.trim()) {
+    return renderTiersPointer(tiers.file.trim()).trim()
+  }
   if (typeof tiers.rendered === 'string' && tiers.rendered.trim()) {
-    const fileNote = tiers.file
-      ? `\n\n(Full rules also saved on disk at ${tiers.file} — already loaded above in full; do not call view_file on this path unless resuming after compaction.)`
-      : ''
-    return `${tiers.rendered.trim()}${fileNote}`
+    return tiers.rendered.trim()
   }
   return [tiers.tier_0, tiers.tier_1].filter(Boolean).join('\n\n').trim()
 }

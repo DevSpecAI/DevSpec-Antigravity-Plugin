@@ -122,6 +122,32 @@ export function blockConversationProject(localId, endpoint, message, { home = os
   })
 }
 
+export function inheritConversationProject(
+  fromLocalId,
+  toLocalId,
+  endpoint,
+  { home = os.homedir() } = {},
+) {
+  const source = readConversationProject(fromLocalId, { endpoint, home })
+  const target = readConversationProject(toLocalId, { endpoint, home })
+  if (
+    target?.status === 'blocked' ||
+    (target?.status === 'selected' &&
+      (source?.status !== 'selected' || source.project.id !== target.project.id))
+  ) {
+    throw new Error(
+      'The resumed conversation has a different project. Its previous remote connection must not be reused.',
+    )
+  }
+  if (source?.status === 'selected') {
+    return saveConversationProject(toLocalId, endpoint, source.project, 'conversation', { home })
+  }
+  if (source?.status === 'blocked') {
+    blockConversationProject(toLocalId, endpoint, source.message, { home })
+  }
+  return null
+}
+
 export function conversationProjectFingerprint(localId, home = os.homedir()) {
   if (!localId) return 'none'
   try {

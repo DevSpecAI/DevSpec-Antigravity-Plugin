@@ -33,6 +33,7 @@ import {
   verifyAndPinDevspecAuth,
 } from './resolve-mcp-auth.mjs'
 import {
+  discoverAntigravityLsAddress,
   ensureListenerForConnection,
   ensurePollerForConnection,
   inferAntigravityTranscriptPath,
@@ -204,17 +205,27 @@ export function connectAtStartupEnabled(
  * Uses `mcpToolsCall` so both JSON and SSE responses as well as `_meta.devspec.connection_capability`
  * are parsed properly.
  */
-async function defaultCallMcp({ mcpUrl, token, name, arguments: args }) {
+async function defaultCallMcp({ mcpUrl, token, name, arguments: args, connectionCapability = null }) {
+  let capturedMeta = null
   const res = await mcpToolsCall({
     mcpUrl,
     token,
     name,
     arguments: args,
+    connectionCapability,
     includeMeta: true,
+    onResultMeta: (meta) => {
+      capturedMeta = meta
+    },
     timeoutMs: 15_000,
   })
-  const data = res?.data && typeof res.data === 'object' ? { ...res.data } : {}
-  const cap = res?.meta?.devspec?.connection_capability
+  const data =
+    res?.data && typeof res.data === 'object'
+      ? { ...res.data }
+      : res && typeof res === 'object'
+        ? { ...res }
+        : {}
+  const cap = (capturedMeta || res?.meta)?.devspec?.connection_capability
   if (cap && typeof cap.value === 'string' && cap.value.startsWith('dvsc_')) {
     data.connection_capability = cap.value
     data.connection_capability_version = cap.version || 1
@@ -266,16 +277,22 @@ export async function autoConnectAtStartup({
   if (!auth?.token) return null
   let mcpUrl = auth.mcp_url || DEFAULT_PROD_URL
   const ownerPid = resolveOwnerPid(explicitOwnerPid || 'auto', null)
+  const windowStandbyLocalId =
+    !conversationId && Number.isInteger(Number(ownerPid)) && Number(ownerPid) > 1
+      ? `agy-window:${ownerPid}`
+      : null
+  const effectiveLocalId = conversationId || windowStandbyLocalId || null
   const agentVersion = LOADED_PLUGIN_VERSION
   const gitRemote = gitRemoteOrigin(cwd)
   const pinnedProjectId = findProjectPin(cwd, { home: effectiveHome })?.project_id || null
   const registerArgs = {
     agent_name: AGENT_NAME,
     agent_version: agentVersion,
-    local_id: conversationId || undefined,
+    local_id: effectiveLocalId || undefined,
     cwd,
     ...(gitRemote ? { git_remote: gitRemote } : {}),
     ...(pinnedProjectId ? { pinned_project_id: pinnedProjectId } : {}),
+    ...(!conversationId ? { folder_scope_only: true } : {}),
     machine_label: os.hostname(),
     connection_capability_version: 1,
     project_selection_version: 1,
@@ -327,6 +344,8 @@ export async function autoConnectAtStartup({
     reg?.project_selection?.project?.name || reg?.project_name || null
   const resolvedTranscriptPath =
     transcriptPath || inferAntigravityTranscriptPath(conversationId, env) || null
+  const discoveredLsAddress =
+    env.ANTIGRAVITY_LS_ADDRESS || discoverAntigravityLsAddress(ownerPid, env) || null
 
   const statePayload = {
     enabled: true,
@@ -340,6 +359,7 @@ export async function autoConnectAtStartup({
     agent_name: AGENT_NAME,
     agent_version: agentVersion,
     local_id: conversationId || null,
+    ...(windowStandbyLocalId ? { pending_local_id: windowStandbyLocalId } : {}),
     transcript_path: resolvedTranscriptPath,
     cwd,
     ...(gitRemote ? { git_remote: gitRemote } : {}),
@@ -359,7 +379,7 @@ export async function autoConnectAtStartup({
           instruction_tiers_hash: reg.instruction_tiers_hash,
         }
       : {}),
-    ...(env.ANTIGRAVITY_LS_ADDRESS ? { ls_address: env.ANTIGRAVITY_LS_ADDRESS } : {}),
+    ...(discoveredLsAddress ? { ls_address: discoveredLsAddress } : {}),
     ...(env.ANTIGRAVITY_CSRF_TOKEN ? { csrf_token: env.ANTIGRAVITY_CSRF_TOKEN } : {}),
     ...(env.ANTIGRAVITY_AGENTAPI_EXE ? { agentapi_exe: env.ANTIGRAVITY_AGENTAPI_EXE } : {}),
     updated_at: new Date().toISOString(),
@@ -487,7 +507,8 @@ export async function runSessionStart(
   }
 
   // If the single live connection for this agent has a different or missing local_id,
-  // rebond it to this conversation when it belongs to the same Antigravity owner process.
+  // rebond it to this conversation when it belongs to the same Antigravity owner process,
+  // and upgrade any pre-conversation window standby bond (`agy-window:<pid>`) in place on the server.
   const currentOwnerPid = resolveOwnerPid('auto', state.owner_pid)
   if (
     conversationId &&
@@ -500,10 +521,66 @@ export async function runSessionStart(
         connectionId: state.connection_id,
         localId: conversationId,
         transcriptPath,
+        env,
       })
     }
+    if (
+      typeof state.connection_capability === 'string' &&
+      state.connection_capability.startsWith('dvsc_') &&
+      state.token &&
+      state.mcp_url
+    ) {
+      try {
+        const upgraded = await callMcp({
+          mcpUrl: state.mcp_url,
+          token: state.token,
+          name: 'register_connection',
+          connectionCapability: state.connection_capability,
+          arguments: {
+            agent_name: AGENT_NAME,
+            agent_version: LOADED_PLUGIN_VERSION,
+            local_id: conversationId,
+            cwd: state.cwd || effectiveCwd,
+            ...(state.project_id ? { project_id: state.project_id } : {}),
+            ...(state.git_remote ? { git_remote: state.git_remote } : {}),
+            machine_hostname: os.hostname(),
+            connection_capability_version: 1,
+            project_selection_version: 1,
+            ...(state.instruction_tiers_version && state.instruction_tiers_hash
+              ? {
+                  known_instruction_tiers_version: state.instruction_tiers_version,
+                  known_instruction_tiers_hash: state.instruction_tiers_hash,
+                }
+              : {}),
+          },
+        })
+        if (upgraded?.connection_capability) {
+          state.connection_capability = upgraded.connection_capability
+          state.connection_capability_version = upgraded.connection_capability_version || 1
+        }
+      } catch {
+        /* non-fatal — devspec-remote-connect.mjs can still upgrade if called later */
+      }
+    }
+    state.local_id = conversationId
+    delete state.pending_local_id
+    if (env.ANTIGRAVITY_LS_ADDRESS) state.ls_address = env.ANTIGRAVITY_LS_ADDRESS
+    if (env.ANTIGRAVITY_CSRF_TOKEN) state.csrf_token = env.ANTIGRAVITY_CSRF_TOKEN
+    if (env.ANTIGRAVITY_AGENTAPI_EXE) state.agentapi_exe = env.ANTIGRAVITY_AGENTAPI_EXE
+    state.updated_at = new Date().toISOString()
+    writeStateFn(state.connection_id, state)
+    writeBondFn(AGENT_NAME, conversationId, {
+      status: 'live',
+      connection_id: state.connection_id,
+      session_id: state.session_id || null,
+      session_codename: state.session_codename || null,
+      cwd: state.cwd || effectiveCwd,
+      transcript_path:
+        transcriptPath || state.transcript_path || inferAntigravityTranscriptPath(conversationId, env) || null,
+      enabled: true,
+    })
   } else if (loadStateFn === loadState) {
-    syncStateTranscriptPath(state, transcriptPath, conversationId)
+    syncStateTranscriptPath(state, transcriptPath, conversationId, { env })
   }
 
   if (state.auth_ok !== false && state.token) {
