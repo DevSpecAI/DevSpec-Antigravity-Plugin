@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.15.0
+
+### Full Antigravity CLI (`agy`) parity with Claude Code and Pi
+
+- **One-shot zero-token connect and cached instruction rules:** Added `scripts/devspec-remote-connect.mjs` and `scripts/instruction-rules.mjs` so `/antigravity-devspec-autopilot-extension:devspec-remote` completes preflight, project resolution, conversation bonding, `register_connection`, optional `create_session` / `attach_connection`, capability v1 rotation, instruction-tier caching (`<connectionId>.rules.md`), and poller startup in a single command before arming `scripts/devspec-remote-wait.mjs`.
+- **Strict Antigravity hook JSON validation and payload normalization:** Added `scripts/hook-output.mjs` (`validateHookOutput`, `emitHookJson`, `normalizeToolHookPayload`) to validate all `SessionStart`, `UserPromptSubmit` (`PreInvocation`), `PreToolUse`, `PostToolUse`, `PreCompact`, and `Stop` hook outputs against Antigravity's strict schemas (`additionalProperties: false` on `hookSpecificOutput`) and normalize both native `call_mcp_tool` / `run_command` and standard MCP tool events.
+- **Materialized local room transcript, room state, and on-demand unread reader:** Added `scripts/room-transcript.mjs` and updated `scripts/devspec-remote-poll.mjs`, `scripts/devspec-remote-wait.mjs`, and `scripts/room-unread.mjs` to materialize room messages and room state to `<connectionId>.transcript.jsonl`, `<connectionId>.room.json`, and `<connectionId>.cursor.json` with no cross-turn `room_context` carry, surfacing compact unread counts and `room_state_changed` indicators for on-demand `room-unread.mjs read`.
+- **Live session-title refresh and richer status bar:** Added `scripts/session-title.mjs` (`UNTITLED_RETRY_MS = 60_000`) and updated `scripts/statusline.mjs` and `scripts/commit-provenance.mjs` so the status bar refreshes `"Untitled session"` titles automatically and displays active automation runs (`automation “<name>”`) and claimed action item titles (`working on “<title>” (<code>)`).
+- **Bundled `rules/AGENTS.md` and `agy mcp add` / `~/.gemini/config/mcp_config.json` setup:** Added `rules/AGENTS.md` so Antigravity automatically loads DevSpec remote-control, local room-context, and implementation-contract rules when the plugin is enabled, and updated all setup/update documentation to use `~/.gemini/config/mcp_config.json` and `agy mcp add`.
+
 ## 0.14.0
 
 ### Antigravity CLI (`agy`) 3-step setup, verified token pinning, and auto-started remote listener

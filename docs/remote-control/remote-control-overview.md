@@ -20,7 +20,7 @@ A **session is optional**. Never invent a session because a cwd or another agent
 | Identity | `register_connection` → `connection_id` + server-minted `codename`. Fixed `AGENT_NAME` per plugin. |
 | Tick | One held `poll_connection` negotiated with numeric `ingress_version: 1`, `delegated_scope_version: 1`, and `active_plan_projection_version: 1`. |
 | Authority | Act only on complete exact-target canonical commands with the server-stamped authority/project-scope pair. Runtime policy: [`devspec://product/remote-ingress-contract`](devspec://product/remote-ingress-contract). |
-| Advisory | Typed canonical context and `active_session_plans` are read-awareness only — never wake, execute, or grant plan mutation authority. |
+| Advisory | Typed canonical context and `active_session_plans` are materialized to local room files (`.transcript.jsonl` / `.room.json`) as read-awareness only — never carried across turns, never wake, execute, or grant plan mutation authority. |
 | Answers (attached) | Agent (or host bridge) posts **one direct answer** via `post_session_message({ connection_id })`. |
 | Answers (sessionless) | Use the explicit command or automation reporting path — never invent chat or infer action-item assignment. |
 | Activity | `report_pickup` → `report_keepalive` → `report_complete`. Server never infers Working. |
@@ -32,7 +32,7 @@ A **session is optional**. Never invent a session because a cwd or another agent
 
 | Family | Members | How a DevSpec command reaches the model |
 |---|---|---|
-| **Local-poller** | Claude Code, Cursor, Grok Build, Antigravity | Detached Node poller long-polls DevSpec → writes inbox file → wait process wakes the model. Model posts the reply (skill-driven). |
+| **Local-poller** | Claude Code, Cursor, Grok Build, Antigravity | Detached Node poller long-polls DevSpec → materializes local `.transcript.jsonl` / `.room.json` and writes command inbox file → wait process wakes the model. Model posts the reply (skill-driven). |
 | **Bridge** | Codex | Poller + **app-server bridge** injects into the Codex thread via `turn/start`. Bridge posts remote-turn replies. |
 | **Native runtime** | OpenCode | In-process TypeScript: `poll_connection` inside OpenCode → `session.promptAsync` injects a **text** prompt → plugin mirrors assistant reply (with dedup). |
 

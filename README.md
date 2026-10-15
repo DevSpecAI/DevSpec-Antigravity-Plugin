@@ -21,7 +21,7 @@ Bring DevSpec into [Google Antigravity CLI](https://antigravity.google) (`agy`).
   - **Room polls (`devspec-poll.mjs`):** Create, update, end, retract, or supersede structured room polls (with optional recommendations and write-ins) without blocking the agent turn.
   - **Directed questions (`devspec-question.mjs`):** Ask a specific person a `text`, `single_select`, or `multi_select` question in the room. When they answer or dismiss it in DevSpec, the poller delivers the canonical interaction or dismissal event and re-opens the exact continuation channel.
 - **Automatic project grounding, pin checks & repo-link nudges.** Starting a session grounds `agy` with your project summary, conventions, and active work. Writing a `.devspec/project.json` pin is validated immediately, and adding a new git remote to a pinned greenfield folder nudges you once if the repository isn't linked in DevSpec yet.
-- **Live status bar & runtime telemetry.** `SessionStart` automatically configures `scripts/statusline.mjs` in `~/.gemini/antigravity-cli/settings.json` to render a concise DevSpec status bar (`DevSpec: <Codename> · <Project> · “<Session>” · working on <item> · <model> (<context%>%)`) and forward model and context-window telemetry on `heartbeat_connection`.
+- **Live status bar & runtime telemetry.** `SessionStart` automatically configures `scripts/statusline.mjs` in `~/.gemini/antigravity-cli/settings.json` to render a concise DevSpec status bar (`DevSpec: <Codename> · <Project> · “<Session>” · automation “<name>” · working on “<title>” (<code>) · <model> (<context%>%)`) with automatic session-title refresh (`scripts/session-title.mjs`) and forwards model and context-window telemetry on `heartbeat_connection`.
 
 ---
 
@@ -38,9 +38,15 @@ Bring DevSpec into [Google Antigravity CLI](https://antigravity.google) (`agy`).
 
 Install once at **user home**, not inside an individual project repository. `agy` resolves which DevSpec project a folder belongs to automatically from `git remote get-url origin` (or `.devspec/project.json`).
 
-### 1. Add your DevSpec MCP token (`mcp_config.json`)
+### 1. Add your DevSpec MCP token (`agy mcp add` or `mcp_config.json`)
 
-Check that Node.js 18+ is installed (`node --version`), then add the `devspec` entry to Antigravity CLI's user-level MCP configuration at `~/.gemini/antigravity-cli/mcp_config.json` (Windows: `%USERPROFILE%\.gemini\antigravity-cli\mcp_config.json`):
+Check that Node.js 18+ is installed (`node --version`), then register the `devspec` MCP server with `agy mcp add`:
+
+```bash
+agy mcp add --header "Authorization: Bearer dvs_YOUR_DEVSPEC_MCP_TOKEN" devspec "https://devspec.ai/api/mcp"
+```
+
+Or merge the `devspec` entry directly into Antigravity CLI's user-level MCP configuration at `~/.gemini/config/mcp_config.json` (Windows: `%USERPROFILE%\.gemini\config\mcp_config.json`; legacy `~/.gemini/antigravity-cli/mcp_config.json` is also supported):
 
 ```json
 {
@@ -78,9 +84,10 @@ git clone https://github.com/DevSpecAI/DevSpec-Antigravity-Plugin.git "$HOME\.ge
 
 ### 3. Start `agy`
 
-Start `agy` in any project directory. On startup, the plugin's `SessionStart` hook automatically:
+Start `agy` in any project directory. On startup, the plugin automatically:
+- Loads `rules/AGENTS.md` so Antigravity knows the DevSpec remote-control, local room-context, and implementation-contract rules whenever the plugin is enabled.
 - Configures the DevSpec status bar (`statusLine`) in `~/.gemini/antigravity-cli/settings.json` (if no custom `statusLine` is already set).
-- Verifies your `dvs_` token against DevSpec, registers this `agy` session on the **Agents page**, and starts the background poller (`DEVSPEC_CONNECT_AT_STARTUP=0` to opt out).
+- Verifies your `dvs_` token against DevSpec, registers this `agy` session on the **Agents page**, caches your personal and project instruction rules (`<connectionId>.rules.md`), and starts the background poller (`DEVSPEC_CONNECT_AT_STARTUP=0` to opt out).
 - Injects initial project grounding when the repository matches a DevSpec project.
 
 > **Updating:** When the Agents page in DevSpec shows an **Update** badge on your Antigravity connection, run `git -C ~/.gemini/config/plugins/antigravity-devspec-autopilot-extension pull` and start a new `agy` session.
@@ -95,7 +102,7 @@ Remote control lets you run a real `agy` session on your machine and steer it fr
 
 | Skill | What it does |
 |---|---|
-| `/antigravity-devspec-autopilot-extension:devspec-remote` | Connect or attach this `agy` conversation to DevSpec (registers connection, negotiates capabilities, starts the background poller, and arms the background wait listener). |
+| `/antigravity-devspec-autopilot-extension:devspec-remote` | Run the one-shot mechanical connect script (`scripts/devspec-remote-connect.mjs`) to register or attach this `agy` conversation, cache instruction rules, start the poller, and arm `scripts/devspec-remote-wait.mjs` in the background. |
 | `/antigravity-devspec-autopilot-extension:devspec-remote-stop` | Disconnect this `agy` conversation from DevSpec and stop its poller (leaving any other active connections untouched). |
 
 You can connect in three ways:
@@ -104,7 +111,7 @@ You can connect in three ways:
 2. **Attach to an existing DevSpec session:** Copy the connect command from a session's settings panel in DevSpec (or pass the session UUID) and run `/antigravity-devspec-autopilot-extension:devspec-remote --session <session-id>`.
 3. **Create and attach a new session:** Run `/antigravity-devspec-autopilot-extension:devspec-remote --new` (with an optional `--title "..."`) to create a fresh shared room and attach immediately.
 
-While waiting for instructions, a lightweight local Node poller (`scripts/devspec-remote-poll.mjs`) holds the long-poll connection to DevSpec and streams wake events through `scripts/devspec-remote-wait.mjs` — **zero LLM tokens are spent while idle**.
+While waiting for instructions, a lightweight local Node poller (`scripts/devspec-remote-poll.mjs`) holds the long-poll connection to DevSpec, materializes room messages and room state to local files (`<connectionId>.transcript.jsonl`, `<connectionId>.room.json`, `<connectionId>.cursor.json`, `<connectionId>.rules.md`), and wakes the agent through `scripts/devspec-remote-wait.mjs` — **zero LLM tokens are spent while idle**, and room messages are never re-injected across turns unless read on demand (`scripts/room-unread.mjs`).
 
 ### Shared session plans, room polls, and directed questions
 
@@ -113,7 +120,7 @@ When connected to a DevSpec session, Antigravity negotiates per-connection capab
 - **Shared Session Plans (`scripts/devspec-plan.mjs`):**
   - Routine read-only investigation and quick answers stay plan-free.
   - When work involves material multi-phase execution, the agent discovers the schema on demand (`node scripts/devspec-plan.mjs --schema`) and manages one revisioned room plan (`create`, `advance`, `update`, `complete`, `abandon`, `adopt`).
-  - If context is compacted or a session reconnects, `session-start-context.mjs` and `session-plan-prompts.mjs` automatically inject the active plan state so the agent can resume seamlessly.
+  - If context is compacted or a session reconnects, `session-start-context.mjs`, `pre-compact.mjs`, and `session-plan-prompts.mjs` automatically inject the active plan state so the agent can resume seamlessly.
 - **Room Polls (`scripts/devspec-poll.mjs`):**
   - Non-blocking structured polls for the room (`create`, `list`, `get`, `update`, `end`, `retract`, `supersede`), supporting single or multi-select options, `allow_write_in`, `recommendation_index`, and poll series.
 - **Directed Questions (`scripts/devspec-question.mjs`):**
@@ -127,7 +134,7 @@ Collaboration in a shared DevSpec room is safe by design:
 
 - DevSpec determines owner and delegated command authority and exact `@`-addressing on the server (`ingress_version: 1`, `delegated_scope_version: 1`, `active_plan_projection_version: 1`).
 - Delegated commands carry a server-owned project scope object and instruction; owner commands carry `null` scope.
-- Room chatter, other agents' messages, and projected active plans arrive as non-executable advisory context (`read-awareness only`), never as implicit commands or mutation authority.
+- Room chatter, other agents' messages, and projected active plans are materialized to `<connectionId>.transcript.jsonl` and `<connectionId>.room.json` as non-executable advisory context (`read-awareness only`), never as implicit commands or mutation authority.
 - Mutable runtime policy is governed by [`devspec://product/remote-ingress-contract`](devspec://product/remote-ingress-contract).
 
 ---
@@ -171,18 +178,20 @@ You rarely need to pass a project ID manually:
 
 ---
 
-## Plugin architecture & hooks (`v0.14.0`)
+## Plugin architecture & hooks (`v0.15.0`)
 
-All hooks are declared in `hooks/hooks.json` (mirrored in root `hooks.json`) and executed via dependency-free Node.js ESM scripts in `scripts/`:
+All hooks are declared in `hooks.json` (mirrored in `hooks/hooks.json`), validated against Antigravity's strict hook JSON schemas (`scripts/hook-output.mjs`), and executed via dependency-free Node.js ESM scripts in `scripts/`:
 
-| Hook Event | Script | Role |
+| Surface / Hook Event | File / Script | Role |
 |---|---|---|
-| `SessionStart` | `scripts/session-start-context.mjs` → `scripts/session-start.mjs` | Auto-configures `statusLine` in `~/.gemini/antigravity-cli/settings.json`, verifies and pins MCP auth (`~/.devspec/auth.json`), auto-registers a standby connection and starts the background poller, injects initial project grounding (`devspec-scope.mjs`), and restores active session plan instructions (`session-plan-prompts.mjs`) after compaction or resume. |
-| `PreInvocation` (`UserPromptSubmit`) | `scripts/pre-invocation.mjs` → `scripts/mirror-turn.mjs` | Mirrors the user's prompt to the attached DevSpec session once per turn and reports connection activity (`report_pickup` / `report_keepalive`). |
-| `PreToolUse` | `scripts/pre-tool-dispatch.mjs` → `scripts/implementation-guard.mjs` | Verifies git commit provenance (`[devspec:<id>]` trailers and repository ancestry) before `record_implementation` or `add_commit_reference` calls, and records active subagent launches (`active-subagents.mjs`). |
-| `PostToolUse` | `scripts/post-tool-dispatch.mjs` | Tracks `claim_work_item` / `release_work_item` / `record_implementation` state (`commit-provenance.mjs`), observes new git commits after `run_command` (`commit-observation.mjs`), validates `.devspec/project.json` edits (`pin-check.mjs`), nudges on unlinked git remotes (`repo-link-nudge.mjs`), and marks explicit session replies (`mirror-turn.mjs`). |
-| `Stop` | `scripts/mirror-turn.mjs` | Holds the turn open if background subagents are still active or an interaction continuation is pending; otherwise mirrors the final assistant response from `transcript.jsonl` and closes the activity turn (`report_complete`). |
-| `statusLine` | `scripts/statusline.mjs` | Renders the single-line DevSpec status bar (`DevSpec: not configured` when missing a `dvs_` token) and records normalized model, effort, token, and context-window telemetry (`<connectionId>.telemetry.json`) for `heartbeat_connection`. |
+| Plugin Rules | `rules/AGENTS.md` | Automatically loaded when the plugin is enabled so `agy` follows the DevSpec remote-control, local room-context, and implementation-contract rules. |
+| `SessionStart` | `scripts/session-start-context.mjs` → `scripts/session-start.mjs` | Auto-configures `statusLine` in `~/.gemini/antigravity-cli/settings.json`, verifies and pins MCP auth (`~/.devspec/auth.json`), auto-registers a standby connection, caches instruction rules (`scripts/instruction-rules.mjs`), starts the background poller, injects initial project grounding (`devspec-scope.mjs`), and restores active session plan instructions (`session-plan-prompts.mjs`). |
+| `PreInvocation` (`UserPromptSubmit`) | `scripts/pre-invocation.mjs` → `scripts/mirror-turn.mjs` | Mirrors the user's prompt to the attached DevSpec session once per turn, surfaces lightweight unread room count / room state changes (`scripts/room-unread.mjs`), and reports connection activity (`report_pickup` / `report_keepalive`). |
+| `PreToolUse` | `scripts/pre-tool-dispatch.mjs` → `scripts/implementation-guard.mjs` | Normalizes Antigravity native (`call_mcp_tool`, `run_command`) and standard MCP tool calls (`scripts/hook-output.mjs`), verifies git commit provenance (`[devspec:<id>]` trailers and repository ancestry) before `record_implementation` or `add_commit_reference` calls, and records active subagent launches (`active-subagents.mjs`). |
+| `PostToolUse` | `scripts/post-tool-dispatch.mjs` | Tracks `claim_work_item` / `release_work_item` / `record_implementation` and `claim_automation_run` / `record_automation_run` state (`commit-provenance.mjs`), observes new git commits after `run_command` (`commit-observation.mjs`), validates `.devspec/project.json` edits (`pin-check.mjs`), nudges on unlinked git remotes (`repo-link-nudge.mjs`), surfaces unread room count (`room-unread.mjs`), and marks explicit session replies (`mirror-turn.mjs`). |
+| `PreCompact` | `scripts/pre-compact.mjs` | Injects active connection continuity, local `.transcript.jsonl` / `.room.json` / `.rules.md` pointers, and active session plan state before context compaction. |
+| `Stop` | `scripts/mirror-turn.mjs` | Holds the turn open (`decision: "block"`) if background subagents are still active or an interaction continuation is pending; otherwise mirrors the final assistant response from `transcript.jsonl` and closes the activity turn (`report_complete`). |
+| `statusLine` | `scripts/statusline.mjs` | Renders the single-line DevSpec status bar (`DevSpec: <Codename> · <Project> · “<Session>” · automation “<name>” · working on “<title>” (<code>) · <model> (<context%>%)`) and records normalized model, effort, token, and context-window telemetry (`<connectionId>.telemetry.json`) for `heartbeat_connection`. |
 
 ### Running the test suite
 
@@ -202,7 +211,7 @@ Each coding agent has its own independent plugin repository tailored to its host
 
 | Host | Config / Install | Remote Transport Family |
 |---|---|---|
-| **Antigravity CLI** (`agy`) | `~/.gemini/antigravity-cli/mcp_config.json` + `~/.gemini/config/plugins/antigravity-devspec-autopilot-extension` | Local poller + wait stream + native `transcript.jsonl` hooks |
+| **Antigravity CLI** (`agy`) | `~/.gemini/config/mcp_config.json` (or `agy mcp add`) + `~/.gemini/config/plugins/antigravity-devspec-autopilot-extension` | Local poller + wait stream + local `.transcript.jsonl` / `.room.json` + native `transcript.jsonl` hooks |
 | **Claude Code** | `/plugin install devspec@devspec` | Local poller + persistent monitor + Claude hooks |
 | **Pi** | `pi install git:github.com/DevSpecAI/DevSpec-Pi` | In-process TypeScript extension + embedded MCP transport |
 | **Codex CLI** | `~/.codex/config.toml` | Local poller + app-server bridge |
