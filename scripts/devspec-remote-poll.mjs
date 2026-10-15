@@ -67,6 +67,7 @@ import {
   readPrivateJson,
   readPrivateJsonResult,
   writePrivateJson,
+  writePrivateText,
 } from './private-state.mjs'
 import {
   DISMISSAL_KIND,
@@ -761,6 +762,52 @@ export function commandWakeContext(
   }
 }
 
+export function formatRoomStateJson(doc) {
+  if (!doc || typeof doc !== 'object') return JSON.stringify(doc, null, 2) + '\n'
+  const SENTINEL = '__DEVSPEC_COMPACT_ROW__'
+  const compactRows = []
+  const markArray = (arr) =>
+    Array.isArray(arr)
+      ? arr.map((row) => {
+          const idx = compactRows.length
+          compactRows.push(JSON.stringify(row))
+          return `${SENTINEL}${idx}__`
+        })
+      : arr
+
+  const clone = {
+    ...doc,
+    ...(doc.still_to_discuss && Array.isArray(doc.still_to_discuss.rows)
+      ? {
+          still_to_discuss: {
+            ...doc.still_to_discuss,
+            rows: markArray(doc.still_to_discuss.rows),
+          },
+        }
+      : {}),
+    ...(doc.session_activity && typeof doc.session_activity === 'object'
+      ? {
+          session_activity: {
+            ...doc.session_activity,
+            ...(Array.isArray(doc.session_activity.items)
+              ? { items: markArray(doc.session_activity.items) }
+              : {}),
+            ...(Array.isArray(doc.session_activity.events)
+              ? { events: markArray(doc.session_activity.events) }
+              : {}),
+          },
+        }
+      : {}),
+  }
+
+  const pretty = JSON.stringify(clone, null, 2)
+  const replaced = pretty.replace(
+    new RegExp(`"${SENTINEL}(\\d+)__"`, 'g'),
+    (_m, idxStr) => compactRows[Number(idxStr)],
+  )
+  return replaced + '\n'
+}
+
 export function writeRoomState(
   connectionId,
   res,
@@ -805,8 +852,14 @@ export function writeRoomState(
   }
   const key = JSON.stringify(body)
   if (key === seen.doc) return seen
+  const fullDoc = { updated_at: now.toISOString(), ...body }
+  const targetPath = roomStatePath(connectionId, dir)
   try {
-    write(roomStatePath(connectionId, dir), { updated_at: now.toISOString(), ...body })
+    if (write === writePrivateJson) {
+      writePrivateText(targetPath, formatRoomStateJson(fullDoc))
+    } else {
+      write(targetPath, fullDoc)
+    }
   } catch {
     return seen
   }

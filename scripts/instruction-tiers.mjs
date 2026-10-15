@@ -68,12 +68,19 @@ export function saveTiersText(connectionId, text, { dir = defaultConnectionsDir(
   return file
 }
 
-export function renderTiersPointer(file) {
+export function renderTiersPointer(file, { alreadyLoadedInSessionStart = false } = {}) {
+  if (alreadyLoadedInSessionStart) {
+    return (
+      '\n## Instructions in force for this run\n\n' +
+      `The owner's and this project's rules for this run are saved in full at:\n\n${file}\n\n` +
+      'These rules are already loaded in your SessionStart system context for this conversation — do NOT call view_file on this file now. ' +
+      'Only read it if you resume after context compaction or if a later wake names a different instruction_context_file.\n'
+    )
+  }
   return (
     '\n## Instructions in force for this run\n\n' +
     `The owner's and this project's rules for this run are saved in full at:\n\n${file}\n\n` +
-    'Read that whole file now, before acting on any request, and follow it for the rest of this conversation. ' +
-    'If it is shown to you in parts, keep reading to the end. A different file name later means the rules changed: read the new one.\n'
+    'If these rules are not already loaded in your SessionStart system context (or if the file name changed or you are resuming after compaction), read that whole file before acting on any work request, and follow it for the rest of this conversation.\n'
   )
 }
 
@@ -206,14 +213,16 @@ export function readTiersFor(connectionId, { home = resolveHome(), dir = undefin
   const effectiveDir = dir || defaultConnectionsDir(home)
   const snap = readPrivateJsonResult(tiersPath(connectionId, effectiveDir))
   if (snap.status === STATE_OK && snap.value?.texts) {
-    const text = renderTiers(snap.value.texts).trim()
+    const rendered = renderTiers(snap.value.texts)
+    const text = rendered.trim()
     if (text) {
-      const file = saveTiersText(connectionId, renderTiers(snap.value.texts), { dir: effectiveDir })
+      const file = saveTiersText(connectionId, rendered, { dir: effectiveDir })
       return {
         tier_0: renderTiersPointer(file).trim(),
         tier_1: '',
         tier_2: '',
         file,
+        rendered: text,
         texts: snap.value.texts,
       }
     }
@@ -279,5 +288,11 @@ export function takeTiersFor(connectionId, localIdOrOpts = {}, maybeOpts = {}) {
 
 export function formatTiersForStartup(tiers) {
   if (!tiers || typeof tiers !== 'object') return ''
+  if (typeof tiers.rendered === 'string' && tiers.rendered.trim()) {
+    const fileNote = tiers.file
+      ? `\n\n(Full rules also saved on disk at ${tiers.file} — already loaded above in full; do not call view_file on this path unless resuming after compaction.)`
+      : ''
+    return `${tiers.rendered.trim()}${fileNote}`
+  }
   return [tiers.tier_0, tiers.tier_1].filter(Boolean).join('\n\n').trim()
 }

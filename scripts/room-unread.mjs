@@ -22,7 +22,7 @@ import { resolveHookConversationId } from './mirror-turn.mjs'
 import { readLocalBond, readStateFile } from './remote-control-state.mjs'
 
 export const READ_STATE_VERSION = 1
-export const READER_PAGE_CHARS = 24000
+export const READER_PAGE_CHARS = 6000
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url)
 const SAFE_ID = /^[A-Za-z0-9._-]{1,128}$/
@@ -413,8 +413,9 @@ export function readPage({ lines, read, selfLabel, budget = READER_PAGE_CHARS, w
     ...unread.map((entry) => ({ ...entry, updated: false })),
     ...updated.map((entry) => ({ ...entry, updated: true })),
   ].sort((a, b) => (Number(a.line.seq) || 0) - (Number(b.line.seq) || 0))
-  const printed = []
+  const chosen = []
   const nextRead = { ...read }
+  const latestIndexByStyleKey = new Map()
   let used = 0
   for (const item of pending) {
     let entry = renderEntry(item, { updated: item.updated, selfLabel })
@@ -428,11 +429,59 @@ export function readPage({ lines, read, selfLabel, budget = READER_PAGE_CHARS, w
       }
       text = JSON.stringify(entry)
     }
-    if (printed.length > 0 && used + text.length + 1 > budget) break
-    printed.push(text)
-    used += text.length + 1
+
+    const cmd = entry.delivered_as_command
+    const styleKey =
+      cmd && Array.isArray(cmd.response_style) && cmd.response_style.length > 0
+        ? JSON.stringify(cmd.response_style)
+        : null
+    const prevIdx = styleKey !== null ? latestIndexByStyleKey.get(styleKey) : undefined
+    let compactedPrev = null
+    let savedChars = 0
+    if (prevIdx !== undefined) {
+      const prev = chosen[prevIdx]
+      const { response_style: _omitted, ...restPrevCmd } = prev.entry.delivered_as_command
+      const compactedEntry = {
+        ...prev.entry,
+        delivered_as_command: {
+          ...restPrevCmd,
+          response_style_same_as_message_id: entry.message_id,
+        },
+      }
+      const compactedText = JSON.stringify(compactedEntry)
+      compactedPrev = { entry: compactedEntry, text: compactedText }
+      savedChars = prev.text.length - compactedText.length
+    }
+
+    const nextUsed = used - savedChars + text.length + 1
+    if (chosen.length > 0 && nextUsed > budget) break
+
+    if (prevIdx !== undefined && compactedPrev) {
+      const oldLatestId = chosen[prevIdx].entry.message_id
+      chosen[prevIdx] = compactedPrev
+      for (let j = 0; j < prevIdx; j++) {
+        const jCmd = chosen[j].entry.delivered_as_command
+        if (jCmd?.response_style_same_as_message_id === oldLatestId) {
+          chosen[j].entry = {
+            ...chosen[j].entry,
+            delivered_as_command: {
+              ...jCmd,
+              response_style_same_as_message_id: entry.message_id,
+            },
+          }
+          chosen[j].text = JSON.stringify(chosen[j].entry)
+        }
+      }
+    }
+    if (styleKey !== null) {
+      latestIndexByStyleKey.set(styleKey, chosen.length)
+    }
+    chosen.push({ entry, text })
+    used = nextUsed
     nextRead[item.line.message_id] = item.version
   }
+
+  const printed = chosen.map((c) => c.text)
   return { printed, read: nextRead, unread: unread.length, updated: updated.length, total: pending.length }
 }
 
@@ -476,7 +525,11 @@ export function readerOutput(room, { scriptPath = SCRIPT_PATH } = {}) {
       updated_at: new Date().toISOString(),
     })
   }
-  return { ok: true, text: [JSON.stringify(header), ...page.printed].join('\n') + '\n' }
+  const outLines = [JSON.stringify(header), ...page.printed]
+  if (remaining > 0) {
+    outLines.push(JSON.stringify({ room_messages_footer: header.room_messages }))
+  }
+  return { ok: true, text: outLines.join('\n') + '\n' }
 }
 
 function argValue(argv, name) {

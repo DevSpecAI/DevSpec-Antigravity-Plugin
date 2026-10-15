@@ -47,6 +47,8 @@ function isRetryableHttpFailure(err) {
 import {
   detectLocalId,
   knownInstructionTiersFor,
+  readLocalBond,
+  readStateFile,
   resolveLocalAction,
   resolveOwnerPid,
   writeConnectionState,
@@ -194,12 +196,16 @@ export async function connect(options = {}, deps = {}) {
   const agentName = agent || AGENT_NAME
   const detected = detectLocalId({ 'local-id': localIdArg }, env)
   const effectiveOwnerPid = resolveOwnerPid(ownerPid, null)
+  const tierDir = path.join(projectHome, '.devspec', 'remote-control', 'connections')
+  const rcDir = path.join(projectHome, '.devspec', 'remote-control')
   const bond = resolveLocalAction({
     agent: agentName,
     localId: detected.local_id,
     ownerPid: effectiveOwnerPid,
     forceNew: !!forceNew || !!createNew,
     maxAgeMinutes: 30,
+    readBond: (ag, id) => readLocalBond(ag, id, rcDir),
+    readConnection: (id) => readStateFile(id, tierDir),
   })
   const localId = detected.local_id || bond?.local_id || null
   const localIdSource = detected.source || (bond?.local_id ? 'owner_pid_bond' : null)
@@ -309,64 +315,116 @@ export async function connect(options = {}, deps = {}) {
     }
   }
 
-  const tierDir = path.join(projectHome, '.devspec', 'remote-control', 'connections')
   const known =
     startup || !hasStoredTiers(bond.connection_id, { dir: tierDir })
       ? null
       : knownInstructionTiersFor(bond.connection_id, tierDir)
 
-  let registration
+  let registration = null
   let connectionCapability = null
-  try {
-    registration = await call(
-      'register_connection',
-      {
-        ...(localId ? { local_id: localId } : {}),
-        agent_name: agentName,
-        agent_version: LOADED_PLUGIN_VERSION,
-        cwd,
-        machine_hostname: os.hostname(),
-        ...(gitRemote ? { git_remote: gitRemote } : {}),
-        ...(pin ? { pinned_project_id: pin.project_id } : {}),
-        ...(name ? { name } : {}),
-        ...(selectedProjectId ? { project_id: selectedProjectId } : {}),
-        ...(startup ? { folder_scope_only: true } : {}),
-        connection_capability_version: 1,
-        project_selection_version: 1,
-        ...(known
-          ? {
-              known_instruction_tiers_version: known.version,
-              known_instruction_tiers_hash: known.hash,
-            }
-          : {}),
-      },
-      {
-        onResultMeta: (meta) => {
-          const negotiated = meta?.devspec?.connection_capability
-          if (negotiated?.version === 1 && typeof negotiated.value === 'string') {
-            connectionCapability = negotiated.value
-          }
+  if (
+    !startup &&
+    !createNew &&
+    !session &&
+    projectSelector === null &&
+    !name &&
+    !forceNew &&
+    bond?.action === 'already_live' &&
+    bond?.connection_id
+  ) {
+    const existing = readStateFile(bond.connection_id, tierDir)
+    const ageMs = existing?.updated_at ? Date.now() - Date.parse(existing.updated_at) : Infinity
+    if (
+      existing &&
+      existing.enabled !== false &&
+      !existing.session_id &&
+      existing.project_id &&
+      typeof existing.connection_capability === 'string' &&
+      existing.connection_capability.startsWith('dvsc_') &&
+      existing.cwd === cwd &&
+      Number.isFinite(ageMs) &&
+      ageMs >= 0 &&
+      ageMs < 60_000
+    ) {
+      connectionCapability = existing.connection_capability
+      registration = {
+        connection_id: existing.connection_id,
+        codename: existing.session_codename || existing.codename || null,
+        created: Boolean(existing.created_by_session_start),
+        reused_startup_registration: true,
+        project_id: existing.project_id,
+        project_name: existing.project_name || existing.project_id,
+        project_selection: existing.project_selection || {
+          version: 1,
+          status: 'selected',
+          source: previousProject?.source || 'conversation',
+          project: {
+            id: existing.project_id,
+            name: existing.project_name || previousProject?.project?.name || existing.project_id,
+            ...(previousProject?.project?.organization
+              ? { organization: previousProject.project.organization }
+              : {}),
+          },
         },
-      },
-    )
-  } catch (e) {
-    const hint =
-      !gitRemote && !pin
-        ? '\nThis folder has no git remote and no .devspec/project.json pin, so nothing identified the project.'
-        : ''
-    const projectSelection = readProjectSelection(e.details)
-    if (projectSelection || projectSelector !== null) {
-      blockConversationProject(
-        localId,
-        auth.mcp_url,
-        'Choose a project explicitly with /devspec-remote --project before using project-scoped DevSpec tools.',
-        { home: projectHome },
-      )
+        instruction_tiers_version: existing.instruction_tiers_version || known?.version || null,
+        instruction_tiers_hash: existing.instruction_tiers_hash || known?.hash || null,
+        instructions_unchanged: Boolean(known?.hash || existing.instruction_tiers_hash),
+      }
     }
-    throw new ConnectError(`register_connection failed: ${e.message}${hint}`, {
-      reason: isRetryableHttpFailure(e) ? 'unreachable' : 'register_refused',
-      projectSelection,
-    })
+  }
+
+  if (!registration) {
+    try {
+      registration = await call(
+        'register_connection',
+        {
+          ...(localId ? { local_id: localId } : {}),
+          agent_name: agentName,
+          agent_version: LOADED_PLUGIN_VERSION,
+          cwd,
+          machine_hostname: os.hostname(),
+          ...(gitRemote ? { git_remote: gitRemote } : {}),
+          ...(pin ? { pinned_project_id: pin.project_id } : {}),
+          ...(name ? { name } : {}),
+          ...(selectedProjectId ? { project_id: selectedProjectId } : {}),
+          ...(startup ? { folder_scope_only: true } : {}),
+          connection_capability_version: 1,
+          project_selection_version: 1,
+          ...(known
+            ? {
+                known_instruction_tiers_version: known.version,
+                known_instruction_tiers_hash: known.hash,
+              }
+            : {}),
+        },
+        {
+          onResultMeta: (meta) => {
+            const negotiated = meta?.devspec?.connection_capability
+            if (negotiated?.version === 1 && typeof negotiated.value === 'string') {
+              connectionCapability = negotiated.value
+            }
+          },
+        },
+      )
+    } catch (e) {
+      const hint =
+        !gitRemote && !pin
+          ? '\nThis folder has no git remote and no .devspec/project.json pin, so nothing identified the project.'
+          : ''
+      const projectSelection = readProjectSelection(e.details)
+      if (projectSelection || projectSelector !== null) {
+        blockConversationProject(
+          localId,
+          auth.mcp_url,
+          'Choose a project explicitly with /devspec-remote --project before using project-scoped DevSpec tools.',
+          { home: projectHome },
+        )
+      }
+      throw new ConnectError(`register_connection failed: ${e.message}${hint}`, {
+        reason: isRetryableHttpFailure(e) ? 'unreachable' : 'register_refused',
+        projectSelection,
+      })
+    }
   }
 
   const connectionId = registration.connection_id || registration.connection?.id

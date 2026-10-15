@@ -21,7 +21,10 @@ import {
   renderStatusBlock,
 } from './devspec-remote-connect.mjs'
 import { buildWakeDeliveryMessage, deliverWakeViaAgentApi } from './devspec-remote-listen.mjs'
-import { resolveLocalAction, writeStateFile } from './remote-control-state.mjs'
+import { formatRoomStateJson } from './devspec-remote-poll.mjs'
+import { formatTiersForStartup, readTiersFor, storeTiers } from './instruction-tiers.mjs'
+import { resolveLocalAction, writeLocalBond, writeStateFile } from './remote-control-state.mjs'
+import { READER_PAGE_CHARS, readerOutput, readPage, transcriptPaths } from './room-unread.mjs'
 import { maybeSpawnWindowAutoConnect, readConnectionView } from './statusline.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -149,6 +152,118 @@ describe('devspec-remote-connect.mjs — one-shot mechanical connect', () => {
       assert.match(block, /<devspec-repository-data>/)
       assert.match(block, /DevSpecAI\/DevSpec-Antigravity-Plugin/)
     } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('reuses a fresh (<60s) sessionless registration from SessionStart on bare /devspec-remote without a second register_connection HTTP round-trip', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-reuse-startup-'))
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-reuse-cwd-'))
+    const connDir = path.join(home, '.devspec', 'remote-control', 'connections')
+    const rcDir = path.join(home, '.devspec', 'remote-control')
+    fs.mkdirSync(connDir, { recursive: true })
+    const origHome = process.env.HOME
+    try {
+      process.env.HOME = home
+      const regPayload = {
+        connection_id: CONN_ID,
+        codename: 'Curious Badger',
+        created: true,
+        project_id: PROJ_ID,
+        project_name: 'DevSpec',
+        instruction_tiers_version: 1,
+        instruction_tiers_hash:
+          'sha256:870c7a92399f88c05b92c403d25644e2745a04c38f6284e9d38247f3b6518b2b',
+        owner_agent_rules: 'VERIFY AT THE RIGHT LAYER.',
+        project_custom_instructions: 'All work goes through DevSpec items.',
+      }
+      storeTiers(CONN_ID, regPayload, { home, dir: connDir })
+      const startupTiers = readTiersFor(CONN_ID, { home, dir: connDir })
+      const startupContext = formatTiersForStartup(startupTiers)
+      assert.match(startupContext, /## Instructions in force for this run/)
+      assert.match(startupContext, /VERIFY AT THE RIGHT LAYER\./)
+      assert.match(startupContext, /already loaded above in full; do not call view_file/)
+
+      writeStateFile(
+        CONN_ID,
+        {
+          enabled: true,
+          connection_id: CONN_ID,
+          session_id: null,
+          session_codename: 'Curious Badger',
+          project_id: PROJ_ID,
+          project_name: 'DevSpec',
+          created_by_session_start: true,
+          agent_name: 'Antigravity',
+          local_id: CONV_ID,
+          cwd,
+          owner_pid: process.pid,
+          connection_capability: 'dvsc_fresh_startup_cap_123',
+          connection_capability_version: 1,
+          instruction_tiers_version: 1,
+          instruction_tiers_hash:
+            'sha256:870c7a92399f88c05b92c403d25644e2745a04c38f6284e9d38247f3b6518b2b',
+          updated_at: new Date().toISOString(),
+        },
+        connDir,
+      )
+      writeLocalBond(
+        'Antigravity',
+        CONV_ID,
+        {
+          status: 'live',
+          connection_id: CONN_ID,
+          session_id: null,
+          session_codename: 'Curious Badger',
+          cwd,
+          enabled: true,
+          updated_at: new Date().toISOString(),
+        },
+        rcDir,
+      )
+
+      let registerCalled = false
+      const summary = await connect(
+        {
+          cwd,
+          localId: CONV_ID,
+          ownerPid: process.pid,
+          noPoller: true,
+          env: { HOME: home, DEVSPEC_MCP_TOKEN: 'dvs_test_token_123456' },
+        },
+        {
+          projectHome: home,
+          resolveAuth: () => ({
+            ok: true,
+            token: 'dvs_test_token_123456',
+            mcp_url: 'https://api.devspecstaging.com/api/mcp',
+            source: 'test',
+          }),
+          writeState: async (opts) => ({
+            path: path.join(connDir, `${opts.connectionId}.json`),
+            session_id: opts.sessionId,
+            owner_pid: opts.ownerPid,
+            mcp_url: 'https://api.devspecstaging.com/api/mcp',
+            auth_ok: true,
+            auth_source: 'test',
+            poller: { skipped: true },
+          }),
+          callTool: async (req) => {
+            if (req.name === 'register_connection') registerCalled = true
+            return {}
+          },
+        },
+      )
+
+      assert.equal(registerCalled, false, 'should reuse fresh startup registration without HTTP call')
+      assert.equal(summary.connection_id, CONN_ID)
+      assert.equal(summary.codename, 'Curious Badger')
+      assert.equal(summary.created, true)
+      assert.equal(summary.cursor_flag, '--from-end')
+    } finally {
+      if (origHome === undefined) delete process.env.HOME
+      else process.env.HOME = origHome
       fs.rmSync(home, { recursive: true, force: true })
       fs.rmSync(cwd, { recursive: true, force: true })
     }
@@ -290,6 +405,119 @@ describe('devspec-remote-listen.mjs — canonical & legacy wake formatting', () 
     })
     assert.equal(res.ok, true)
     assert.equal(newConvCalls[0].args[0], 'new-conversation')
+  })
+})
+
+describe('room-unread.mjs & devspec-remote-poll.mjs — Antigravity token/truncation optimizations', () => {
+  it('uses READER_PAGE_CHARS = 6000, deduplicates identical response_style arrays across older commands in a page, and appends room_messages_footer when remaining > 0', () => {
+    assert.equal(READER_PAGE_CHARS, 6000)
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-room-unread-'))
+    try {
+      const styleArray = [
+        'Use numbered sections and explicit file links.',
+        'Ground in DevSpec before editing code.',
+        'Keep status updates concise.',
+      ]
+      const lines = [
+        {
+          seq: 1,
+          at: '2026-10-15T08:00:00Z',
+          message_id: 'msg-1',
+          from: { label: 'Ali Price', kind: 'human' },
+          to: 'Curious Badger',
+          state: 'active',
+          text: 'First command',
+          delivered_as_command: {
+            authority: 'owner',
+            response_style: styleArray,
+          },
+        },
+        {
+          seq: 2,
+          at: '2026-10-15T08:01:00Z',
+          message_id: 'msg-2',
+          from: { label: 'Ali Price', kind: 'human' },
+          to: 'Curious Badger',
+          state: 'active',
+          text: 'Second command',
+          delivered_as_command: {
+            authority: 'owner',
+            response_style: styleArray,
+          },
+        },
+        {
+          seq: 3,
+          at: '2026-10-15T08:02:00Z',
+          message_id: 'msg-3',
+          from: { label: 'Ali Price', kind: 'human' },
+          to: 'Curious Badger',
+          state: 'active',
+          text: 'Third command ' + 'x'.repeat(5600),
+          delivered_as_command: {
+            authority: 'owner',
+            response_style: styleArray,
+          },
+        },
+      ]
+      const page = readPage({
+        lines,
+        read: {},
+        selfLabel: 'Curious Badger',
+        budget: 6000,
+        writeOverflow: () => '/tmp/overflow.txt',
+      })
+      assert.equal(page.printed.length, 2)
+      const firstObj = JSON.parse(page.printed[0])
+      const secondObj = JSON.parse(page.printed[1])
+      assert.equal(
+        firstObj.delivered_as_command.response_style_same_as_message_id,
+        'msg-2',
+        'older command in same page should reference newest command with identical response_style',
+      )
+      assert.equal(firstObj.delivered_as_command.response_style, undefined)
+      assert.deepEqual(secondObj.delivered_as_command.response_style, styleArray)
+
+      const paths = transcriptPaths(CONN_ID, SESS_ID, dir)
+      fs.writeFileSync(paths.transcript, lines.map((l) => JSON.stringify(l)).join('\n') + '\n')
+      fs.writeFileSync(paths.state, JSON.stringify({ self_label: 'Curious Badger' }))
+      const out = readerOutput({ connectionId: CONN_ID, sessionId: SESS_ID, dir })
+      assert.equal(out.ok, true)
+      const outLines = out.text.trim().split('\n')
+      const footer = JSON.parse(outLines[outLines.length - 1])
+      assert.ok(footer.room_messages_footer, 'should repeat room_messages_footer when remaining > 0')
+      assert.equal(footer.room_messages_footer.remaining, 1)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('formats .room.json array rows one-per-line while remaining 100% JSON.parse identical', () => {
+    const sampleDoc = {
+      updated_at: '2026-10-15T10:00:00.000Z',
+      advisory: true,
+      executable: false,
+      still_to_discuss: {
+        version: 1,
+        open_count: 1,
+        rows: [{ id: 'd-1', kind: 'point', title: 'Architecture check', status: 'open' }],
+      },
+      session_activity: {
+        list_readable: true,
+        items: [
+          { id: 'item-1', code: 'DEV-1', title: 'First item', status: 'in_progress' },
+          { id: 'item-2', code: 'DEV-2', title: 'Second item', status: 'completed' },
+        ],
+        events: [
+          { seq: 1, kind: 'claimed', item_id: 'item-1', at: '2026-10-15T09:50:00Z' },
+          { seq: 2, kind: 'completed', item_id: 'item-2', at: '2026-10-15T09:55:00Z' },
+        ],
+      },
+    }
+    const formatted = formatRoomStateJson(sampleDoc)
+    assert.deepEqual(JSON.parse(formatted), sampleDoc)
+    const lineCount = formatted.trim().split('\n').length
+    const naiveLineCount = JSON.stringify(sampleDoc, null, 2).trim().split('\n').length
+    assert.ok(lineCount < naiveLineCount - 15, `expected compact lines (${lineCount} vs ${naiveLineCount})`)
   })
 })
 

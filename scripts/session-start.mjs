@@ -242,7 +242,7 @@ export async function autoConnectAtStartup({
 } = {}) {
   const effectiveHome = home || env?.HOME || os.homedir()
   let auth = null
-  if (callMcp === defaultCallMcp) {
+  if (verifyAuthFn !== verifyAndPinDevspecAuth) {
     try {
       auth = await verifyAuthFn(cwd, { env, home: effectiveHome })
     } catch {
@@ -256,35 +256,64 @@ export async function autoConnectAtStartup({
       hostToken: hostTokenFromEnv(env, { cwd, home: effectiveHome }),
     })
   }
+  if (!auth?.token && callMcp === defaultCallMcp) {
+    try {
+      auth = await verifyAuthFn(cwd, { env, home: effectiveHome })
+    } catch {
+      auth = null
+    }
+  }
   if (!auth?.token) return null
-  const mcpUrl = auth.mcp_url || DEFAULT_PROD_URL
+  let mcpUrl = auth.mcp_url || DEFAULT_PROD_URL
   const ownerPid = resolveOwnerPid(explicitOwnerPid || 'auto', null)
   const agentVersion = LOADED_PLUGIN_VERSION
   const gitRemote = gitRemoteOrigin(cwd)
   const pinnedProjectId = findProjectPin(cwd, { home: effectiveHome })?.project_id || null
-  const reg = await callMcp({
-    mcpUrl,
-    token: auth.token,
-    name: 'register_connection',
-    arguments: {
-      agent_name: AGENT_NAME,
-      agent_version: agentVersion,
-      local_id: conversationId || undefined,
-      cwd,
-      ...(gitRemote ? { git_remote: gitRemote } : {}),
-      ...(pinnedProjectId ? { pinned_project_id: pinnedProjectId } : {}),
-      machine_label: os.hostname(),
-      connection_capability_version: 1,
-      project_selection_version: 1,
-      capabilities: {
-        can_execute: true,
-        can_edit_files: true,
-        can_run_commands: true,
-        supports_mcp: true,
-        supports_trail: true,
-      },
+  const registerArgs = {
+    agent_name: AGENT_NAME,
+    agent_version: agentVersion,
+    local_id: conversationId || undefined,
+    cwd,
+    ...(gitRemote ? { git_remote: gitRemote } : {}),
+    ...(pinnedProjectId ? { pinned_project_id: pinnedProjectId } : {}),
+    machine_label: os.hostname(),
+    connection_capability_version: 1,
+    project_selection_version: 1,
+    capabilities: {
+      can_execute: true,
+      can_edit_files: true,
+      can_run_commands: true,
+      supports_mcp: true,
+      supports_trail: true,
     },
-  })
+  }
+  let reg = null
+  try {
+    reg = await callMcp({
+      mcpUrl,
+      token: auth.token,
+      name: 'register_connection',
+      arguments: registerArgs,
+    })
+  } catch (err) {
+    if (callMcp === defaultCallMcp && verifyAuthFn === verifyAndPinDevspecAuth) {
+      const fallbackAuth = await verifyAuthFn(cwd, { env, home: effectiveHome }).catch(() => null)
+      if (fallbackAuth?.token && fallbackAuth.token !== auth.token) {
+        auth = fallbackAuth
+        mcpUrl = auth.mcp_url || DEFAULT_PROD_URL
+        reg = await callMcp({
+          mcpUrl,
+          token: auth.token,
+          name: 'register_connection',
+          arguments: registerArgs,
+        })
+      } else {
+        throw err
+      }
+    } else {
+      throw err
+    }
+  }
   const connectionId = reg?.connection_id || reg?.connection?.id || null
   if (!connectionId) return null
 
@@ -306,6 +335,8 @@ export async function autoConnectAtStartup({
     session_codename: reg?.codename || reg?.connection?.codename || null,
     project_id: resolvedProjectId,
     ...(resolvedProjectName ? { project_name: resolvedProjectName } : {}),
+    ...(reg?.project_selection ? { project_selection: reg.project_selection } : {}),
+    ...(typeof reg?.created === 'boolean' ? { created_by_session_start: reg.created } : {}),
     agent_name: AGENT_NAME,
     agent_version: agentVersion,
     local_id: conversationId || null,

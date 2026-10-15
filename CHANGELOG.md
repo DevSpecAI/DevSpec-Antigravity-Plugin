@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.15.2
+
+### Antigravity (`agy`) host latency and token-footprint optimizations
+
+- **Direct `SessionStart` instruction-tier injection and single-round-trip startup connect (`scripts/instruction-tiers.mjs`, `scripts/session-start.mjs`):** `autoConnectAtStartup` now uses the resolved single/pinned MCP token directly for `register_connection` without a redundant `verify_agent_connection` pre-call, and `formatTiersForStartup` injects the full rendered 4-tier instructions directly in the `SessionStart` `systemMessage` (alongside the saved `.tiers-<hash>.txt` path for post-compaction recovery) so `/devspec-remote` does not require a separate `view_file` turn.
+- **Fresh startup registration reuse on `/devspec-remote` (`scripts/devspec-remote-connect.mjs`):** Bare `/devspec-remote` now reuses a fresh (`<60s`) sessionless registration created by `SessionStart` for the same conversation/`owner_pid`, avoiding a duplicate `register_connection` HTTP round-trip.
+- **Antigravity-safe `room-unread.mjs` pagination (`READER_PAGE_CHARS = 6000`), footer repetition, and `response_style` deduplication (`scripts/room-unread.mjs`):** Tuned the unread page budget to fit within Antigravity `run_command`'s ~7.5 KB stdout limit (which top-truncates long outputs), repeated `room_messages_footer` at the end of stdout when `remaining > 0`, and deduplicated identical `delivered_as_command.response_style` arrays across earlier commands in the same page.
+- **Compact single-line array rows in `.room.json` (`scripts/devspec-remote-poll.mjs`):** Added `formatRoomStateJson` so array rows (`session_activity.items`, `session_activity.events`, `still_to_discuss.rows`) are formatted one-per-line (~240 lines instead of 1,680+ lines) while remaining 100% `JSON.parse`-identical, fitting inside a single Antigravity `view_file` call (800-line cap).
+- **Lazy MCP tool quick-reference and spilled output guidance (`rules/AGENTS.md`, `skills/devspec-remote/SKILL.md`):** Added compact parameter signatures for core lazy DevSpec MCP tools (`post_session_message`, `get_action_item`, `get_action_items`, `get_action_item_siblings`, `search_action_items`, `reserve_work_items`, `claim_work_item`, `record_implementation`, `record_criterion_verdicts`) and guidance against multi-page `view_file` reads on spilled `output.txt` files.
+
 ## 0.15.1
 
 ### Canonical remote-ingress 1.6.0 wire validation, transcript store parity, and connection reuse
