@@ -1,318 +1,176 @@
+#!/usr/bin/env node
 /**
- * Canonical remote ingress v1 validator and normalizer (1.1.0 through 1.6.0).
+ * Dependency-free validator/normalizer for the negotiated remote-ingress v1 wire.
  *
- * The versioned authority/wake/context/delivery policy lives at
- * `devspec://product/remote-ingress-contract`. This module validates that a
- * negotiated `poll_connection` response carries a well-formed `ingress`
- * envelope addressed to THIS connection before any wake record can be written.
+ * The product contract is authoritative: devspec://product/remote-ingress-contract.
+ * This module mirrors its v1 wire shape only because hook scripts deliberately have
+ * no package dependencies. Unknown versions and every malformed/cross-field-invalid
+ * envelope fail closed at the network boundary.
  */
 
-export const REMOTE_INGRESS_RESOURCE_URI = 'devspec://product/remote-ingress-contract'
-export const REMOTE_INGRESS_KIND = 'devspec.remote_ingress'
 export const REMOTE_INGRESS_SCHEMA_VERSION = 1
-export const REMOTE_INGRESS_CONTRACT_VERSION = '1.1.0'
-export const REMOTE_INGRESS_POLICY_VERSION = '2026-08-19.2'
-export const REMOTE_INGRESS_SCOPE_CONTRACT_VERSION = '1.2.0'
-export const REMOTE_INGRESS_SCOPE_POLICY_VERSION = '2026-08-19.3'
-export const REMOTE_INGRESS_PLAN_CONTRACT_VERSION = '1.3.0'
-export const REMOTE_INGRESS_PLAN_POLICY_VERSION = '2026-08-21.1'
+export const REMOTE_INGRESS_CONTRACT_VERSION = '1.3.0'
+export const REMOTE_INGRESS_POLICY_VERSION = '2026-08-21.1'
+/**
+ * 1.4 adds system_notices; 1.5 adds the sender's response style per delivered
+ * command (item af5e3d6c). The ladder is nested, so asking for style means
+ * asking for notices too — the server refuses sender_style_version without
+ * system_notice_version.
+ */
+export const REMOTE_INGRESS_SENDER_STYLE_CONTRACT_VERSION = '1.5.0'
+export const REMOTE_INGRESS_SENDER_STYLE_POLICY_VERSION = '2026-09-18.1'
+/**
+ * 1.6 adds room context (item 1dcb75df): every emitted record's addressee,
+ * attachment references and state, a coverage point a local room copy checks
+ * itself against, and the answers to the copy's own questions (open_check,
+ * deletions). It also may carry session_activity (item d37b3343). 1.6 carries
+ * everything 1.5 does; the ladder stays nested.
+ */
+export const REMOTE_INGRESS_ROOM_CONTEXT_CONTRACT_VERSION = '1.6.0'
+export const REMOTE_INGRESS_ROOM_CONTEXT_POLICY_VERSION = '2026-09-24.1'
+export const ROOM_CONTEXT_VERSION = 1
+export const ROOM_PAGE_MAX = 500
+export const SESSION_ACTIVITY_MAX_ENTRIES = 1000
+/**
+ * The room's record history (item 744c9724, server item f6a8f4f2): a section the
+ * poller negotiates with session_events_version on top of 1.6.0. What happened to
+ * the records the room produced or referenced, with the time it happened.
+ */
+export const SESSION_EVENTS_VERSION = 1
+export const SESSION_EVENTS_MAX = 2000
 export const REMOTE_INGRESS_SYSTEM_NOTICE_CONTRACT_VERSION = '1.4.0'
 export const REMOTE_INGRESS_SYSTEM_NOTICE_POLICY_VERSION = '2026-08-22.1'
-export const REMOTE_INGRESS_SENDER_STYLE_CONTRACT_VERSION = '1.5.0'
-export const REMOTE_INGRESS_SENDER_STYLE_POLICY_VERSION = '2026-08-23.1'
-// Remote-ingress 1.6.0 (item 1a4f0246): room-context fields on `context.*` rows plus
-// `session_activity` and `session_events` on the envelope so the poller can maintain a
-// complete local `.transcript.jsonl` and `.room.json` without `get_session_transcript`.
-export const REMOTE_INGRESS_ROOM_CONTEXT_CONTRACT_VERSION = '1.6.0'
-export const REMOTE_INGRESS_ROOM_CONTEXT_POLICY_VERSION = '2026-08-25.1'
-export const ROOM_CONTEXT_VERSION = 1
-// Item bba35976: poll inventory that is never dropped when the room has more polls than fit.
-export const SESSION_POLL_PROJECTION_VERSION_2 = 2
-
-// Backward-compatible aliases for existing Antigravity tests
-export const REMOTE_INGRESS_PREVIOUS_CONTRACT_VERSION = REMOTE_INGRESS_SCOPE_CONTRACT_VERSION
-export const REMOTE_INGRESS_PREVIOUS_POLICY_VERSION = REMOTE_INGRESS_SCOPE_POLICY_VERSION
-export const REMOTE_INGRESS_OWNER_ONLY_CONTRACT_VERSION = REMOTE_INGRESS_CONTRACT_VERSION
-export const REMOTE_INGRESS_OWNER_ONLY_POLICY_VERSION = REMOTE_INGRESS_POLICY_VERSION
-
+export const SYSTEM_NOTICE_VERSION = 1
+export const SENDER_STYLE_VERSION = 1
+export const REMOTE_INGRESS_SCOPE_CONTRACT_VERSION = '1.2.0'
+export const REMOTE_INGRESS_SCOPE_POLICY_VERSION = '2026-08-19.3'
+export const ACTIVE_PLAN_PROJECTION_VERSION = 1
+export const ACTIVE_PLAN_MAX_PLANS = 64
+export const ACTIVE_PLAN_MAX_STEPS = 64
+export const ACTIVE_PLAN_MAX_TITLE_CHARS = 300
+export const ACTIVE_PLAN_MAX_FAILURE_REASON_CHARS = 4096
+export const ACTIVE_PLAN_MAX_IDENTITY_CHARS = 300
+export const ACTIVE_PLAN_MAX_TOTAL_TEXT_CHARS = 131_072
 export const ACTIVE_PLAN_AUTHORITY_NOTE =
   'Advisory read-awareness only. Presence does not authorize execution or mutation; manage_plan still requires a capability-authenticated caller identity, explicit plan_id for cross-plan work, and expected_revision.'
+/**
+ * Room awareness that is NOT part of the ingress envelope (item b1e26146).
+ *
+ * `session_polls` and `still_to_discuss` ride the poll response beside `ingress`,
+ * not inside it, so they have their own shapes and their own authority notes. Both
+ * are advisory: a poll is something the room is deciding and a discussion point is
+ * something it has parked, and neither is an instruction to this agent.
+ *
+ * The notes are pinned verbatim because they are the server's own words about what
+ * the data does not authorize. Drifting from them would quietly relax a boundary.
+ */
+export const SESSION_POLL_PROJECTION_VERSION = 1
+/**
+ * Version 2 (item bba35976) is never missing while the session has polls: it carries
+ * the newest polls that fit the text budget, the totals, and a continuation naming
+ * where the rest are. Version 1 refused outright past 16 active polls, so a busy room
+ * arrived as no polls at all.
+ */
+export const SESSION_POLL_PROJECTION_VERSION_2 = 2
+export const SESSION_POLL_CONTINUATION = 'Call manage_poll list to read every poll in this session.'
+export const SESSION_POLL_MAX_ACTIVE = 16
+export const SESSION_POLL_MAX_ENDED = 5
+export const SESSION_POLL_MAX_OPTIONS = 30
+export const SESSION_POLL_MAX_QUESTION_CHARS = 400
+export const SESSION_POLL_MAX_LABEL_CHARS = 80
+export const SESSION_POLL_MAX_VOTER_CHARS = 80
+export const SESSION_POLL_MAX_TOTAL_TEXT_CHARS = 16_384
 export const SESSION_POLL_AUTHORITY_NOTE =
-  'Advisory read-awareness only. Presence does not authorize execution or mutation; manage_poll still requires a capability-authenticated caller identity and expected_revision for mutations.'
+  'Advisory read-awareness only. Presence does not authorize execution or mutation; manage_poll still requires a capability-authenticated caller identity and expected_revision. Votes are not commands and do not keep Working on.'
+
+export const STILL_TO_DISCUSS_PROJECTION_VERSION = 1
+export const STILL_TO_DISCUSS_MAX_ROWS = 24
+export const STILL_TO_DISCUSS_MAX_TITLE_CHARS = 300
+export const STILL_TO_DISCUSS_MAX_PREVIEW_CHARS = 2048
 export const STILL_TO_DISCUSS_AUTHORITY_NOTE =
-  'Advisory read-awareness only. Presence does not authorize execution or mutation; manage_discussion_point remains the only write surface.'
-export const SESSION_ACTIVITY_AUTHORITY_NOTE =
-  'Advisory read-awareness only. Items and events record what this session produced and referenced; presence does not authorize execution or mutation.'
+  'Raised in this room, or brought into it. Advisory read-awareness. Do not add, strike, or reopen unless the human asked.'
 
-export const DELEGATED_PROJECT_SCOPE_KIND = 'devspec_project'
-export const DELEGATED_PROJECT_SCOPE_POLICY_ID = 'delegated_project_v1'
+export const REMOTE_INGRESS_RESOURCE_URI = 'devspec://product/remote-ingress-contract'
 
-export function formatDelegatedProjectScopeInstruction(projectId) {
-  return (
-    `Delegated project scope: this command is authorized ONLY for DevSpec project ${projectId}. ` +
-    `Pass project_id: "${projectId}" on project-scoped DevSpec calls, and do not read, modify, or execute work for any other project or unassociated repository.`
-  )
-}
-
-const CANONICAL_CONTRACTS = new Map([
-  [REMOTE_INGRESS_CONTRACT_VERSION, { policyVersion: REMOTE_INGRESS_POLICY_VERSION, scopeAware: false, planAware: false, systemNoticeAware: false, senderStyleAware: false, roomContextAware: false }],
-  [REMOTE_INGRESS_SCOPE_CONTRACT_VERSION, { policyVersion: REMOTE_INGRESS_SCOPE_POLICY_VERSION, scopeAware: true, planAware: false, systemNoticeAware: false, senderStyleAware: false, roomContextAware: false }],
-  [REMOTE_INGRESS_PLAN_CONTRACT_VERSION, { policyVersion: REMOTE_INGRESS_PLAN_POLICY_VERSION, scopeAware: true, planAware: true, systemNoticeAware: false, senderStyleAware: false, roomContextAware: false }],
-  [REMOTE_INGRESS_SYSTEM_NOTICE_CONTRACT_VERSION, { policyVersion: REMOTE_INGRESS_SYSTEM_NOTICE_POLICY_VERSION, scopeAware: true, planAware: true, systemNoticeAware: true, senderStyleAware: false, roomContextAware: false }],
-  [REMOTE_INGRESS_SENDER_STYLE_CONTRACT_VERSION, { policyVersion: REMOTE_INGRESS_SENDER_STYLE_POLICY_VERSION, scopeAware: true, planAware: true, systemNoticeAware: true, senderStyleAware: true, roomContextAware: false }],
-  [REMOTE_INGRESS_ROOM_CONTEXT_CONTRACT_VERSION, { policyVersion: REMOTE_INGRESS_ROOM_CONTEXT_POLICY_VERSION, scopeAware: true, planAware: true, systemNoticeAware: true, senderStyleAware: true, roomContextAware: true }],
+const CONTRACT_POLICY_PAIRS = new Map([
+  ['1.1.0', '2026-08-19.2'],
+  ['1.1.1', '2026-08-19.2'],
+  [REMOTE_INGRESS_SCOPE_CONTRACT_VERSION, REMOTE_INGRESS_SCOPE_POLICY_VERSION],
+  [REMOTE_INGRESS_CONTRACT_VERSION, REMOTE_INGRESS_POLICY_VERSION],
+  [REMOTE_INGRESS_SYSTEM_NOTICE_CONTRACT_VERSION, REMOTE_INGRESS_SYSTEM_NOTICE_POLICY_VERSION],
+  [REMOTE_INGRESS_SENDER_STYLE_CONTRACT_VERSION, REMOTE_INGRESS_SENDER_STYLE_POLICY_VERSION],
+  [REMOTE_INGRESS_ROOM_CONTEXT_CONTRACT_VERSION, REMOTE_INGRESS_ROOM_CONTEXT_POLICY_VERSION],
 ])
+// Every version from 1.2 up carries project_scope on delegated commands. 1.4 and
+// 1.5 inherit that; leaving them out rejected every command on the new lanes.
+const SCOPE_AWARE_CONTRACT_VERSIONS = new Set([
+  REMOTE_INGRESS_SCOPE_CONTRACT_VERSION,
+  REMOTE_INGRESS_CONTRACT_VERSION,
+  REMOTE_INGRESS_SYSTEM_NOTICE_CONTRACT_VERSION,
+  REMOTE_INGRESS_SENDER_STYLE_CONTRACT_VERSION,
+  REMOTE_INGRESS_ROOM_CONTEXT_CONTRACT_VERSION,
+])
+const SUPPORTED_POLICY_VERSIONS = new Set(CONTRACT_POLICY_PAIRS.values())
 
-const NIL_UUID = '00000000-0000-0000-0000-000000000000'
-const MAX_UUID = 'ffffffff-ffff-ffff-ffff-ffffffffffff'
-const RFC_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-const ISO_DATETIME_PATTERN =
-  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:Z|[+-](\d{2}):(\d{2}))$/
-const COMMAND_AUTHORITIES = new Set(['owner', 'delegated'])
-const DELEGATED_MODES = new Set(['project', 'allowlist'])
+const UUID = /^(?:00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12})$/
+const OFFSET_DATETIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|([+-])(\d{2}):(\d{2}))$/
 const WAKE_KINDS = new Set([
   'conversational_command',
   'control',
+  'system_notice',
   'advisory_update',
   'history_reseed',
   'idle',
 ])
-const DELIVERY_STATES = new Set(['live', 'replay', 'reseed'])
-const CONTROL_VERBS = new Set(['abort', 'compact', 'set_model', 'set_thinking_level'])
-const CONTEXT_BUCKETS = ['human_context', 'agent_context', 'ai_context', 'system_context']
-const CONTEXT_ACTOR_BY_BUCKET = {
-  human_context: 'human',
-  agent_context: 'agent',
-  ai_context: 'ai',
-  system_context: 'system',
-}
-const ATTACHMENT_TYPES = new Set(['image', 'text', 'binary'])
-const UNAVAILABLE_REASONS = new Set(['missing_resource', 'invalid_payload', 'access_denied'])
-const OMISSION_REASONS = new Set(['policy_limit', 'byte_budget', 'delivery_retry'])
-const ACTIVE_PLAN_STEP_STATUSES = new Set(['pending', 'in_progress', 'completed', 'skipped'])
-const ACTIVE_PLAN_ORIGIN_KINDS = new Set(['connection', 'ai_assistant', 'human'])
-const ACTIVE_PLAN_STEWARD_KINDS = new Set(['connection', 'ai_assistant', 'unassigned'])
-const SYSTEM_NOTICE_ACTOR_KINDS = new Set(['owner', 'delegated', 'system'])
-const SYSTEM_NOTICE_CODES = new Set(['rate_limit', 'concurrency_limit', 'budget_exceeded', 'turn_failed', 'provider_error', 'system_notice'])
+const AUTHORITY_KINDS = new Set(['owner', 'delegated'])
+const AUTHORITY_MODES = new Set(['owner', 'project', 'allowlist'])
+const ACTOR_KINDS = new Set(['human', 'agent', 'ai', 'system'])
+const RELATIONSHIPS = new Set(['before_window', 'within_window', 'after_command'])
+const OMISSION_REASONS = new Set([
+  'policy_limit',
+  'model_budget',
+  'transport_budget',
+  'filter',
+  'history_before_window',
+  'delivery_retry',
+])
+const CONTROL_VERBS = new Set(['abort', 'set_model', 'set_thinking', 'compact', 'clear', 'reload', 'list_models'])
+const THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
+const CONTEXT_BUCKETS = [
+  ['human_context', 'human'],
+  ['agent_context', 'agent'],
+  ['ai_context', 'ai'],
+  ['system_context', 'system'],
+]
 
-const BASE_ENVELOPE_KEYS = new Set([
-  'kind',
-  'schema_version',
-  'contract_version',
-  'policy_version',
-  'envelope_id',
-  'connection',
-  'wake',
-  'delivery_state',
-  'command_message_ids',
-  'commands',
-  'control',
-  'context',
-  'window',
-])
-const PLAN_ENVELOPE_KEYS = new Set([...BASE_ENVELOPE_KEYS, 'active_session_plans'])
-const SYSTEM_NOTICE_ENVELOPE_KEYS = new Set([...PLAN_ENVELOPE_KEYS, 'system_notices'])
-const SENDER_STYLE_ENVELOPE_KEYS = new Set([...SYSTEM_NOTICE_ENVELOPE_KEYS, 'sender_response_styles'])
-const ROOM_CONTEXT_ENVELOPE_KEYS = new Set([
-  ...SENDER_STYLE_ENVELOPE_KEYS,
-  'session_activity',
-  'session_events',
-])
-const SENDER_STYLE_KEYS = new Set(['message_id', 'sender_user_id', 'notes'])
-const SYSTEM_NOTICE_KEYS = new Set([
-  'notice_id', 'created_at', 'code', 'summary', 'actor_kind', 'requester', 'advisory', 'executable',
-])
-const CONNECTION_KEYS = new Set(['connection_id', 'agent_name', 'codename', 'label'])
-const WAKE_KEYS = new Set(['kind', 'active', 'reason_id'])
-const ORDER_KEYS = new Set(['sequence', 'created_at', 'message_id'])
-const CONTENT_KEYS = new Set(['mode', 'body', 'complete'])
-const CONTENT_ROOM_KEYS = new Set(['mode', 'body', 'complete', 'updated_at'])
-const REQUESTER_KEYS = new Set(['user_id', 'display_name'])
-const AUTHORITY_KEYS = new Set([
-  'kind',
-  'mode',
-  'requested_by_user_id',
-  'connection_owner_user_id',
-  'decision_source',
-])
-const DELIVERY_KEYS = new Set([
-  'provenance_ref',
-  'turn_id',
-  'primary_provenance_ref',
-  'is_primary',
-])
-const BASE_COMMAND_KEYS = new Set([
-  'message_id',
-  'order',
-  'content',
-  'attachments',
-  'requester',
-  'authority',
-  'addressee',
-  'delivery',
-])
-const SCOPED_COMMAND_KEYS = new Set([...BASE_COMMAND_KEYS, 'project_scope'])
-const PROJECT_SCOPE_KEYS = new Set(['kind', 'policy_id', 'project_id', 'instruction'])
-const CONTROL_KEYS = new Set(['id', 'verb', 'issued_at', 'issued_by_user_id', 'args'])
-const CONTEXT_KEYS = new Set(CONTEXT_BUCKETS)
-const CONTEXT_ACTOR_KEYS = new Set(['kind', 'user_id', 'display_name', 'agent_tool', 'model'])
-const CONTEXT_ENTRY_KEYS = new Set([
-  'message_id',
-  'order',
-  'actor',
-  'source_type',
-  'relationship',
-  'content',
-  'advisory',
-])
-const CONTEXT_ENTRY_ROOM_KEYS = new Set([...CONTEXT_ENTRY_KEYS, 'attachments', 'room'])
-const CONTEXT_ROOM_KEYS = new Set([
-  'updated_at',
-  'author_connection_id',
-  'author_codename',
-  'addressed_to',
-  'work_trail',
-  'trail_events',
-])
-const CONTEXT_ADDRESSED_TO_KEYS = new Set(['connection_id', 'agent_name', 'codename'])
-const WINDOW_KEYS = new Set([
-  'policy_version',
-  'returned',
-  'total_known',
-  'source_window',
-  'truncated',
-  'has_more',
-  'next_cursor',
-  'fetch_id',
-  'omission_reason',
-])
-const SOURCE_WINDOW_KEYS = new Set(['start', 'end'])
-const METADATA_ATTACHMENT_KEYS = new Set([
-  'materialization',
-  'filename',
-  'mime_type',
-  'type',
-  'size_bytes',
-  'resource_id',
-])
-const UNAVAILABLE_ATTACHMENT_KEYS = new Set([
-  'materialization',
-  'filename',
-  'mime_type',
-  'type',
-  'size_bytes',
-  'resource_id',
-  'reason',
-])
-const ACTIVE_PLAN_PROJECTION_KEYS = new Set([
-  'version',
-  'advisory',
-  'authority_note',
-  'inventory',
-  'plans',
-])
-const ACTIVE_PLAN_INVENTORY_KEYS = new Set(['returned', 'total_known', 'truncated'])
-const ACTIVE_PLAN_KEYS = new Set([
-  'id',
-  'title',
-  'revision',
-  'status',
-  'created_at',
-  'origin',
-  'steward',
-  'owner',
-  'orphaned',
-  'progress',
-  'steps',
-])
-const ACTIVE_PLAN_ACTOR_KEYS = new Set(['kind', 'connection_id', 'agent_name', 'codename'])
-const ACTIVE_PLAN_PROGRESS_KEYS = new Set(['terminal', 'total', 'completed', 'skipped'])
-const ACTIVE_PLAN_STEP_KEYS = new Set(['id', 'position', 'title', 'status'])
-
-const SESSION_POLL_PROJECTION_KEYS = new Set([
-  'version', 'advisory', 'authority_note', 'inventory', 'polls',
-])
-const SESSION_POLL_V2_INVENTORY_KEYS = new Set([
-  'returned', 'total_known', 'open_total', 'closed_total', 'truncated', 'read_Hint', 'read_hint',
-])
-const SESSION_POLL_KEYS = new Set([
-  'id', 'question', 'status', 'revision', 'created_at', 'closed_at',
-  'creator', 'recommendation_index', 'options', 'total_votes',
-])
-const SESSION_POLL_CREATOR_KEYS = new Set([
-  'kind', 'user_id', 'connection_id', 'display_name', 'agent_name', 'codename',
-])
-const SESSION_POLL_OPTION_KEYS = new Set(['index', 'label', 'vote_count', 'voters'])
-const SESSION_POLL_VOTER_KEYS = new Set(['user_id', 'display_name'])
-
-const STILL_TO_DISCUSS_PROJECTION_KEYS = new Set([
-  'version', 'advisory', 'authority_note', 'inventory', 'points',
-])
-const STILL_TO_DISCUSS_POINT_KEYS = new Set([
-  'id', 'title', 'body', 'status', 'position', 'created_at', 'resolved_at', 'source_message_id',
-])
-
-const SESSION_ACTIVITY_KEYS = new Set([
-  'version', 'advisory', 'authority_note', 'list_readable', 'items', 'events',
-])
-const SESSION_ACTIVITY_ITEM_KEYS = new Set([
-  'id', 'short_code', 'title', 'status', 'priority', 'Display', 'origin', 'assignee',
-  'claimed_by', 'created_at', 'updated_at', 'completed_at',
-])
-const SESSION_ACTIVITY_EVENT_KEYS = new Set([
-  'id', 'kind', 'item_id', 'short_code', 'title', 'status', 'actor', 'at', 'summary',
-])
-const SESSION_EVENTS_PROJECTION_KEYS = new Set([
-  'version', 'advisory', 'inventory', 'events',
-])
-const SESSION_EVENT_KEYS = new Set([
-  'id', 'message_type', 'created_at', 'actor_name', 'content', 'metadata', 'attachments',
-])
-
-function isPlainObject(value) {
-  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+function record(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
-function hasExactKeys(value, allowed) {
-  if (!isPlainObject(value)) return false
-  const keys = Object.keys(value)
-  return keys.length === allowed.size && keys.every((key) => allowed.has(key))
+function exactKeys(value, keys) {
+  if (!record(value)) return false
+  const actual = Object.keys(value).sort()
+  const expected = [...keys].sort()
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index])
 }
 
-function hasOnlyAllowedKeys(value, allowed) {
-  if (!isPlainObject(value)) return false
-  return Object.keys(value).every((key) => allowed.has(key))
+function optionalExactKeys(value, required, optional = []) {
+  if (!record(value)) return false
+  const allowed = new Set([...required, ...optional])
+  return required.every((key) => Object.hasOwn(value, key)) && Object.keys(value).every((key) => allowed.has(key))
 }
 
-export function isCanonicalUuid(value) {
-  if (typeof value !== 'string') return false
-  if (value === NIL_UUID || value === MAX_UUID) return true
-  return RFC_UUID_PATTERN.test(value)
-}
-
-function isNonEmptyString(value) {
+function nonempty(value) {
   return typeof value === 'string' && value.length > 0
 }
 
-function isNonBlankString(value) {
-  return typeof value === 'string' && value.trim().length > 0
+function uuid(value) {
+  return typeof value === 'string' && UUID.test(value)
 }
 
-export function isSafeNonNegativeInteger(value) {
-  return Number.isSafeInteger(value) && value >= 0
-}
-
-function isSafePositiveInteger(value) {
-  return Number.isSafeInteger(value) && value >= 1
-}
-
-function daysInUtcMonth(year, month) {
-  return new Date(Date.UTC(year, month, 0)).getUTCDate()
-}
-
-export function isCanonicalIsoDatetime(value) {
+function datetime(value) {
   if (typeof value !== 'string') return false
-  const match = ISO_DATETIME_PATTERN.exec(value)
+  const match = OFFSET_DATETIME.exec(value)
   if (!match) return false
   const year = Number(match[1])
   const month = Number(match[2])
@@ -320,821 +178,965 @@ export function isCanonicalIsoDatetime(value) {
   const hour = Number(match[4])
   const minute = Number(match[5])
   const second = Number(match[6])
-  const offsetHour = match[7] === undefined ? 0 : Number(match[7])
-  const offsetMinute = match[8] === undefined ? 0 : Number(match[8])
-  if (month < 1 || month > 12) return false
-  if (day < 1 || day > daysInUtcMonth(year, month)) return false
-  if (hour > 23 || minute > 59 || second > 59) return false
-  if (offsetHour > 23 || offsetMinute > 59) return false
-  return !Number.isNaN(Date.parse(value))
+  const offsetHour = match[8] === undefined ? 0 : Number(match[8])
+  const offsetMinute = match[9] === undefined ? 0 : Number(match[9])
+  if (
+    month < 1 || month > 12 ||
+    hour > 23 || minute > 59 || second > 59 ||
+    offsetHour > 23 || offsetMinute > 59
+  ) return false
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+  return day >= 1 && day <= days[month - 1]
 }
 
-function compareOrder(left, right) {
-  if (left.sequence !== right.sequence) return left.sequence - right.sequence
-  if (left.created_at !== right.created_at) return left.created_at < right.created_at ? -1 : 1
-  if (left.message_id !== right.message_id) return left.message_id < right.message_id ? -1 : 1
-  return 0
+function nullable(value, predicate) {
+  return value === null || predicate(value)
 }
 
-function sameOrder(left, right) {
+function nonnegativeInt(value) {
+  return Number.isSafeInteger(value) && value >= 0
+}
+
+function positiveInt(value) {
+  return Number.isSafeInteger(value) && value > 0
+}
+
+function orderPoint(value) {
   return (
-    left.sequence === right.sequence &&
-    left.created_at === right.created_at &&
-    left.message_id === right.message_id
+    exactKeys(value, ['sequence', 'created_at', 'message_id']) &&
+    positiveInt(value.sequence) &&
+    datetime(value.created_at) &&
+    uuid(value.message_id)
   )
 }
 
-function isOrderKey(value) {
-  return (
-    hasExactKeys(value, ORDER_KEYS) &&
-    isSafeNonNegativeInteger(value.sequence) &&
-    isCanonicalIsoDatetime(value.created_at) &&
-    isCanonicalUuid(value.message_id)
-  )
+function compareOrder(a, b) {
+  return a.sequence - b.sequence
 }
 
-function isConnectionIdentity(value) {
-  return (
-    hasExactKeys(value, CONNECTION_KEYS) &&
-    isCanonicalUuid(value.connection_id) &&
-    isNonEmptyString(value.agent_name) &&
-    (value.codename === null || isNonEmptyString(value.codename)) &&
-    isNonEmptyString(value.label)
-  )
+/** The canonical attachment shape, for sidecars that carry a command's manifest. */
+export function isRemoteIngressAttachment(value) {
+  return attachment(value)
 }
 
-function isAttachment(value) {
-  if (hasExactKeys(value, METADATA_ATTACHMENT_KEYS)) {
+function strictlyOrdered(rows) {
+  return rows.every((row, index) => index === 0 || compareOrder(rows[index - 1].order, row.order) < 0)
+}
+
+function attachment(value) {
+  if (!record(value) || value.materialization === 'metadata') {
     return (
+      exactKeys(value, [
+        'materialization',
+        'filename',
+        'mime_type',
+        'type',
+        'size_bytes',
+        'resource_id',
+      ]) &&
       value.materialization === 'metadata' &&
-      isNonEmptyString(value.filename) &&
-      isNonEmptyString(value.mime_type) &&
-      ATTACHMENT_TYPES.has(value.type) &&
-      isSafeNonNegativeInteger(value.size_bytes) &&
-      isCanonicalUuid(value.resource_id)
+      nonempty(value.filename) &&
+      nonempty(value.mime_type) &&
+      nonempty(value.type) &&
+      nullable(value.size_bytes, nonnegativeInt) &&
+      uuid(value.resource_id)
     )
   }
-  if (hasExactKeys(value, UNAVAILABLE_ATTACHMENT_KEYS)) {
+  if (value.materialization === 'unavailable') {
     return (
-      value.materialization === 'unavailable' &&
-      isNonEmptyString(value.filename) &&
-      isNonEmptyString(value.mime_type) &&
-      ATTACHMENT_TYPES.has(value.type) &&
-      (value.size_bytes === null || isSafeNonNegativeInteger(value.size_bytes)) &&
-      (value.resource_id === null || isCanonicalUuid(value.resource_id)) &&
-      UNAVAILABLE_REASONS.has(value.reason)
+      exactKeys(value, [
+        'materialization',
+        'filename',
+        'mime_type',
+        'type',
+        'size_bytes',
+        'resource_id',
+        'reason',
+      ]) &&
+      nonempty(value.filename) &&
+      nonempty(value.mime_type) &&
+      nonempty(value.type) &&
+      nullable(value.size_bytes, nonnegativeInt) &&
+      value.resource_id === null &&
+      ['missing_resource', 'legacy_inline_payload', 'access_denied'].includes(value.reason)
     )
   }
   return false
 }
 
-export function validateRemoteCommandProjectScope(projectScope, authorityKind) {
-  if (authorityKind === 'owner') {
-    return projectScope === null ? null : 'owner command project_scope must be null'
-  }
-  if (authorityKind !== 'delegated') {
-    return 'unknown command authority kind'
-  }
-  if (!hasExactKeys(projectScope, PROJECT_SCOPE_KEYS)) {
-    return 'delegated command project_scope must have the exact v1 key set'
-  }
-  if (
-    projectScope.kind !== DELEGATED_PROJECT_SCOPE_KIND ||
-    projectScope.policy_id !== DELEGATED_PROJECT_SCOPE_POLICY_ID ||
-    !isCanonicalUuid(projectScope.project_id) ||
-    !isNonBlankString(projectScope.instruction)
-  ) {
-    return 'delegated command project_scope fields are invalid'
-  }
-  return null
-}
-
-export function isRemoteCommandProjectScope(projectScope, authorityKind) {
-  return validateRemoteCommandProjectScope(projectScope, authorityKind) === null
-}
-
-function isCommandAuthority(authority, requester, scopeAware) {
-  if (!hasExactKeys(authority, AUTHORITY_KEYS)) return false
-  if (
-    !COMMAND_AUTHORITIES.has(authority.kind) ||
-    !isCanonicalUuid(authority.requested_by_user_id) ||
-    !isCanonicalUuid(authority.connection_owner_user_id) ||
-    authority.decision_source !== 'server' ||
-    authority.requested_by_user_id !== requester.user_id
-  ) {
-    return false
-  }
-  if (authority.kind === 'owner') {
-    return (
-      authority.mode === 'owner' &&
-      authority.requested_by_user_id === authority.connection_owner_user_id
-    )
-  }
+function addressee(value) {
   return (
-    scopeAware &&
-    DELEGATED_MODES.has(authority.mode) &&
-    authority.requested_by_user_id !== authority.connection_owner_user_id
+    exactKeys(value, ['connection_id', 'agent_name', 'codename', 'label']) &&
+    uuid(value.connection_id) &&
+    nullable(value.agent_name, nonempty) &&
+    nullable(value.codename, nonempty) &&
+    nonempty(value.label)
   )
 }
 
-function isValidContent(content, roomContextAware) {
-  if (!isPlainObject(content)) return false
-  const allowed = roomContextAware ? CONTENT_ROOM_KEYS : CONTENT_KEYS
-  if (!hasOnlyAllowedKeys(content, allowed)) return false
-  if (content.mode !== 'full' || typeof content.body !== 'string' || content.complete !== true) {
-    return false
-  }
-  if (Object.hasOwn(content, 'updated_at') && !isCanonicalIsoDatetime(content.updated_at)) {
-    return false
-  }
-  return true
+function authority(value) {
+  if (
+    !exactKeys(value, [
+      'kind',
+      'mode',
+      'requested_by_user_id',
+      'connection_owner_user_id',
+      'decision_source',
+    ]) ||
+    !AUTHORITY_KINDS.has(value.kind) ||
+    !AUTHORITY_MODES.has(value.mode) ||
+    !uuid(value.requested_by_user_id) ||
+    !uuid(value.connection_owner_user_id) ||
+    value.decision_source !== 'server'
+  ) return false
+  const requesterIsOwner = value.requested_by_user_id === value.connection_owner_user_id
+  return (value.kind === 'owner') === requesterIsOwner && !(value.mode === 'owner' && value.kind !== 'owner')
 }
 
-function isCommand(value, connectionId, { scopeAware = true, roomContextAware = false } = {}) {
-  const expectedKeys = scopeAware ? SCOPED_COMMAND_KEYS : BASE_COMMAND_KEYS
-  if (!hasExactKeys(value, expectedKeys)) return false
-  if (!isCanonicalUuid(value.message_id) || !isOrderKey(value.order)) return false
-  if (value.order.message_id !== value.message_id) return false
-  if (!isValidContent(value.content, roomContextAware)) return false
-  if (!Array.isArray(value.attachments) || !value.attachments.every(isAttachment)) return false
-  if (
-    !hasExactKeys(value.requester, REQUESTER_KEYS) ||
-    !isCanonicalUuid(value.requester.user_id) ||
-    !isNonEmptyString(value.requester.display_name)
-  ) {
-    return false
-  }
-  if (!isCommandAuthority(value.authority, value.requester, scopeAware)) return false
-  if (scopeAware && !isRemoteCommandProjectScope(value.project_scope, value.authority.kind)) {
-    return false
-  }
-  if (!isConnectionIdentity(value.addressee) || value.addressee.connection_id !== connectionId) {
-    return false
-  }
-  if (
-    !hasExactKeys(value.delivery, DELIVERY_KEYS) ||
-    !isCanonicalUuid(value.delivery.provenance_ref) ||
-    !isCanonicalUuid(value.delivery.turn_id) ||
-    !isCanonicalUuid(value.delivery.primary_provenance_ref) ||
-    typeof value.delivery.is_primary !== 'boolean'
-  ) {
-    return false
-  }
-  return true
-}
-
-function isControl(value) {
-  if (!isPlainObject(value)) return false
-  const keys = Object.keys(value)
-  if (keys.some((key) => !CONTROL_KEYS.has(key))) return false
+export function isRemoteCommandProjectScope(value, authorityKind) {
+  if (authorityKind === 'owner') return value === null
   return (
-    isCanonicalUuid(value.id) &&
-    CONTROL_VERBS.has(value.verb) &&
-    isCanonicalIsoDatetime(value.issued_at) &&
-    isCanonicalUuid(value.issued_by_user_id) &&
-    (value.args === undefined || isPlainObject(value.args))
+    authorityKind === 'delegated' &&
+    exactKeys(value, ['kind', 'policy_id', 'project_id', 'instruction']) &&
+    value.kind === 'devspec_project' &&
+    value.policy_id === 'delegated_project_v1' &&
+    uuid(value.project_id) &&
+    typeof value.instruction === 'string' &&
+    value.instruction.trim().length > 0
   )
 }
 
-function isRoomAttachment(att) {
-  if (!isPlainObject(att)) return false
-  return isNonEmptyString(att.filename)
-}
-
-function isContextRoomMetadata(room) {
-  if (!isPlainObject(room) || !hasOnlyAllowedKeys(room, CONTEXT_ROOM_KEYS)) return false
-  if (!isCanonicalIsoDatetime(room.updated_at)) return false
-  if (room.author_connection_id !== null && room.author_connection_id !== undefined && !isCanonicalUuid(room.author_connection_id)) {
-    return false
-  }
-  if (room.author_codename !== null && room.author_codename !== undefined && !isNonEmptyString(room.author_codename)) {
-    return false
-  }
-  if (room.addressed_to !== null && room.addressed_to !== undefined) {
-    if (!hasExactKeys(room.addressed_to, CONTEXT_ADDRESSED_TO_KEYS)) return false
-    if (!isCanonicalUuid(room.addressed_to.connection_id) || !isNonEmptyString(room.addressed_to.agent_name)) return false
-    if (room.addressed_to.codename !== null && !isNonEmptyString(room.addressed_to.codename)) return false
-  }
-  if (room.work_trail !== undefined && room.work_trail !== null && typeof room.work_trail !== 'string') {
-    return false
-  }
-  if (room.trail_events !== undefined && room.trail_events !== null && !Array.isArray(room.trail_events)) {
-    return false
-  }
-  return true
-}
-
-function isContextEntry(value, expectedKind, roomContextAware = false) {
-  if (!isPlainObject(value)) return false
-  const allowed = roomContextAware ? CONTEXT_ENTRY_ROOM_KEYS : CONTEXT_ENTRY_KEYS
-  if (!hasOnlyAllowedKeys(value, allowed)) return false
-  for (const req of CONTEXT_ENTRY_KEYS) {
-    if (!Object.hasOwn(value, req)) return false
-  }
-  if (!isCanonicalUuid(value.message_id) || !isOrderKey(value.order)) return false
-  if (value.order.message_id !== value.message_id) return false
-  if (!hasExactKeys(value.actor, CONTEXT_ACTOR_KEYS) || value.actor.kind !== expectedKind) {
-    return false
-  }
-  if (value.actor.user_id !== null && !isCanonicalUuid(value.actor.user_id)) return false
-  if (!isNonEmptyString(value.actor.display_name)) return false
-  if (value.actor.agent_tool !== null && !isNonEmptyString(value.actor.agent_tool)) return false
-  if (value.actor.model !== null && !isNonEmptyString(value.actor.model)) return false
-  if (!isNonEmptyString(value.source_type) || value.relationship !== 'within_window') return false
-  if (typeof value.content !== 'string' || value.advisory !== true) return false
-  if (Object.hasOwn(value, 'attachments')) {
-    if (!Array.isArray(value.attachments) || !value.attachments.every(isRoomAttachment)) return false
-  }
-  if (Object.hasOwn(value, 'room')) {
-    if (value.room !== null && !isContextRoomMetadata(value.room)) return false
-  }
-  return true
-}
-
-function isStrictlyOrdered(entries) {
-  for (let i = 1; i < entries.length; i++) {
-    if (compareOrder(entries[i - 1].order, entries[i].order) >= 0) return false
-  }
-  return true
-}
-
-function isActivePlanActor(value, allowedKinds) {
-  if (!hasExactKeys(value, ACTIVE_PLAN_ACTOR_KEYS) || !allowedKinds.has(value.kind)) return false
-  if (value.kind === 'connection') {
-    return (
-      isCanonicalUuid(value.connection_id) &&
-      isNonBlankString(value.agent_name) &&
-      (value.codename === null || isNonBlankString(value.codename))
-    )
-  }
-  return value.connection_id === null && value.agent_name === null && value.codename === null
-}
-
-function isActivePlanStep(value) {
+function command(value, scopeAware) {
+  const keys = [
+    'message_id',
+    'order',
+    'content',
+    'attachments',
+    'requester',
+    'authority',
+    'addressee',
+    'delivery',
+    ...(scopeAware ? ['project_scope'] : []),
+  ]
   return (
-    hasExactKeys(value, ACTIVE_PLAN_STEP_KEYS) &&
-    isCanonicalUuid(value.id) &&
-    isSafeNonNegativeInteger(value.position) &&
-    value.position < 64 &&
-    isNonBlankString(value.title) &&
-    ACTIVE_PLAN_STEP_STATUSES.has(value.status)
+    exactKeys(value, keys) &&
+    uuid(value.message_id) &&
+    orderPoint(value.order) &&
+    value.message_id === value.order.message_id &&
+    exactKeys(value.content, ['mode', 'body', 'complete']) &&
+    value.content.mode === 'full' &&
+    typeof value.content.body === 'string' &&
+    value.content.complete === true &&
+    Array.isArray(value.attachments) &&
+    value.attachments.every(attachment) &&
+    exactKeys(value.requester, ['user_id', 'display_name']) &&
+    uuid(value.requester.user_id) &&
+    nullable(value.requester.display_name, nonempty) &&
+    authority(value.authority) &&
+    value.requester.user_id === value.authority.requested_by_user_id &&
+    (scopeAware
+      ? isRemoteCommandProjectScope(value.project_scope, value.authority.kind)
+      : value.authority.kind === 'owner') &&
+    addressee(value.addressee) &&
+    exactKeys(value.delivery, [
+      'provenance_ref',
+      'turn_id',
+      'primary_provenance_ref',
+      'is_primary',
+    ]) &&
+    uuid(value.delivery.provenance_ref) &&
+    uuid(value.delivery.turn_id) &&
+    uuid(value.delivery.primary_provenance_ref) &&
+    typeof value.delivery.is_primary === 'boolean'
   )
 }
 
-function isActiveSessionPlanSummary(value) {
-  if (!hasExactKeys(value, ACTIVE_PLAN_KEYS)) return false
-  if (
-    !isCanonicalUuid(value.id) ||
-    !isNonBlankString(value.title) ||
-    !isSafePositiveInteger(value.revision) ||
-    value.status !== 'active' ||
-    !isCanonicalIsoDatetime(value.created_at) ||
-    !isActivePlanActor(value.origin, ACTIVE_PLAN_ORIGIN_KINDS) ||
-    !isActivePlanActor(value.steward, ACTIVE_PLAN_STEWARD_KINDS) ||
-    !hasExactKeys(value.owner, REQUESTER_KEYS) ||
-    !isCanonicalUuid(value.owner.user_id) ||
-    !isNonBlankString(value.owner.display_name) ||
-    typeof value.orphaned !== 'boolean' ||
-    !hasExactKeys(value.progress, ACTIVE_PLAN_PROGRESS_KEYS) ||
-    !Array.isArray(value.steps) ||
-    value.steps.length > 64 ||
-    !value.steps.every(isActivePlanStep)
-  ) {
-    return false
-  }
-  if (value.orphaned && value.steward.kind !== 'connection') return false
-  const stepIds = new Set()
-  for (let i = 0; i < value.steps.length; i++) {
-    const step = value.steps[i]
-    if (stepIds.has(step.id)) return false
-    stepIds.add(step.id)
-    if (i > 0 && value.steps[i - 1].position >= step.position) return false
-  }
-  const completed = value.steps.filter((step) => step.status === 'completed').length
-  const skipped = value.steps.filter((step) => step.status === 'skipped').length
-  const terminal = completed + skipped
+function actor(value) {
   return (
-    value.progress.total === value.steps.length &&
-    value.progress.completed === completed &&
-    value.progress.skipped === skipped &&
-    value.progress.terminal === terminal
+    exactKeys(value, ['kind', 'user_id', 'display_name', 'agent_tool', 'model']) &&
+    ACTOR_KINDS.has(value.kind) &&
+    nullable(value.user_id, uuid) &&
+    nonempty(value.display_name) &&
+    nullable(value.agent_tool, nonempty) &&
+    nullable(value.model, nonempty)
   )
 }
 
-export function isActiveSessionPlansProjectionV1(value) {
-  if (!hasExactKeys(value, ACTIVE_PLAN_PROJECTION_KEYS)) return false
-  if (
-    value.version !== 1 ||
-    value.advisory !== true ||
-    value.authority_note !== ACTIVE_PLAN_AUTHORITY_NOTE ||
-    !hasExactKeys(value.inventory, ACTIVE_PLAN_INVENTORY_KEYS) ||
-    !isSafeNonNegativeInteger(value.inventory.returned) ||
-    !isSafeNonNegativeInteger(value.inventory.total_known) ||
-    value.inventory.truncated !== false ||
-    !Array.isArray(value.plans) ||
-    value.plans.length > 64 ||
-    !value.plans.every(isActiveSessionPlanSummary)
-  ) {
-    return false
-  }
-  const planIds = new Set(value.plans.map((plan) => plan.id))
+function contextEntry(value) {
   return (
-    planIds.size === value.plans.length &&
-    value.inventory.returned === value.plans.length &&
-    value.inventory.total_known === value.plans.length
+    exactKeys(value, [
+      'message_id',
+      'order',
+      'actor',
+      'source_type',
+      'relationship',
+      'content',
+      'advisory',
+    ]) &&
+    uuid(value.message_id) &&
+    orderPoint(value.order) &&
+    value.message_id === value.order.message_id &&
+    actor(value.actor) &&
+    nonempty(value.source_type) &&
+    RELATIONSHIPS.has(value.relationship) &&
+    typeof value.content === 'string' &&
+    value.advisory === true
   )
 }
 
-export function validateActiveSessionPlansV1(value) {
-  return isActiveSessionPlansProjectionV1(value)
-    ? null
-    : 'active_session_plans projection is malformed or inconsistent'
+export function isRemoteIngressTypedContext(value) {
+  if (!exactKeys(value, CONTEXT_BUCKETS.map(([name]) => name))) return false
+  return CONTEXT_BUCKETS.every(([name, kind]) =>
+    Array.isArray(value[name]) &&
+    value[name].every((entry) => contextEntry(entry) && entry.actor.kind === kind) &&
+    strictlyOrdered(value[name]),
+  )
 }
 
-function isSessionPollItem(poll) {
-  if (!hasExactKeys(poll, SESSION_POLL_KEYS)) return false
+export function isRemoteIngressBoundedMetadata(value) {
   if (
-    !isCanonicalUuid(poll.id) ||
-    !isNonBlankString(poll.question) ||
-    (poll.status !== 'open' && poll.status !== 'closed') ||
-    !isSafePositiveInteger(poll.revision) ||
-    !isCanonicalIsoDatetime(poll.created_at) ||
-    (poll.closed_at !== null && !isCanonicalIsoDatetime(poll.closed_at)) ||
-    !hasExactKeys(poll.creator, SESSION_POLL_CREATOR_KEYS) ||
-    (poll.recommendation_index !== null && !isSafeNonNegativeInteger(poll.recommendation_index)) ||
-    !Array.isArray(poll.options) ||
-    poll.options.length < 2 ||
-    !isSafeNonNegativeInteger(poll.total_votes)
-  ) {
+    !exactKeys(value, [
+      'policy_version',
+      'returned',
+      'total_known',
+      'source_window',
+      'truncated',
+      'has_more',
+      'next_cursor',
+      'fetch_id',
+      'omission_reason',
+    ]) ||
+    !SUPPORTED_POLICY_VERSIONS.has(value.policy_version) ||
+    !nonnegativeInt(value.returned) ||
+    !nullable(value.total_known, nonnegativeInt) ||
+    !exactKeys(value.source_window, ['start', 'end']) ||
+    !nullable(value.source_window.start, orderPoint) ||
+    !nullable(value.source_window.end, orderPoint) ||
+    typeof value.truncated !== 'boolean' ||
+    typeof value.has_more !== 'boolean' ||
+    !nullable(value.next_cursor, nonempty) ||
+    !nullable(value.fetch_id, nonempty) ||
+    !nullable(value.omission_reason, (reason) => OMISSION_REASONS.has(reason))
+  ) return false
+  const { start, end } = value.source_window
+  if ((start === null) !== (end === null) || (start && end && compareOrder(start, end) > 0)) return false
+  if (value.has_more && !value.next_cursor) return false
+  if (value.truncated && (!value.omission_reason || !value.fetch_id)) return false
+  return value.total_known === null || value.returned <= value.total_known
+}
+
+function control(value) {
+  if (!optionalExactKeys(value, ['id', 'verb', 'issued_at', 'issued_by_user_id'], ['args'])) return false
+  if (!uuid(value.id) || !CONTROL_VERBS.has(value.verb) || !datetime(value.issued_at) || !uuid(value.issued_by_user_id)) {
     return false
   }
-  for (let i = 0; i < poll.options.length; i++) {
-    const opt = poll.options[i]
-    if (
-      !hasExactKeys(opt, SESSION_POLL_OPTION_KEYS) ||
-      opt.index !== i ||
-      !isNonBlankString(opt.label) ||
-      !isSafeNonNegativeInteger(opt.vote_count) ||
-      !Array.isArray(opt.voters) ||
-      !opt.voters.every((v) => hasExactKeys(v, SESSION_POLL_VOTER_KEYS) && isCanonicalUuid(v.user_id) && isNonBlankString(v.display_name))
-    ) {
+  if (Object.hasOwn(value, 'args')) {
+    if (!optionalExactKeys(value.args, [], ['model', 'thinking'])) return false
+    if (Object.hasOwn(value.args, 'model') && !nonempty(value.args.model)) return false
+    if (Object.hasOwn(value.args, 'thinking') && !THINKING_LEVELS.has(value.args.thinking)) return false
+  }
+  if (value.verb === 'set_model' && !value.args?.model) return false
+  return value.verb !== 'set_thinking' || !!value.args?.thinking
+}
+
+function sameAddressee(a, b) {
+  return (
+    a.connection_id === b.connection_id &&
+    a.agent_name === b.agent_name &&
+    a.codename === b.codename &&
+    a.label === b.label
+  )
+}
+
+function rowsFitWindow(rows, window) {
+  if (rows.length === 0) return true
+  const { start, end } = window.source_window
+  return !!start && !!end && rows.every(
+    (row) => compareOrder(row.order, start) >= 0 && compareOrder(row.order, end) <= 0,
+  )
+}
+
+function activePlanIdentity(value) {
+  if (!exactKeys(value, ['kind', 'connection_id', 'agent_name', 'codename'])) return false
+  if (typeof value.agent_name !== 'string' || value.agent_name.length < 1 ||
+      value.agent_name.length > ACTIVE_PLAN_MAX_IDENTITY_CHARS ||
+      !nullable(value.codename, (item) => nonempty(item) && item.length <= ACTIVE_PLAN_MAX_IDENTITY_CHARS)) {
+    return false
+  }
+  return value.kind === 'dev'
+    ? value.connection_id === null
+    : value.kind === 'connection' && uuid(value.connection_id)
+}
+
+function activePlanStep(value) {
+  if (!optionalExactKeys(
+    value,
+    ['id', 'position', 'title', 'status'],
+    ['failure_reason', 'retryable'],
+  )) return false
+  if (!uuid(value.id) || !Number.isSafeInteger(value.position) ||
+      value.position < 0 || value.position >= ACTIVE_PLAN_MAX_STEPS ||
+      !nonempty(value.title) || value.title.length > ACTIVE_PLAN_MAX_TITLE_CHARS ||
+      !['pending', 'in_progress', 'completed', 'failed', 'skipped'].includes(value.status)) return false
+  const hasFailure = Object.hasOwn(value, 'failure_reason') || Object.hasOwn(value, 'retryable')
+  if ((value.status === 'failed') !== hasFailure) return false
+  if (value.status === 'failed') {
+    if (typeof value.retryable !== 'boolean') return false
+    if (Object.hasOwn(value, 'failure_reason') &&
+        (!nonempty(value.failure_reason) || value.failure_reason.length > ACTIVE_PLAN_MAX_FAILURE_REASON_CHARS)) {
       return false
     }
   }
   return true
 }
 
+function activePlan(value) {
+  if (!exactKeys(value, [
+    'id', 'title', 'revision', 'status', 'created_at', 'origin', 'steward', 'owner',
+    'orphaned', 'progress', 'steps',
+  ])) return false
+  if (!uuid(value.id) || !nonempty(value.title) || value.title.length > ACTIVE_PLAN_MAX_TITLE_CHARS ||
+      !positiveInt(value.revision) || value.status !== 'active' || !datetime(value.created_at) ||
+      !activePlanIdentity(value.origin) || !activePlanIdentity(value.steward) ||
+      !exactKeys(value.owner, ['user_id', 'display_name']) || !uuid(value.owner.user_id) ||
+      !nonempty(value.owner.display_name) || value.owner.display_name.length > ACTIVE_PLAN_MAX_IDENTITY_CHARS ||
+      typeof value.orphaned !== 'boolean' ||
+      !exactKeys(value.progress, ['terminal', 'total', 'completed', 'skipped']) ||
+      !Object.values(value.progress).every(nonnegativeInt) ||
+      !Array.isArray(value.steps) || value.steps.length > ACTIVE_PLAN_MAX_STEPS ||
+      !value.steps.every(activePlanStep)) return false
+  if (new Set(value.steps.map((step) => step.id)).size !== value.steps.length ||
+      new Set(value.steps.map((step) => step.position)).size !== value.steps.length ||
+      value.steps.some((step, index) => index > 0 && step.position <= value.steps[index - 1].position)) {
+    return false
+  }
+  const completed = value.steps.filter((step) => step.status === 'completed').length
+  const skipped = value.steps.filter((step) => step.status === 'skipped').length
+  return value.progress.total === value.steps.length &&
+    value.progress.completed === completed &&
+    value.progress.skipped === skipped &&
+    value.progress.terminal === completed + skipped
+}
+
+export function isActiveSessionPlansProjectionV1(value) {
+  if (!exactKeys(value, ['version', 'advisory', 'authority_note', 'inventory', 'plans']) ||
+      value.version !== ACTIVE_PLAN_PROJECTION_VERSION || value.advisory !== true ||
+      value.authority_note !== ACTIVE_PLAN_AUTHORITY_NOTE ||
+      !exactKeys(value.inventory, ['returned', 'total_known', 'truncated']) ||
+      !positiveInt(value.inventory.returned) || value.inventory.returned > ACTIVE_PLAN_MAX_PLANS ||
+      !positiveInt(value.inventory.total_known) || value.inventory.total_known > ACTIVE_PLAN_MAX_PLANS ||
+      value.inventory.truncated !== false || !Array.isArray(value.plans) ||
+      value.plans.length < 1 || value.plans.length > ACTIVE_PLAN_MAX_PLANS ||
+      !value.plans.every(activePlan) ||
+      new Set(value.plans.map((plan) => plan.id)).size !== value.plans.length ||
+      value.inventory.returned !== value.plans.length ||
+      value.inventory.total_known !== value.plans.length) return false
+  const chars = value.plans.reduce((sum, plan) => sum + plan.title.length +
+    plan.origin.agent_name.length + (plan.origin.codename?.length ?? 0) +
+    plan.steward.agent_name.length + (plan.steward.codename?.length ?? 0) +
+    plan.owner.display_name.length + plan.steps.reduce((stepSum, step) =>
+      stepSum + step.title.length + (step.failure_reason?.length ?? 0), 0), 0)
+  return chars <= ACTIVE_PLAN_MAX_TOTAL_TEXT_CHARS
+}
+
+/**
+ * The sender's response style for one delivered command (item af5e3d6c).
+ *
+ * Read verbatim and never recomputed: the server froze this onto the message
+ * row when it was sent, so an older command keeps rendering the same way on a
+ * later poll.
+ */
+/**
+ * One poll option. `percent` is server-computed and `voters` are display names,
+ * both already bounded by the server's own schema; this re-checks rather than
+ * trusts, because the inbox is a file on disk that outlives the poll.
+ */
+function pollOption(value) {
+  return (
+    exactKeys(value, ['label', 'human_vote_count', 'percent', 'voters']) &&
+    nonempty(value.label) && value.label.length <= SESSION_POLL_MAX_LABEL_CHARS &&
+    nonnegativeInt(value.human_vote_count) &&
+    nonnegativeInt(value.percent) &&
+    Array.isArray(value.voters) && value.voters.length <= 32 &&
+    value.voters.every((voter) => nonempty(voter) && voter.length <= SESSION_POLL_MAX_VOTER_CHARS)
+  )
+}
+
+function poll(value) {
+  return (
+    exactKeys(value, [
+      'id', 'question', 'status', 'revision', 'multi_select', 'allow_write_in',
+      'recommendation', 'human_voter_count', 'winning_labels', 'options',
+    ]) &&
+    uuid(value.id) &&
+    nonempty(value.question) && value.question.length <= SESSION_POLL_MAX_QUESTION_CHARS &&
+    (value.status === 'active' || value.status === 'ended') &&
+    positiveInt(value.revision) &&
+    typeof value.multi_select === 'boolean' &&
+    typeof value.allow_write_in === 'boolean' &&
+    nullable(value.recommendation, (label) =>
+      nonempty(label) && label.length <= SESSION_POLL_MAX_LABEL_CHARS) &&
+    nonnegativeInt(value.human_voter_count) &&
+    Array.isArray(value.winning_labels) &&
+    value.winning_labels.length <= SESSION_POLL_MAX_OPTIONS &&
+    value.winning_labels.every((label) =>
+      nonempty(label) && label.length <= SESSION_POLL_MAX_LABEL_CHARS) &&
+    Array.isArray(value.options) &&
+    value.options.length >= 2 && value.options.length <= SESSION_POLL_MAX_OPTIONS &&
+    value.options.every(pollOption)
+  )
+}
+
+/** The advisory poll inventory delivered beside a canonical command (b1e26146). */
 export function isSessionPollsProjectionV1(value) {
-  if (!hasExactKeys(value, SESSION_POLL_PROJECTION_KEYS)) return false
-  if (
-    value.version !== 1 ||
-    value.advisory !== true ||
-    value.authority_note !== SESSION_POLL_AUTHORITY_NOTE ||
-    !hasExactKeys(value.inventory, ACTIVE_PLAN_INVENTORY_KEYS) ||
-    !isSafeNonNegativeInteger(value.inventory.returned) ||
-    !isSafeNonNegativeInteger(value.inventory.total_known) ||
-    value.inventory.truncated !== false ||
-    !Array.isArray(value.polls) ||
-    !value.polls.every(isSessionPollItem)
-  ) {
-    return false
-  }
-  return value.inventory.returned === value.polls.length
+  if (!exactKeys(value, ['version', 'advisory', 'authority_note', 'inventory', 'polls']) ||
+      value.version !== SESSION_POLL_PROJECTION_VERSION || value.advisory !== true ||
+      value.authority_note !== SESSION_POLL_AUTHORITY_NOTE ||
+      !exactKeys(value.inventory, ['active_returned', 'ended_returned', 'truncated_ended']) ||
+      !nonnegativeInt(value.inventory.active_returned) ||
+      value.inventory.active_returned > SESSION_POLL_MAX_ACTIVE ||
+      !nonnegativeInt(value.inventory.ended_returned) ||
+      value.inventory.ended_returned > SESSION_POLL_MAX_ENDED ||
+      typeof value.inventory.truncated_ended !== 'boolean' ||
+      !Array.isArray(value.polls) || value.polls.length < 1 ||
+      value.polls.length > SESSION_POLL_MAX_ACTIVE + SESSION_POLL_MAX_ENDED ||
+      !value.polls.every(poll) ||
+      new Set(value.polls.map((entry) => entry.id)).size !== value.polls.length) return false
+  // The counts must describe the array they arrived with, or a reader can be told
+  // there is one open poll while being handed none.
+  const active = value.polls.filter((entry) => entry.status === 'active').length
+  const ended = value.polls.filter((entry) => entry.status === 'ended').length
+  if (active !== value.inventory.active_returned || ended !== value.inventory.ended_returned) return false
+  return pollTextChars(value.polls) <= SESSION_POLL_MAX_TOTAL_TEXT_CHARS
 }
 
+function pollTextChars(polls) {
+  return polls.reduce((sum, entry) => sum + entry.question.length +
+    (entry.recommendation?.length ?? 0) +
+    entry.winning_labels.reduce((n, label) => n + label.length, 0) +
+    entry.options.reduce((n, option) => n + option.label.length +
+      option.voters.reduce((v, voter) => v + voter.length, 0), 0), 0)
+}
+
+/**
+ * The v2 poll inventory (item bba35976). Its counts must tell the truth about what
+ * was left out: `truncated_*` exactly when fewer were returned than exist, and the
+ * continuation exactly when anything was truncated, so a reader is never shown a
+ * partial list that looks complete.
+ */
 export function isSessionPollsProjectionV2(value) {
-  if (!hasExactKeys(value, SESSION_POLL_PROJECTION_KEYS)) return false
-  if (
-    value.version !== SESSION_POLL_PROJECTION_VERSION_2 ||
-    value.advisory !== true ||
-    value.authority_note !== SESSION_POLL_AUTHORITY_NOTE ||
-    !isPlainObject(value.inventory) ||
-    !hasOnlyAllowedKeys(value.inventory, SESSION_POLL_V2_INVENTORY_KEYS) ||
-    !isSafeNonNegativeInteger(value.inventory.returned) ||
-    !isSafeNonNegativeInteger(value.inventory.total_known) ||
-    typeof value.inventory.truncated !== 'boolean' ||
-    !Array.isArray(value.polls) ||
-    !value.polls.every(isSessionPollItem)
-  ) {
-    return false
-  }
-  return value.inventory.returned === value.polls.length
+  if (!exactKeys(value, ['version', 'advisory', 'authority_note', 'inventory', 'polls']) ||
+      value.version !== SESSION_POLL_PROJECTION_VERSION_2 || value.advisory !== true ||
+      value.authority_note !== SESSION_POLL_AUTHORITY_NOTE) return false
+  const inv = value.inventory
+  if (!exactKeys(inv, ['active_total', 'active_returned', 'truncated_active', 'ended_total', 'ended_returned', 'truncated_ended', 'continuation']) ||
+      ![inv.active_total, inv.active_returned, inv.ended_total, inv.ended_returned].every(nonnegativeInt) ||
+      inv.ended_returned > SESSION_POLL_MAX_ENDED ||
+      inv.active_returned > inv.active_total || inv.ended_returned > inv.ended_total ||
+      inv.truncated_active !== (inv.active_returned < inv.active_total) ||
+      inv.truncated_ended !== (inv.ended_returned < inv.ended_total) ||
+      inv.continuation !== ((inv.truncated_active || inv.truncated_ended) ? SESSION_POLL_CONTINUATION : null) ||
+      inv.active_total + inv.ended_total === 0 ||
+      !Array.isArray(value.polls) || !value.polls.every(poll) ||
+      new Set(value.polls.map((entry) => entry.id)).size !== value.polls.length) return false
+  const active = value.polls.filter((entry) => entry.status === 'active').length
+  const ended = value.polls.filter((entry) => entry.status === 'ended').length
+  if (active !== inv.active_returned || ended !== inv.ended_returned) return false
+  return pollTextChars(value.polls) <= SESSION_POLL_MAX_TOTAL_TEXT_CHARS
 }
 
+/** Either poll inventory a server may send; v2 is what this plugin asks for. */
 export function isSessionPollsProjection(value) {
   return isSessionPollsProjectionV1(value) || isSessionPollsProjectionV2(value)
 }
 
-function isDiscussionPointItem(pt) {
-  if (!hasExactKeys(pt, STILL_TO_DISCUSS_POINT_KEYS)) return false
+function discussionPoint(value) {
   return (
-    isCanonicalUuid(pt.id) &&
-    isNonBlankString(pt.title) &&
-    (pt.body === null || typeof pt.body === 'string') &&
-    (pt.status === 'open' || pt.status === 'resolved') &&
-    isSafeNonNegativeInteger(pt.position) &&
-    isCanonicalIsoDatetime(pt.created_at) &&
-    (pt.resolved_at === null || isCanonicalIsoDatetime(pt.resolved_at)) &&
-    (pt.source_message_id === null || isCanonicalUuid(pt.source_message_id))
+    exactKeys(value, ['id', 'title', 'state', 'preview']) &&
+    uuid(value.id) &&
+    nonempty(value.title) && value.title.length <= STILL_TO_DISCUSS_MAX_TITLE_CHARS &&
+    (value.state === 'open' || value.state === 'discussed') &&
+    typeof value.preview === 'string' && value.preview.length <= STILL_TO_DISCUSS_MAX_PREVIEW_CHARS
   )
 }
 
+/** The advisory Still to Discuss snapshot delivered beside a command (b1e26146). */
 export function isStillToDiscussProjectionV1(value) {
-  if (!hasExactKeys(value, STILL_TO_DISCUSS_PROJECTION_KEYS)) return false
-  if (
-    value.version !== 1 ||
-    value.advisory !== true ||
-    value.authority_note !== STILL_TO_DISCUSS_AUTHORITY_NOTE ||
-    !hasExactKeys(value.inventory, ACTIVE_PLAN_INVENTORY_KEYS) ||
-    !isSafeNonNegativeInteger(value.inventory.returned) ||
-    !isSafeNonNegativeInteger(value.inventory.total_known) ||
-    value.inventory.truncated !== false ||
-    !Array.isArray(value.points) ||
-    !value.points.every(isDiscussionPointItem)
-  ) {
+  return (
+    exactKeys(value, ['version', 'advisory', 'authority_note', 'truncated', 'rows']) &&
+    value.version === STILL_TO_DISCUSS_PROJECTION_VERSION && value.advisory === true &&
+    value.authority_note === STILL_TO_DISCUSS_AUTHORITY_NOTE &&
+    typeof value.truncated === 'boolean' &&
+    Array.isArray(value.rows) && value.rows.length >= 1 &&
+    value.rows.length <= STILL_TO_DISCUSS_MAX_ROWS &&
+    value.rows.every(discussionPoint) &&
+    new Set(value.rows.map((row) => row.id)).size !== 0 &&
+    new Set(value.rows.map((row) => row.id)).size === value.rows.length
+  )
+}
+
+export function isSenderResponseStyleV1(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  if (!exactKeys(value, ['message_id', 'notes'])) return false
+  if (!uuid(value.message_id)) return false
+  if (!Array.isArray(value.notes) || value.notes.length === 0 || value.notes.length > 8) return false
+  return value.notes.every((note) => nonempty(note))
+}
+
+const ROOM_MESSAGE_STATES = new Set(['final', 'in_progress', 'deleted'])
+const OPEN_CHECK_STATES = new Set(['final', 'in_progress', 'deleted', 'absent'])
+const SHA256 = /^sha256:[a-f0-9]{64}$/
+
+function roomAddressee(value) {
+  if (!record(value)) return false
+  if (value.kind === 'connection') {
+    return exactKeys(value, ['kind', 'connection_id', 'label']) && uuid(value.connection_id) && nonempty(value.label)
+  }
+  return (value.kind === 'dev' || value.kind === 'room') && exactKeys(value, ['kind'])
+}
+
+function roomMessage(value) {
+  return (
+    exactKeys(value, ['message_id', 'addressee', 'attachments', 'state']) &&
+    uuid(value.message_id) &&
+    roomAddressee(value.addressee) &&
+    Array.isArray(value.attachments) &&
+    value.attachments.every(attachment) &&
+    ROOM_MESSAGE_STATES.has(value.state)
+  )
+}
+
+function uniqueUuids(list, max) {
+  return Array.isArray(list) && list.length <= max && list.every(uuid) && new Set(list).size === list.length
+}
+
+function roomCoverage(value) {
+  return (
+    exactKeys(value, ['through', 'eligible_count', 'deleted_count', 'open_message_ids']) &&
+    orderPoint(value.through) &&
+    nonnegativeInt(value.eligible_count) &&
+    nonnegativeInt(value.deleted_count) &&
+    uniqueUuids(value.open_message_ids, ROOM_PAGE_MAX) &&
+    value.deleted_count + value.open_message_ids.length <= value.eligible_count
+  )
+}
+
+function roomOpenCheck(value) {
+  if (!Array.isArray(value) || value.length > ROOM_PAGE_MAX) return false
+  const ids = new Set()
+  for (const check of value) {
+    if (!optionalExactKeys(check, ['message_id', 'state'], ['entry'])) return false
+    if (!uuid(check.message_id) || !OPEN_CHECK_STATES.has(check.state)) return false
+    const hasEntry = Object.hasOwn(check, 'entry')
+    if ((check.state === 'final') !== hasEntry) return false
+    if (hasEntry && (!contextEntry(check.entry) || check.entry.message_id !== check.message_id)) return false
+    const key = check.message_id.toLowerCase()
+    if (ids.has(key)) return false
+    ids.add(key)
+  }
+  return true
+}
+
+function deletionPoint(value) {
+  return exactKeys(value, ['deleted_at', 'message_id']) && datetime(value.deleted_at) && uuid(value.message_id)
+}
+
+export function isRoomDeletionsSeen(value) {
+  return (
+    exactKeys(value, ['through', 'total']) &&
+    nullable(value.through, deletionPoint) &&
+    nullable(value.total, nonnegativeInt)
+  )
+}
+
+function roomDeletions(value) {
+  return (
+    exactKeys(value, ['message_ids', 'truncated', 'total', 'seen']) &&
+    uniqueUuids(value.message_ids, ROOM_PAGE_MAX) &&
+    typeof value.truncated === 'boolean' &&
+    nonnegativeInt(value.total) &&
+    value.message_ids.length <= value.total &&
+    isRoomDeletionsSeen(value.seen) &&
+    (value.message_ids.length === 0 || value.seen.through !== null) &&
+    (!value.truncated || value.message_ids.length > 0) &&
+    value.seen.total === (value.truncated ? null : value.total)
+  )
+}
+
+export function isRoomContextV1(value) {
+  if (!optionalExactKeys(value, ['version', 'messages', 'coverage'], ['open_check', 'deletions'])) return false
+  if (value.version !== ROOM_CONTEXT_VERSION) return false
+  if (!Array.isArray(value.messages) || value.messages.length > ROOM_PAGE_MAX || !value.messages.every(roomMessage)) {
     return false
   }
-  return value.inventory.returned === value.points.length
+  if (!nullable(value.coverage, roomCoverage)) return false
+  if (Object.hasOwn(value, 'open_check') && !nullable(value.open_check, roomOpenCheck)) return false
+  if (Object.hasOwn(value, 'deletions') && !nullable(value.deletions, roomDeletions)) return false
+  return true
+}
+
+function activityEntry(value) {
+  return (
+    exactKeys(value, ['kind', 'id', 'title', 'status', 'relation', 'creator']) &&
+    ['action_item', 'memory', 'artifact'].includes(value.kind) &&
+    uuid(value.id) &&
+    nonempty(value.title) &&
+    nullable(value.status, nonempty) &&
+    ['produced', 'referenced'].includes(value.relation) &&
+    nullable(value.creator, (creator) =>
+      exactKeys(creator, ['kind', 'label']) &&
+      ['agent', 'person', 'platform'].includes(creator.kind) &&
+      nonempty(creator.label))
+  )
 }
 
 export function isSessionActivityV1(value) {
-  if (!isPlainObject(value) || !hasOnlyAllowedKeys(value, SESSION_ACTIVITY_KEYS)) return false
-  if (
-    value.version !== 1 ||
-    value.advisory !== true ||
-    typeof value.list_readable !== 'boolean' ||
-    !Array.isArray(value.items) ||
-    !Array.isArray(value.events)
-  ) {
-    return false
+  if (!exactKeys(value, ['version', 'advisory', 'status', 'as_of', 'revision', 'entries', 'truncated'])) return false
+  if (value.version !== 1 || value.advisory !== true || !datetime(value.as_of)) return false
+  if (!['available', 'unavailable'].includes(value.status) || typeof value.truncated !== 'boolean') return false
+  if (!nullable(value.revision, (revision) => typeof revision === 'string' && SHA256.test(revision))) return false
+  if (!Array.isArray(value.entries) || value.entries.length > SESSION_ACTIVITY_MAX_ENTRIES ||
+      !value.entries.every(activityEntry)) return false
+  const keys = value.entries.map((entry) => `${entry.kind}:${entry.id}`)
+  if (new Set(keys).size !== keys.length) return false
+  if (value.status === 'unavailable') {
+    return value.entries.length === 0 && value.revision === null && value.truncated === false
   }
-  for (const item of value.items) {
-    if (!isPlainObject(item) || !isCanonicalUuid(item.id) || !isNonBlankString(item.title)) return false
-  }
-  for (const ev of value.events) {
-    if (!isPlainObject(ev) || !isNonEmptyString(ev.id) || !isCanonicalIsoDatetime(ev.at)) return false
-  }
-  return true
+  return value.revision !== null
 }
 
-export function isSessionEventsV1(value) {
-  if (!isPlainObject(value) || !hasOnlyAllowedKeys(value, SESSION_EVENTS_PROJECTION_KEYS)) return false
-  if (
-    value.version !== 1 ||
-    value.advisory !== true ||
-    !isPlainObject(value.inventory) ||
-    typeof value.inventory.truncated !== 'boolean' ||
-    !Array.isArray(value.events)
-  ) {
-    return false
-  }
-  for (const ev of value.events) {
-    if (!isPlainObject(ev) || !isNonEmptyString(ev.id) || !isCanonicalIsoDatetime(ev.created_at)) return false
-  }
-  return true
+function eventActor(value) {
+  return nullable(value, (actor) =>
+    exactKeys(actor, ['kind', 'label']) &&
+    ['agent', 'person', 'platform'].includes(actor.kind) &&
+    nonempty(actor.label))
 }
 
-function isSystemNotice(value) {
-  if (!hasExactKeys(value, SYSTEM_NOTICE_KEYS)) return false
-  if (
-    !isCanonicalUuid(value.notice_id) ||
-    !isCanonicalIsoDatetime(value.created_at) ||
-    !SYSTEM_NOTICE_CODES.has(value.code) ||
-    !isNonBlankString(value.summary) ||
-    !SYSTEM_NOTICE_ACTOR_KINDS.has(value.actor_kind) ||
-    value.advisory !== true ||
-    value.executable !== false
-  ) {
-    return false
-  }
-  if (value.requester !== null) {
-    if (
-      !hasExactKeys(value.requester, REQUESTER_KEYS) ||
-      !isCanonicalUuid(value.requester.user_id) ||
-      !isNonBlankString(value.requester.display_name)
-    ) {
+const EVENT_BASE_KEYS = ['id', 'at', 'kind', 'record_id', 'event']
+
+function sessionEvent(value) {
+  if (!value || typeof value !== 'object') return false
+  const base =
+    typeof value.id === 'string' && value.id.length > 0 && value.id.length <= 200 &&
+    datetime(value.at) &&
+    ['action_item', 'memory', 'artifact'].includes(value.kind) &&
+    uuid(value.record_id)
+  if (!base) return false
+  switch (value.event) {
+    case 'produced':
+    case 'retracted':
+    case 'archived':
+      return exactKeys(value, [...EVENT_BASE_KEYS, 'actor']) && eventActor(value.actor)
+    case 'referenced':
+      return exactKeys(value, [...EVENT_BASE_KEYS, 'message_id']) && uuid(value.message_id)
+    case 'lifecycle_changed':
+      return exactKeys(value, [...EVENT_BASE_KEYS, 'from', 'to']) &&
+        value.kind === 'action_item' && nonempty(value.from) && nonempty(value.to)
+    case 'superseded':
+      return exactKeys(value, [...EVENT_BASE_KEYS, 'by', 'actor']) &&
+        nullable(value.by, uuid) && eventActor(value.actor)
+    default:
       return false
-    }
   }
-  return true
 }
 
-function isSenderResponseStyle(value, commandMessageIds) {
-  if (!hasExactKeys(value, SENDER_STYLE_KEYS)) return false
-  if (
-    !isCanonicalUuid(value.message_id) ||
-    !commandMessageIds.has(value.message_id) ||
-    !isCanonicalUuid(value.sender_user_id) ||
-    !Array.isArray(value.notes) ||
-    value.notes.length === 0 ||
-    !value.notes.every(isNonBlankString)
-  ) {
-    return false
+/** The negotiated session_events section, mirrored from the served contract. */
+export function isSessionEventsV1(value) {
+  if (!exactKeys(value, ['version', 'advisory', 'status', 'as_of', 'revision', 'events', 'truncated'])) return false
+  if (value.version !== SESSION_EVENTS_VERSION || value.advisory !== true || !datetime(value.as_of)) return false
+  if (!['available', 'unchanged', 'unavailable'].includes(value.status) || typeof value.truncated !== 'boolean') return false
+  if (!nullable(value.revision, (revision) => typeof revision === 'string' && SHA256.test(revision))) return false
+  if (!Array.isArray(value.events) || value.events.length > SESSION_EVENTS_MAX || !value.events.every(sessionEvent)) return false
+  const ids = value.events.map((event) => event.id)
+  if (new Set(ids).size !== ids.length) return false
+  if (value.status === 'unavailable') {
+    return value.events.length === 0 && value.revision === null && value.truncated === false
   }
-  return true
-}
-
-function isWindowMetadata(windowValue, rows, expectedPolicyVersion) {
-  if (!hasExactKeys(windowValue, WINDOW_KEYS)) return false
-  if (
-    windowValue.policy_version !== expectedPolicyVersion ||
-    !isSafeNonNegativeInteger(windowValue.returned) ||
-    !isSafeNonNegativeInteger(windowValue.total_known) ||
-    windowValue.returned !== rows.length ||
-    windowValue.total_known < windowValue.returned ||
-    !hasExactKeys(windowValue.source_window, SOURCE_WINDOW_KEYS) ||
-    typeof windowValue.truncated !== 'boolean' ||
-    typeof windowValue.has_more !== 'boolean'
-  ) {
-    return false
-  }
-
-  const { start, end } = windowValue.source_window
-  if (rows.length === 0) {
-    if (start !== null || end !== null) return false
-  } else {
-    if (!isOrderKey(start) || !isOrderKey(end)) return false
-    if (!sameOrder(start, rows[0].order) || !sameOrder(end, rows.at(-1).order)) return false
-  }
-
-  if (windowValue.has_more) {
-    return (
-      isNonEmptyString(windowValue.next_cursor) &&
-      isNonEmptyString(windowValue.fetch_id) &&
-      OMISSION_REASONS.has(windowValue.omission_reason)
-    )
-  }
-  if (windowValue.next_cursor !== null || windowValue.fetch_id !== null) return false
-  if (windowValue.truncated) return OMISSION_REASONS.has(windowValue.omission_reason)
-  return windowValue.omission_reason === null
-}
-
-export function validateRemoteIngressV1(ingress, connectionId) {
-  if (!isCanonicalUuid(connectionId)) {
-    return { ok: false, error: 'connectionId is not a canonical UUID' }
-  }
-  if (!isPlainObject(ingress)) {
-    return { ok: false, error: 'ingress is missing or not an object' }
-  }
-  const contract = CANONICAL_CONTRACTS.get(ingress.contract_version)
-  if (
-    ingress.kind !== REMOTE_INGRESS_KIND ||
-    ingress.schema_version !== REMOTE_INGRESS_SCHEMA_VERSION ||
-    !contract ||
-    ingress.policy_version !== contract.policyVersion ||
-    !isCanonicalUuid(ingress.envelope_id)
-  ) {
-    return { ok: false, error: 'ingress header/version mismatch' }
-  }
-  const expectedEnvelopeKeys = contract.roomContextAware
-    ? ROOM_CONTEXT_ENVELOPE_KEYS
-    : contract.senderStyleAware
-      ? SENDER_STYLE_ENVELOPE_KEYS
-      : contract.systemNoticeAware
-        ? SYSTEM_NOTICE_ENVELOPE_KEYS
-        : contract.planAware
-          ? PLAN_ENVELOPE_KEYS
-          : BASE_ENVELOPE_KEYS
-  if (!contract.planAware && Object.hasOwn(ingress, 'active_session_plans')) {
-    return { ok: false, error: 'active_session_plans requires canonical contract 1.3.0' }
-  }
-  if (contract.roomContextAware) {
-    if (!hasOnlyAllowedKeys(ingress, expectedEnvelopeKeys)) {
-      return { ok: false, error: 'ingress does not match the v1.6 key set' }
-    }
-    for (const req of SENDER_STYLE_ENVELOPE_KEYS) {
-      if (!Object.hasOwn(ingress, req)) {
-        return { ok: false, error: `ingress missing required field ${req}` }
-      }
-    }
-  } else if (!hasExactKeys(ingress, expectedEnvelopeKeys)) {
-    return { ok: false, error: 'ingress does not have the exact v1 key set' }
-  }
-  if (
-    !isConnectionIdentity(ingress.connection) ||
-    ingress.connection.connection_id !== connectionId
-  ) {
-    return { ok: false, error: 'ingress connection identity does not match this connection' }
-  }
-  if (
-    !hasExactKeys(ingress.wake, WAKE_KEYS) ||
-    !WAKE_KINDS.has(ingress.wake.kind) ||
-    typeof ingress.wake.active !== 'boolean' ||
-    !isNonEmptyString(ingress.wake.reason_id) ||
-    !DELIVERY_STATES.has(ingress.delivery_state)
-  ) {
-    return { ok: false, error: 'ingress wake/delivery_state is invalid' }
-  }
-  if (
-    !Array.isArray(ingress.command_message_ids) ||
-    !ingress.command_message_ids.every(isCanonicalUuid) ||
-    !Array.isArray(ingress.commands) ||
-    !ingress.commands.every((entry) =>
-      isCommand(entry, connectionId, {
-        scopeAware: contract.scopeAware,
-        roomContextAware: contract.roomContextAware,
-      }),
-    ) ||
-    !isStrictlyOrdered(ingress.commands)
-  ) {
-    return { ok: false, error: 'ingress commands are invalid or out of order' }
-  }
-  if (
-    ingress.command_message_ids.length !== ingress.commands.length ||
-    ingress.commands.some((entry, idx) => entry.message_id !== ingress.command_message_ids[idx])
-  ) {
-    return { ok: false, error: 'command_message_ids does not match commands' }
-  }
-
-  const provenanceRefs = new Set()
-  const turnIds = new Set()
-  const primaryRefs = new Set()
-  for (const command of ingress.commands) {
-    if (
-      command.delivery.is_primary !==
-      (command.delivery.provenance_ref === command.delivery.primary_provenance_ref)
-    ) {
-      return { ok: false, error: 'invalid is_primary in turn binding' }
-    }
-    if (provenanceRefs.has(command.delivery.provenance_ref)) {
-      return { ok: false, error: 'duplicate command provenance_ref in turn binding' }
-    }
-    provenanceRefs.add(command.delivery.provenance_ref)
-    turnIds.add(command.delivery.turn_id)
-    primaryRefs.add(command.delivery.primary_provenance_ref)
-  }
-  if (ingress.commands.length > 0 && (turnIds.size !== 1 || primaryRefs.size !== 1)) {
-    return { ok: false, error: 'commands do not share one turn binding' }
-  }
-
-  if (ingress.control !== null && !isControl(ingress.control)) {
-    return { ok: false, error: 'ingress control is invalid' }
-  }
-
-  if (!hasExactKeys(ingress.context, CONTEXT_KEYS)) {
-    return { ok: false, error: 'ingress context buckets are invalid' }
-  }
-  for (const bucket of CONTEXT_BUCKETS) {
-    const entries = ingress.context[bucket]
-    const kind = CONTEXT_ACTOR_BY_BUCKET[bucket]
-    if (
-      !Array.isArray(entries) ||
-      !entries.every((entry) => isContextEntry(entry, kind, contract.roomContextAware)) ||
-      !isStrictlyOrdered(entries)
-    ) {
-      return { ok: false, error: `ingress ${bucket} is invalid or out of order` }
-    }
-  }
-
-  if (
-    contract.planAware &&
-    ingress.active_session_plans !== null &&
-    !isActiveSessionPlansProjectionV1(ingress.active_session_plans)
-  ) {
-    return { ok: false, error: 'ingress active_session_plans is invalid' }
-  }
-
-  if (contract.systemNoticeAware) {
-    if (!Array.isArray(ingress.system_notices) || !ingress.system_notices.every(isSystemNotice)) {
-      return { ok: false, error: 'ingress system_notices is invalid' }
-    }
-  }
-
-  if (contract.senderStyleAware) {
-    const cmdIdSet = new Set(ingress.command_message_ids)
-    if (
-      !Array.isArray(ingress.sender_response_styles) ||
-      !ingress.sender_response_styles.every((s) => isSenderResponseStyle(s, cmdIdSet))
-    ) {
-      return { ok: false, error: 'ingress sender_response_styles is invalid' }
-    }
-  }
-
-  if (contract.roomContextAware) {
-    if (
-      ingress.session_activity !== undefined &&
-      ingress.session_activity !== null &&
-      !isSessionActivityV1(ingress.session_activity)
-    ) {
-      return { ok: false, error: 'ingress session_activity is invalid' }
-    }
-    if (
-      ingress.session_events !== undefined &&
-      ingress.session_events !== null &&
-      !isSessionEventsV1(ingress.session_events)
-    ) {
-      return { ok: false, error: 'ingress session_events is invalid' }
-    }
-  }
-
-  const allRows = [
-    ...ingress.commands,
-    ...CONTEXT_BUCKETS.flatMap((bucket) => ingress.context[bucket]),
-  ].sort((left, right) => compareOrder(left.order, right.order))
-  if (!isStrictlyOrdered(allRows)) {
-    return { ok: false, error: 'ingress window contains duplicate order keys' }
-  }
-  const commandIds = new Set(ingress.command_message_ids)
-  for (const bucket of CONTEXT_BUCKETS) {
-    for (const entry of ingress.context[bucket]) {
-      if (commandIds.has(entry.message_id)) {
-        return { ok: false, error: 'message appears in both commands and context' }
-      }
-    }
-  }
-  if (!isWindowMetadata(ingress.window, allRows, contract.policyVersion)) {
-    return { ok: false, error: 'ingress window metadata does not match returned rows' }
-  }
-
-  if (ingress.wake.kind === 'conversational_command') {
-    if (
-      !ingress.wake.active ||
-      ingress.delivery_state !== 'live' ||
-      ingress.commands.length === 0 ||
-      ingress.control !== null
-    ) {
-      return { ok: false, error: 'conversational_command wake invariant failed' }
-    }
-  } else if (ingress.wake.kind === 'control') {
-    if (
-      !ingress.wake.active ||
-      ingress.delivery_state !== 'live' ||
-      ingress.control === null ||
-      ingress.commands.length !== 0
-    ) {
-      return { ok: false, error: 'control wake invariant failed' }
-    }
-  } else if (
-    ingress.wake.active ||
-    ingress.commands.length !== 0 ||
-    ingress.control !== null ||
-    (ingress.wake.kind === 'history_reseed' && ingress.delivery_state === 'live')
-  ) {
-    return { ok: false, error: 'non-wake envelope invariant failed' }
-  }
-
-  return { ok: true, envelope: ingress }
+  if (value.status === 'unchanged' && value.events.length > 0) return false
+  return value.revision !== null
 }
 
 /**
- * Backward-compatible validator returning `null` when valid or an error string when
- * invalid (including when a command attachment is `unavailable`).
+ * 1.6 cross-field rules, mirrored from the served contract so a malformed page
+ * cannot poison a local room copy: room_context describes exactly the records
+ * the envelope emits, a command is always a final present message, and a
+ * coverage claim agrees with the states the page describes.
  */
+function roomContextCrossCheck(value, allRows) {
+  const room = value.room_context
+  const emitted = new Set(allRows.map((row) => row.message_id))
+  const described = room.messages.map((message) => message.message_id)
+  if (new Set(described).size !== described.length || described.length !== emitted.size ||
+      described.some((id) => !emitted.has(id))) {
+    return 'room context must describe every emitted record exactly once'
+  }
+  const stateById = new Map(room.messages.map((message) => [message.message_id, message.state]))
+  if (value.commands.some((entry) => stateById.get(entry.message_id) !== 'final')) {
+    return 'a delivered command must be a final, present message'
+  }
+  if (room.coverage) {
+    const { through } = room.coverage
+    const end = value.window.source_window.end
+    if (end) {
+      if (through.sequence !== end.sequence || through.message_id !== end.message_id ||
+          Date.parse(through.created_at) !== Date.parse(end.created_at)) {
+        return 'coverage point must be the end of this envelope source window'
+      }
+    } else if (allRows.length > 0) {
+      return 'coverage point must be the end of this envelope source window'
+    }
+    if (room.coverage.eligible_count < allRows.length) return 'eligible_count below emitted records'
+    const open = new Set(room.coverage.open_message_ids)
+    const describedDeleted = room.messages.filter((message) => message.state === 'deleted').length
+    if (room.messages.some((message) => (message.state === 'in_progress') !== open.has(message.message_id)) ||
+        describedDeleted > room.coverage.deleted_count) {
+      return 'coverage contradicts the states this page describes'
+    }
+  }
+  if (Array.isArray(room.open_check) && room.open_check.some((check) => emitted.has(check.message_id))) {
+    return 'open_check answers rows outside this page only'
+  }
+  return null
+}
+
+function envelopeV1(value) {
+  const roomContextLane = value?.contract_version === REMOTE_INGRESS_ROOM_CONTEXT_CONTRACT_VERSION
+  const senderStyleLane = roomContextLane || value?.contract_version === REMOTE_INGRESS_SENDER_STYLE_CONTRACT_VERSION
+  const noticeLane = senderStyleLane ||
+    value?.contract_version === REMOTE_INGRESS_SYSTEM_NOTICE_CONTRACT_VERSION
+  const enhanced = noticeLane || value?.contract_version === REMOTE_INGRESS_CONTRACT_VERSION
+  const requiredKeys = [
+    'kind',
+    'schema_version',
+    'contract_version',
+    'policy_version',
+    'envelope_id',
+    'connection',
+    'wake',
+    'delivery_state',
+    'command_message_ids',
+    'commands',
+    'control',
+    'context',
+    'window',
+  ]
+  // 1.4 always carries system_notices (possibly empty); 1.5 adds an optional
+  // sender_response_styles. Both are additive sections, which is the only shape
+  // this validator tolerates — a CHANGED key would fail here, by design.
+  const laneRequiredKeys = noticeLane
+    ? [...requiredKeys, 'system_notices', ...(roomContextLane ? ['room_context'] : [])]
+    : requiredKeys
+  const laneOptionalKeys = senderStyleLane
+    ? ['active_session_plans', 'sender_response_styles', ...(roomContextLane ? ['session_activity', 'session_events'] : [])]
+    : ['active_session_plans']
+  if (!(enhanced
+    ? optionalExactKeys(value, laneRequiredKeys, laneOptionalKeys)
+    : exactKeys(value, requiredKeys))) return 'ingress must contain exactly the canonical v1 fields'
+  if (value.kind !== 'devspec.remote_ingress') return 'unknown ingress kind'
+  if (value.schema_version !== REMOTE_INGRESS_SCHEMA_VERSION) return 'unsupported ingress schema_version'
+  const pairedPolicy = CONTRACT_POLICY_PAIRS.get(value.contract_version)
+  if (!pairedPolicy) return 'unsupported ingress contract_version'
+  if (value.policy_version !== pairedPolicy) return 'ingress contract_version/policy_version mismatch'
+  if (!uuid(value.envelope_id) || !addressee(value.connection)) return 'invalid envelope identity or connection'
+  if (
+    !exactKeys(value.wake, ['kind', 'active', 'reason_id']) ||
+    !WAKE_KINDS.has(value.wake.kind) ||
+    typeof value.wake.active !== 'boolean' ||
+    !nonempty(value.wake.reason_id)
+  ) return 'invalid wake metadata'
+  const activeKind = value.wake.kind === 'conversational_command' ||
+    value.wake.kind === 'control' || value.wake.kind === 'system_notice'
+  if (value.wake.active !== activeKind) return 'wake active flag contradicts kind'
+  if (!['live', 'replay', 'reseed'].includes(value.delivery_state)) return 'invalid delivery_state'
+  if (value.delivery_state !== 'live' && (value.wake.kind !== 'history_reseed' || value.wake.active)) {
+    return 'replay/reseed must be inactive history'
+  }
+  if (value.wake.kind === 'history_reseed' && value.delivery_state === 'live') {
+    return 'history wake requires replay/reseed state'
+  }
+  if (!Array.isArray(value.command_message_ids) || !value.command_message_ids.every(uuid)) {
+    return 'invalid command_message_ids'
+  }
+  const scopeAware = SCOPE_AWARE_CONTRACT_VERSIONS.has(value.contract_version)
+  if (!Array.isArray(value.commands) || !value.commands.every((entry) => command(entry, scopeAware))) {
+    return 'invalid canonical command'
+  }
+  if ((value.wake.kind === 'control') !== (value.control !== null)) return 'control payload/wake mismatch'
+  if (value.control !== null && !control(value.control)) return 'invalid control payload'
+  if (
+    !isRemoteIngressTypedContext(value.context) ||
+    !isRemoteIngressBoundedMetadata(value.window) ||
+    value.window.policy_version !== value.policy_version
+  ) return 'invalid typed context or window'
+  if (noticeLane) {
+    // Always present on 1.4+, usually empty. Nonempty only on a notice wake, and
+    // never alongside commands — the server's own invariant, checked here so a
+    // malformed package cannot be mistaken for work.
+    if (!Array.isArray(value.system_notices) || value.system_notices.length > 25) {
+      return 'invalid system_notices'
+    }
+    const hasNotices = value.system_notices.length > 0
+    if (hasNotices !== (value.wake.kind === 'system_notice')) {
+      return 'system_notices must be nonempty iff wake kind is system_notice'
+    }
+    if (hasNotices && (value.commands.length > 0 || value.control !== null)) {
+      return 'system notices cannot accompany commands or control'
+    }
+  }
+  if (senderStyleLane && Object.hasOwn(value, 'sender_response_styles')) {
+    const styles = value.sender_response_styles
+    if (!Array.isArray(styles) || !styles.every(isSenderResponseStyleV1)) {
+      return 'invalid sender_response_styles'
+    }
+    // Style describes a command this delta delivered, exactly once. A style for
+    // a command we were never handed would be a preference with nothing to apply
+    // it to.
+    const delivered = new Set(value.command_message_ids)
+    const ids = styles.map((style) => style.message_id)
+    if (ids.some((id) => !delivered.has(id)) || new Set(ids).size !== ids.length) {
+      return 'sender response style must name a delivered command exactly once'
+    }
+  }
+  if (enhanced && Object.hasOwn(value, 'active_session_plans') &&
+      !isActiveSessionPlansProjectionV1(value.active_session_plans)) {
+    return 'invalid active_session_plans projection'
+  }
+  if (roomContextLane && !isRoomContextV1(value.room_context)) return 'invalid room_context'
+  if (roomContextLane && Object.hasOwn(value, 'session_activity') && !isSessionActivityV1(value.session_activity)) {
+    return 'invalid session_activity'
+  }
+  if (roomContextLane && Object.hasOwn(value, 'session_events') && !isSessionEventsV1(value.session_events)) {
+    return 'invalid session_events'
+  }
+
+  const listedIds = new Set(value.command_message_ids)
+  const commandIds = new Set(value.commands.map((entry) => entry.message_id))
+  if (
+    listedIds.size !== value.command_message_ids.length ||
+    commandIds.size !== value.commands.length ||
+    commandIds.size !== listedIds.size ||
+    value.command_message_ids.some((id) => !commandIds.has(id))
+  ) return 'command ids do not exactly match commands'
+  if (value.wake.kind === 'conversational_command' && value.commands.length === 0) {
+    return 'command wake requires a complete command'
+  }
+  if (value.commands.some((entry) => !sameAddressee(entry.addressee, value.connection))) {
+    return 'command addressee does not exactly match envelope connection'
+  }
+  if (!strictlyOrdered(value.commands)) return 'commands are not in stable total order'
+
+  const contextRows = CONTEXT_BUCKETS.flatMap(([name]) => value.context[name])
+  const allRows = [...value.commands, ...contextRows]
+  if (new Set(allRows.map((row) => row.message_id)).size !== allRows.length) {
+    return 'command/context records overlap'
+  }
+  if (value.window.returned !== allRows.length || !rowsFitWindow(allRows, value.window)) {
+    return 'canonical window count/range mismatch'
+  }
+  if (roomContextLane) {
+    const roomError = roomContextCrossCheck(value, allRows)
+    if (roomError) return roomError
+  }
+  if (value.commands.length > 0) {
+    const turnIds = new Set(value.commands.map((entry) => entry.delivery.turn_id))
+    const primaryRefs = new Set(value.commands.map((entry) => entry.delivery.primary_provenance_ref))
+    const provenanceRefs = value.commands.map((entry) => entry.delivery.provenance_ref)
+    const sharedPrimaryRef = value.commands[0].delivery.primary_provenance_ref
+    const primaryFlagsMatch = value.commands.every((entry) =>
+      entry.delivery.is_primary === (entry.delivery.provenance_ref === sharedPrimaryRef)
+    )
+    if (
+      turnIds.size !== 1 ||
+      primaryRefs.size !== 1 ||
+      new Set(provenanceRefs).size !== provenanceRefs.length ||
+      !primaryFlagsMatch
+    ) return 'command delta does not preserve one immutable turn primary'
+  }
+  return null
+}
+
+/**
+ * Validate an ingress value and determine whether it may wake this connection.
+ * The returned envelope is the original object: command bytes and all canonical
+ * identity/order/delivery/window metadata are never rewritten or summarized.
+ */
+export function normalizeRemoteIngressV1(input, connectionId) {
+  const target =
+    record(input) && input.kind !== 'devspec.remote_ingress' && record(input.ingress)
+      ? input.ingress
+      : input
+  const error = envelopeV1(target)
+  if (error) return { ok: false, error }
+  if (!uuid(connectionId) || target.connection.connection_id !== connectionId) {
+    return { ok: false, error: 'ingress is not for this exact connection' }
+  }
+
+  const conversational =
+    target.wake.kind === 'conversational_command' &&
+    target.wake.active === true &&
+    target.delivery_state === 'live'
+  if (!conversational) {
+    return { ok: true, envelope: target, wake: false, reason: target.wake.kind, commands: [] }
+  }
+
+  // Attachments are an atomic part of a command turn. A canonical unavailable
+  // descriptor therefore rejects the turn before any inbox wake is written.
+  if (target.commands.some((entry) =>
+    entry.attachments.some((item) => item.materialization === 'unavailable')
+  )) {
+    return { ok: true, envelope: target, wake: false, reason: 'unavailable_attachment', commands: [] }
+  }
+
+  return { ok: true, envelope: target, wake: true, reason: 'conversational_command', commands: target.commands }
+}
+
+/** Actor-labelled, explicitly advisory context for a model-facing event. */
+export function renderAdvisoryContext(context) {
+  if (!isRemoteIngressTypedContext(context)) return []
+  return CONTEXT_BUCKETS.flatMap(([bucket]) =>
+    context[bucket].map((entry) => ({
+      bucket,
+      advisory: true,
+      actor_label: `${entry.actor.kind.toUpperCase()}: ${entry.actor.display_name}`,
+      message_id: entry.message_id,
+      order: entry.order,
+      source_type: entry.source_type,
+      relationship: entry.relationship,
+      content: entry.content,
+    })),
+  ).sort((a, b) => compareOrder(a.order, b.order))
+}
+
+export function isCanonicalUuid(value) {
+  return uuid(value)
+}
+
+export function isCanonicalIsoDatetime(value) {
+  return datetime(value)
+}
+
+export function formatDelegatedProjectScopeInstruction(projectId) {
+  return `Execute this delegated command only within DevSpec project ${projectId}. Refuse any DevSpec project_id or repository target outside this project.`
+}
+
+export function validateActiveSessionPlansV1(value) {
+  return isActiveSessionPlansProjectionV1(value) ? null : 'invalid active_session_plans projection'
+}
+
 export function validateRemoteIngressEnvelopeV1(ingress, connectionId) {
-  const res = validateRemoteIngressV1(ingress, connectionId)
-  if (!res.ok) return res.error
-  const hasUnavailable = ingress.commands.some((command) =>
-    command.attachments.some((attachment) => attachment.materialization === 'unavailable'),
+  const err = envelopeV1(ingress)
+  if (err) return err
+  if (!uuid(connectionId) || ingress.connection.connection_id !== connectionId) {
+    return 'ingress is not for this exact connection'
+  }
+  const hasUnavailable = ingress.commands.some((cmd) =>
+    cmd.attachments.some((att) => att.materialization === 'unavailable'),
   )
   if (hasUnavailable) return 'command attachment unavailable'
   return null
 }
 
-/**
- * Validate and classify a canonical ingress envelope for runtime delivery.
- * Accepts either the raw `ingress` envelope object OR a poll response `{ ingress }`.
- */
-export function normalizeRemoteIngressV1(input, connectionId) {
-  const ingress =
-    isPlainObject(input) && input.kind !== REMOTE_INGRESS_KIND && isPlainObject(input.ingress)
-      ? input.ingress
-      : input
-  const validated = validateRemoteIngressV1(ingress, connectionId)
-  if (!validated.ok) return validated
-
-  const envelope = validated.envelope
-  const hasUnavailableCommandAttachment = envelope.commands.some((command) =>
-    command.attachments.some((attachment) => attachment.materialization === 'unavailable'),
-  )
-  if (hasUnavailableCommandAttachment) {
-    return {
-      ok: true,
-      wake: false,
-      reason: 'unavailable_attachment',
-      envelope,
-      commands: [],
-    }
-  }
-
-  const wake =
-    envelope.wake.kind === 'conversational_command' &&
-    envelope.wake.active === true &&
-    envelope.delivery_state === 'live' &&
-    envelope.commands.length > 0
-
-  return {
-    ok: true,
-    wake,
-    reason: wake ? 'conversational_command' : envelope.wake.kind,
-    envelope,
-    commands: wake ? envelope.commands : [],
-  }
-}
-
-/**
- * Bounded newest-first carry for typed advisory context when a caller wants an
- * in-memory summary. Kept for test and backward-compatibility surfaces.
- */
 export function emptyCanonicalContextCarry() {
   return {
     context: {
@@ -1157,7 +1159,7 @@ export function mergeCanonicalContextCarry(
 ) {
   const base = carry || emptyCanonicalContextCarry()
   const byId = new Map()
-  for (const bucket of CONTEXT_BUCKETS) {
+  for (const [bucket] of CONTEXT_BUCKETS) {
     for (const row of base.context?.[bucket] ?? []) {
       if (row?.message_id) byId.set(row.message_id, { bucket, row })
     }
@@ -1216,7 +1218,3 @@ export function mergeCanonicalContextCarry(
   }
 }
 
-export function renderAdvisoryContext(context) {
-  if (!context || typeof context !== 'object') return []
-  return CONTEXT_BUCKETS.flatMap((bucket) => (Array.isArray(context[bucket]) ? context[bucket] : []))
-}

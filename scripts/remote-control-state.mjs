@@ -971,10 +971,16 @@ export function resolveLocalAction({
     }
   }
 
-  let bond = localId ? readBond(agentName, localId) : null
+  let effectiveLocalId = localId
+  let bond = effectiveLocalId ? readBond(agentName, effectiveLocalId) : null
   // If this conversation has no bond yet, check if this exact Antigravity window
   // (owner_pid) already auto-connected at startup with local_id === null.
-  if (localId && (!bond || !bond.connection_id) && Number.isInteger(Number(ownerPid)) && Number(ownerPid) > 1) {
+  if (
+    effectiveLocalId &&
+    (!bond || !bond.connection_id) &&
+    Number.isInteger(Number(ownerPid)) &&
+    Number(ownerPid) > 1
+  ) {
     const matchingStartup = listStates().find(
       (s) =>
         s &&
@@ -988,18 +994,57 @@ export function resolveLocalAction({
       rebondConnectionToConversation({
         agent: agentName,
         connectionId: matchingStartup.connection_id,
-        localId,
+        localId: effectiveLocalId,
       })
-      bond = readBond(agentName, localId)
+      bond = readBond(agentName, effectiveLocalId)
+    }
+  } else if (
+    !effectiveLocalId &&
+    Number.isInteger(Number(ownerPid)) &&
+    Number(ownerPid) > 1
+  ) {
+    // When invoked from a run_command shell where ANTIGRAVITY_CONVERSATION_ID is not
+    // in process.env, reuse the active connection already bound to this window's owner_pid.
+    const candidates = listStates().filter(
+      (s) =>
+        s &&
+        !s.ended_from_ui &&
+        String(s.agent_name || '').toLowerCase() === String(agentName).toLowerCase() &&
+        Number(s.owner_pid) === Number(ownerPid),
+    )
+    const matchingOwnerConn =
+      candidates.find((s) => s.enabled !== false && s.local_id) ||
+      candidates.find((s) => s.enabled !== false) ||
+      candidates.find((s) => s.local_id) ||
+      null
+    if (matchingOwnerConn?.connection_id) {
+      if (matchingOwnerConn.local_id) {
+        effectiveLocalId = matchingOwnerConn.local_id
+        bond = readBond(agentName, effectiveLocalId)
+      }
+      if (!bond || !bond.connection_id) {
+        bond = {
+          status: matchingOwnerConn.enabled === false ? 'stopped' : 'live',
+          connection_id: matchingOwnerConn.connection_id,
+          agent_name: matchingOwnerConn.agent_name || agentName,
+          local_id: effectiveLocalId || null,
+          session_id: matchingOwnerConn.session_id || null,
+          session_codename:
+            matchingOwnerConn.session_codename || matchingOwnerConn.codename || null,
+          title: matchingOwnerConn.title || null,
+          end_reason: matchingOwnerConn.end_reason || null,
+          updated_at: matchingOwnerConn.updated_at || null,
+        }
+      }
     }
   }
 
-  if (!localId || !bond || !bond.connection_id) {
+  if (!bond || !bond.connection_id) {
     return {
       ok: true,
       action: 'register',
       found: false,
-      local_id: localId || null,
+      local_id: effectiveLocalId || null,
       agent_name: agentName,
       connection_id: null,
       session_id: null,
@@ -1010,7 +1055,7 @@ export function resolveLocalAction({
       cursor_after_message_id: null,
       age_ms: null,
       max_age_minutes: clampMax,
-      note: !localId
+      note: !effectiveLocalId
         ? 'No local conversation id — register a fresh sessionless connection. Never rejoin by cwd/repo.'
         : 'No connection bond for this conversation — register a fresh sessionless connection.',
     }
@@ -1026,7 +1071,7 @@ export function resolveLocalAction({
   const base = {
     ok: true,
     found: true,
-    local_id: localId,
+    local_id: effectiveLocalId || conn.local_id || null,
     agent_name: bond.agent_name || agentName,
     connection_id: bond.connection_id,
     session_id: bond.session_id || conn.session_id || null,
@@ -1385,7 +1430,8 @@ export async function writeConnectionState({
       !!prev.token &&
       prev.token === state.token &&
       (prev.mcp_url || null) === (state.mcp_url || null) &&
-      (Number(prev.owner_pid) || null) === (Number(state.owner_pid) || null)
+      (Number(prev.owner_pid) || null) === (Number(state.owner_pid) || null) &&
+      (prev.connection_capability || null) === (state.connection_capability || null)
     const poller = ensurePollerForConnection(connectionId, {
       cwd,
       ownerPid,
@@ -1616,12 +1662,13 @@ if (isMain) {
     const result = resolveLocalAction({
       agent: agentName,
       localId,
+      ownerPid: resolveOwnerPid(args['owner-pid'], null),
       forceNew: !!args.forceNew,
       maxAgeMinutes,
     })
 
     result.cwd = args.cwd ? path.resolve(args.cwd) : process.cwd()
-    result.local_id_source = detected.source
+    result.local_id_source = detected.source || (result.local_id ? 'owner_pid_bond' : null)
     result.candidates =
       result.action === 'reconnect' || result.action === 'already_live'
         ? [

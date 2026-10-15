@@ -55,6 +55,7 @@ import { materialiseBatchAttachments } from './attachment-store.mjs'
 import { commandOfferArguments, parseCommandOfferResponse } from './command-offer.mjs'
 import { connectAtStartupEnabled, runSessionStart } from './session-start.mjs'
 import { buildWakeDeliveryMessage, deliverWakeViaAgentApi } from './devspec-remote-listen.mjs'
+import { resolveLocalAction } from './remote-control-state.mjs'
 
 const ME = 'conn-mine-1111'
 const OTHER_CONN = 'conn-theirs-2222'
@@ -1066,29 +1067,62 @@ describe('Parity 3: room transcript, 4-tier instruction files, repository contex
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-parity3-room-'))
     try {
       const sessId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
-      const store = loadTranscriptStore(ME, sessId, { dir: tmpDir, selfLabel: 'Antigravity · Roaming Zebra' })
-      const env = fixtureEnvelope()
-      applyIngressToStore(store, env, {
-        selfConnectionId: ME,
-        selfLabel: 'Antigravity · Roaming Zebra',
+      const store = loadTranscriptStore(FIXTURE_ID.connection, sessId, {
+        dir: tmpDir,
+        selfLabel: 'Antigravity · Calm Fox',
       })
+      const baseEnv = fixtureEnvelope()
+      const env = {
+        ...baseEnv,
+        contract_version: '1.6.0',
+        policy_version: '2026-09-24.1',
+        system_notices: [],
+        window: {
+          ...baseEnv.window,
+          policy_version: '2026-09-24.1',
+        },
+        room_context: {
+          version: 1,
+          messages: [],
+          coverage: {
+            complete_from_start: true,
+            through: baseEnv.commands[0].order,
+          },
+          open_check: null,
+          deletions: {
+            supported: true,
+            complete: true,
+            total: 0,
+            through: null,
+            message_ids: [],
+          },
+        },
+      }
+      const applied = applyIngressToStore(store, env, {
+        sessionId: sessId,
+      })
+      assert.equal(applied.applied, true)
       assert.equal(persistTranscriptStore(store, { dir: tmpDir }), true)
 
-      const tPaths = transcriptPaths(ME, sessId, tmpDir)
+      const tPaths = transcriptPaths(FIXTURE_ID.connection, sessId, tmpDir)
       assert.equal(fs.existsSync(tPaths.transcript), true)
       assert.equal(fs.existsSync(tPaths.state), true)
 
       writeRoomState(
-        ME,
+        FIXTURE_ID.connection,
         { session_id: sessId, ingress: env },
         {},
         { dir: tmpDir },
       )
-      assert.equal(fs.existsSync(roomStatePath(ME, tmpDir)), true)
+      assert.equal(fs.existsSync(roomStatePath(FIXTURE_ID.connection, tmpDir)), true)
 
       assert.deepEqual(commandOfferArguments({ negotiable: true }), { command_offer_version: 1 })
       assert.deepEqual(
-        parseCommandOfferResponse({ command_offer_version: 1, command_offers: [] }),
+        parseCommandOfferResponse({
+          command_offer_version: 1,
+          command_handoff_stale: false,
+          command_offer: null,
+        }),
         { supported: true, offer: null, stale: false },
       )
 
@@ -1112,5 +1146,39 @@ describe('Parity 3: room transcript, 4-tier instruction files, repository contex
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true })
     }
+  })
+
+  it('reuses the window owner_pid connection in resolveLocalAction when invoked from a shell without localId', () => {
+    const connState = {
+      connection_id: ME,
+      agent_name: 'Antigravity',
+      local_id: 'c01518ab-467e-42e9-b1c9-bdb3557683c3',
+      session_id: '7069bedd-878d-4c5a-b52c-b5cfc1bcd544',
+      session_codename: 'Sturdy Marten',
+      owner_pid: 4166454,
+      enabled: true,
+      ended_from_ui: false,
+      updated_at: new Date().toISOString(),
+    }
+    const res = resolveLocalAction({
+      agent: 'Antigravity',
+      localId: null,
+      ownerPid: 4166454,
+      listStates: () => [connState],
+      readBond: () => ({
+        status: 'live',
+        connection_id: ME,
+        agent_name: 'Antigravity',
+        local_id: connState.local_id,
+        session_id: connState.session_id,
+        session_codename: connState.session_codename,
+        updated_at: connState.updated_at,
+      }),
+      readConnection: () => connState,
+    })
+    assert.equal(res.action, 'already_live')
+    assert.equal(res.connection_id, ME)
+    assert.equal(res.local_id, 'c01518ab-467e-42e9-b1c9-bdb3557683c3')
+    assert.equal(res.session_id, '7069bedd-878d-4c5a-b52c-b5cfc1bcd544')
   })
 })

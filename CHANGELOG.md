@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.15.1
+
+### Canonical remote-ingress 1.6.0 wire validation, transcript store parity, and connection reuse
+
+- **Canonical 1.6.0 ingress validator (`scripts/remote-ingress-v1.mjs`):** Aligned the 1.5.0/1.6.0 policy versions (`2026-09-18.1` / `2026-09-24.1`) and `room_context`, `session_activity`, `session_events`, `session_polls`, and `still_to_discuss` schemas with the server's `devspec://product/remote-ingress-contract` so live 1.6.0 poll responses validate and wake immediately.
+- **Canonical room transcript and command-offer negotiation (`scripts/room-transcript.mjs`, `scripts/command-offer.mjs`):** Fixed `room_deletions_seen` wire shape (`null` or `{ through, total }`), `store.rows` transcript map, `.transcript.jsonl` sequence records (`seq`/`from`/`to`/`text` for `room-unread.mjs`), and singular `command_offer` parsing.
+- **MCP `_meta.devspec.connection_capability` and window `owner_pid` connection reuse (`scripts/mcp-call.mjs`, `scripts/remote-control-state.mjs`, `scripts/devspec-remote-connect.mjs`):** Added `onResultMeta`, `readServerFailure`, `isRetryableHttpFailure`, and `McpToolRefusalError` to `scripts/mcp-call.mjs`, and updated `resolveLocalAction` and `devspec-remote-connect.mjs` to reuse the current window's `owner_pid` connection and `local_id` when invoked from a shell without `ANTIGRAVITY_CONVERSATION_ID`.
+
 ## 0.15.0
 
 ### Full Antigravity CLI (`agy`) parity with Claude Code and Pi

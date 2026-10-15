@@ -178,7 +178,7 @@ You rarely need to pass a project ID manually:
 
 ---
 
-## Plugin architecture & hooks (`v0.15.0`)
+## Plugin architecture & hooks (`v0.15.1`)
 
 All hooks are declared in `hooks.json` (mirrored in `hooks/hooks.json`), validated against Antigravity's strict hook JSON schemas (`scripts/hook-output.mjs`), and executed via dependency-free Node.js ESM scripts in `scripts/`:
 

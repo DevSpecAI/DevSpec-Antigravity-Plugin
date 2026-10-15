@@ -193,7 +193,16 @@ export async function connect(options = {}, deps = {}) {
   const cwd = cwdArg ? path.resolve(cwdArg) : process.cwd()
   const agentName = agent || AGENT_NAME
   const detected = detectLocalId({ 'local-id': localIdArg }, env)
-  const localId = detected.local_id
+  const effectiveOwnerPid = resolveOwnerPid(ownerPid, null)
+  const bond = resolveLocalAction({
+    agent: agentName,
+    localId: detected.local_id,
+    ownerPid: effectiveOwnerPid,
+    forceNew: !!forceNew || !!createNew,
+    maxAgeMinutes: 30,
+  })
+  const localId = detected.local_id || bond?.local_id || null
+  const localIdSource = detected.source || (bond?.local_id ? 'owner_pid_bond' : null)
   const gitRemote = gitRemoteOrigin(cwd)
   const pin = findProjectPin(cwd, { home: projectHome })
   const previousProject = readConversationProject(localId, { home: projectHome })
@@ -219,15 +228,6 @@ export async function connect(options = {}, deps = {}) {
       { reason: 'auth' },
     )
   }
-
-  const effectiveOwnerPid = resolveOwnerPid(ownerPid, null)
-  const bond = resolveLocalAction({
-    agent: agentName,
-    localId,
-    ownerPid: effectiveOwnerPid,
-    forceNew: !!forceNew || !!createNew,
-    maxAgeMinutes: 30,
-  })
 
   const call = (toolName, toolArgs, callOptions = {}) =>
     withHttpRetry(
@@ -500,7 +500,7 @@ export async function connect(options = {}, deps = {}) {
     session_id: effectiveSessionId,
     session_access: sessionAccess,
     local_id: localId,
-    local_id_source: detected.source,
+    local_id_source: localIdSource,
     project_id: confirmedProject.id,
     project_selection: projectState,
     project_scope: {

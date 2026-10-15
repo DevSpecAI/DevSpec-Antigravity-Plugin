@@ -1,243 +1,162 @@
+#!/usr/bin/env node
 /**
- * Command offer and question-to-command handoff (item a11d27fa,
- * devspec://product/command-offer-contract).
+ * Claude Code's half of the negotiated command handoff (item a11d27fa; server
+ * 9abe0be20 / migration 985, Pi reference 4284a43c).
  *
- * When a connection is working on an answered directed question, a conversational
- * command that arrives behind it is held back by the server (`delivery_retry`) until
- * that question's turn finishes. The server now advertises that held command on
- * `poll_connection` in its `command_offer` sidecar (availability only — no body, no authority,
- * no cursor movement) and lets this poller declare `command_handoff_ready` on the
- * next poll once the answer has been durably delivered into the model's wake stream,
- * retiring the question's attempt and delivering the canonical command in one move.
+ * While an answered question's exact continuation owns this connection, the server
+ * holds every ordinary command back (migration 904), so a message the person sends
+ * while Claude is still working on their answer used to wait until that work ended.
+ * With `command_offer_version: 1` the poll says so instead: a non-executable offer
+ * naming the held message and the exact question attempt holding it. It has no body
+ * and no authority, and it never reaches the model.
+ *
+ * Pi has to abort its foreground and wait for it to settle before it can take a new
+ * message. Claude Code does not: a monitor event reaches a running conversation
+ * between steps. So this host is ready as soon as the answer itself is settled — its
+ * application ACKed (the server refuses a handoff for an unacknowledged answer) and its
+ * events flushed to the model. The next poll then carries `command_handoff_ready` with
+ * the exact question identity; under the connection lock the server retires the
+ * question attempt and opens the held message through the ordinary canonical
+ * delivery, and that same response delivers it. Nothing is interrupted: the model
+ * keeps what it was doing and reads the new message at its next step.
+ *
+ * Pure functions only, so the poller, the wait stream and the tests share one
+ * definition of each rule.
  */
 
-import { isCanonicalIsoDatetime, isCanonicalUuid } from './remote-ingress-v1.mjs'
-import { continuationDelivered } from './interaction-events.mjs'
+import { continuationDelivered, continuationIdentity } from './interaction-events.mjs'
+import { isRemoteIngressAttachment } from './remote-ingress-v1.mjs'
 
-export const COMMAND_OFFER_CONTRACT_URI = 'devspec://product/command-offer-contract'
 export const COMMAND_OFFER_VERSION = 1
-export const COMMAND_OFFER_KIND = 'devspec.command_offer'
+export const QUESTION_HANDOFF_EVENT = 'question_turn_handed_over'
 
-const OFFER_KEYS = new Set([
-  'kind',
-  'version',
-  'offer_id',
-  'origin_connection_id',
-  'source_session_id',
-  'attachment_id',
-  'source_message_id',
-  'created_at',
-  'blocking_attempt_id',
-  'blocking_question_id',
-  'blocking_event_id',
-  'blocking_response_id',
-])
+const UUID = /^(?:00000000-0000-0000-0000-000000000000|[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i
+const OFFER_KEYS = ['version', 'connection_id', 'source_session_id', 'attachment_id',
+  'source_message_id', 'blocking_attempt_id', 'attachments']
 
-const HANDOFF_KEYS = new Set(['question_id', 'source_message_id'])
-
-function hasExactKeys(value, allowed) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
-  const keys = Object.keys(value)
-  return keys.length === allowed.size && keys.every((key) => allowed.has(key))
+function isUuid(value) {
+  return typeof value === 'string' && UUID.test(value)
 }
 
 /**
- * Can this poll negotiate command offers?
+ * Can this poll negotiate offers?
  *
- * Catch-up / seed polls are history drains, never live handoffs, and an offer names
- * the live speech attachment (`attachment_id`), so we negotiate only once we know
- * our capability, our attached session, and that session's current attachment id.
+ * The server refuses `command_offer_version` without the exact connection capability,
+ * so negotiating without one would fail the whole poll. It computes offers only on a
+ * live poll of an attached connection with a speech attachment, never on a catch-up
+ * page, so there is nothing to ask for otherwise.
  */
-export function commandOfferNegotiable({
-  connectionCapability = null,
-  sessionId = null,
-  attachmentId = null,
-  catchUp = false,
-} = {}) {
+export function commandOfferNegotiable({ connectionCapability, sessionId, attachmentId, catchUp } = {}) {
   return Boolean(
-    !catchUp &&
-    typeof connectionCapability === 'string' && connectionCapability.startsWith('dvsc_') &&
-    isCanonicalUuid(sessionId) &&
-    isCanonicalUuid(attachmentId),
+    typeof connectionCapability === 'string' && connectionCapability &&
+    isUuid(sessionId) && isUuid(attachmentId) && !catchUp,
   )
 }
 
-/**
- * Poll arguments for the offer/handoff exchange. A readiness requires the version on
- * the same call; when not negotiable, neither field is sent.
- */
-export function commandOfferArguments({ negotiable = false, ready = null } = {}) {
+/** Poll arguments. `ready` rides only a negotiated poll. */
+export function commandOfferArguments({ negotiable, ready = null } = {}) {
   if (!negotiable) return {}
-  return {
-    command_offer_version: COMMAND_OFFER_VERSION,
-    ...(ready ? { command_handoff_ready: ready } : {}),
-  }
-}
-
-export function validateCommandOffer(
-  offer,
-  { connectionId = null, sessionId = null, attachmentId = null } = {},
-) {
-  if (!hasExactKeys(offer, OFFER_KEYS)) {
-    return { ok: false, error: 'command offer must have the exact v1 key set' }
-  }
-  if (offer.kind !== COMMAND_OFFER_KIND || offer.version !== COMMAND_OFFER_VERSION) {
-    return { ok: false, error: 'command offer kind/version mismatch' }
-  }
-  for (const field of [
-    'offer_id',
-    'origin_connection_id',
-    'source_session_id',
-    'attachment_id',
-    'source_message_id',
-    'blocking_attempt_id',
-    'blocking_question_id',
-    'blocking_event_id',
-    'blocking_response_id',
-  ]) {
-    if (!isCanonicalUuid(offer[field])) {
-      return { ok: false, error: `command offer ${field} must be a canonical UUID` }
-    }
-  }
-  if (!isCanonicalIsoDatetime(offer.created_at)) {
-    return { ok: false, error: 'command offer created_at must be an ISO datetime' }
-  }
-  if (!isCanonicalUuid(connectionId) || offer.origin_connection_id !== connectionId) {
-    return { ok: false, error: 'command offer origin_connection_id does not match this connection' }
-  }
-  if (!isCanonicalUuid(sessionId) || offer.source_session_id !== sessionId) {
-    return { ok: false, error: 'command offer source_session_id does not match the attached session' }
-  }
-  if (!isCanonicalUuid(attachmentId) || offer.attachment_id !== attachmentId) {
-    return { ok: false, error: 'command offer attachment_id does not match the current attachment' }
-  }
-  return { ok: true, offer }
+  return { command_offer_version: COMMAND_OFFER_VERSION, ...(ready ? { command_handoff_ready: ready } : {}) }
 }
 
 /**
- * Read the offer sidecar from a `poll_connection` response. Throws on malformed
- * shapes so the caller logs and ignores the offer without touching canonical ingress.
- */
-export function parseCommandOfferResponse(
-  res,
-  { connectionId = null, sessionId = null, attachmentId = null } = {},
-) {
-  if (!res || typeof res !== 'object') return { supported: false, offer: null, stale: false }
-  const hasVersion = Object.hasOwn(res, 'command_offer_version')
-  const hasOffers = Object.hasOwn(res, 'command_offers')
-  const hasStale = Object.hasOwn(res, 'command_handoff_stale')
-  if (!hasVersion && !hasOffers && !hasStale) {
-    return { supported: false, offer: null, stale: false }
-  }
-  if (res.command_offer_version !== COMMAND_OFFER_VERSION) {
-    throw new Error(`unsupported command_offer_version: ${String(res.command_offer_version)}`)
-  }
-  if (!Array.isArray(res.command_offers) || res.command_offers.length > 1) {
-    throw new Error('command_offers must be an array of at most 1 offer')
-  }
-  if (hasStale && typeof res.command_handoff_stale !== 'boolean') {
-    throw new Error('command_handoff_stale must be a boolean when present')
-  }
-  const stale = res.command_handoff_stale === true
-  if (res.command_offers.length === 0) {
-    return { supported: true, offer: null, stale }
-  }
-  const validated = validateCommandOffer(res.command_offers[0], {
-    connectionId,
-    sessionId,
-    attachmentId,
-  })
-  if (!validated.ok) throw new Error(validated.error)
-  return { supported: true, offer: validated.offer, stale }
-}
-
-/**
- * Decide whether an offered command may take over the open question continuation.
+ * Read the offer sidecar, strictly.
  *
- * All four gates must hold before we send `command_handoff_ready`:
- *   1. There is an offer.
- *   2. We hold a live answer continuation (never a dismissal) whose attempt,
- *      question, event and response ids all match the offer's `blocking_*` fields.
- *   3. The answer's own `interaction_ack` has already been sent (`ackPending === false`),
- *      because the server only hands over an answer it has recorded as applied.
- *   4. The wait stream has already flushed the answer events to the model
- *      (`continuationDelivered(continuation, inboxByteOffset)`), so the model never
- *      receives the follow-up command without having received the answer first.
+ * `supported:false` is a server that does not offer (the legacy lane, unchanged).
+ * Throws on anything malformed or aimed elsewhere, and the caller treats a throw as
+ * "no offer": a bad sidecar can only cost the early handoff, never deliver anything.
  */
-export function commandHandoffDecision({
-  offer = null,
-  continuation = null,
-  ackPending = false,
-  inboxByteOffset = null,
-} = {}) {
-  if (!offer) return { action: 'none' }
-  if (!continuation || typeof continuation !== 'object') {
-    return { action: 'wait', reason: 'no_active_continuation' }
+export function parseCommandOfferResponse(res, { connectionId, sessionId, attachmentId } = {}) {
+  if (!res || typeof res !== 'object' || Array.isArray(res)) throw new Error('invalid command offer response')
+  if (res.command_offer_version === undefined) return { supported: false, stale: false, offer: null }
+  if (res.command_offer_version !== COMMAND_OFFER_VERSION || typeof res.command_handoff_stale !== 'boolean') {
+    throw new Error('unsupported command offer response')
   }
-  if (
-    continuation.attempt_id !== offer.blocking_attempt_id ||
-    continuation.question_id !== offer.blocking_question_id ||
-    continuation.event_id !== offer.blocking_event_id ||
-    typeof continuation.response_id !== 'string' ||
-    continuation.response_id !== offer.blocking_response_id ||
-    typeof continuation.claim_token !== 'string' ||
-    !isCanonicalUuid(continuation.claim_token)
-  ) {
-    return { action: 'wait', reason: 'continuation_mismatch' }
+  if (res.command_offer === null) return { supported: true, stale: res.command_handoff_stale, offer: null }
+  const offer = res.command_offer
+  if (!offer || typeof offer !== 'object' || Array.isArray(offer)) throw new Error('invalid command offer')
+  const keys = Object.keys(offer)
+  if (keys.length !== OFFER_KEYS.length || OFFER_KEYS.some((key) => !Object.hasOwn(offer, key)) || offer.version !== 1) {
+    throw new Error('invalid command offer fields')
   }
-  if (ackPending) {
-    return { action: 'wait', reason: 'interaction_ack_pending' }
+  for (const key of OFFER_KEYS.slice(1, -1)) {
+    if (!isUuid(offer[key])) throw new Error(`command offer ${key} is not a UUID`)
   }
+  if (offer.connection_id !== connectionId || offer.source_session_id !== sessionId || offer.attachment_id !== attachmentId) {
+    throw new Error('command offer is not for this connection, room and attachment')
+  }
+  if (!Array.isArray(offer.attachments) || !offer.attachments.every(isRemoteIngressAttachment)) {
+    throw new Error('invalid command offer attachments')
+  }
+  return { supported: true, stale: res.command_handoff_stale, offer }
+}
+
+/**
+ * What an offer asks of this host.
+ *
+ * `ignore` — the offer is not about a question this host holds, so there is nothing
+ *            of ours to hand over and the legacy wait applies.
+ * `wait`   — ours, but the answer is not settled yet: its ACK has not ridden a poll
+ *            that returned, or its events have not reached the model. Handing over
+ *            before the model has the answer would close the reply channel its wake
+ *            is about to name. A later poll offers again.
+ * `ready`  — send `ready` on the next poll.
+ */
+export function commandHandoffDecision({ offer, continuation, ackPending = false, inboxByteOffset = null } = {}) {
+  if (!offer) return { action: 'ignore', reason: 'no offer' }
+  if (!continuation || continuation.attempt_id !== offer.blocking_attempt_id) {
+    return { action: 'ignore', reason: 'not blocked by a question this host holds' }
+  }
+  if (continuation.session_id !== offer.source_session_id) {
+    return { action: 'ignore', reason: 'the question belongs to another room' }
+  }
+  if (ackPending) return { action: 'wait', reason: 'the answer has not been acknowledged yet' }
   if (!continuationDelivered(continuation, inboxByteOffset)) {
-    return { action: 'wait', reason: 'answer_not_yet_delivered_to_wait' }
+    return { action: 'wait', reason: 'the answer has not reached the model yet' }
   }
   return {
     action: 'ready',
     ready: {
-      offer_id: offer.offer_id,
-      source_session_id: offer.source_session_id,
-      attachment_id: offer.attachment_id,
       source_message_id: offer.source_message_id,
-      attempt_id: offer.blocking_attempt_id,
-      interaction_event_id: offer.blocking_event_id,
-      interaction_response_id: offer.blocking_response_id,
-      interaction_claim_token: continuation.claim_token,
+      attempt_id: continuation.attempt_id,
+      attachment_id: offer.attachment_id,
+      ...continuationIdentity(continuation),
     },
   }
 }
 
+/** One key per (message, question attempt): a repeat is retried with backoff, not at once. */
 export function commandHandoffKey(ready) {
-  if (!ready || typeof ready !== 'object') return ''
-  return `${ready.offer_id}:${ready.attempt_id}:${ready.source_message_id}`
-}
-
-/** Validate the `question_handoff` annotation stored on a `canonical_commands` inbox record. */
-export function validQuestionHandoff(value, executeMessageIds = null) {
-  if (!hasExactKeys(value, HANDOFF_KEYS)) return null
-  if (!isCanonicalUuid(value.question_id) || !isCanonicalUuid(value.source_message_id)) return null
-  if (executeMessageIds instanceof Set && !executeMessageIds.has(value.source_message_id)) return null
-  return {
-    question_id: value.question_id,
-    source_message_id: value.source_message_id,
-  }
+  return ready ? `${ready.source_message_id}:${ready.attempt_id}` : null
 }
 
 /**
- * Advisory wake event emitted immediately before the `owner_message` that took over
- * the answered question's turn, so the model knows `devspec-question.mjs respond` is
- * closed and a normal `post_session_message` reply answers both.
+ * The marker the poller puts on the inbox record of a handed-over message, revalidated
+ * when read back: it came from a file. Null unless it names a message in this batch.
+ */
+export function validQuestionHandoff(value, commandIds) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  if (!isUuid(value.question_id) || !isUuid(value.source_message_id)) return null
+  if (!commandIds.has(value.source_message_id)) return null
+  return { question_id: value.question_id, source_message_id: value.source_message_id }
+}
+
+/**
+ * The model-facing notice, emitted just before the message it describes. Without it the
+ * answer's own wake is the last word on how to reply, and that names a channel the
+ * handoff has closed. Kept well under the host's 500-character line cap.
  */
 export function questionHandoffEvent(handoff, { sessionId = null } = {}) {
   return {
-    type: 'question_turn_handed_off',
+    type: QUESTION_HANDOFF_EVENT,
     question_id: handoff.question_id,
-    to_message_id: handoff.source_message_id,
+    message_id: handoff.source_message_id,
+    note:
+      'The next message came while you worked on the answer and now owns the turn. The ' +
+      'question\'s reply channel is closed: do not use devspec-question respond. Reply with ' +
+      'post_session_message and connection_id, covering the answer\'s work if still owed.',
     session_id: sessionId,
     authoritative: false,
     executable: false,
-    note:
-      `Your question ${handoff.question_id}'s turn was handed to message ${handoff.source_message_id} ` +
-      'below. Do not run `devspec-question.mjs respond` for that question — reply to this message ' +
-      'with `post_session_message` instead.',
   }
 }

@@ -17,6 +17,7 @@ it('carries a connection capability header and can return hidden MCP result meta
     }), { status: 200, headers: { 'content-type': 'application/json' } })
   }
   try {
+    let callbackMeta = null
     const result = await mcpToolsCall({
       mcpUrl: 'https://example.test/mcp',
       token: 'dvs_test',
@@ -24,10 +25,14 @@ it('carries a connection capability header and can return hidden MCP result meta
       arguments: {},
       connectionCapability: 'dvsc_existing',
       includeMeta: true,
+      onResultMeta: (meta) => {
+        callbackMeta = meta
+      },
     })
     assert.equal(request.headers['x-devspec-connection-capability'], 'dvsc_existing')
     assert.equal(result.data.connection_id, 'connection')
     assert.equal(result.meta.devspec.connection_capability.value, 'dvsc_secret')
+    assert.equal(callbackMeta.devspec.connection_capability.value, 'dvsc_secret')
   } finally {
     globalThis.fetch = original
   }
