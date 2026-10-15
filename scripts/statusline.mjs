@@ -19,10 +19,14 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AGENT_NAME } from './agent-identity.mjs'
 import {
+  backfillAutomationDetails,
+  backfillClaimedItemDetails,
   canonicalRepo,
   readActiveAutomation,
   readClaimedWorkItems,
   readClaims,
+  resolveLocalAutomationDetails,
+  resolveLocalItemDetails,
 } from './commit-provenance.mjs'
 import { readConversationProject } from './conversation-project.mjs'
 import { findProjectPin, gitRemoteOrigin } from './devspec-scope.mjs'
@@ -477,10 +481,24 @@ export function readConnectionView({
       if (Array.isArray(claimedItems) && claimedItems.length > 0) {
         for (const item of claimedItems) {
           if (typeof item?.id === 'string' && item.id) {
+            let resolvedTitle =
+              typeof item.title === 'string' && item.title ? cleanLabel(item.title) : null
+            if (!resolvedTitle) {
+              const local = resolveLocalItemDetails(item.id, {
+                conversationId,
+                connectionId,
+                home,
+                env,
+              })
+              if (local?.title) {
+                resolvedTitle = cleanLabel(local.title)
+                backfillClaimedItemDetails(scope, item.id, local, { env })
+              }
+            }
             work.push(item.id)
             workItems.push({
               id: item.id,
-              title: typeof item.title === 'string' && item.title ? cleanLabel(item.title) : null,
+              title: resolvedTitle,
             })
           }
         }
@@ -489,13 +507,39 @@ export function readConnectionView({
         if (Array.isArray(claimed)) {
           for (const id of claimed) {
             if (typeof id === 'string' && id) {
+              const local = resolveLocalItemDetails(id, {
+                conversationId,
+                connectionId,
+                home,
+                env,
+              })
+              const resolvedTitle = local?.title ? cleanLabel(local.title) : null
+              if (local?.title) {
+                backfillClaimedItemDetails(scope, id, local, { env })
+              }
               work.push(id)
-              workItems.push({ id, title: null })
+              workItems.push({ id, title: resolvedTitle })
             }
           }
         }
       }
       automation = readActiveAutomation(scope, { env })
+      if (automation && !automation.automation_name && automation.run_id) {
+        const localAuto = resolveLocalAutomationDetails(automation.run_id, {
+          conversationId,
+          connectionId,
+          home,
+          env,
+        })
+        if (localAuto?.automation_name) {
+          automation = {
+            ...automation,
+            automation_id: automation.automation_id || localAuto.automation_id || null,
+            automation_name: localAuto.automation_name,
+          }
+          backfillAutomationDetails(scope, localAuto, { env })
+        }
+      }
     } catch {
       /* ignore */
     }
@@ -619,11 +663,13 @@ export function formatStatusLine(view, work = [], telemetry = null) {
       : Array.isArray(view.workItems) && view.workItems.length > 0
         ? view.workItems
         : view.work || []
-  if (view.state === 'ended_from_devspec') {
+  const hasActiveWork =
+    items.length > 0 || Boolean(view.automation?.automation_name || view.automation?.run_id)
+  if (view.state === 'ended_from_devspec' && !hasActiveWork) {
     const name = view.codename || 'connected'
     return `DevSpec: ${name} · ended from DevSpec`
   }
-  if (view.state === 'disconnected') {
+  if (view.state === 'disconnected' && !hasActiveWork) {
     const name = view.codename || 'connected'
     return `DevSpec: ${name} · disconnected`
   }
@@ -631,6 +677,10 @@ export function formatStatusLine(view, work = [], telemetry = null) {
   const parts = []
   if (view.state === 'connected') {
     parts.push(view.codename || 'connected')
+  } else if (view.state === 'ended_from_devspec') {
+    parts.push(`${view.codename || 'connected'} · ended from DevSpec`)
+  } else if (view.state === 'disconnected') {
+    parts.push(`${view.codename || 'connected'} · disconnected`)
   }
   if (view.projectName) parts.push(view.projectName)
   if (view.sessionId) {

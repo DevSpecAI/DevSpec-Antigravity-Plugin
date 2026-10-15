@@ -28,7 +28,9 @@ import {
   heredocGitCommit,
   isSimpleGitPush,
   pendingNudgeNotice,
+  readActiveAutomation,
   readClaimDetails,
+  readClaimedWorkItems,
   readClaims,
   referenceIn,
   simpleGitCommit,
@@ -36,6 +38,7 @@ import {
 import { runDevspecToolInput } from './devspec-tool-input.mjs'
 import { runPostInvocation } from './post-invocation.mjs'
 import { runPostToolDispatch } from './post-tool-dispatch.mjs'
+import { renderStatusLine } from './statusline.mjs'
 
 const ITEM = 'cdd7a494-ed6a-414b-9f8f-bd0741b9de55'
 const OTHER = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
@@ -587,5 +590,167 @@ describe('commit-observation.mjs — pre/post git commit observation', () => {
       preResult.overwrite.CommandLine,
       `git commit -m "feat: protojson payload [devspec:${ITEM}]"`,
     )
+  })
+
+  it('resolves action item title, work_claim_ref, and automation name in Antigravity when PostToolUse omits tool_response', () => {
+    const testEnv = { ...env, HOME: sandbox }
+    const brainDir = path.join(sandbox, '.gemini', 'antigravity-cli', 'brain', CONVERSATION)
+    const stepDir = path.join(brainDir, '.system_generated', 'steps', '42')
+    fs.mkdirSync(stepDir, { recursive: true, mode: 0o700 })
+
+    // 1. Antigravity fires PostToolUse BEFORE steps/42/output.txt is flushed to disk (no tool_response)
+    handlePost(
+      {
+        conversationId: CONVERSATION,
+        stepIdx: 42,
+        artifactDirectoryPath: brainDir,
+        workspacePaths: [repo],
+        toolCall: {
+          name: 'call_mcp_tool',
+          args: {
+            ServerName: 'devspec',
+            ToolName: 'claim_work_item',
+            Arguments: { action_item_id: ITEM, agent_branch: 'feat/test' },
+          },
+        },
+      },
+      { env: testEnv },
+    )
+
+    // Initially recorded with title: null because output.txt wasn't written yet
+    assert.deepEqual(readClaimedWorkItems(scope(), { env: testEnv }), [
+      { id: ITEM, title: null, work_claim_ref: null, provenance_ref: null },
+    ])
+
+    // 2. Antigravity flushes steps/42/output.txt right as the tool step completes
+    fs.writeFileSync(
+      path.join(stepDir, 'output.txt'),
+      JSON.stringify({
+        id: ITEM,
+        title: 'Status line action item title resolution',
+        work_claim_ref: CLAIM_REF,
+      }),
+      { mode: 0o600 },
+    )
+
+    // 3. statusline.mjs renders the full title AND backfills .claims.json (including work_claim_ref)
+    const connDir = path.join(sandbox, '.devspec', 'remote-control', 'connections')
+    fs.mkdirSync(connDir, { recursive: true, mode: 0o700 })
+    fs.writeFileSync(
+      path.join(connDir, `${connState.connection_id}.json`),
+      JSON.stringify({
+        ...connState,
+        session_codename: 'Curious Badger',
+        project_name: 'DevSpec',
+        session_id: '7069bedd-878d-4c5a-b52c-b5cfc1bcd544',
+        session_title: 'Remote Session',
+        session_title_for: '7069bedd-878d-4c5a-b52c-b5cfc1bcd544',
+      }),
+      { mode: 0o600 },
+    )
+    const bondDir = path.join(sandbox, '.devspec', 'remote-control', 'local', 'antigravity')
+    fs.mkdirSync(bondDir, { recursive: true, mode: 0o700 })
+    fs.writeFileSync(
+      path.join(bondDir, `${CONVERSATION}.json`),
+      JSON.stringify({ connection_id: connState.connection_id }),
+      { mode: 0o600 },
+    )
+
+    const line = renderStatusLine(
+      JSON.stringify({ conversation_id: CONVERSATION, cwd: repo }),
+      { home: sandbox, env: testEnv },
+    )
+    assert.match(
+      line,
+      /DevSpec: Curious Badger · DevSpec · “Remote Session” · working on “Status line action item title resolution” \(cdd7a494\)/,
+    )
+    assert.deepEqual(readClaimedWorkItems(scope(), { env: testEnv }), [
+      {
+        id: ITEM,
+        title: 'Status line action item title resolution',
+        work_claim_ref: CLAIM_REF,
+        provenance_ref: null,
+      },
+    ])
+    assert.equal(readClaimDetails(scope(), { env: testEnv })?.work_claim_ref, CLAIM_REF)
+
+    // 4. record_implementation via node -e with escaped quotes releases the claim
+    handlePost(
+      {
+        conversationId: CONVERSATION,
+        workspacePaths: [repo],
+        toolCall: {
+          name: 'run_command',
+          args: {
+            CommandLine: `node -e "mcpToolsCall({ name: \\"record_implementation\\", arguments: { \\"action_item_id\\": \\"${ITEM}\\" } })"`,
+            Cwd: repo,
+          },
+        },
+      },
+      { env: testEnv },
+    )
+    assert.deepEqual(readClaims(scope(), { env: testEnv }), [])
+
+    // 5. Automation run dispatched via .inbox.jsonl + claimed via call_mcp_tool without tool_response
+    const runId = '88888888-8888-4888-8888-888888888888'
+    const autoId = '99999999-9999-4999-8999-999999999999'
+    fs.writeFileSync(
+      path.join(connDir, `${connState.connection_id}.inbox.jsonl`),
+      `${JSON.stringify({
+        type: 'automation_run',
+        dispatch: {
+          run_id: runId,
+          automation_id: autoId,
+          automation_name: 'Nightly Regression Sweep',
+        },
+      })}\n`,
+      { mode: 0o600 },
+    )
+
+    handlePost(
+      {
+        conversationId: CONVERSATION,
+        workspacePaths: [repo],
+        toolCall: {
+          name: 'call_mcp_tool',
+          args: {
+            ServerName: 'devspec',
+            ToolName: 'claim_automation_run',
+            Arguments: { run_id: runId },
+          },
+        },
+      },
+      { env: testEnv },
+    )
+
+    assert.deepEqual(readActiveAutomation(scope(), { env: testEnv }), {
+      run_id: runId,
+      automation_id: autoId,
+      automation_name: 'Nightly Regression Sweep',
+    })
+
+    const autoLine = renderStatusLine(
+      JSON.stringify({ conversation_id: CONVERSATION, cwd: repo }),
+      { home: sandbox, env: testEnv },
+    )
+    assert.match(autoLine, /automation “Nightly Regression Sweep”/)
+
+    // 6. record_automation_run without tool_response clears the active automation
+    handlePost(
+      {
+        conversationId: CONVERSATION,
+        workspacePaths: [repo],
+        toolCall: {
+          name: 'call_mcp_tool',
+          args: {
+            ServerName: 'devspec',
+            ToolName: 'record_automation_run',
+            Arguments: { run_id: runId, status: 'succeeded' },
+          },
+        },
+      },
+      { env: testEnv },
+    )
+    assert.equal(readActiveAutomation(scope(), { env: testEnv }), null)
   })
 })

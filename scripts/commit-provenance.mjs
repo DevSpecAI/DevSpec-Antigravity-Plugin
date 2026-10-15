@@ -277,10 +277,24 @@ export function readClaimDetails(scope, options = {}) {
   if (claims.length !== 1) return null
   const id = claims[0]
   const entry = details[id] && typeof details[id] === 'object' ? details[id] : {}
+  let workClaimRef = typeof entry.work_claim_ref === 'string' ? entry.work_claim_ref : null
+  const provenanceRef = typeof entry.provenance_ref === 'string' ? entry.provenance_ref : null
+  if (!workClaimRef && scope?.sessionId) {
+    const local = resolveLocalItemDetails(id, {
+      conversationId: scope.sessionId,
+      env: options.env ?? process.env,
+    })
+    if (local?.work_claim_ref) {
+      workClaimRef = local.work_claim_ref
+      backfillClaimedItemDetails(scope, id, local, options)
+    } else if (local?.title && !entry.title) {
+      backfillClaimedItemDetails(scope, id, local, options)
+    }
+  }
   return {
     action_item_id: id,
-    work_claim_ref: typeof entry.work_claim_ref === 'string' ? entry.work_claim_ref : null,
-    provenance_ref: typeof entry.provenance_ref === 'string' ? entry.provenance_ref : null,
+    work_claim_ref: workClaimRef,
+    provenance_ref: provenanceRef,
   }
 }
 
@@ -361,6 +375,55 @@ export function writeActiveAutomation(
   )
 }
 
+export function backfillClaimedItemDetails(
+  scope,
+  itemId,
+  resolved,
+  { env = process.env, now = Date.now(), platform = process.platform } = {},
+) {
+  if (!scope || !itemId || !UUID_RE.test(itemId) || !resolved || typeof resolved !== 'object') return false
+  const targetId = itemId.toLowerCase()
+  const { claims, details } = readClaimsRecord(scope, { env, now, platform })
+  if (!claims.includes(targetId)) return false
+  const current = details[targetId] && typeof details[targetId] === 'object' ? details[targetId] : {}
+  const nextTitle =
+    (typeof current.title === 'string' && current.title.trim()) ||
+    (typeof resolved.title === 'string' && resolved.title.trim() ? resolved.title.trim() : null)
+  const nextClaimRef =
+    current.work_claim_ref ||
+    (typeof resolved.work_claim_ref === 'string' && resolved.work_claim_ref.trim()
+      ? resolved.work_claim_ref.trim()
+      : null)
+  const nextProvRef =
+    current.provenance_ref ||
+    (typeof resolved.provenance_ref === 'string' && resolved.provenance_ref.trim()
+      ? resolved.provenance_ref.trim()
+      : null)
+  if (
+    nextTitle === (current.title ?? null) &&
+    nextClaimRef === (current.work_claim_ref ?? null) &&
+    nextProvRef === (current.provenance_ref ?? null)
+  ) {
+    return false
+  }
+  const nextDetails = {
+    ...details,
+    [targetId]: {
+      ...current,
+      title: nextTitle,
+      work_claim_ref: nextClaimRef,
+      provenance_ref: nextProvRef,
+      at: current.at ?? now,
+    },
+  }
+  try {
+    writeClaims(scope, claims, nextDetails, { env, now, platform })
+    return true
+  } catch {
+    return false
+  }
+}
+
 export function clearActiveAutomation(
   scope,
   runId = null,
@@ -375,6 +438,50 @@ export function clearActiveAutomation(
     fs.unlinkSync(file)
   } catch {
     /* nothing to remove */
+  }
+}
+
+export function backfillAutomationDetails(
+  scope,
+  resolved,
+  { env = process.env, now = Date.now(), platform = process.platform } = {},
+) {
+  if (!scope || !resolved || typeof resolved !== 'object') return false
+  const active = readActiveAutomation(scope, { env, now, platform })
+  if (!active) return false
+  if (
+    active.run_id &&
+    resolved.run_id &&
+    active.run_id.toLowerCase() !== String(resolved.run_id).toLowerCase()
+  ) {
+    return false
+  }
+  const nextName =
+    active.automation_name ||
+    (typeof resolved.automation_name === 'string' && resolved.automation_name.trim()
+      ? resolved.automation_name.trim()
+      : null)
+  const nextAutoId =
+    active.automation_id ||
+    (typeof resolved.automation_id === 'string' && resolved.automation_id.trim()
+      ? resolved.automation_id.trim()
+      : null)
+  if (nextName === active.automation_name && nextAutoId === active.automation_id) {
+    return false
+  }
+  try {
+    writeActiveAutomation(
+      scope,
+      {
+        run_id: active.run_id || resolved.run_id || null,
+        automation_id: nextAutoId,
+        automation_name: nextName,
+      },
+      { env, now, platform },
+    )
+    return true
+  } catch {
+    return false
   }
 }
 
@@ -811,7 +918,10 @@ export function handlePost(input, options = {}) {
   if (verb === CLAIM_AUTOMATION_VERB) {
     let scope
     try { scope = scopeFrom(input, env) } catch { return null }
-    const parsedAuto = parseAutomationClaimResponse(input, rawName, rawToolInput, command)
+    const parsedAuto = parseAutomationClaimResponse(input, rawName, rawToolInput, command, {
+      env,
+      sessionId: scope.sessionId,
+    })
     if (!parsedAuto) return null
     try {
       writeActiveAutomation(scope, parsedAuto, { env, now, platform })
@@ -825,7 +935,7 @@ export function handlePost(input, options = {}) {
   if (verb === RECORD_AUTOMATION_VERB) {
     let scope
     try { scope = scopeFrom(input, env) } catch { return null }
-    const recorded = parseAutomationRecordResponse(input, rawName, rawToolInput, command)
+    const recorded = parseAutomationRecordResponse(input, rawName, rawToolInput, command, { env })
     if (!recorded?.ok) return null
     try {
       clearActiveAutomation(scope, recorded.run_id, { env, now, platform })
@@ -839,25 +949,35 @@ export function handlePost(input, options = {}) {
   let scope
   try { scope = scopeFrom(input, env) } catch { return null }
 
-  const parsed = parseClaimResponse(input, rawName, rawToolInput, command)
-  if (!parsed?.id) return null
-  const itemId = parsed.id
   const { claims: current, details } = readClaimsRecord(scope, { env, now, platform })
+  const parsed = parseClaimResponse(input, rawName, rawToolInput, command, {
+    env,
+    sessionId: scope.sessionId,
+    verb,
+  })
+  const itemId =
+    parsed?.id ??
+    (RELEASE_VERBS.has(verb) &&
+    current.length === 1 &&
+    !(typeof input?.error === 'string' && input.error.trim().length > 0)
+      ? current[0]
+      : null)
+  if (!itemId) return null
   try {
     if (verb === CLAIM_VERB) {
       const nextDetails = {
         ...details,
         [itemId]: {
-          title: parsed.title ?? details[itemId]?.title ?? null,
-          work_claim_ref: parsed.work_claim_ref ?? details[itemId]?.work_claim_ref ?? null,
-          provenance_ref: parsed.provenance_ref ?? details[itemId]?.provenance_ref ?? null,
+          title: parsed?.title ?? details[itemId]?.title ?? null,
+          work_claim_ref: parsed?.work_claim_ref ?? details[itemId]?.work_claim_ref ?? null,
+          provenance_ref: parsed?.provenance_ref ?? details[itemId]?.provenance_ref ?? null,
           at: now,
         },
       }
       writeClaims(scope, [...current, itemId], nextDetails, { env, now, platform })
       clearPendingNudge(scope.sessionId, { env })
     } else if (verb === GET_ITEM_VERB) {
-      if (current.includes(itemId) && parsed.title) {
+      if (current.includes(itemId) && parsed?.title) {
         const nextDetails = {
           ...details,
           [itemId]: {
@@ -894,26 +1014,172 @@ function collectResponseTexts(response) {
   return texts
 }
 
+const MAX_LOCAL_OUTPUT_BYTES = 512 * 1024
+
+function readSmallTextFile(filePath, maxBytes = MAX_LOCAL_OUTPUT_BYTES) {
+  if (typeof filePath !== 'string' || !filePath) return null
+  try {
+    const stat = fs.statSync(filePath)
+    if (!stat.isFile() || stat.size <= 0 || stat.size > maxBytes) return null
+    return fs.readFileSync(filePath, 'utf8')
+  } catch {
+    return null
+  }
+}
+
+function readTailLines(filePath, maxBytes = 128 * 1024) {
+  if (typeof filePath !== 'string' || !filePath) return []
+  let fd
+  try {
+    const stat = fs.statSync(filePath)
+    if (!stat.isFile() || stat.size <= 0) return []
+    const readSize = Math.min(stat.size, maxBytes)
+    const offset = stat.size - readSize
+    fd = fs.openSync(filePath, 'r')
+    const buf = Buffer.alloc(readSize)
+    fs.readSync(fd, buf, 0, readSize, offset)
+    const text = buf.toString('utf8')
+    const lines = text.split(/\r?\n/).filter(Boolean)
+    return offset > 0 ? lines.slice(1) : lines
+  } catch {
+    return []
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd) } catch { /* ignore */ }
+    }
+  }
+}
+
+function resolveBrainDir(input, { conversationId = null, home = null, env = process.env } = {}) {
+  if (typeof input?.artifactDirectoryPath === 'string' && input.artifactDirectoryPath.trim()) {
+    return input.artifactDirectoryPath.trim()
+  }
+  if (typeof input?.transcriptPath === 'string' && input.transcriptPath.includes('.system_generated')) {
+    const base = input.transcriptPath.split('.system_generated')[0].replace(/[\\/]+$/, '')
+    if (base) return base
+  }
+  const cid = conversationId || resolveProvenanceSessionId(input, env)
+  const effectiveHome = home || env.USERPROFILE || env.HOME || os.homedir()
+  if (cid && validSessionId(cid) && effectiveHome) {
+    return path.join(effectiveHome, '.gemini', 'antigravity-cli', 'brain', cid)
+  }
+  return null
+}
+
+function collectAntigravityStepTexts(input, { env = process.env, sessionId = null } = {}) {
+  const texts = []
+  if (!input || typeof input !== 'object') return texts
+  const home = env.USERPROFILE || env.HOME || os.homedir()
+  const conversationId = sessionId || resolveProvenanceSessionId(input, env)
+  const brainDir = resolveBrainDir(input, { conversationId, home, env })
+  const rawStep = input.stepIdx ?? input.step_index
+  const stepNum = rawStep !== undefined && rawStep !== null && rawStep !== '' ? Number(rawStep) : NaN
+
+  if (brainDir && Number.isInteger(stepNum) && stepNum >= 0) {
+    for (const candidateStep of [stepNum, stepNum + 1]) {
+      const stepOut = path.join(brainDir, '.system_generated', 'steps', String(candidateStep), 'output.txt')
+      const content = readSmallTextFile(stepOut)
+      if (content) texts.push(content)
+    }
+  }
+
+  const transcriptCandidates = []
+  if (brainDir) {
+    transcriptCandidates.push(
+      path.join(brainDir, '.system_generated', 'logs', 'transcript_full.jsonl'),
+      path.join(brainDir, '.system_generated', 'logs', 'transcript.jsonl'),
+    )
+  }
+  if (typeof input.transcriptPath === 'string' && input.transcriptPath.trim()) {
+    const tp = input.transcriptPath.trim()
+    if (!transcriptCandidates.includes(tp)) transcriptCandidates.push(tp)
+  }
+
+  for (const tp of transcriptCandidates) {
+    const lines = readTailLines(tp, 64 * 1024)
+    if (lines.length === 0) continue
+    for (let i = lines.length - 1; i >= Math.max(0, lines.length - 6); i--) {
+      try {
+        const entry = JSON.parse(lines[i])
+        if (entry?.type !== 'GENERIC' || typeof entry.content !== 'string') continue
+        if (
+          Number.isInteger(stepNum) &&
+          typeof entry.step_index === 'number' &&
+          entry.step_index !== stepNum &&
+          entry.step_index !== stepNum + 1
+        ) {
+          continue
+        }
+        texts.push(entry.content)
+      } catch {
+        /* ignore malformed line */
+      }
+    }
+    if (texts.length > 0) break
+  }
+
+  return texts
+}
+
 function parseJsonCandidates(texts) {
   const objects = []
-  for (const text of texts) {
+  const pushParsed = (parsed) => {
+    const values = Array.isArray(parsed) ? parsed : [parsed]
+    for (const v of values) if (v && typeof v === 'object') objects.push(v)
+  }
+
+  for (const rawText of texts) {
+    const text = String(rawText ?? '')
+    if (!text.trim()) continue
     try {
-      const parsed = JSON.parse(text)
-      const values = Array.isArray(parsed) ? parsed : [parsed]
-      for (const v of values) if (v && typeof v === 'object') objects.push(v)
+      pushParsed(JSON.parse(text))
       continue
     } catch {
-      /* try line-by-line JSON in command stdout */
+      /* try spilled file URI, header-stripped multi-line JSON, or line-by-line JSON */
     }
-    for (const line of String(text).split(/\r?\n/)) {
-      const trimmed = line.trim()
-      if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) continue
+
+    const fileUriMatch = /file:\/\/(\/[^\s"'<>]+\.txt)/i.exec(text)
+    if (fileUriMatch) {
+      const spilledPath = decodeURIComponent(fileUriMatch[1])
+      const spilledContent = readSmallTextFile(spilledPath)
+      if (spilledContent) {
+        try {
+          pushParsed(JSON.parse(spilledContent))
+          continue
+        } catch {
+          /* continue to other fallbacks */
+        }
+      }
+    }
+
+    const blockMatch = /(?:^|\r?\n)\s*(\{[\s\S]*\}|\[[\s\S]*\])\s*$/.exec(text)
+    if (blockMatch) {
       try {
-        const parsed = JSON.parse(trimmed)
-        const values = Array.isArray(parsed) ? parsed : [parsed]
-        for (const v of values) if (v && typeof v === 'object') objects.push(v)
+        pushParsed(JSON.parse(blockMatch[1]))
+        continue
       } catch {
-        /* ignore non-JSON line */
+        /* fall through to line-by-line scan */
+      }
+    }
+
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        try {
+          pushParsed(JSON.parse(trimmed))
+          continue
+        } catch {
+          /* ignore non-JSON line */
+        }
+      }
+      const braceIdx = trimmed.indexOf('{')
+      if (braceIdx > 0 && trimmed.endsWith('}')) {
+        try {
+          pushParsed(JSON.parse(trimmed.slice(braceIdx)))
+        } catch {
+          /* ignore */
+        }
       }
     }
   }
@@ -935,23 +1201,357 @@ function extractItemTitle(value) {
   return null
 }
 
+function extractItemFieldsFromText(text, itemId) {
+  if (typeof text !== 'string' || !text || !itemId) return null
+  const esc = itemId.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')
+  const r1 = new RegExp(
+    `"(?:action_item_)?id"\\s*:\\s*"${esc}"[\\s\\S]{0,600}?"title"\\s*:\\s*"((?:[^"\\\\]|\\\\.)+)"`,
+    'i',
+  )
+  const r2 = new RegExp(
+    `"title"\\s*:\\s*"((?:[^"\\\\]|\\\\.)+)"[\\s\\S]{0,600}?"(?:action_item_)?id"\\s*:\\s*"${esc}"`,
+    'i',
+  )
+  const m = r1.exec(text) || r2.exec(text)
+  if (!m) return null
+  let title = m[1]
+  try {
+    title = JSON.parse(`"${m[1]}"`)
+  } catch {
+    /* keep raw match */
+  }
+  if (typeof title !== 'string' || !title.trim()) return null
+  const refMatch = /"work_claim_ref"\s*:\s*"([0-9a-f-]{36})"/i.exec(text)
+  return {
+    id: itemId.toLowerCase(),
+    title: title.trim(),
+    work_claim_ref: refMatch ? refMatch[1] : null,
+  }
+}
+
+function matchItemFromCandidateObject(value, targetId) {
+  if (!value || typeof value !== 'object') return null
+  const candidates = [value]
+  for (const listKey of ['items', 'action_items', 'results']) {
+    if (Array.isArray(value[listKey])) {
+      for (const el of value[listKey]) if (el && typeof el === 'object') candidates.push(el)
+    }
+  }
+  if (Array.isArray(value.session_activity?.items)) {
+    for (const el of value.session_activity.items) {
+      if (el && typeof el === 'object') candidates.push(el)
+    }
+  }
+  for (const obj of candidates) {
+    const rawId =
+      typeof obj.id === 'string'
+        ? obj.id
+        : typeof obj.action_item_id === 'string'
+          ? obj.action_item_id
+          : typeof obj.item?.id === 'string'
+            ? obj.item.id
+            : null
+    if (!rawId || rawId.toLowerCase() !== targetId) continue
+    const title = extractItemTitle(obj)
+    if (title) {
+      return {
+        id: targetId,
+        title,
+        work_claim_ref: typeof obj.work_claim_ref === 'string' ? obj.work_claim_ref : null,
+      }
+    }
+  }
+  return null
+}
+
+function resolveConnectionIdsForSession(conversationId, explicitConnectionId, home) {
+  const ids = []
+  if (typeof explicitConnectionId === 'string' && UUID_RE.test(explicitConnectionId)) {
+    ids.push(explicitConnectionId)
+  }
+  if (conversationId && validSessionId(conversationId) && home) {
+    const bondFile = path.join(home, '.devspec', 'remote-control', 'local', 'antigravity', `${conversationId}.json`)
+    const bondText = readSmallTextFile(bondFile, 64 * 1024)
+    if (bondText) {
+      try {
+        const bond = JSON.parse(bondText)
+        if (typeof bond?.connection_id === 'string' && UUID_RE.test(bond.connection_id) && !ids.includes(bond.connection_id)) {
+          ids.push(bond.connection_id)
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  return ids
+}
+
+export function resolveLocalItemDetails(
+  itemId,
+  { conversationId = null, connectionId = null, home = null, brainDir = null, env = process.env } = {},
+) {
+  if (typeof itemId !== 'string' || !UUID_RE.test(itemId)) return null
+  const targetId = itemId.toLowerCase()
+  const effectiveHome = home || env.USERPROFILE || env.HOME || os.homedir()
+  const effectiveBrainDir =
+    brainDir ||
+    (conversationId && validSessionId(conversationId) && effectiveHome
+      ? path.join(effectiveHome, '.gemini', 'antigravity-cli', 'brain', conversationId)
+      : null)
+
+  // 1. Check Antigravity spilled step outputs (<brain>/<cid>/.system_generated/steps/*/output.txt),
+  // which contain both `title` and `work_claim_ref` from claim_work_item / get_action_item.
+  if (effectiveBrainDir) {
+    const stepsDir = path.join(effectiveBrainDir, '.system_generated', 'steps')
+    try {
+      if (fs.existsSync(stepsDir)) {
+        const stepDirs = fs
+          .readdirSync(stepsDir)
+          .filter((d) => /^\d+$/.test(d))
+          .sort((a, b) => Number(b) - Number(a))
+          .slice(0, 50)
+        for (const stepName of stepDirs) {
+          const outFile = path.join(stepsDir, stepName, 'output.txt')
+          const txt = readSmallTextFile(outFile)
+          if (!txt || !txt.toLowerCase().includes(targetId)) continue
+          for (const obj of parseJsonCandidates([txt])) {
+            const matched = matchItemFromCandidateObject(obj, targetId)
+            if (matched?.title) return matched
+          }
+          const regexMatched = extractItemFieldsFromText(txt, targetId)
+          if (regexMatched?.title) return regexMatched
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // 2. Check cached .room.json files (fast, tiny, already materialized by poller).
+  if (effectiveHome) {
+    const connDir = path.join(effectiveHome, '.devspec', 'remote-control', 'connections')
+    const connIds = resolveConnectionIdsForSession(conversationId, connectionId, effectiveHome)
+    const roomFiles = connIds.map((cid) => path.join(connDir, `${cid}.room.json`))
+    try {
+      if (roomFiles.length === 0 && fs.existsSync(connDir)) {
+        for (const f of fs.readdirSync(connDir)) {
+          if (f.endsWith('.room.json')) roomFiles.push(path.join(connDir, f))
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    for (const rf of roomFiles) {
+      const txt = readSmallTextFile(rf)
+      if (!txt || !txt.toLowerCase().includes(targetId)) continue
+      try {
+        const room = JSON.parse(txt)
+        const matched = matchItemFromCandidateObject(room, targetId)
+        if (matched?.title) return matched
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  // 3. Check Antigravity conversation transcript logs (transcript_full.jsonl / transcript.jsonl).
+  if (effectiveBrainDir) {
+    for (const logName of ['transcript_full.jsonl', 'transcript.jsonl']) {
+      const logPath = path.join(effectiveBrainDir, '.system_generated', 'logs', logName)
+      const lines = readTailLines(logPath, 256 * 1024)
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i]
+        if (!line.toLowerCase().includes(targetId)) continue
+        try {
+          const entry = JSON.parse(line)
+          const content = typeof entry?.content === 'string' ? entry.content : ''
+          if (!content) continue
+          for (const obj of parseJsonCandidates([content])) {
+            const matched = matchItemFromCandidateObject(obj, targetId)
+            if (matched?.title) return matched
+          }
+          const regexMatched = extractItemFieldsFromText(content, targetId)
+          if (regexMatched?.title) return regexMatched
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+
+  return null
+}
+
+export function resolveLocalAutomationDetails(
+  runId,
+  { conversationId = null, connectionId = null, home = null, brainDir = null, env = process.env } = {},
+) {
+  const targetRunId = typeof runId === 'string' && runId.trim() ? runId.trim().toLowerCase() : null
+  const effectiveHome = home || env.USERPROFILE || env.HOME || os.homedir()
+
+  // 1. Check .inbox.jsonl where devspec-remote-poll.mjs records automation_run dispatches with automation_name.
+  if (effectiveHome) {
+    const connDir = path.join(effectiveHome, '.devspec', 'remote-control', 'connections')
+    const connIds = resolveConnectionIdsForSession(conversationId, connectionId, effectiveHome)
+    const inboxFiles = connIds.map((cid) => path.join(connDir, `${cid}.inbox.jsonl`))
+    try {
+      if (fs.existsSync(connDir)) {
+        for (const f of fs.readdirSync(connDir)) {
+          if (f.endsWith('.inbox.jsonl')) {
+            const full = path.join(connDir, f)
+            if (!inboxFiles.includes(full)) inboxFiles.push(full)
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    for (const inboxFile of inboxFiles) {
+      const lines = readTailLines(inboxFile, 128 * 1024)
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i]
+        if (targetRunId && !line.toLowerCase().includes(targetRunId)) continue
+        try {
+          const entry = JSON.parse(line)
+          const dispatch =
+            entry?.dispatch && typeof entry.dispatch === 'object' ? entry.dispatch : entry
+          const candRunId =
+            (typeof dispatch?.run_id === 'string' && dispatch.run_id.trim()) ||
+            (typeof dispatch?.id === 'string' && dispatch.id.trim()) ||
+            (typeof entry?.run_id === 'string' && entry.run_id.trim()) ||
+            null
+          if (targetRunId && (!candRunId || candRunId.toLowerCase() !== targetRunId)) continue
+          const candName =
+            (typeof dispatch?.automation_name === 'string' && dispatch.automation_name.trim()) ||
+            (typeof dispatch?.automation?.name === 'string' && dispatch.automation.name.trim()) ||
+            (typeof entry?.automation_name === 'string' && entry.automation_name.trim()) ||
+            null
+          const candAutoId =
+            (typeof dispatch?.automation_id === 'string' && dispatch.automation_id.trim()) ||
+            (typeof dispatch?.automation?.id === 'string' && dispatch.automation.id.trim()) ||
+            (typeof entry?.automation_id === 'string' && entry.automation_id.trim()) ||
+            null
+          if (candName || candAutoId) {
+            return {
+              run_id: candRunId || (typeof runId === 'string' ? runId.trim() : null),
+              automation_id: candAutoId,
+              automation_name: candName,
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+
+  // 2. Check Antigravity spilled step outputs and transcript logs.
+  const effectiveBrainDir =
+    brainDir ||
+    (conversationId && validSessionId(conversationId) && effectiveHome
+      ? path.join(effectiveHome, '.gemini', 'antigravity-cli', 'brain', conversationId)
+      : null)
+
+  const extractAutoFromObject = (value) => {
+    if (!value || typeof value !== 'object') return null
+    const autoObj = value.automation && typeof value.automation === 'object' ? value.automation : null
+    const runObj = value.run && typeof value.run === 'object' ? value.run : null
+    const candRunId =
+      (typeof runObj?.id === 'string' && runObj.id.trim()) ||
+      (typeof runObj?.run_id === 'string' && runObj.run_id.trim()) ||
+      (typeof value.run_id === 'string' && value.run_id.trim()) ||
+      null
+    if (targetRunId && candRunId && candRunId.toLowerCase() !== targetRunId) return null
+    const candName =
+      (typeof autoObj?.name === 'string' && autoObj.name.trim()) ||
+      (typeof value.automation_name === 'string' && value.automation_name.trim()) ||
+      (typeof runObj?.automation_name === 'string' && runObj.automation_name.trim()) ||
+      null
+    const candAutoId =
+      (typeof autoObj?.id === 'string' && autoObj.id.trim()) ||
+      (typeof value.automation_id === 'string' && value.automation_id.trim()) ||
+      (typeof runObj?.automation_id === 'string' && runObj.automation_id.trim()) ||
+      null
+    if (!candName) return null
+    return {
+      run_id: candRunId || (typeof runId === 'string' ? runId.trim() : null),
+      automation_id: candAutoId,
+      automation_name: candName,
+    }
+  }
+
+  if (effectiveBrainDir) {
+    const stepsDir = path.join(effectiveBrainDir, '.system_generated', 'steps')
+    try {
+      if (fs.existsSync(stepsDir)) {
+        const stepDirs = fs
+          .readdirSync(stepsDir)
+          .filter((d) => /^\d+$/.test(d))
+          .sort((a, b) => Number(b) - Number(a))
+          .slice(0, 40)
+        for (const stepName of stepDirs) {
+          const outFile = path.join(stepsDir, stepName, 'output.txt')
+          const txt = readSmallTextFile(outFile)
+          if (!txt) continue
+          if (targetRunId && !txt.toLowerCase().includes(targetRunId)) continue
+          for (const obj of parseJsonCandidates([txt])) {
+            const matched = extractAutoFromObject(obj)
+            if (matched?.automation_name) return matched
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+
+    for (const logName of ['transcript_full.jsonl', 'transcript.jsonl']) {
+      const logPath = path.join(effectiveBrainDir, '.system_generated', 'logs', logName)
+      const lines = readTailLines(logPath, 256 * 1024)
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i]
+        if (targetRunId && !line.toLowerCase().includes(targetRunId)) continue
+        try {
+          const entry = JSON.parse(line)
+          const content = typeof entry?.content === 'string' ? entry.content : ''
+          if (!content) continue
+          for (const obj of parseJsonCandidates([content])) {
+            const matched = extractAutoFromObject(obj)
+            if (matched?.automation_name) return matched
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+
+  return null
+}
+
 function parseClaimResponse(
   input,
   rawName = input?.tool_name ?? input?.toolName ?? input?.toolCall?.name,
   rawToolInput = input?.tool_input ?? input?.toolInput ?? input?.toolCall?.args ?? {},
   command = '',
+  { env = process.env, sessionId = null, verb = null } = {},
 ) {
   if (typeof input?.error === 'string' && input.error.trim().length > 0) return null
   const response = input?.tool_response ?? input?.toolResponse ?? input?.result
   const toolInput = unwrapDevspecArgs(rawName, rawToolInput)
   const texts = collectResponseTexts(response)
+  if (texts.length === 0) {
+    texts.push(...collectAntigravityStepTexts(input, { env, sessionId }))
+  }
   let requested = toolInput.action_item_id
   if (!requested && command) {
-    const m = new RegExp(`action_item_id['"\\s:]+(${UUID})`, 'i').exec(command)
+    const m = new RegExp(`action_item_id[\\\\'"\\s:]+(${UUID})`, 'i').exec(command)
     if (m) requested = m[1]
   }
   const requestedProvenanceRef = typeof toolInput.provenance_ref === 'string' ? toolInput.provenance_ref : null
   const requestedWorkClaimRef = typeof toolInput.work_claim_ref === 'string' ? toolInput.work_claim_ref : null
+  const conversationId = sessionId || resolveProvenanceSessionId(input, env)
+  const brainDir = resolveBrainDir(input, { conversationId, env })
+
   for (const value of parseJsonCandidates(texts)) {
     if (value.error || value.success === false || value.ok === false || value.claim_success === false) {
       continue
@@ -965,42 +1565,67 @@ function parseClaimResponse(
             ? value.item.id
             : null
     if (rawId && UUID_RE.test(rawId)) {
+      const id = rawId.toLowerCase()
+      let title = extractItemTitle(value)
+      let workClaimRef = typeof value.work_claim_ref === 'string' ? value.work_claim_ref : requestedWorkClaimRef
+      if (!title && (verb === CLAIM_VERB || verb === GET_ITEM_VERB || !verb)) {
+        const local = resolveLocalItemDetails(id, { conversationId, brainDir, env })
+        if (local?.title) title = local.title
+        if (!workClaimRef && local?.work_claim_ref) workClaimRef = local.work_claim_ref
+      }
       return {
-        id: rawId.toLowerCase(),
-        title: extractItemTitle(value),
-        work_claim_ref: typeof value.work_claim_ref === 'string' ? value.work_claim_ref : requestedWorkClaimRef,
+        id,
+        title,
+        work_claim_ref: workClaimRef,
         provenance_ref: typeof value.provenance_ref === 'string' ? value.provenance_ref : requestedProvenanceRef,
       }
     }
   }
   if (UUID_RE.test(requested || '') && !texts.some((t) => /"error"|not found|failed/i.test(t))) {
+    const id = requested.toLowerCase()
+    const local =
+      verb === CLAIM_VERB || verb === GET_ITEM_VERB || !verb
+        ? resolveLocalItemDetails(id, { conversationId, brainDir, env })
+        : null
     return {
-      id: requested.toLowerCase(),
-      title: null,
-      work_claim_ref: requestedWorkClaimRef,
+      id,
+      title: local?.title ?? null,
+      work_claim_ref: local?.work_claim_ref ?? requestedWorkClaimRef,
       provenance_ref: requestedProvenanceRef,
     }
   }
   return null
 }
 
-function parseAutomationClaimResponse(input, rawName, rawToolInput, command = '') {
+function parseAutomationClaimResponse(
+  input,
+  rawName,
+  rawToolInput,
+  command = '',
+  { env = process.env, sessionId = null } = {},
+) {
   if (typeof input?.error === 'string' && input.error.trim().length > 0) return null
   const response = input?.tool_response ?? input?.toolResponse ?? input?.result
   const toolInput = unwrapDevspecArgs(rawName, rawToolInput)
   const texts = collectResponseTexts(response)
-  let requestedRunId = typeof toolInput.run_id === 'string' ? toolInput.run_id : null
+  if (texts.length === 0) {
+    texts.push(...collectAntigravityStepTexts(input, { env, sessionId }))
+  }
+  let requestedRunId = typeof toolInput.run_id === 'string' && toolInput.run_id.trim() ? toolInput.run_id.trim() : null
   if (!requestedRunId && command) {
-    const m = new RegExp(`run_id['"\\s:]+(${UUID}|[A-Za-z0-9_-]+)`, 'i').exec(command)
+    const m = new RegExp(`run_id[\\\\'"\\s:]+(${UUID}|[A-Za-z0-9_-]+)`, 'i').exec(command)
     if (m) requestedRunId = m[1]
   }
+  const conversationId = sessionId || resolveProvenanceSessionId(input, env)
+  const brainDir = resolveBrainDir(input, { conversationId, env })
+
   for (const value of parseJsonCandidates(texts)) {
     if (value.error || value.success === false || value.ok === false || value.claimed === false) {
       continue
     }
     const autoObj = value.automation && typeof value.automation === 'object' ? value.automation : null
     const runObj = value.run && typeof value.run === 'object' ? value.run : null
-    const name =
+    let name =
       (typeof autoObj?.name === 'string' && autoObj.name.trim()) ||
       (typeof value.automation_name === 'string' && value.automation_name.trim()) ||
       (typeof runObj?.automation_name === 'string' && runObj.automation_name.trim()) ||
@@ -1011,12 +1636,17 @@ function parseAutomationClaimResponse(input, rawName, rawToolInput, command = ''
       (typeof value.run_id === 'string' && value.run_id.trim()) ||
       requestedRunId ||
       null
-    const automationId =
+    let automationId =
       (typeof autoObj?.id === 'string' && autoObj.id.trim()) ||
       (typeof value.automation_id === 'string' && value.automation_id.trim()) ||
       (typeof runObj?.automation_id === 'string' && runObj.automation_id.trim()) ||
       null
     if (value.claimed === true || name || (runId && autoObj)) {
+      if (!name && runId) {
+        const local = resolveLocalAutomationDetails(runId, { conversationId, brainDir, env })
+        if (local?.automation_name) name = local.automation_name
+        if (!automationId && local?.automation_id) automationId = local.automation_id
+      }
       return {
         run_id: runId,
         automation_id: automationId,
@@ -1024,17 +1654,35 @@ function parseAutomationClaimResponse(input, rawName, rawToolInput, command = ''
       }
     }
   }
+
+  if (requestedRunId && !texts.some((t) => /"error"|not found|failed/i.test(t))) {
+    const local = resolveLocalAutomationDetails(requestedRunId, { conversationId, brainDir, env })
+    return {
+      run_id: requestedRunId,
+      automation_id: local?.automation_id ?? null,
+      automation_name: local?.automation_name ?? null,
+    }
+  }
   return null
 }
 
-function parseAutomationRecordResponse(input, rawName, rawToolInput, command = '') {
+function parseAutomationRecordResponse(
+  input,
+  rawName,
+  rawToolInput,
+  command = '',
+  { env = process.env } = {},
+) {
   if (typeof input?.error === 'string' && input.error.trim().length > 0) return null
   const response = input?.tool_response ?? input?.toolResponse ?? input?.result
   const toolInput = unwrapDevspecArgs(rawName, rawToolInput)
   const texts = collectResponseTexts(response)
+  if (texts.length === 0) {
+    texts.push(...collectAntigravityStepTexts(input, { env }))
+  }
   let requestedRunId = typeof toolInput.run_id === 'string' ? toolInput.run_id : null
   if (!requestedRunId && command) {
-    const m = new RegExp(`run_id['"\\s:]+(${UUID}|[A-Za-z0-9_-]+)`, 'i').exec(command)
+    const m = new RegExp(`run_id[\\\\'"\\s:]+(${UUID}|[A-Za-z0-9_-]+)`, 'i').exec(command)
     if (m) requestedRunId = m[1]
   }
   for (const value of parseJsonCandidates(texts)) {

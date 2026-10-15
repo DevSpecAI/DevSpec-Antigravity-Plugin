@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.15.5
+
+### Antigravity status line action item title and automation name resolution
+
+- **Resolve action item titles, `work_claim_ref`, and automation names when `PostToolUse` omits `tool_response` (`scripts/commit-provenance.mjs`, `scripts/statusline.mjs`):** Antigravity's `PostToolUse` hook payload does not include `tool_response`, which previously caused `parseClaimResponse` to fall back to `title: null` (rendering only the 8-char item ID on the status line) and `parseAutomationClaimResponse` to return `null` (never writing `<digest>.automation.json`). Added `collectAntigravityStepTexts`, `resolveLocalItemDetails`, `resolveLocalAutomationDetails`, `backfillClaimedItemDetails`, and `backfillAutomationDetails` to resolve and backfill action item titles, `work_claim_ref`, and automation names from Antigravity's `.system_generated/steps/<N>/output.txt`, `transcript_full.jsonl` / `transcript.jsonl`, `.room.json` (`session_activity.items`), and `.inbox.jsonl` (`automation_run` dispatches), and kept active work/automation visible on the status line even when remote control is disconnected.
+
 ## 0.15.4
 
 ### Mechanical runtime model stamping on session posts and effort-suffix normalization
