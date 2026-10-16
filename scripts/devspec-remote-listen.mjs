@@ -213,7 +213,20 @@ export function buildWakeDeliveryMessage(entry, opts = {}) {
   return lines.join('\n\n')
 }
 
-function resolveAgentApiCommand(mergedEnv, execFileImpl, explicitEnv, state) {
+/**
+ * Which executable delivers the wake.
+ *
+ * `ANTIGRAVITY_AGENTAPI_EXE` (and the state file's copy of it) names the binary the
+ * agy process was started from. agy updates itself by renaming that running binary
+ * to `agy.<n>.old`, and a later agy launch deletes it, while the long-lived agy
+ * process and its env still name the old path. Every delivery then fails to spawn,
+ * every later room message waits in the inbox, and the person has to type at the
+ * terminal instead (item 479607e6, observed on connection baa40bfd: the stored path
+ * was gone and two megabytes of inbox sat undelivered). A named path that no longer
+ * exists is therefore skipped for the wrapper agy keeps pointing at its current
+ * binary, then for `agentapi` on PATH.
+ */
+export function resolveAgentApiCommand(mergedEnv, execFileImpl, explicitEnv, state, existsImpl = fs.existsSync) {
   const allowAgentApiExe =
     execFileImpl === execFile ||
     Boolean(explicitEnv && 'ANTIGRAVITY_AGENTAPI_EXE' in explicitEnv) ||
@@ -224,11 +237,11 @@ function resolveAgentApiCommand(mergedEnv, execFileImpl, explicitEnv, state) {
     mergedEnv.ANTIGRAVITY_AGENTAPI_EXE.trim()
       ? mergedEnv.ANTIGRAVITY_AGENTAPI_EXE.trim()
       : null
-  if (explicitExe) {
+  if (explicitExe && (!path.isAbsolute(explicitExe) || existsImpl(explicitExe))) {
     return { bin: explicitExe, prefixArgs: ['agentapi'] }
   }
   const wrapperPath = path.join(os.homedir(), '.gemini', 'antigravity-cli', 'bin', 'agentapi')
-  if (execFileImpl === execFile && fs.existsSync(wrapperPath)) {
+  if ((execFileImpl === execFile || explicitExe) && existsImpl(wrapperPath)) {
     return { bin: wrapperPath, prefixArgs: [] }
   }
   return { bin: 'agentapi', prefixArgs: [] }
@@ -270,6 +283,7 @@ export function deliverWakeViaAgentApi({
   env: explicitEnv,
   state = null,
   execFileImpl = execFile,
+  existsImpl = fs.existsSync,
   timeoutMs = 5_000,
 } = {}) {
   const env = explicitEnv || process.env
@@ -294,7 +308,7 @@ export function deliverWakeViaAgentApi({
       : {}),
   }
 
-  const { bin, prefixArgs } = resolveAgentApiCommand(mergedEnv, execFileImpl, explicitEnv, state)
+  const { bin, prefixArgs } = resolveAgentApiCommand(mergedEnv, execFileImpl, explicitEnv, state, existsImpl)
 
   // Backward-compatible signature: in unit tests or explicit calls with conversationId,
   // invoke `agentapi send-message <conversationId> <message>` (or `<ANTIGRAVITY_AGENTAPI_EXE> agentapi send-message ...`).
@@ -477,6 +491,11 @@ async function main() {
         ? fs.statSync(inboxPath).size
         : 0
 
+  // A wake that cannot be delivered stays in the inbox and is retried every tick; say
+  // so once per distinct reason (and again when it recovers), so a stuck listener is
+  // visible in its log instead of silently holding every room message (479607e6).
+  let lastDeliveryError = null
+
   // eslint-disable-next-line no-constant-condition
   while (true) {
     if (ownerAnchor && !ownerAlive(ownerAnchor)) {
@@ -522,6 +541,12 @@ async function main() {
           })
           if (res.ok) {
             deliveredVia = 'agentapi'
+            if (lastDeliveryError !== null) {
+              process.stdout.write(
+                JSON.stringify({ type: 'wake_delivery_recovered', connection_id: connectionId, at: new Date().toISOString() }) + '\n',
+              )
+              lastDeliveryError = null
+            }
             writeTurnMarker(connectionId, { remoteTurn: true })
             if (live?.token && live?.mcp_url) {
               mcpToolsCall({
@@ -540,11 +565,27 @@ async function main() {
             } catch {
               /* non-fatal */
             }
-          } else if (!args.once) {
-            // Do not advance offset if agentapi delivery failed in daemon mode,
-            // so devspec-remote-wait.mjs or a later tick can deliver it.
-            allDeliveredOrNonCommand = false
-            break
+          } else {
+            const error = String(res.error || 'agentapi_failed')
+            if (error !== lastDeliveryError) {
+              process.stdout.write(
+                JSON.stringify({
+                  type: 'wake_delivery_failed',
+                  connection_id: connectionId,
+                  conversation_id: conversationId,
+                  error,
+                  retrying: !args.once,
+                  at: new Date().toISOString(),
+                }) + '\n',
+              )
+              lastDeliveryError = error
+            }
+            if (!args.once) {
+              // Do not advance offset if agentapi delivery failed in daemon mode,
+              // so devspec-remote-wait.mjs or a later tick can deliver it.
+              allDeliveredOrNonCommand = false
+              break
+            }
           }
         } else {
           writeTurnMarker(connectionId, { remoteTurn: true })

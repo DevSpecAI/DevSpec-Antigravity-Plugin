@@ -15,6 +15,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, it } from 'node:test'
+import { PROVENANCE_REF_TOOLS, REQUEST_REF_TOOLS } from './request-ref.mjs'
 
 const SELF = fileURLToPath(import.meta.url)
 const ROOT = path.resolve(path.dirname(SELF), '..')
@@ -50,20 +51,24 @@ function serverCheckout() {
   }
 }
 
-let serverNames = null
-function serverToolNames(root) {
-  if (serverNames) return serverNames
+let serverTools = null
+/** The server's tools, each with the names of its input parameters. */
+function serverToolParams(root) {
+  if (serverTools) return serverTools
   const tsx = path.join(root, 'node_modules/.bin/tsx')
   assert.ok(fs.existsSync(tsx), `${root} has no node_modules/.bin/tsx; run npm ci there`)
   const script = `import { getMcpAllTools } from ${JSON.stringify(path.join(root, DEFINITIONS))}
-process.stdout.write(JSON.stringify(getMcpAllTools().map((tool) => tool.name)))`
+process.stdout.write(JSON.stringify(getMcpAllTools().map((tool) => [tool.name, Object.keys(tool.inputSchema?.properties ?? {})])))`
   const out = execFileSync(tsx, ['--tsconfig=apps/web/tsconfig.json', '-e', script], {
     cwd: root,
     encoding: 'utf8',
     maxBuffer: 16 * 1024 * 1024,
   })
-  serverNames = new Set(JSON.parse(out))
-  return serverNames
+  serverTools = new Map(JSON.parse(out))
+  return serverTools
+}
+function serverToolNames(root) {
+  return new Set(serverToolParams(root).keys())
 }
 
 function referencedNames() {
@@ -87,9 +92,9 @@ function referencedNames() {
   return found
 }
 
-function pairedServer(t) {
+function pairedServer(t, read = serverToolNames) {
   const checkout = serverCheckout()
-  if (checkout.root && fs.existsSync(path.join(checkout.root, DEFINITIONS))) return serverToolNames(checkout.root)
+  if (checkout.root && fs.existsSync(path.join(checkout.root, DEFINITIONS))) return read(checkout.root)
   if (checkout.named) assert.fail(`DEVSPEC_V2_ROOT names ${checkout.root}, which has no ${DEFINITIONS}`)
   t.skip('no devspecv2 checkout beside this repo')
   return null
@@ -115,5 +120,25 @@ describe('DevSpec tools this plugin names', () => {
       assert.ok(found.has(name), `${name} is set aside but nothing here names it any more; remove it`)
       assert.ok(!server.has(name), `${name} is set aside but it is a DevSpec tool now; remove it so it is checked`)
     }
+  })
+})
+
+// PreToolUse stamps request_ref and provenance_ref only on the tools these sets name
+// (request-ref.mjs). A server tool that gains either parameter and is missing here
+// gets no stamp, so its writes cannot say whose request they serve; one named here
+// that lost it would be refused for an unknown argument. Nothing else compares them.
+describe('the tools PreToolUse stamps with the request a write serves', () => {
+  const taking = (tools, param) => [...tools].filter(([, params]) => params.includes(param)).map(([name]) => name).sort()
+
+  it('are exactly the server tools that take request_ref', (t) => {
+    const tools = pairedServer(t, serverToolParams)
+    if (!tools) return
+    assert.deepEqual([...REQUEST_REF_TOOLS].sort(), taking(tools, 'request_ref'))
+  })
+
+  it('are exactly the server tools that take provenance_ref', (t) => {
+    const tools = pairedServer(t, serverToolParams)
+    if (!tools) return
+    assert.deepEqual([...PROVENANCE_REF_TOOLS].sort(), taking(tools, 'provenance_ref'))
   })
 })

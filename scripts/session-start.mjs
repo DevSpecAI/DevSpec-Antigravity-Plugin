@@ -17,6 +17,8 @@ import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { LOADED_PLUGIN_VERSION } from './connection-version.mjs'
+import { ensureHostPluginHeader } from './host-mcp-header.mjs'
+import { readGithubIdentity, renderGithubIdentity, storeGithubIdentity } from './github-identity.mjs'
 import { findProjectPin, gitRemoteOrigin } from './devspec-scope.mjs'
 import {
   formatTiersForStartup,
@@ -393,6 +395,7 @@ export async function autoConnectAtStartup({
 
   storeTiers(connectionId, reg, { home: effectiveHome, dir: connDir })
   storeRepositoryContext(connectionId, reg, { dir: connDir })
+  storeGithubIdentity(connectionId, reg, { dir: connDir })
 
   const resolvedProjectId =
     reg?.project_id || reg?.connection?.project_id || pinnedProjectId || null
@@ -505,6 +508,13 @@ export async function runSessionStart(
     ensureStatusLineConfigured({ home: effectiveHome })
   } catch {
     /* non-fatal */
+  }
+  try {
+    // Antigravity's own MCP client names this plugin and its running version on
+    // every DevSpec call through the user's mcp_config.json (item 7a01644a).
+    ensureHostPluginHeader({ home: effectiveHome })
+  } catch {
+    /* non-fatal: the plugin's scripts send the header themselves */
   }
 
   try {
@@ -665,9 +675,13 @@ export async function runSessionStart(
     consume: true,
   })
   const tierContext = formatTiersForStartup(cachedTiers)
-  const additionalContext = tierContext
-    ? `${parts.join(' | ')}\n\n${tierContext}`
-    : parts.join(' | ')
+  const githubLines = renderGithubIdentity(
+    readGithubIdentity(state.connection_id, {
+      dir: path.join(effectiveHome, '.devspec', 'remote-control', 'connections'),
+    }),
+  )
+  const head = githubLines.length > 0 ? `${parts.join(' | ')}\n${githubLines.join('\n')}` : parts.join(' | ')
+  const additionalContext = tierContext ? `${head}\n\n${tierContext}` : head
 
   return {
     injectSteps: [

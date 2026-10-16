@@ -708,7 +708,9 @@ function serverNoticeRecord(value) {
     nonempty(value.record_id) && value.record_id.length <= 200 &&
     nullable(value.title, (title) => nonempty(title) && title.length <= 500) &&
     nonempty(value.text) && value.text.length <= 8000 &&
-    nullable(value.url, (url) => nonempty(url) && url.length <= 500)
+    // The server's own bound (ServerNoticeRecordV1Schema: url max 1000). A tighter
+    // bound here refused a whole valid notice envelope for one long link.
+    nullable(value.url, (url) => nonempty(url) && url.length <= 1000)
   )
 }
 

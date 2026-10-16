@@ -548,6 +548,7 @@ describe('devspec-remote-listen.mjs — canonical & legacy wake formatting', () 
         exeCalls.push({ bin, args })
         cb(null, '{"status":"ok"}', '')
       },
+      existsImpl: (file) => file === '/opt/antigravity/bin/agy',
     })
     assert.equal(okRes.ok, true)
     assert.equal(exeCalls[0].bin, '/opt/antigravity/bin/agy')
@@ -564,9 +565,33 @@ describe('devspec-remote-listen.mjs — canonical & legacy wake formatting', () 
       execFileImpl: (_bin, _args, _opts, cb) => {
         cb(null, '{"error":"language server unreachable"}', '')
       },
+      existsImpl: (file) => file === '/opt/antigravity/bin/agy',
     })
     assert.equal(errRes.ok, false)
     assert.match(errRes.error, /language server unreachable/)
+
+    // agy renamed the running binary to agy.<n>.old on update and a later launch
+    // deleted it, while the env still names it (479607e6): deliver through the
+    // wrapper agy keeps pointing at its current binary instead of failing forever.
+    const staleCalls = []
+    const wrapper = path.join(os.homedir(), '.gemini', 'antigravity-cli', 'bin', 'agentapi')
+    const staleRes = await deliverWakeViaAgentApi({
+      conversationId: CONV_ID,
+      message: 'wake payload',
+      env: {
+        ANTIGRAVITY_AGENTAPI_EXE: '/home/someone/.local/bin/agy.1792139574779166696.old',
+        ANTIGRAVITY_LS_ADDRESS: 'localhost:46803',
+        ANTIGRAVITY_CSRF_TOKEN: 'csrf-123',
+      },
+      execFileImpl: (bin, args, _opts, cb) => {
+        staleCalls.push({ bin, args })
+        cb(null, 'sent', '')
+      },
+      existsImpl: (file) => file === wrapper,
+    })
+    assert.equal(staleRes.ok, true)
+    assert.equal(staleCalls[0].bin, wrapper)
+    assert.deepEqual(staleCalls[0].args.slice(0, 2), ['send-message', CONV_ID])
   })
 
   it('renders wake: ALREADY ARMED when wake_armed is true and ARM THE BACKGROUND WAIT NOW when false', () => {

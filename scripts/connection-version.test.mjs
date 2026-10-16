@@ -5,7 +5,7 @@ import { dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { parseConnectionCall, runConnectionCall, publicConnectionResult } from './connection-call.mjs'
-import { LOADED_PLUGIN_VERSION } from './connection-version.mjs'
+import { LOADED_PLUGIN_VERSION, PLUGIN_HEADER, pluginHeaderValue, pluginHeaders } from './connection-version.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url)), root = resolve(here, '..')
@@ -64,10 +64,14 @@ test('an installed artifact reports its own loaded package rather than later fil
     writeFileSync(manifest, JSON.stringify({ name: 'devspec-antigravity-plugin', version: '1.2.3', type: 'module' }))
     const file = join(fixture, 'scripts/connection-version.mjs')
     writeFileSync(file, readFileSync(join(here, 'connection-version.mjs')))
+    // Its one import: the plugin id for the x-devspec-plugin header.
+    writeFileSync(join(fixture, 'scripts/agent-identity.mjs'), readFileSync(join(here, 'agent-identity.mjs')))
     const loaded = await import(pathToFileURL(file).href)
     assert.equal(loaded.LOADED_PLUGIN_VERSION, '1.2.3')
     writeFileSync(manifest, JSON.stringify({ name: 'devspec-antigravity-plugin', version: '9.9.9' }))
     assert.equal(loaded.versionedConnectionArguments('attach_connection', {}).plugin_version, '1.2.3')
+    // The header names the release that loaded, not a later file on disk.
+    assert.deepEqual(loaded.pluginHeaders(), { 'x-devspec-plugin': 'antigravity/1.2.3' })
   } finally { rmSync(fixture, { recursive: true, force: true }) }
 })
 test('Stop marks the connection offline and detaches through the mechanical caller, so the model calls no plumbing', async () => {
@@ -85,4 +89,13 @@ test('Stop marks the connection offline and detaches through the mechanical call
   assert.ok(!stop.includes('<plugin>/hooks/scripts/'))
   const remote = readFileSync(join(root, 'skills/devspec-remote/SKILL.md'), 'utf8')
   assert.ok(!/heartbeat_connection\(|poll_connection\(\{/.test(remote))
+})
+
+test('the x-devspec-plugin header is antigravity/<the loaded package version>, or absent', () => {
+  assert.equal(PLUGIN_HEADER, 'x-devspec-plugin')
+  assert.equal(pluginHeaderValue(), `antigravity/${version}`)
+  assert.deepEqual(pluginHeaders(), { 'x-devspec-plugin': `antigravity/${version}` })
+  assert.equal(pluginHeaderValue('1.2.3-rc.1'), 'antigravity/1.2.3-rc.1')
+  // <id>/<version> must stay one split: an unreadable or slash-bearing version sends nothing.
+  for (const bad of [null, '', 'has space', 'a/b', '../1']) assert.deepEqual(pluginHeaders(bad), {}, String(bad))
 })

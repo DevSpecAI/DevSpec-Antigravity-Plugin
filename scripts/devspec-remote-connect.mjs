@@ -19,6 +19,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { LOADED_PLUGIN_VERSION } from './connection-version.mjs'
+import { ensureHostPluginHeader } from './host-mcp-header.mjs'
 import {
   blockConversationProject,
   matchingProjects,
@@ -29,6 +30,7 @@ import {
   saveConversationProject,
 } from './conversation-project.mjs'
 import { findProjectPin, gitRemoteOrigin } from './devspec-scope.mjs'
+import { readGithubIdentity, renderGithubIdentity, storeGithubIdentity } from './github-identity.mjs'
 import {
   hasStoredTiers,
   mergeInstructionTiers,
@@ -178,6 +180,7 @@ export async function connect(options = {}, deps = {}) {
     resolveAuth = resolveDevspecMcpAuth,
     projectHome = os.homedir(),
     onRetryMessage = (message) => process.stderr.write(message),
+    ensureHostHeader = ensureHostPluginHeader,
   } = deps
 
   const [major] = process.versions.node.split('.')
@@ -236,6 +239,13 @@ export async function connect(options = {}, deps = {}) {
   })
   if (!auth.ok || !auth.token) {
     throw new ConnectError(auth.error || formatMissingAuthMessage(), { reason: 'auth' })
+  }
+  try {
+    // Connecting is the moment an updated plugin most needs Antigravity's own MCP
+    // client to name it (item 7a01644a); SessionStart does the same at window open.
+    ensureHostHeader({ home: projectHome })
+  } catch {
+    /* non-fatal: the plugin's scripts send the header themselves */
   }
 
   if (previousProject && previousProject.endpoint !== auth.mcp_url) {
@@ -384,6 +394,7 @@ export async function connect(options = {}, deps = {}) {
         instruction_tiers_version: existing.instruction_tiers_version || known?.version || null,
         instruction_tiers_hash: existing.instruction_tiers_hash || known?.hash || null,
         instructions_unchanged: Boolean(known?.hash || existing.instruction_tiers_hash),
+        reused_github_identity: readGithubIdentity(existing.connection_id, { dir: tierDir }),
       }
     }
   }
@@ -563,6 +574,9 @@ export async function connect(options = {}, deps = {}) {
   })
 
   storeRepositoryContext(connectionId, registration, { dir: tierDir })
+  const githubIdentity = registration.reused_startup_registration
+    ? registration.reused_github_identity ?? null
+    : storeGithubIdentity(connectionId, registration, { dir: tierDir })
 
   const effectiveSessionId = written.session_id || null
   const transcript = effectiveSessionId
@@ -623,6 +637,7 @@ export async function connect(options = {}, deps = {}) {
         : 'unavailable — reconnect/update required',
     transcript,
     room_state: roomStatePath(connectionId, projectHome),
+    github_identity: githubIdentity,
     registration,
   }
 }
@@ -644,6 +659,7 @@ export function renderStatusBlock(
     `Session:    ${summary.session_id ? `${short(summary.session_id)}${summary.session_access ? ` (${summary.session_access})` : ''}` : 'none — available'}`,
   )
   lines.push(`Status:     ${summary.status}`)
+  for (const line of renderGithubIdentity(summary.github_identity)) lines.push(line)
   lines.push('Open:       Agents page')
   lines.push('Stop with:  /devspec-remote-stop')
   lines.push('─────────────────────────────')

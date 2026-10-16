@@ -14,7 +14,7 @@
  * deliberate abort from a network failure. Omitting them keeps the original behaviour.
  */
 
-import { versionedConnectionArguments } from './connection-version.mjs'
+import { pluginHeaders, versionedConnectionArguments } from './connection-version.mjs'
 
 /** HTTP statuses that describe a transient condition, not a verdict on the request. */
 const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 502, 503, 504])
@@ -111,10 +111,16 @@ export async function mcpRequest({
   try {
     res = await fetch(mcpUrl, {
       method: 'POST',
+      // Every DevSpec request the plugin's own scripts make (poller, wait, listen,
+      // connect, mirror-turn, plan/question bridges) goes through here, so this is
+      // where they say which plugin they are. Antigravity's own MCP client sends the
+      // same header from the user's mcp_config.json, which host-mcp-header.mjs keeps
+      // current (item 7a01644a).
       headers: {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
         Accept: 'application/json, text/event-stream',
+        ...pluginHeaders(),
         ...(connectionCapability
           ? { 'x-devspec-connection-capability': connectionCapability }
           : {}),

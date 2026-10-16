@@ -63,6 +63,7 @@ Or merge the `devspec` entry directly into Antigravity CLI's user-level MCP conf
 ```
 
 - Replace `dvs_YOUR_DEVSPEC_MCP_TOKEN` with a literal `dvs_...` token string (do not use shell variable interpolation like `${TOKEN}`).
+- You don't add anything else. At session start and when you run `/devspec-remote`, the plugin adds one header to this `devspec` entry, `x-devspec-plugin: antigravity/<plugin version>`, and moves it on after an update, so DevSpec can tell which plugin and version each call comes from. It changes nothing else in the file and unlocks nothing; the plugin's own background scripts send the same header themselves.
 - On first verified connection, the plugin pins your working token and URL at `~/.devspec/auth.json` (`0600`) so stale or placeholder project files never shadow it.
 - **Internal staging / custom endpoint override:** End users default to production (`https://devspec.ai/api/mcp`). For internal testing against staging (`devspecstaging.com`), copy the `agy mcp add` or `mcp_config.json` snippet directly from [staging Agents settings](https://app.devspecstaging.com/settings/agents) (which sets `serverUrl` to `https://api.devspecstaging.com/api/mcp`, or `https://devspecstaging.com/api/mcp`) or set `DEVSPEC_MCP_URL=https://api.devspecstaging.com/api/mcp`. Every hook and background poller resolves `serverUrl` from your MCP config (`resolve-mcp-auth.mjs`) so all traffic stays on staging.
 
@@ -94,6 +95,8 @@ Start `agy` in any project directory. On startup, the plugin automatically:
 - When you want to connect your terminal to the **Agents page** or a **Session room** in DevSpec so it can receive remote commands, run `/antigravity-devspec-autopilot-extension:devspec-remote` (because `agy` only exposes `ANTIGRAVITY_CSRF_TOKEN` and `ANTIGRAVITY_LS_ADDRESS` to child processes of `/devspec-remote`'s tool execution, running `/devspec-remote` is what arms zero-token background wake delivery via `agentapi`).
 
 > **Updating:** When the Agents page in DevSpec shows an **Update** badge on your Antigravity connection, run `git -C ~/.gemini/config/plugins/antigravity-devspec-autopilot-extension pull` and start a new `agy` session.
+>
+> **GitHub identity:** when you connect to a project whose repositories are on GitHub and you haven't linked your GitHub account to DevSpec yet, the connect status shows `GitHub: NOT LINKED` with a link. Open it once in your browser: GitHub confirms who you are so your commits and pull requests show as yours, and DevSpec keeps no access to your account.
 
 ---
 
@@ -181,7 +184,7 @@ You rarely need to pass a project ID manually:
 
 ---
 
-## Plugin architecture & hooks (`v0.15.6`)
+## Plugin architecture & hooks (`v0.17.0`)
 
 All hooks are declared in `hooks.json` (mirrored in `hooks/hooks.json`), validated against Antigravity's strict hook JSON schemas (`scripts/hook-output.mjs`), and executed via dependency-free Node.js ESM scripts in `scripts/`:
 

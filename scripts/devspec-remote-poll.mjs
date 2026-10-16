@@ -34,6 +34,7 @@ import {
   parseCommandOfferResponse,
 } from './command-offer.mjs'
 import { stripConnectionCapability as stripConnectionCapabilityFields } from './connection-capability-state.mjs'
+import { pluginHeaders } from './connection-version.mjs'
 import { captureInstructionContext } from './instruction-tiers.mjs'
 import {
   activeContinuation,
@@ -1276,6 +1277,7 @@ export function openPushChannel({
         headers: {
           Authorization: `Bearer ${token}`,
           Accept: 'text/event-stream',
+          ...pluginHeaders(),
           ...(connectionCapability ? { 'x-devspec-connection-capability': connectionCapability } : {}),
         },
         signal: controller.signal,

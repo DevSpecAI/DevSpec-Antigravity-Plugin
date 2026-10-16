@@ -29,6 +29,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { pluginHeaders } from './connection-version.mjs'
 
 export const DEFAULT_PROD_URL = 'https://devspec.ai/api/mcp'
 
@@ -342,6 +343,7 @@ async function defaultVerifyToken({ mcpUrl, token }) {
       'Content-Type': 'application/json',
       Accept: 'application/json, text/event-stream',
       Authorization: `Bearer ${token}`,
+      ...pluginHeaders(),
     },
     body: JSON.stringify({
       jsonrpc: '2.0',

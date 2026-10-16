@@ -19,7 +19,8 @@ const CONNECTION_SUBJECT = /(?:^|_)connection(?:_|$)|^report_(?:pickup|keepalive
 
 /**
  * The DevSpec tools that record who asked for a write and take `request_ref`.
- * Verified against `apps/web/lib/mcp/tool-definitions.ts` via `server-tool-names.test.mjs`.
+ * Kept equal to the server tools that take `request_ref` by `server-tool-names.test.mjs`
+ * (run with DEVSPEC_V2_ROOT naming a devspecv2 checkout).
  */
 export const REQUEST_REF_TOOLS = new Set([
   'add_commit_reference',
@@ -37,10 +38,12 @@ export const REQUEST_REF_TOOLS = new Set([
   'manage_protected_intent',
   'record_completed_work',
   'record_criterion_verdicts',
+  'record_duplicate_nonmatch',
   'record_implementation',
   'record_memory',
   'release_work_item',
   'reopen_action_item',
+  'resolve_duplicate',
   'resolve_memory_flag',
   'resolve_resource_flag',
   'retract_memory',

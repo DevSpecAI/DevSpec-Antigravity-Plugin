@@ -514,6 +514,8 @@ export function formatSystemNoticeContent(notice) {
     }
     lines.push(
       '',
+      'Tell the person: say in plain words what this notice means for the work, and quote each labelled record above as delivered (its label, title and text), not a paraphrase of it. ' +
+        'Then act only within the allowed outcomes and tools. An answer, OK, ruling or ownership choice that belongs to a person is theirs to give: ask them, never give it for them.',
       'Authority: exact_connection_system_notice (devspec://product/remote-ingress-contract). ' +
         'This is a server-initiated notice on your own work, not a room message or new work authorization.',
     )
