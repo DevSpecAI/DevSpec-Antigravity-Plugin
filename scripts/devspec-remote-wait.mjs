@@ -22,6 +22,7 @@ import {
   materialiseAttachments,
   MAX_INLINE_ATTACHMENT_CHARS,
 } from './attachment-store.mjs'
+import { closeAntigravityOnEnd, ownedByAntigravityProcess } from './close-on-end.mjs'
 import { questionHandoffEvent, validQuestionHandoff } from './command-offer.mjs'
 import {
   buildInteractionAnswerEvents,
@@ -991,8 +992,31 @@ async function main() {
   )
 
   let delivered = 0
+  let sawLive = Boolean(
+    state &&
+      state.enabled !== false &&
+      state.ended_from_ui !== true &&
+      state.end_reason !== 'ui' &&
+      (!ownerAnchor || ownedByAntigravityProcess(state, ownerAnchor)),
+  )
   while (deadline === null || Date.now() < deadline) {
     const live = readState(connectionId)
+    if (live?.end_reason === 'ui' || live?.ended_from_ui) {
+      const outcome = closeAntigravityOnEnd({
+        state: live,
+        sawLive,
+        ownerPid: ownerAnchor,
+      })
+      process.stdout.write(
+        JSON.stringify({ type: 'session_ended', reason: 'ended_from_ui', connection_id: connectionId }) + '\n',
+      )
+      process.stderr.write(
+        `devspec-remote-wait: ${
+          outcome.closed ? 'ended from DevSpec — closing Antigravity' : 'ended from DevSpec — exit 1'
+        } (reason=${outcome.reason} pid=${outcome.pid ?? 'none'})\n`,
+      )
+      process.exit(EXIT_TERMINAL)
+    }
     if (live && live.enabled === false) {
       process.stderr.write('devspec-remote-wait: disabled — exit 1\n')
       process.exit(EXIT_TERMINAL)
@@ -1004,11 +1028,8 @@ async function main() {
       process.stderr.write(`devspec-remote-wait: owner process ${ownerAnchor} gone — exit 1\n`)
       process.exit(EXIT_TERMINAL)
     }
-    if (live?.end_reason === 'ui' || live?.ended_from_ui) {
-      process.stdout.write(
-        JSON.stringify({ type: 'session_ended', reason: 'ended_from_ui', connection_id: connectionId }) + '\n',
-      )
-      process.exit(EXIT_TERMINAL)
+    if (live && (!ownerAnchor || ownedByAntigravityProcess(live, ownerAnchor))) {
+      sawLive = true
     }
 
     const records = readInboxRecords(file, offset)

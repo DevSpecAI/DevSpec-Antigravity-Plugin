@@ -19,6 +19,11 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
+import {
+  closeAntigravityOnEnd,
+  ownedByAnotherAntigravityProcess,
+  ownedByAntigravityProcess,
+} from './close-on-end.mjs'
 import { formatInboxEntryForStream, formatSystemNoticeContent } from './devspec-remote-wait.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { loadState, writeTurnMarker } from './mirror-turn.mjs'
@@ -495,6 +500,13 @@ async function main() {
   // so once per distinct reason (and again when it recovers), so a stuck listener is
   // visible in its log instead of silently holding every room message (479607e6).
   let lastDeliveryError = null
+  let sawLive = Boolean(
+    state &&
+      state.enabled !== false &&
+      state.ended_from_ui !== true &&
+      state.end_reason !== 'ui' &&
+      (!ownerAnchor || ownedByAntigravityProcess(state, ownerAnchor)),
+  )
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -503,9 +515,33 @@ async function main() {
       process.exit(0)
     }
     const live = readStateFile(connectionId)
-    if (live && (live.enabled === false || live.ended_from_ui === true || live.end_reason === 'ui')) {
+    if (live && ownerAnchor && ownedByAnotherAntigravityProcess(live, ownerAnchor)) {
+      process.stderr.write(
+        `devspec-remote-listen: connection ${connectionId} moved to another Antigravity process (${live.owner_pid}) — standing down\n`,
+      )
       removeListenerMarker()
       process.exit(0)
+    }
+    if (live && (live.enabled === false || live.ended_from_ui === true || live.end_reason === 'ui')) {
+      if (!args.once) {
+        const outcome = closeAntigravityOnEnd({
+          state: live,
+          sawLive,
+          ownerPid: ownerAnchor,
+        })
+        process.stderr.write(
+          `devspec-remote-listen: ${
+            outcome.closed
+              ? 'ended from DevSpec — closing Antigravity'
+              : 'ended — Antigravity stays open'
+          } (connection=${connectionId} reason=${outcome.reason} pid=${outcome.pid ?? 'none'})\n`,
+        )
+      }
+      removeListenerMarker()
+      process.exit(0)
+    }
+    if (live && (!ownerAnchor || ownedByAntigravityProcess(live, ownerAnchor))) {
+      sawLive = true
     }
     if (live?.local_id && live.local_id !== conversationId) {
       conversationId = live.local_id

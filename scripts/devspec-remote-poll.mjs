@@ -33,9 +33,11 @@ import {
   commandOfferNegotiable,
   parseCommandOfferResponse,
 } from './command-offer.mjs'
+import { closeAntigravityOnEnd } from './close-on-end.mjs'
 import { stripConnectionCapability as stripConnectionCapabilityFields } from './connection-capability-state.mjs'
 import { pluginHeaders } from './connection-version.mjs'
 import { captureInstructionContext } from './instruction-tiers.mjs'
+import { markBondsStoppedForConnection } from './remote-control-state.mjs'
 import {
   activeContinuation,
   classifyContinuationStart,
@@ -749,12 +751,26 @@ export function disabledLocalConnectionState(
   return s
 }
 
-function disableLocalState({ connectionId, reason }) {
+export function disableLocalState({
+  connectionId,
+  reason,
+  dir = CONNECTIONS_DIR,
+  legacyPath = LEGACY_STATE_PATH,
+  localDir = path.join(path.dirname(dir), 'local'),
+} = {}) {
   try {
-    const s = disabledLocalConnectionState(readState(connectionId), { connectionId, reason })
-    writeState(s, connectionId)
+    const current = readStateResult(connectionId, { dir, legacyPath }).value
+    const s = disabledLocalConnectionState(current, { connectionId, reason })
+    writeState(s, connectionId, { dir, legacyPath })
+    markBondsStoppedForConnection(connectionId, reason, {
+      localDir,
+      endedFromUi: s.ended_from_ui === true,
+      now: s.updated_at,
+    })
+    return s
   } catch (e) {
     process.stderr.write(`devspec-remote-poll: failed to disable state: ${e.message}\n`)
+    return null
   }
 }
 
@@ -2254,6 +2270,27 @@ async function main() {
     `devspec-remote-poll: long-poll mode connection=${connectionId} session=${sessionId || '(none)'} inbox=${inboxPathForConnection(connectionId)}\n`,
   )
 
+  function handlePermanentEnd(reason = 'ended_from_ui') {
+    if (shuttingDown) return
+    shuttingDown = true
+    const listenerArmed = readListenerArmed(connectionId, readState(connectionId)) === true
+    const disabled = disableLocalState({ connectionId, reason })
+    if (!listenerArmed && disabled) {
+      closeAntigravityOnEnd({ state: disabled, sawLive: true, ownerPid: ownerAnchor })
+    }
+    process.stdout.write(
+      JSON.stringify({
+        type: 'session_ended',
+        reason,
+        recoverable: false,
+        connection_id: connectionId,
+        message: 'Remote control was ended. Local poller stopping; do not restart.',
+      }) + '\n',
+    )
+    process.stderr.write(`devspec-remote-poll: ended (${reason}) — disabling and exiting\n`)
+    process.exit(1)
+  }
+
   let sseWakePending = false
   if (process.env.DEVSPEC_DISABLE_SSE !== '1') {
     openPushChannel({
@@ -2264,6 +2301,11 @@ async function main() {
       onEvent: (evt) => {
         if (evt.kind === 'wake') {
           sseWakePending = true
+        } else if (evt.kind === 'ended') {
+          sseWakePending = true
+          if (evt.endReason && PERMANENT_END_REASONS.includes(evt.endReason)) {
+            handlePermanentEnd(evt.endReason)
+          }
         }
       },
       onFallback: (reason) => {
@@ -2420,19 +2462,8 @@ async function main() {
       process.exit(1)
     }
     if (terminal) {
-      const reason = terminal.reason || 'ended_from_ui'
-      disableLocalState({ connectionId, reason })
-      process.stdout.write(
-        JSON.stringify({
-          type: 'session_ended',
-          reason,
-          recoverable: false,
-          connection_id: connectionId,
-          message: 'Remote control was ended. Local poller stopping; do not restart.',
-        }) + '\n',
-      )
-      process.stderr.write(`devspec-remote-poll: ended (${reason}) — disabling and exiting\n`)
-      process.exit(1)
+      handlePermanentEnd(terminal.reason || 'ended_from_ui')
+      return
     }
     consecutiveRecoverableEnds = 0
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.17.1
+
+### Close Antigravity (`agy`) in its terminal when ended from DevSpec (`end_reason === "ui"`)
+
+- **Close the owning `agy` process cleanly via `SIGTERM` on UI End (`scripts/close-on-end.mjs`, `scripts/devspec-remote-listen.mjs`, `scripts/devspec-remote-wait.mjs`):** Added `scripts/close-on-end.mjs` (`closeAntigravityOnEnd`, `closeOnEndDecision`, `ownedByAntigravityProcess`, `ownedByAnotherAntigravityProcess`, `antigravityProcessOf`, `processStartTime`). When a connection that the listener served while live (`sawLive === true`) transitions to `end_reason === "ui"`, the listener sends `SIGTERM` to the owning `agy` process (`owner_pid`, verified alive, matching `agy`/`antigravity`, and matching `/proc/<pid>/stat` start time `owner_started`), triggering Bubble Tea's graceful terminal shutdown while keeping the conversation resumable (`agy --resume`). Non-UI ends (`local_stop`, `idle_timeout`, `server_ended`, `owner_gone`), already-ended state files (`sawLive === false`), and other terminals' `agy` processes are never signaled.
+- **Immediate SSE `event: ended` teardown and stopped local conversation bonds (`scripts/devspec-remote-poll.mjs`, `scripts/remote-control-state.mjs`):** `openPushChannel` in `scripts/devspec-remote-poll.mjs` now invokes `handlePermanentEnd(evt.endReason)` immediately on SSE `event: ended` frames (`evt.kind === "ended"`) without waiting out the 25–30s long-poll hold, falls back to `closeAntigravityOnEnd` if no listener is armed, and `disableLocalState` calls `markBondsStoppedForConnection` so `~/.devspec/remote-control/local/antigravity/<local_id>.json` is marked `status: "stopped", enabled: false, ended_from_ui, end_reason`. `writeConnectionState` also records `owner_started` alongside `owner_pid` to defeat PID reuse.
+
 ## 0.17.0
 
 ### Plugin identification header, GitHub identity link at connect, wakes that survive an agy self-update, and Protecting intent wording

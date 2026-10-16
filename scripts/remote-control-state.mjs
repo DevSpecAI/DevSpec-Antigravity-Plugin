@@ -63,6 +63,7 @@ import {
   stripConnectionCapability,
 } from './connection-capability-state.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
+import { processStartTime } from './close-on-end.mjs'
 import { saveConversationProject } from './conversation-project.mjs'
 import { findProjectPin, gitRemoteOrigin } from './devspec-scope.mjs'
 
@@ -950,12 +951,21 @@ export function writeLocalBond(agentOrLocalId, localIdOrPatch, patchOrDir = null
 }
 
 /** Mark every local bond that points at connectionId as stopped. */
-function markBondsStoppedForConnection(connectionId, endReason = 'local_stop') {
+export function markBondsStoppedForConnection(
+  connectionId,
+  endReason = 'local_stop',
+  {
+    localDir = LOCAL_DIR,
+    endedFromUi = endReason === 'ui' || endReason === 'ended_from_ui',
+    now = new Date().toISOString(),
+  } = {},
+) {
   const updated = []
   try {
-    if (!fs.existsSync(LOCAL_DIR)) return updated
-    for (const agentDir of fs.readdirSync(LOCAL_DIR)) {
-      const dir = path.join(LOCAL_DIR, agentDir)
+    const resolvedDir = resolveLocalDir(localDir)
+    if (!fs.existsSync(resolvedDir)) return updated
+    for (const agentDir of fs.readdirSync(resolvedDir)) {
+      const dir = path.join(resolvedDir, agentDir)
       let st
       try {
         st = fs.statSync(dir)
@@ -971,8 +981,10 @@ function markBondsStoppedForConnection(connectionId, endReason = 'local_stop') {
         const next = {
           ...b,
           status: 'stopped',
+          enabled: false,
+          ended_from_ui: Boolean(endedFromUi),
           end_reason: endReason || b.end_reason || 'local_stop',
-          updated_at: new Date().toISOString(),
+          updated_at: now,
         }
         writeJson(p, next)
         updated.push({ path: p, local_id: b.local_id, agent_name: b.agent_name })
@@ -1448,6 +1460,8 @@ export async function writeConnectionState({
       localId && String(localId).startsWith('agy-window:') ? localId : null,
     transcript_path: transcriptPath,
     owner_pid: ownerPid,
+    owner_started:
+      (ownerPid ? processStartTime(ownerPid) : null) ?? prev.owner_started ?? null,
     project_id: projectId,
     ...(projectName ? { project_name: projectName } : {}),
     mcp_url: auth.mcp_url || prev.mcp_url || 'https://devspec.ai/api/mcp',
@@ -2107,6 +2121,8 @@ if (isMain) {
       local_id: localId ?? prev.local_id ?? null,
       transcript_path: transcriptPath,
       owner_pid: ownerPid,
+      owner_started:
+        (ownerPid ? processStartTime(ownerPid) : null) ?? prev.owner_started ?? null,
       project_id: projectId,
       mcp_url: args.url || auth.mcp_url || prev.mcp_url || 'https://api.devspec.ai/api/mcp',
       token: auth.token || prev.token || undefined,
