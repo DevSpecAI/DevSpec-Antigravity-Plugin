@@ -18,6 +18,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { LOADED_PLUGIN_VERSION } from './connection-version.mjs'
 import { ensureHostPluginHeader } from './host-mcp-header.mjs'
+import { privateStateRoot, tightenPrivateTree } from './private-state.mjs'
 import { readGithubIdentity, renderGithubIdentity, storeGithubIdentity } from './github-identity.mjs'
 import { findProjectPin, gitRemoteOrigin } from './devspec-scope.mjs'
 import {
@@ -511,10 +512,19 @@ export async function runSessionStart(
   }
   try {
     // Antigravity's own MCP client names this plugin and its running version on
-    // every DevSpec call through the user's mcp_config.json (item 7a01644a).
+    // every DevSpec call through the user's mcp_config.json (item 7a01644a). The
+    // same pass sets that file, which holds the person's key, back to 0600 in a 0700
+    // folder: agy rewrites it 0644 on every `agy mcp` command (item b17cb7d7).
     ensureHostPluginHeader({ home: effectiveHome })
   } catch {
     /* non-fatal: the plugin's scripts send the header themselves */
+  }
+  try {
+    // Repair what earlier versions left in ~/.devspec: key-holding state is already
+    // 0600, but logs were created 0664 and directories 0775 (item b17cb7d7).
+    tightenPrivateTree(privateStateRoot(effectiveHome))
+  } catch {
+    /* non-fatal: every write still lands owner-only */
   }
 
   try {

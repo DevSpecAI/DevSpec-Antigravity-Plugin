@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.17.2
+
+### Your DevSpec key stays off command lines, out of printed output, and in owner-only files
+
+- **Install no longer puts the key on a command line (`README.md`, `scripts/resolve-mcp-auth.mjs`).** The install step and the "not configured" message told people to run `agy mcp add --header "Authorization: Bearer dvs_…"`, which puts the key in that process's command line (readable by every account on the computer while it runs) and in shell history. Both now say to paste the entry into `~/.gemini/config/mcp_config.json` and keep that file owner-only (`chmod 600`). Measured on agy 1.4.0: headers come only from that file or from `--header`, and `agy mcp add|remove|enable|disable` rewrites the file as a new `0644` file (under the usual umask) whatever mode it had.
+- **`--host-token` is gone (`scripts/remote-control-state.mjs`).** Nothing shipped used it. The key is read from Antigravity's MCP config only.
+- **No command prints the key.** `resolve-mcp-auth.mjs`, `remote-control-state.mjs resolve-auth` and `remote-control-state.mjs read` report it as `token_fingerprint`, its first twelve characters (what DevSpec shows under Access tokens); `read` reports the CSRF token and connection capability by presence only. Agents had been building `curl -H "Authorization: Bearer …"` command lines out of the printed key. `rules/AGENTS.md` now tells agents never to put the key on a command line or print the files that hold it.
+- **Every file holding the key is `0600` in a `0700` folder after every write, including one that already existed looser (`scripts/private-state.mjs`).** Connection state, the legacy pointer and `~/.devspec/auth.json` are written aside and renamed through one helper (`remote-control-state.mjs`, `mirror-turn.mjs` and `resolve-mcp-auth.mjs` wrote some of them in place, so `0600` applied only when a file was first created), and folders are chmodded `0700` up to `~/.devspec` because `mkdir`'s mode applies only to folders it creates. Listener and poller logs are opened owner-only, including logs an earlier version created `0664`.
+- **Antigravity's `mcp_config.json` is set back to `0600` and its folder to `0700` at every session start and `/devspec-remote` (`scripts/host-mcp-header.mjs`),** whether or not the plugin header changes; a rewrite is always `0600` instead of keeping the old mode. agy leaves the folder's mode alone, so the `0700` folder keeps other accounts out between one of agy's rewrites and the next pass.
+- **SessionStart repairs what earlier versions left in `~/.devspec`:** folders to `0700`, files to `0600`, never following a symlink (`tightenPrivateTree`).
+- **Windows:** POSIX modes do not apply and the sweep is skipped. The files sit under `%USERPROFILE%` and inherit the profile folder's default access list: that user, SYSTEM and Administrators.
+
 ## 0.17.1
 
 ### Close Antigravity (`agy`) in its terminal when ended from DevSpec (`end_reason === "ui"`)

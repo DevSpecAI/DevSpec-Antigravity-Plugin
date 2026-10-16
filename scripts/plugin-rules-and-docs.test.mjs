@@ -35,10 +35,9 @@ describe('Item 5 parity: rules/AGENTS.md, package version 0.15.0, and documentat
     assert.equal(changelog.match(/^## (\S+)/m)?.[1], pkg.version)
   })
 
-  it('documents ~/.gemini/config/mcp_config.json, agy mcp add, and why the plugin is required in README.md and has no non-existent agy flags', () => {
+  it('documents ~/.gemini/config/mcp_config.json and why the plugin is required in README.md and has no non-existent agy flags', () => {
     const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8')
     assert.match(readme, /~\/\.gemini\/config\/mcp_config\.json/)
-    assert.match(readme, /agy mcp add/)
     assert.match(readme, /rules\/AGENTS\.md/)
     assert.match(readme, /Installing the plugin is required alongside the MCP server/)
     assert.match(readme, /local \(\/devspec-remote to connect\)/)

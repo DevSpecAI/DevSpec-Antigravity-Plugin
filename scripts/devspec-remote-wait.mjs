@@ -37,6 +37,7 @@ import {
   STATE_ABSENT,
   STATE_OK,
   STATE_UNREADABLE,
+  ensurePrivateDir,
   readPrivateJsonResult,
   writePrivateJson,
 } from './private-state.mjs'
@@ -134,7 +135,7 @@ function armWaitPidfile(connectionId, dir = CONNECTIONS_DIR) {
   if (!connectionId) return
   const p = waitPidPath(connectionId, dir)
   try {
-    fs.mkdirSync(dir, { recursive: true })
+    ensurePrivateDir(dir)
     fs.writeFileSync(p, String(process.pid), { mode: 0o600 })
   } catch {
     return
@@ -252,7 +253,7 @@ export function writeStatePatch(
       connection_id: connectionId,
       updated_at: new Date().toISOString(),
     }
-    fs.mkdirSync(dir, { recursive: true })
+    ensurePrivateDir(dir)
     writePrivateJson(statePath(connectionId, dir), next)
     const leg = readPrivateJsonResult(legacyPath)
     if (
@@ -290,7 +291,7 @@ function commitDeliveredOffset(
     connection_id: connectionId,
     updated_at: new Date().toISOString(),
   }
-  fs.mkdirSync(dir, { recursive: true })
+  ensurePrivateDir(dir)
   writePrivateJson(statePath(connectionId, dir), next)
   const leg = readPrivateJsonResult(legacyPath)
   if (
@@ -958,7 +959,7 @@ async function main() {
   }
 
   const file = inboxPath(connectionId)
-  fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
+  ensurePrivateDir(CONNECTIONS_DIR)
   if (!fs.existsSync(file)) {
     fs.writeFileSync(file, '', { mode: 0o600 })
   }

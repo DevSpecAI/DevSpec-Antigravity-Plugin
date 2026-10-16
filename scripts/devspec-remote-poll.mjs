@@ -67,6 +67,7 @@ import {
   STATE_ABSENT,
   STATE_OK,
   STATE_UNREADABLE,
+  ensurePrivateDir,
   readPrivateJson,
   readPrivateJsonResult,
   writePrivateJson,
@@ -587,7 +588,7 @@ function truncateInterruptedJsonlTail(fd) {
 export function appendDurableRecord(connectionId, record, dir = CONNECTIONS_DIR) {
   let fd
   try {
-    fs.mkdirSync(dir, { recursive: true })
+    ensurePrivateDir(dir)
     const inbox = path.join(dir, `${connectionId}.inbox.jsonl`)
     fd = fs.openSync(inbox, 'a+', 0o600)
     truncateInterruptedJsonlTail(fd)

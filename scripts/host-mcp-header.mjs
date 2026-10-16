@@ -12,16 +12,29 @@
  *
  * So SessionStart and the connect script write the one header into the user-level
  * entry, naming the running version, and move it on after an update. Nothing else in
- * the file changes: the token, other headers, other servers and the file's mode are
- * kept, a file that does not parse is left alone, and the write is atomic. Antigravity
- * reads the change the next time it loads its MCP config; until then its own calls
- * name the version it loaded.
+ * the file's content changes: the token, other headers and other servers are kept, a
+ * file that does not parse is left alone, and the write is atomic. Antigravity reads
+ * the change the next time it loads its MCP config; until then its own calls name the
+ * version it loaded.
+ *
+ * The same pass keeps the file private (item b17cb7d7). It holds the person's DevSpec
+ * key, which is where Antigravity's own MCP client reads it from: measured on agy
+ * 1.4.0, headers come only from this file or from `agy mcp add --header` (which puts
+ * the key on a command line), and every `agy mcp add|remove|enable|disable` rewrites
+ * the file as a new file created 0644 (less the umask, so 0644 under the usual 022 or
+ * 002), whatever mode it had before. So every user-level config that
+ * exists is set to 0600 and its folder to 0700 on each pass, written or not, and a
+ * rewrite is always 0600. agy leaves the folder's mode alone, so between one of its
+ * rewrites and the next pass the 0700 folder is what keeps other accounts out. On
+ * Windows POSIX modes do not apply; the files inherit the user-profile ACL (that user,
+ * SYSTEM, Administrators).
  */
 
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { PLUGIN_HEADER, pluginHeaderValue } from './connection-version.mjs'
+import { PRIVATE_DIR_MODE, PRIVATE_FILE_MODE, tightenMode } from './private-state.mjs'
 
 /** The DevSpec entry names resolve-mcp-auth.mjs reads the token from. */
 const DEVSPEC_ENTRY_KEYS = ['devspec', 'DevSpec', 'devspec-mcp']
@@ -73,11 +86,11 @@ function indentOf(raw) {
   return match ? match[1] : 2
 }
 
-function writeAtomic(file, text, mode) {
+function writeAtomic(file, text) {
   const temp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${Date.now()}.tmp`)
   try {
-    fs.writeFileSync(temp, text, { mode })
-    fs.chmodSync(temp, mode)
+    fs.writeFileSync(temp, text, { mode: PRIVATE_FILE_MODE })
+    fs.chmodSync(temp, PRIVATE_FILE_MODE)
     fs.renameSync(temp, file)
   } catch (error) {
     fs.rmSync(temp, { force: true })
@@ -86,9 +99,29 @@ function writeAtomic(file, text, mode) {
 }
 
 /**
+ * Set every existing user-level Antigravity MCP config to 0600 and its folder to
+ * 0700 when either is looser. Returns the files whose file or folder mode changed.
+ */
+export function secureHostMcpConfig({ home = os.homedir(), files = hostMcpConfigFiles(home) } = {}) {
+  const tightened = []
+  for (const file of files) {
+    try {
+      if (!fs.lstatSync(file).isFile()) continue
+    } catch {
+      continue
+    }
+    const dirChanged = tightenMode(path.dirname(file), PRIVATE_DIR_MODE)
+    const fileChanged = tightenMode(file, PRIVATE_FILE_MODE)
+    if (dirChanged || fileChanged) tightened.push(file)
+  }
+  return tightened
+}
+
+/**
  * Bring the header on the user's DevSpec MCP entries to `value` (default: this
- * running version). Returns `{ value, updated: [files], unchanged: [files] }`;
- * never throws for a missing or unreadable file.
+ * running version), and keep each config owner-only. Returns
+ * `{ value, updated: [files], unchanged: [files], tightened: [files] }`; never throws
+ * for a missing or unreadable file.
  */
 export function ensureHostPluginHeader({
   home = os.homedir(),
@@ -97,13 +130,12 @@ export function ensureHostPluginHeader({
 } = {}) {
   const updated = []
   const unchanged = []
-  if (!value) return { value: null, updated, unchanged }
+  const tightened = secureHostMcpConfig({ home, files })
+  if (!value) return { value: null, updated, unchanged, tightened }
   for (const file of files) {
     let raw
-    let stat
     try {
-      stat = fs.statSync(file)
-      if (!stat.isFile()) continue
+      if (!fs.statSync(file).isFile()) continue
       raw = fs.readFileSync(file, 'utf8')
     } catch {
       continue
@@ -119,11 +151,11 @@ export function ensureHostPluginHeader({
       continue
     }
     try {
-      writeAtomic(file, JSON.stringify(config, null, indentOf(raw)) + (raw.endsWith('\n') ? '\n' : ''), stat.mode & 0o777)
+      writeAtomic(file, JSON.stringify(config, null, indentOf(raw)) + (raw.endsWith('\n') ? '\n' : ''))
       updated.push(file)
     } catch {
       /* non-fatal: the scripts still send the header themselves */
     }
   }
-  return { value, updated, unchanged }
+  return { value, updated, unchanged, tightened }
 }

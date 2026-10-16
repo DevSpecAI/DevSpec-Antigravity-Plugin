@@ -19,6 +19,7 @@ import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { resolveHookConversationId } from './mirror-turn.mjs'
+import { ensurePrivateDir } from './private-state.mjs'
 import { readLocalBond, readStateFile } from './remote-control-state.mjs'
 
 export const READ_STATE_VERSION = 1
@@ -57,14 +58,14 @@ function readJsonSafe(file) {
 }
 
 function writeJsonSafe(file, data) {
-  fs.mkdirSync(path.dirname(file), { recursive: true })
+  ensurePrivateDir(path.dirname(file))
   const tmp = `${file}.tmp.${process.pid}`
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 })
   fs.renameSync(tmp, file)
 }
 
 function writeTextSafe(file, text) {
-  fs.mkdirSync(path.dirname(file), { recursive: true })
+  ensurePrivateDir(path.dirname(file))
   const tmp = `${file}.tmp.${process.pid}`
   fs.writeFileSync(tmp, String(text ?? ''), { mode: 0o600 })
   fs.renameSync(tmp, file)

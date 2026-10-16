@@ -17,19 +17,24 @@
  *
  * Lookup order:
  * 1. DEVSPEC_MCP_TOKEN / DEVSPEC_TOKEN (+ DEVSPEC_MCP_URL) — explicit override.
- * 2. opts.hostToken — an explicitly supplied host bearer.
+ * 2. opts.hostToken — the bearer a caller already resolved with `hostTokenFromEnv`
+ *    (an in-process value; no command takes a key as an argument).
  * 3. Antigravity MCP config — `~/.gemini/antigravity-cli/mcp_config.json` then
  *    `<cwd>/.gemini/antigravity-cli/mcp_config.json`.
  * 4. Project `.mcp.json` (cwd and parents) — fallback for non-standard setups.
  *
- * Prints JSON: { ok, token?, mcp_url?, source?, error? }
- * Never prints the full token in human logs — only to stdout JSON for piping.
+ * Run as a command it prints JSON: { ok, token_fingerprint?, mcp_url?, source?, error? }.
+ * It never prints the key itself (item b17cb7d7): whatever a command prints ends up
+ * in agent transcripts and terminal logs, and agents built `curl -H "Authorization:
+ * Bearer …"` command lines out of it. Scripts that need the key import
+ * `resolveDevspecMcpAuth` and keep it in memory.
  */
 
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { pluginHeaders } from './connection-version.mjs'
+import { readPrivateJson, writePrivateJson } from './private-state.mjs'
 
 export const DEFAULT_PROD_URL = 'https://devspec.ai/api/mcp'
 
@@ -38,7 +43,25 @@ export function formatMissingAuthMessage(platform = process.platform) {
     platform === 'win32'
       ? '%USERPROFILE%\\.gemini\\config\\mcp_config.json (or %USERPROFILE%\\.gemini\\antigravity-cli\\mcp_config.json)'
       : '~/.gemini/config/mcp_config.json (or ~/.gemini/antigravity-cli/mcp_config.json)'
-  return `DevSpec is not configured properly: run \`agy mcp add --header "Authorization: Bearer dvs_..." devspec https://devspec.ai/api/mcp\` or place your "dvs_..." token in ${configPath} under mcpServers.devspec.headers.Authorization ("Bearer dvs_..."), then restart agy.`
+  const ownerOnly = platform === 'win32' ? '' : ', keep that file readable only by you (`chmod 600`)'
+  return `DevSpec is not configured properly: put your "dvs_..." token in ${configPath} under mcpServers.devspec.headers.Authorization ("Bearer dvs_...")${ownerOnly}, then restart agy. The Connect a tool step on DevSpec's Agents settings page has the entry ready to paste. Do not pass the token to \`agy mcp add --header\`: that puts it on a command line and in your shell history.`
+}
+
+/**
+ * How a key is shown wherever this plugin reports one: the same first twelve
+ * characters DevSpec shows for it under Access tokens, so a person can tell which key
+ * is configured, and nothing an attacker could use. Never the key itself.
+ */
+export function tokenFingerprint(token) {
+  if (typeof token !== 'string' || !token.trim()) return null
+  return `${token.trim().slice(0, 12)}…`
+}
+
+/** An auth result with the key replaced by its fingerprint, for printing. */
+export function printableAuth(result) {
+  if (!result || typeof result !== 'object') return result
+  const { token, ...rest } = result
+  return token ? { ...rest, token_fingerprint: tokenFingerprint(token) } : rest
 }
 
 export function isValidConfigToken(token) {
@@ -99,7 +122,9 @@ export function pinnedAuthPath(home = os.homedir()) {
 
 export function readPinnedAuth({ home = os.homedir() } = {}) {
   const file = pinnedAuthPath(home)
-  const parsed = readJson(file)
+  // Private-state read: a copy left at a looser mode by an earlier version is
+  // tightened before it is read.
+  const parsed = readPrivateJson(file)
   if (!parsed || !isValidConfigToken(parsed.token)) return null
   return {
     token: parsed.token.trim(),
@@ -116,13 +141,13 @@ export function writePinnedAuth(
   if (!isValidConfigToken(token)) return null
   const file = pinnedAuthPath(home)
   try {
-    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
     const payload = {
       token: token.trim(),
       mcp_url: (typeof mcp_url === 'string' && mcp_url.trim()) || DEFAULT_PROD_URL,
       verified_at,
     }
-    fs.writeFileSync(file, JSON.stringify(payload, null, 2) + '\n', { mode: 0o600 })
+    // 0600 in a 0700 ~/.devspec, written aside and renamed (item b17cb7d7).
+    writePrivateJson(file, payload, { root: path.dirname(file) })
     return { ...payload, source: file }
   } catch {
     return null
@@ -441,7 +466,8 @@ export async function verifyAndPinDevspecAuth(
 // CLI
 if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith('resolve-mcp-auth.mjs')) {
   // Reflect the same host-token preference the write path uses, for diagnostics.
+  // The key is reported by its fingerprint only.
   const result = resolveDevspecMcpAuth(process.cwd(), { hostToken: hostTokenFromEnv(process.env) })
-  process.stdout.write(JSON.stringify(result) + '\n')
+  process.stdout.write(JSON.stringify(printableAuth(result)) + '\n')
   process.exit(result.ok ? 0 : 1)
 }

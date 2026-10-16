@@ -33,7 +33,7 @@
  * Usage:
  *   node remote-control-state.mjs write --connection-id <uuid> [--session <uuid>]
  *       [--agent "Antigravity"] [--project-id <uuid>] [--cwd <path>] [--codename "Colorful Possum"]
- *       [--title "…"] [--local-id <id>] [--owner-pid <pid>] [--host-token <bearer>] [--no-poller]
+ *       [--title "…"] [--local-id <id>] [--owner-pid <pid>] [--no-poller]
  *   node remote-control-state.mjs ensure-poller --connection-id <uuid> [--session <uuid>] [--owner-pid <pid>]
  *   node remote-control-state.mjs disable --connection-id <uuid>
  *   node remote-control-state.mjs disable-local [--agent "Antigravity"] [--local-id <id>]
@@ -47,7 +47,13 @@
  *       [--max-age-minutes 30] [--force-new]
  *     → action: already_live | reconnect | register | create_and_attach
  *   node remote-control-state.mjs stop-poller --connection-id <uuid>
- *   node remote-control-state.mjs resolve-auth
+ *   node remote-control-state.mjs resolve-auth   (reports the key by fingerprint only)
+ *
+ * No command takes the DevSpec key as an argument and none prints it (item b17cb7d7):
+ * a command line is readable by every local account, and whatever a command prints
+ * lands in agent transcripts. The key is read from Antigravity's MCP config
+ * (`resolve-mcp-auth.mjs`). Every file here that holds it is written through
+ * `private-state.mjs`: 0600, in a 0700 directory, a looser existing file replaced.
  */
 
 import crypto from 'node:crypto'
@@ -56,7 +62,19 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
+import {
+  resolveDevspecMcpAuth,
+  hostTokenFromEnv,
+  printableAuth,
+  tokenFingerprint,
+} from './resolve-mcp-auth.mjs'
+import {
+  ensurePrivateDir,
+  openPrivateAppend,
+  readPrivateJson,
+  writePrivateJson,
+  writePrivateText,
+} from './private-state.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import {
   applyConnectionCapabilityRotation,
@@ -137,11 +155,11 @@ export function ensureListenerForConnection(connectionId, opts = {}) {
     return { ok: false, error: 'missing owner_pid for listener' }
   }
   stopListenerForConnection(connectionId, connDir)
-  fs.mkdirSync(connDir, { recursive: true })
   const logPath = path.join(connDir, `${connectionId}.listen.log`)
   let logFd
   try {
-    logFd = fs.openSync(logPath, 'a')
+    // Owner-only, including a log an earlier version created 0664.
+    logFd = openPrivateAppend(logPath)
   } catch (e) {
     return { ok: false, error: `could not open listen log: ${e.message}` }
   }
@@ -207,18 +225,19 @@ function connectionPath(connectionId, connDir = CONNECTIONS_DIR) {
   return path.join(connDir, `${connectionId}.json`)
 }
 
+/** State that may hold the key: tightened to 0600 before it is read. */
 function readJson(filePath) {
-  try {
-    if (!fs.existsSync(filePath)) return null
-    return JSON.parse(fs.readFileSync(filePath, 'utf8'))
-  } catch {
-    return null
-  }
+  return readPrivateJson(filePath)
 }
 
+/**
+ * Connection state holds the bearer the connection registered with (the poller,
+ * listener and mirror authenticate as that one token, item 74b29c76), Antigravity's
+ * CSRF token and the connection capability. Written 0600 aside and renamed, so a
+ * looser existing file is replaced, in a 0700 directory.
+ */
 function writeJson(filePath, state) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true })
-  fs.writeFileSync(filePath, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 })
+  writePrivateJson(filePath, state)
 }
 
 export function readStateFile(connectionId, connDir = CONNECTIONS_DIR) {
@@ -264,8 +283,6 @@ function parseArgs(argv) {
       out['max-age-minutes'] = argv[++i]
     } else if (a === '--owner-pid') {
       out['owner-pid'] = argv[++i]
-    } else if (a === '--host-token' || a === '--host_token') {
-      out['host-token'] = argv[++i]
     } else if (a === '--except-connection' || a === '--except-session') {
       out['except-connection'] = argv[++i]
     } else if (a === '--no-poller' || a === '--skip-poller') {
@@ -567,7 +584,7 @@ export function ensurePollerForConnection(connectionId, opts = {}) {
   }
 
   const stopped = stopPollerForConnection(connectionId)
-  fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
+  ensurePrivateDir(CONNECTIONS_DIR)
 
   const logPath = pollerLogPath(connectionId)
   const pidPath = pollerPidPath(connectionId)
@@ -577,7 +594,8 @@ export function ensurePollerForConnection(connectionId, opts = {}) {
 
   let logFd
   try {
-    logFd = fs.openSync(logPath, 'a')
+    // Owner-only, including a log an earlier version created 0664.
+    logFd = openPrivateAppend(logPath)
   } catch (e) {
     return { ok: false, error: `could not open poll log: ${e.message}`, stopped }
   }
@@ -613,7 +631,7 @@ export function ensurePollerForConnection(connectionId, opts = {}) {
   const pid = child.pid
   if (!pid) return { ok: false, error: 'spawn returned no pid', stopped }
   try {
-    fs.writeFileSync(pidPath, `${pid}\n`, { mode: 0o600 })
+    writePrivateText(pidPath, `${pid}\n`)
   } catch (e) {
     return { ok: false, error: `wrote poller but failed pid file: ${e.message}`, pid, log: logPath, stopped }
   }
@@ -1609,16 +1627,11 @@ if (isMain) {
   const cmd = args._[0] || 'read'
 
   if (cmd === 'resolve-auth') {
-    const hostToken =
-      (typeof args['host-token'] === 'string' && args['host-token'].trim()
-        ? args['host-token'].trim()
-        : null) || hostTokenFromEnv(process.env)
-    const auth = resolveDevspecMcpAuth(args.cwd || process.cwd(), { hostToken })
-    if (process.argv.includes('--mask') && auth.token) {
-      auth.token_preview = auth.token.slice(0, 8) + '…' + auth.token.slice(-4)
-      delete auth.token
-    }
-    process.stdout.write(JSON.stringify(auth, null, 2) + '\n')
+    // Diagnostics only: the key is shown by fingerprint (`--mask` is now always on).
+    const auth = resolveDevspecMcpAuth(args.cwd || process.cwd(), {
+      hostToken: hostTokenFromEnv(process.env),
+    })
+    process.stdout.write(JSON.stringify(printableAuth(auth), null, 2) + '\n')
     process.exit(auth.ok ? 0 : 1)
   }
 
@@ -1905,9 +1918,14 @@ if (isMain) {
         s = null
       }
     }
+    // Secrets are reported by presence (and the key by fingerprint), never by value.
     const printable = s
       ? {
           ...s,
+          token: undefined,
+          token_fingerprint: tokenFingerprint(s.token),
+          csrf_token: undefined,
+          csrf_token_present: typeof s.csrf_token === 'string' && s.csrf_token.length > 0,
           connection_capability_present: typeof s.connection_capability === 'string',
           connection_capability: undefined,
         }
@@ -2065,16 +2083,11 @@ if (isMain) {
     // Token symmetry (item 74b29c76): prefer the SAME bearer the host MCP client
     // used for register_connection so the poller heartbeats THIS connection under
     // the same identity — otherwise the server rejects with "connection belongs to
-    // a different token" and dispatch delivery spams. The host token comes from an
-    // explicit --host-token (the write "receives one") or the reachable plugin
-    // userConfig env Claude Code exports (an env "carries it"); it wins over the
-    // .mcp.json walk but not an explicit DEVSPEC_MCP_TOKEN. Absent on non-Claude
-    // plugins / dev-from-source setups → resolution is unchanged. See resolve-mcp-auth.mjs.
-    const hostToken =
-      (typeof args['host-token'] === 'string' && args['host-token'].trim()
-        ? args['host-token'].trim()
-        : null) || hostTokenFromEnv(process.env)
-    const auth = resolveDevspecMcpAuth(cwd, { hostToken })
+    // a different token" and dispatch delivery spams. That is the bearer in
+    // Antigravity's own MCP config (`hostTokenFromEnv`); it wins over the .mcp.json
+    // walk but not an explicit DEVSPEC_MCP_TOKEN. It is never taken from the command
+    // line (item b17cb7d7). See resolve-mcp-auth.mjs.
+    const auth = resolveDevspecMcpAuth(cwd, { hostToken: hostTokenFromEnv(process.env) })
     const prev = readJson(connectionPath(connectionId)) || {}
     const agentName = args.agent || prev.agent_name || AGENT_NAME
     // The conversation this write belongs to — stamped INTO the per-connection state

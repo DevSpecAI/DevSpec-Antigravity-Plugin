@@ -20,6 +20,7 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { ensurePrivateDir, writePrivateJson } from './private-state.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import {
   detectLocalId,
@@ -85,7 +86,7 @@ export function writeTurnMarker(connectionId, extra = {}, dir = CONNECTIONS_DIR)
     ...restExtra,
   }
   try {
-    fs.mkdirSync(dir, { recursive: true })
+    ensurePrivateDir(dir)
     if (!existing && !preserveExplicitReply) {
       fs.rmSync(path.join(dir, `${connectionId}.explicit-reply`), { force: true })
       fs.rmSync(trailStatePath(connectionId, dir), { force: true })
@@ -123,7 +124,7 @@ export function recordOwnedLaunch(
   const marker = readTurnMarker(connectionId, dir)
   if (!marker) return false
   try {
-    fs.mkdirSync(dir, { recursive: true })
+    ensurePrivateDir(dir)
     const line = {
       id: String(launch.id),
       kind: launch.kind || 'task',
@@ -413,7 +414,8 @@ export function syncStateTranscriptPath(
         ...(agentapiExe ? { agentapi_exe: agentapiExe } : {}),
         updated_at: new Date().toISOString(),
       }
-      fs.writeFileSync(file, JSON.stringify(updated, null, 2), { mode: 0o600 })
+      // Connection state holds the key: 0600 aside-and-rename (item b17cb7d7).
+      writePrivateJson(file, updated)
       if (resolvedPath) state.transcript_path = resolvedPath
       if (nextLocalId) state.local_id = nextLocalId
       if (currentIsStandby && conversationId) state.pending_local_id = null
@@ -430,7 +432,7 @@ export function syncStateTranscriptPath(
         const bond = JSON.parse(fs.readFileSync(bondFile, 'utf8'))
         if (resolvedPath && bond.transcript_path !== resolvedPath) {
           bond.transcript_path = resolvedPath
-          fs.writeFileSync(bondFile, JSON.stringify(bond, null, 2), { mode: 0o600 })
+          writePrivateJson(bondFile, bond)
         }
       } else if (shouldUpgradeLocalId) {
         writeLocalBond(
@@ -576,7 +578,7 @@ export function explicitReplyMarkerPath(connectionId, dir = CONNECTIONS_DIR) {
 export function writeExplicitReplyMarker(connectionId, dir = CONNECTIONS_DIR) {
   if (!connectionId) return false
   try {
-    fs.mkdirSync(dir, { recursive: true })
+    ensurePrivateDir(dir)
     fs.writeFileSync(
       explicitReplyMarkerPath(connectionId, dir),
       JSON.stringify({ at: Date.now() }),
@@ -1284,7 +1286,7 @@ export async function streamTurnTrailIfChanged(
   }
 
   try {
-    fs.mkdirSync(connectionsDir, { recursive: true })
+    ensurePrivateDir(connectionsDir)
     fs.writeFileSync(
       stateFile,
       JSON.stringify({
@@ -1440,7 +1442,8 @@ export function patchOwnState(connectionId, patch, connectionsDir = CONNECTIONS_
       ...patch,
       updated_at: new Date().toISOString(),
     }
-    fs.writeFileSync(file, JSON.stringify(updated, null, 2), { mode: 0o600 })
+    // Connection state holds the key: 0600 aside-and-rename (item b17cb7d7).
+    writePrivateJson(file, updated)
     return true
   } catch {
     return false

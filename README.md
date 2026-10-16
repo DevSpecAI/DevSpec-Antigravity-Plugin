@@ -38,15 +38,9 @@ Bring DevSpec into [Google Antigravity CLI](https://antigravity.google) (`agy`).
 
 Install once at **user home**, not inside an individual project repository. `agy` resolves which DevSpec project a folder belongs to automatically from `git remote get-url origin` (or `.devspec/project.json`).
 
-### 1. Add your DevSpec MCP token (`agy mcp add` or `mcp_config.json`)
+### 1. Add your DevSpec MCP token to `mcp_config.json`
 
-Check that Node.js 18+ is installed (`node --version`), then register the `devspec` MCP server with `agy mcp add`:
-
-```bash
-agy mcp add --header "Authorization: Bearer dvs_YOUR_DEVSPEC_MCP_TOKEN" devspec "https://devspec.ai/api/mcp"
-```
-
-Or merge the `devspec` entry directly into Antigravity CLI's user-level MCP configuration at `~/.gemini/config/mcp_config.json` (Windows: `%USERPROFILE%\.gemini\config\mcp_config.json`; legacy `~/.gemini/antigravity-cli/mcp_config.json` is also supported):
+Check that Node.js 18+ is installed (`node --version`), then add the `devspec` entry to Antigravity CLI's user-level MCP configuration at `~/.gemini/config/mcp_config.json` (Windows: `%USERPROFILE%\.gemini\config\mcp_config.json`; legacy `~/.gemini/antigravity-cli/mcp_config.json` is also supported). Keep any servers already in the file. The **Connect a tool** step on your [Agents settings page](https://devspec.ai/settings/agents) shows this entry with your token filled in:
 
 ```json
 {
@@ -62,10 +56,23 @@ Or merge the `devspec` entry directly into Antigravity CLI's user-level MCP conf
 }
 ```
 
+Then make the file readable only by you (macOS / Linux):
+
+```bash
+chmod 700 ~/.gemini/config && chmod 600 ~/.gemini/config/mcp_config.json
+```
+
+- Edit the file in an editor and paste the token there. **Don't use `agy mcp add --header "Authorization: Bearer …"`**: that puts your token on a command line, where any other account on the computer can read it while it runs, and in your shell history, and `agy` saves the file readable by every account.
 - Replace `dvs_YOUR_DEVSPEC_MCP_TOKEN` with a literal `dvs_...` token string (do not use shell variable interpolation like `${TOKEN}`).
 - You don't add anything else. At session start and when you run `/devspec-remote`, the plugin adds one header to this `devspec` entry, `x-devspec-plugin: antigravity/<plugin version>`, and moves it on after an update, so DevSpec can tell which plugin and version each call comes from. It changes nothing else in the file and unlocks nothing; the plugin's own background scripts send the same header themselves.
 - On first verified connection, the plugin pins your working token and URL at `~/.devspec/auth.json` (`0600`) so stale or placeholder project files never shadow it.
-- **Internal staging / custom endpoint override:** End users default to production (`https://devspec.ai/api/mcp`). For internal testing against staging (`devspecstaging.com`), copy the `agy mcp add` or `mcp_config.json` snippet directly from [staging Agents settings](https://app.devspecstaging.com/settings/agents) (which sets `serverUrl` to `https://api.devspecstaging.com/api/mcp`, or `https://devspecstaging.com/api/mcp`) or set `DEVSPEC_MCP_URL=https://api.devspecstaging.com/api/mcp`. Every hook and background poller resolves `serverUrl` from your MCP config (`resolve-mcp-auth.mjs`) so all traffic stays on staging.
+- **Internal staging / custom endpoint override:** End users default to production (`https://devspec.ai/api/mcp`). For internal testing against staging (`devspecstaging.com`), copy the `mcp_config.json` entry directly from [staging Agents settings](https://app.devspecstaging.com/settings/agents) (which sets `serverUrl` to `https://api.devspecstaging.com/api/mcp`, or `https://devspecstaging.com/api/mcp`) or set `DEVSPEC_MCP_URL=https://api.devspecstaging.com/api/mcp`. Every hook and background poller resolves `serverUrl` from your MCP config (`resolve-mcp-auth.mjs`) so all traffic stays on staging.
+
+#### Where your token is kept
+
+- **In Antigravity's MCP config, and nowhere on a command line.** Antigravity's own MCP client reads the token from `mcp_config.json`; the plugin's scripts read it from the same file and keep it in memory. No plugin command takes the token as an argument, and none prints it: `resolve-mcp-auth.mjs` and `remote-control-state.mjs resolve-auth` / `read` show its first twelve characters, the same identifier DevSpec shows under **Access tokens**.
+- **Owner-only files.** The plugin's copies (`~/.devspec/auth.json` and the connection state under `~/.devspec/remote-control/`) are written `0600` inside `0700` folders, and a copy an older version left with a looser mode is replaced or tightened. `agy` itself saves `mcp_config.json` as a new file every time `agy mcp add`, `remove`, `enable` or `disable` runs, readable by every account under the usual `umask` (`0644`), so at every session start and every `/devspec-remote` the plugin sets it back to `0600` and its folder to `0700`. `agy` leaves the folder's mode alone, so the `0700` folder keeps other accounts out in between.
+- **Windows.** POSIX modes do not apply. The files sit under `%USERPROFILE%` and inherit the profile folder's default access list: your account, SYSTEM and Administrators. Other standard accounts on the computer cannot open them.
 
 ### 2. Clone the plugin globally (Required)
 
@@ -217,7 +224,7 @@ Each coding agent has its own independent plugin repository tailored to its host
 
 | Host | Config / Install | Remote Transport Family |
 |---|---|---|
-| **Antigravity CLI** (`agy`) | `~/.gemini/config/mcp_config.json` (or `agy mcp add`) + `~/.gemini/config/plugins/antigravity-devspec-autopilot-extension` | Local poller + wait stream + local `.transcript.jsonl` / `.room.json` + native `transcript.jsonl` hooks |
+| **Antigravity CLI** (`agy`) | `~/.gemini/config/mcp_config.json` (`0600`) + `~/.gemini/config/plugins/antigravity-devspec-autopilot-extension` | Local poller + wait stream + local `.transcript.jsonl` / `.room.json` + native `transcript.jsonl` hooks |
 | **Claude Code** | `/plugin install devspec@devspec` | Local poller + persistent monitor + Claude hooks |
 | **Pi** | `pi install git:github.com/DevSpecAI/DevSpec-Pi` | In-process TypeScript extension + embedded MCP transport |
 | **Codex CLI** | `~/.codex/config.toml` | Local poller + app-server bridge |

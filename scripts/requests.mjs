@@ -15,6 +15,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
+import { ensurePrivateDir } from './private-state.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const KEY = /^[A-Za-z0-9_.:-]{1,128}$/
@@ -39,7 +40,7 @@ export function appendRequestEvent(
 ) {
   if (!connectionId || !event?.op) return false
   try {
-    fs.mkdirSync(dir, { recursive: true })
+    ensurePrivateDir(dir)
     fs.appendFileSync(
       requestLogPath(connectionId, dir),
       `${JSON.stringify({ ...event, at: new Date(now).toISOString() })}\n`,

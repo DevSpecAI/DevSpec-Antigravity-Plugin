@@ -181,15 +181,19 @@ describe('resolveDevspecMcpAuth (Antigravity)', { concurrency: false }, () => {
     assert.equal(auth.error, formatMissingAuthMessage())
   })
 
-  it('formats a deterministic OS-aware missing auth message for POSIX and Windows', () => {
-    assert.equal(
-      formatMissingAuthMessage('linux'),
-      'DevSpec is not configured properly: run `agy mcp add --header "Authorization: Bearer dvs_..." devspec https://devspec.ai/api/mcp` or place your "dvs_..." token in ~/.gemini/config/mcp_config.json (or ~/.gemini/antigravity-cli/mcp_config.json) under mcpServers.devspec.headers.Authorization ("Bearer dvs_..."), then restart agy.',
-    )
-    assert.equal(
-      formatMissingAuthMessage('win32'),
-      'DevSpec is not configured properly: run `agy mcp add --header "Authorization: Bearer dvs_..." devspec https://devspec.ai/api/mcp` or place your "dvs_..." token in %USERPROFILE%\\.gemini\\config\\mcp_config.json (or %USERPROFILE%\\.gemini\\antigravity-cli\\mcp_config.json) under mcpServers.devspec.headers.Authorization ("Bearer dvs_..."), then restart agy.',
-    )
+  it('formats an OS-aware missing auth message that never hands out a command carrying the key', () => {
+    const posix = formatMissingAuthMessage('linux')
+    assert.match(posix, /~\/\.gemini\/config\/mcp_config\.json \(or ~\/\.gemini\/antigravity-cli\/mcp_config\.json\)/)
+    assert.match(posix, /mcpServers\.devspec\.headers\.Authorization/)
+    assert.match(posix, /chmod 600/)
+    const windows = formatMissingAuthMessage('win32')
+    assert.match(windows, /%USERPROFILE%\\\.gemini\\config\\mcp_config\.json/)
+    assert.doesNotMatch(windows, /chmod/)
+    // Item b17cb7d7: the old message told people to run `agy mcp add --header
+    // "Authorization: Bearer dvs_..."`, which puts the key in that process's argv.
+    for (const message of [posix, windows]) {
+      assert.doesNotMatch(message, /`agy mcp add[^`]*Bearer/)
+    }
   })
 
   it('reads ~/.gemini/config/mcp_config.json (migrated agy global path) and prefers it over legacy path', () => {

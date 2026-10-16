@@ -33,6 +33,7 @@ import { findProjectPin, gitRemoteOrigin } from './devspec-scope.mjs'
 import { resolveOwnConnectionId } from './launch-guard.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveHookConversationId } from './mirror-turn.mjs'
+import { ensurePrivateDir } from './private-state.mjs'
 import { ownerAlive, resolveOwnerPid } from './remote-control-state.mjs'
 import { DEFAULT_PROD_URL, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { connectAtStartupEnabled } from './session-start.mjs'
@@ -711,7 +712,7 @@ export function maybeSpawnWindowAutoConnect({
         return { spawned: false, reason: 'already_attempted' }
       }
     }
-    fs.mkdirSync(lockDir, { recursive: true })
+    ensurePrivateDir(lockDir)
     fs.writeFileSync(lockFile, `${Date.now()}\n`, { mode: 0o600 })
   } catch {
     return { spawned: false, reason: 'lock_failed' }

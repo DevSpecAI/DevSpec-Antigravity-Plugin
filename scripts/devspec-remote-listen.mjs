@@ -35,6 +35,7 @@ import {
   resolveOwnerPid,
   writeStateFile,
 } from './remote-control-state.mjs'
+import { ensurePrivateDir } from './private-state.mjs'
 import { recordDeliveredBatchRequests } from './requests.mjs'
 import { autoConnectAtStartup, connectAtStartupEnabled } from './session-start.mjs'
 
@@ -437,7 +438,7 @@ async function main() {
   const listenerFile = listenerInfoPath(connectionId)
   const writeListenerMarker = () => {
     try {
-      fs.mkdirSync(path.dirname(listenerFile), { recursive: true })
+      ensurePrivateDir(path.dirname(listenerFile))
       fs.writeFileSync(
         listenerFile,
         JSON.stringify(

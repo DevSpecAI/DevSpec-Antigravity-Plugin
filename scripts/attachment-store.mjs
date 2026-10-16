@@ -20,6 +20,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { ensurePrivateDir } from './private-state.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 
@@ -51,7 +52,7 @@ function decodeAttachmentBuffer(att) {
 }
 
 export function defaultWriteFile(target, buf) {
-  fs.mkdirSync(path.dirname(target), { recursive: true })
+  ensurePrivateDir(path.dirname(target))
   fs.writeFileSync(target, buf, { mode: 0o600 })
 }
 
