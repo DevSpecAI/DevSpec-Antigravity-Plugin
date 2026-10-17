@@ -187,7 +187,10 @@ export function persistedDismissalDisposition(text, event) {
   }
   return applied ? 'applied' : 'new'
 }
-export function buildQuestionDismissalEvents(record, { inboxFile, bridge } = {}) {
+export function buildQuestionDismissalEvents(
+  record,
+  { inboxFile, bridge, rearm = 'devspec-remote-wait' } = {},
+) {
   const queued = record.disposition === 'queued'
   return [
     {
@@ -202,7 +205,7 @@ export function buildQuestionDismissalEvents(record, { inboxFile, bridge } = {})
       context: formatQuestionDismissalEventContext(record.event),
       note: queued
         ? 'The exact continuation is not open. Do not reply or complete it. Finish the current turn; a dedicated delivery follows when the channel is available.'
-        : `Continue only the existing workflow, without treating dismissal as an answer or new authorization. Post genuine continuation output with:\n  node "${bridge}" respond --connection-id ${record.connection_id} --message '<your reply>'\nThis closes only the exact dismissal continuation.`,
+        : `Continue only the existing workflow, without treating dismissal as an answer or new authorization. Post genuine continuation output with:\n  node "${bridge}" respond --connection-id ${record.connection_id} --message '<your reply>'\nThis closes only the exact dismissal continuation. Do NOT also call post_session_message.`,
     },
     {
       type: 'wake',
@@ -213,7 +216,7 @@ export function buildQuestionDismissalEvents(record, { inboxFile, bridge } = {})
       authoritative: false,
       executable: false,
       continuous_poller: true,
-      rearm: 'devspec-remote-wait',
+      rearm,
     },
   ]
 }

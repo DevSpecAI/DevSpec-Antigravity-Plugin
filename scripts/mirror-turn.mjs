@@ -829,6 +829,9 @@ export function isSessionReplyToolCall(toolName, args = {}) {
     if (cmdLine.includes('post_session_message') && !/phase\s*:\s*['"]trail['"]/.test(cmdLine)) {
       return true
     }
+    if (cmdLine.includes('devspec-question.mjs') && /\brespond\b/.test(cmdLine)) {
+      return true
+    }
   }
   return false
 }
@@ -851,6 +854,7 @@ export function isRemotePlumbingToolCall(toolName, args = {}) {
       cmdLine.includes('devspec-remote-poll.mjs') ||
       cmdLine.includes('devspec-remote-connect.mjs') ||
       cmdLine.includes('devspec-remote-stop.mjs') ||
+      cmdLine.includes('devspec-question.mjs') ||
       cmdLine.includes('remote-control-state.mjs') ||
       cmdLine.includes('connection-call.mjs') ||
       cmdLine.includes('post_session_message') ||

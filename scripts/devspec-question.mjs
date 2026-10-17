@@ -23,7 +23,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { mcpToolsCall, mcpToolsList } from './mcp-call.mjs'
-import { clearTurnMarker } from './mirror-turn.mjs'
+import { clearTurnMarker, writeExplicitReplyMarker } from './mirror-turn.mjs'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import {
@@ -60,7 +60,9 @@ export function parseArgs(argv) {
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index]
     if (!out.command && COMMANDS.has(arg)) out.command = arg
-    else if (arg === '--connection-id' || arg === '--connection_id') out.connectionId = argv[++index]
+    else if (arg === '--schema') {
+      if (!out.command) out.command = 'describe'
+    } else if (arg === '--connection-id' || arg === '--connection_id') out.connectionId = argv[++index]
     else if (arg === '--input' || arg === '--json') out.input = argv[++index]
     else if (arg === '--message' || arg === '--reply') out.message = argv[++index]
     else if (arg === '--keep-turn' || arg === '--keep_turn') out.keepTurn = true
@@ -70,13 +72,17 @@ export function parseArgs(argv) {
 
 /** Keep host flag and tool argument on the same create payload. */
 export function directedQuestionToolArguments(input, { keepTurn } = {}) {
-  if (input?.action === 'create' && keepTurn) return { ...input, keep_turn: true }
+  if (input?.action === 'create' && (keepTurn || input?.keep_turn === true)) {
+    return { ...input, keep_turn: true }
+  }
   return input
 }
 
-export function askTurnBoundaryPlan({ action, keepTurn, continuation, result } = {}) {
+export function askTurnBoundaryPlan({ action, keepTurn, input, continuation, result } = {}) {
   if (action !== 'create') return { endTurn: false, reason: 'not an ask' }
-  if (keepTurn) return { endTurn: false, reason: 'caller has more work this turn' }
+  if (keepTurn || input?.keep_turn === true) {
+    return { endTurn: false, reason: 'caller has more work this turn' }
+  }
   if (continuation) return { endTurn: false, reason: 'an exact interaction attempt is open' }
   if (result?.question?.status !== 'pending') {
     return { endTurn: false, reason: 'no pending question was created' }
@@ -198,7 +204,7 @@ export function questionRequestOptions(state) {
   }
 }
 
-/** Drop the resolved continuation without disturbing concurrently-written fields. */
+/** Drop the resolved continuation and mark the local turn replied + closed so Stop never double-posts. */
 export function clearStoredContinuation(connectionId, dir = CONNECTIONS_DIR) {
   const statePath = path.join(dir, `${connectionId}.json`)
   const prev = readPrivateJson(statePath)
@@ -208,6 +214,12 @@ export function clearStoredContinuation(connectionId, dir = CONNECTIONS_DIR) {
     interaction_continuation: null,
     updated_at: new Date().toISOString(),
   })
+}
+
+export function finishQuestionRespondTurn(connectionId, dir = CONNECTIONS_DIR) {
+  clearStoredContinuation(connectionId, dir)
+  writeExplicitReplyMarker(connectionId, dir)
+  clearTurnMarker(connectionId, dir)
 }
 
 export function respondArguments({ connectionId, continuation, message }) {
@@ -276,7 +288,7 @@ async function main() {
         message: message.slice(0, MAX_REPLY_CHARS),
       }),
     })
-    clearStoredContinuation(args.connectionId)
+    finishQuestionRespondTurn(args.connectionId)
     process.stdout.write(JSON.stringify(result, null, 2) + '\n')
     return
   }
@@ -290,19 +302,22 @@ async function main() {
   }
   const validation = validateDirectedQuestionArguments(input)
   if (!validation.ok) throw new Error(validation.error)
+  const keepTurn = Boolean(args.keepTurn || input?.keep_turn === true)
   const result = await mcpToolsCall({
     ...options,
     name: TOOL,
-    arguments: directedQuestionToolArguments(input, { keepTurn: args.keepTurn }),
+    arguments: directedQuestionToolArguments(input, { keepTurn }),
   })
 
   const boundary = askTurnBoundaryPlan({
     action: input.action,
-    keepTurn: args.keepTurn,
+    keepTurn,
+    input,
     continuation,
     result,
   })
   if (boundary.endTurn) {
+    writeExplicitReplyMarker(args.connectionId)
     clearTurnMarker(args.connectionId)
   }
   process.stdout.write(JSON.stringify({ ...result, turn_ended: boundary.endTurn }, null, 2) + '\n')

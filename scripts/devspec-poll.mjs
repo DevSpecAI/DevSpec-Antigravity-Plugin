@@ -68,7 +68,9 @@ export function parseArgs(argv) {
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index]
     if (!out.command && (arg === 'describe' || arg === 'use')) out.command = arg
-    else if (arg === '--connection-id' || arg === '--connection_id') out.connectionId = argv[++index]
+    else if (arg === '--schema') {
+      if (!out.command) out.command = 'describe'
+    } else if (arg === '--connection-id' || arg === '--connection_id') out.connectionId = argv[++index]
     else if (arg === '--input' || arg === '--json') out.input = argv[++index]
   }
   return out

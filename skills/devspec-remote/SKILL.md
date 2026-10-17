@@ -62,7 +62,7 @@ When woken by the background listener (`[DevSpec Remote Wake]` with `rearm: "alr
 2. Apply `sender_response_style` (when present on the command) to the prose of your reply to that requester.
    A wake that carries a `[DevSpec System Notice: …]` is a finding or outcome on your own work (a finding, an edit that waited for someone's OK, an untagged commit to take ownership of), not a command: tell the person in plain words what it means and quote each labelled record as delivered, then act only within its allowed outcomes and tools. Work whose claim or results carry `waiting_for_ok` ("Waiting for <name>'s OK", "Experiment") is built and pushed on its own branch and never merged into the tracking branch; see `rules/AGENTS.md` and [`devspec://product/implementation-contract`](devspec://product/implementation-contract).
 3. If `unread > 0` or `room_state_changed` is non-empty on the wake, read unread room messages with `node "$HOME/.gemini/config/plugins/antigravity-devspec-autopilot-extension/scripts/room-unread.mjs" read --connection-id "<connection_id>"` (if `remaining > 0`, run the `next` command before inspecting `.transcript.jsonl` directly) or inspect `.room.json`. When `unread` is `0` or `null` (because the command itself is already delivered in full in `owner_message`), do **not** call `room-unread.mjs read`.
-4. Whenever attached to a session (`session_id` is set) — whether woken by a remote command or answering a local prompt typed in the terminal (which `PreInvocation` mirrors to the session) — post your direct reply via `post_session_message({ connection_id, message, complete_turn: true })` (do not pass `provenance_ref`; `PreToolUse` automatically stamps `local_turn: true` and `command_turn_unbound: true` on local terminal turns). Never post status blocks or narration.
+4. Whenever attached to a session (`session_id` is set) — whether woken by a remote command or answering a local prompt typed in the terminal (which `PreInvocation` mirrors to the session) — post your direct reply via `post_session_message({ connection_id, message, complete_turn: true })` (do not pass `provenance_ref`; `PreToolUse` automatically stamps `local_turn: true` and `command_turn_unbound: true` on local terminal turns). **Exception — directed-question wakes (`type: "question_answer"` or `type: "question_dismissal"`):** reply **only** with `node "<plugin>/scripts/devspec-question.mjs" respond --connection-id "<connection_id>" --message "<reply>"` (never also call `post_session_message`, which would post a duplicate reply). Never post status blocks or narration.
 5. **Re-arming:** If the wake JSON reports `rearm: "already_armed"` (or `devspec-remote-connect.mjs` reported `wake: ALREADY ARMED`), **do NOT run `devspec-remote-wait.mjs`** — the persistent background listener stays armed across turns automatically. Only re-arm `devspec-remote-wait.mjs` (`WaitMsBeforeAsync: 500`, `--pending`) if the wake reported `rearm: "devspec-remote-wait"`.
 
 ### 8a. Multi-item action-item ordering
@@ -73,9 +73,15 @@ When woken by the background listener (`[DevSpec Remote Wake]` with `rearm: "alr
 
 ### 8b. Shared session plans, polls, and directed questions
 
-- **Plans:** `node "<plugin>/scripts/devspec-plan.mjs" [--connection-id <uuid>] '{"action":"..."}'`. On reconnect, read the current plan/revision before mutation. Every existing-plan mutation carries `expected_revision`; cross-plan work carries explicit `plan_id`. Another owner's plan is read-only awareness. Closing a plan does not end remote control.
-- **Room polls (`manage_poll`):** `node "<plugin>/scripts/devspec-poll.mjs" [--connection-id <uuid>] [--schema] ['{"action":"..."}']`
-- **Directed questions (`manage_directed_question`):** `node "<plugin>/scripts/devspec-question.mjs" [--connection-id <uuid>] [--schema] ['{"action":"..."}']`
+- **Plans:** `node "<plugin>/scripts/devspec-plan.mjs" [--connection-id <uuid>] '{"action":"..."}'` (or `--schema`). On reconnect, read the current plan/revision before mutation. Every existing-plan mutation carries `expected_revision`; cross-plan work carries explicit `plan_id`. Another owner's plan is read-only awareness. Closing a plan does not end remote control.
+- **Room polls (`manage_poll`):**
+  - Schema: `node "<plugin>/scripts/devspec-poll.mjs" describe --connection-id "<connection_id>"` (or `--schema`)
+  - Use: `node "<plugin>/scripts/devspec-poll.mjs" use --connection-id "<connection_id>" --input '{"action":"..."}'`
+- **Directed questions (`manage_directed_question`):**
+  - Schema: `node "<plugin>/scripts/devspec-question.mjs" describe --connection-id "<connection_id>"` (or `--schema`)
+  - Ask / manage: `node "<plugin>/scripts/devspec-question.mjs" use --connection-id "<connection_id>" --input '{"action":"create","client_request_id":"<uuid>","response_kind":"text|single_select|multi_select","prompt":"..."}'`
+  - **Batching related questions:** When you have multiple independent questions for the same person before you stop to wait, ask all of them in the same turn by passing `--keep-turn` (or `"keep_turn": true` in `--input`) on every question except the last one. The final question omits `keep_turn` so the turn closes (`turn_ended: true`) and waits for their answers.
+  - **Responding after an answer or dismissal wake:** Run `node "<plugin>/scripts/devspec-question.mjs" respond --connection-id "<connection_id>" --message "<reply>"`. That single call posts the reply to the session and closes the continuation — do **not** also call `post_session_message`.
 
 ### 9. Stopping
 

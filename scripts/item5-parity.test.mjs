@@ -14,12 +14,14 @@ import {
   askTurnBoundaryPlan,
   clearStoredContinuation,
   directedQuestionToolArguments,
+  finishQuestionRespondTurn,
   parseArgs as parseQuestionArgs,
   questionRequestOptions,
   readQuestionConnectionState,
   respondArguments,
   validateDirectedQuestionArguments,
 } from './devspec-question.mjs'
+import { formatInboxEntryForStream } from './devspec-remote-wait.mjs'
 import {
   activeContinuation,
   classifyContinuationStart,
@@ -28,9 +30,17 @@ import {
   INTERACTION_EVENT_VERSION,
   interactionAnswerRecord,
   interactionNegotiationArguments,
+  QUEUED,
   scanPersistedInteractionEventIds,
   validateInteractionEvent,
 } from './interaction-events.mjs'
+import {
+  consumeExplicitReplyMarker,
+  isRemotePlumbingToolCall,
+  isSessionReplyToolCall,
+  readTurnMarker,
+  writeTurnMarker,
+} from './mirror-turn.mjs'
 import { checkPinAfterTool, pinProblem } from './pin-check.mjs'
 import { runPostToolDispatch } from './post-tool-dispatch.mjs'
 import {
@@ -101,6 +111,7 @@ describe('Item 5 Parity: devspec-poll.mjs and devspec-question.mjs bridges', () 
     const parsed = parsePollArgs(['use', '--connection-id', CONN_ID, '--input', '{"action":"list"}'])
     assert.equal(parsed.command, 'use')
     assert.equal(parsed.connectionId, CONN_ID)
+    assert.equal(parsePollArgs(['--schema', '--connection-id', CONN_ID]).command, 'describe')
 
     assert.deepEqual(
       validateManagePollArguments({
@@ -157,6 +168,7 @@ describe('Item 5 Parity: devspec-poll.mjs and devspec-question.mjs bridges', () 
     ])
     assert.equal(parsed.command, 'use')
     assert.equal(parsed.keepTurn, true)
+    assert.equal(parseQuestionArgs(['--schema', '--connection-id', CONN_ID]).command, 'describe')
 
     assert.deepEqual(
       validateDirectedQuestionArguments({
@@ -173,6 +185,10 @@ describe('Item 5 Parity: devspec-poll.mjs and devspec-question.mjs bridges', () 
       { action: 'create', prompt: 'Hi', keep_turn: true },
     )
     assert.deepEqual(
+      directedQuestionToolArguments({ action: 'create', prompt: 'Hi', keep_turn: true }, { keepTurn: false }),
+      { action: 'create', prompt: 'Hi', keep_turn: true },
+    )
+    assert.deepEqual(
       askTurnBoundaryPlan({
         action: 'create',
         keepTurn: false,
@@ -180,6 +196,16 @@ describe('Item 5 Parity: devspec-poll.mjs and devspec-question.mjs bridges', () 
         result: { question: { status: 'pending' } },
       }),
       { endTurn: true, reason: 'asked and stopped' },
+    )
+    assert.deepEqual(
+      askTurnBoundaryPlan({
+        action: 'create',
+        keepTurn: false,
+        input: { action: 'create', keep_turn: true },
+        continuation: null,
+        result: { question: { status: 'pending' } },
+      }),
+      { endTurn: false, reason: 'caller has more work this turn' },
     )
 
     const cont = activeContinuation(state.interaction_continuation, {
@@ -198,14 +224,31 @@ describe('Item 5 Parity: devspec-poll.mjs and devspec-question.mjs bridges', () 
     assert.equal(respArgs.interaction_response_id, RESP_ID)
     assert.equal(respArgs.interaction_claim_token, CLAIM_ID)
 
-    clearStoredContinuation(CONN_ID, dir)
+    writeTurnMarker(CONN_ID, { remoteTurn: true }, dir)
+    assert.ok(readTurnMarker(CONN_ID, dir))
+    finishQuestionRespondTurn(CONN_ID, dir)
     const cleared = readQuestionConnectionState(CONN_ID, dir)
     assert.equal(cleared.interaction_continuation, null)
+    assert.equal(readTurnMarker(CONN_ID, dir), null)
+    assert.equal(consumeExplicitReplyMarker(CONN_ID, dir), true)
+
+    assert.equal(
+      isSessionReplyToolCall('default_api:run_command', {
+        CommandLine: `node "/path/to/scripts/devspec-question.mjs" respond --connection-id ${CONN_ID} --message "Done"`,
+      }),
+      true,
+    )
+    assert.equal(
+      isRemotePlumbingToolCall('default_api:run_command', {
+        CommandLine: `node "/path/to/scripts/devspec-question.mjs" use --connection-id ${CONN_ID} --input '{"action":"create"}'`,
+      }),
+      true,
+    )
   })
 })
 
 describe('Item 5 Parity: canonical interaction and dismissal contracts', () => {
-  it('validates directed-question answers and dismissals and tracks inbox deduplication', () => {
+  it('validates directed-question answers and dismissals, tracks inbox deduplication, and forwards rearm on wakes', () => {
     const neg = interactionNegotiationArguments({
       enabled: true,
       connection_id: CONN_ID,
@@ -246,6 +289,31 @@ describe('Item 5 Parity: canonical interaction and dismissal contracts', () => {
     const ids = scanPersistedInteractionEventIds(inboxLine)
     assert.equal(ids.has(EVT_ID), true)
 
+    const answerWakeLines = formatInboxEntryForStream(record, {
+      inboxFile: '/tmp/inbox.jsonl',
+      rearm: 'already_armed',
+    })
+      .split('\n')
+      .map((line) => JSON.parse(line))
+    assert.equal(answerWakeLines[1].type, 'wake')
+    assert.equal(answerWakeLines[1].rearm, 'already_armed')
+
+    const queuedRecord = interactionAnswerRecord({
+      connectionId: CONN_ID,
+      sessionId: SESS_ID,
+      event: validated.event,
+      attemptId: null,
+      disposition: QUEUED,
+    })
+    const queuedWakeLines = formatInboxEntryForStream(queuedRecord, {
+      inboxFile: '/tmp/inbox.jsonl',
+      rearm: 'already_armed',
+    })
+      .split('\n')
+      .map((line) => JSON.parse(line))
+    assert.equal(queuedWakeLines[1].type, 'wake')
+    assert.equal(queuedWakeLines[1].rearm, 'already_armed')
+
     const rawDismissal = {
       kind: DISMISSAL_KIND,
       version: 1,
@@ -277,6 +345,22 @@ describe('Item 5 Parity: canonical interaction and dismissal contracts', () => {
       claim_token: CLAIM_ID,
       question_id: Q_ID,
     })
+
+    const dismissalRecord = interactionAnswerRecord({
+      connectionId: CONN_ID,
+      sessionId: SESS_ID,
+      event: validDismissal.event,
+      attemptId: ATT_ID,
+      disposition: DELIVERED,
+    })
+    const dismissalWakeLines = formatInboxEntryForStream(dismissalRecord, {
+      inboxFile: '/tmp/inbox.jsonl',
+      rearm: 'already_armed',
+    })
+      .split('\n')
+      .map((line) => JSON.parse(line))
+    assert.equal(dismissalWakeLines[1].type, 'wake')
+    assert.equal(dismissalWakeLines[1].rearm, 'already_armed')
   })
 })
 

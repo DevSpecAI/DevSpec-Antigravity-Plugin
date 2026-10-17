@@ -883,8 +883,8 @@ export function formatInboxEntryForStream(
   } else if (batch.type === INTERACTION_ANSWER_RECORD_TYPE || batch.type === DISMISSAL_RECORD_TYPE) {
     events =
       batch.disposition === QUEUED
-        ? buildQueuedAnswerEvents(batch, { inboxFile })
-        : buildInteractionAnswerEvents(batch, { inboxFile })
+        ? buildQueuedAnswerEvents(batch, { inboxFile, rearm })
+        : buildInteractionAnswerEvents(batch, { inboxFile, rearm })
   } else if (batch.type === 'automation_run' && batch.dispatch) {
     events = buildAutomationRunEvents(batch, { inboxFile })
   } else if (batch.type === 'owner_messages') {

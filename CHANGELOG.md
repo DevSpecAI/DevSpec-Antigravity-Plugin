@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.17.4
+
+### Single-post directed-question replies, JSON `keep_turn` batching, and `rearm: "already_armed"` on answer/dismissal wakes
+
+- **Answering or asking a directed question no longer triggers a duplicate fallback reply (`scripts/devspec-question.mjs`, `scripts/mirror-turn.mjs`).** `devspec-question.mjs respond` now calls `finishQuestionRespondTurn`, which clears `interaction_continuation`, writes `.explicit-reply`, and clears `.turn`; `devspec-question.mjs use` also writes `.explicit-reply` alongside clearing `.turn` when a pending question ends the turn; and `isSessionReplyToolCall` / `isRemotePlumbingToolCall` in `scripts/mirror-turn.mjs` recognize `devspec-question.mjs` so `PostToolUse` does not re-open `.turn` and `Stop` does not post a second `post_session_message`.
+- **`"keep_turn": true` inside JSON `--input` keeps the local turn open for batched questions (`scripts/devspec-question.mjs`).** Passing `"keep_turn": true` in `--input` to `devspec-question.mjs use` now sets `keepTurn = true` for both `directedQuestionToolArguments` and `askTurnBoundaryPlan`, matching the `--keep-turn` CLI flag when asking multiple independent questions in one turn.
+- **Directed-question answer and dismissal wakes preserve `rearm: "already_armed"` (`scripts/devspec-remote-wait.mjs`, `scripts/interaction-events.mjs`, `scripts/question-dismissal-events.mjs`).** `formatInboxEntryForStream` now forwards `rearm` to `buildQueuedAnswerEvents`, `buildInteractionAnswerEvents`, and `buildQuestionDismissalEvents` so wakes delivered by the persistent background listener (`devspec-remote-listen.mjs`) report `rearm: "already_armed"` instead of hardcoded `"devspec-remote-wait"`.
+- **Aligned CLI flags and instructions (`scripts/devspec-question.mjs`, `scripts/devspec-poll.mjs`, `skills/devspec-remote/SKILL.md`, `rules/AGENTS.md`).** `devspec-question.mjs` and `devspec-poll.mjs` accept `--schema` as an alias for `describe`, and `SKILL.md` / `rules/AGENTS.md` document `describe` / `use` / `respond`, batching questions with `keep_turn: true`, and replying to `question_answer` / `question_dismissal` wakes exclusively via `devspec-question.mjs respond`.
+
 ## 0.17.3
 
 ### Findings about the agent's own work reach it again

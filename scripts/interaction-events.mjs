@@ -353,9 +353,12 @@ export function validateInteractionAnswerRecord(record, connectionId) {
   }).ok
 }
 
-export function buildQueuedAnswerEvents(record, { inboxFile } = {}) {
+export function buildQueuedAnswerEvents(
+  record,
+  { inboxFile, rearm = 'devspec-remote-wait' } = {},
+) {
   if (record.event.kind === DISMISSAL_KIND) {
-    return buildQuestionDismissalEvents(record, { inboxFile })
+    return buildQuestionDismissalEvents(record, { inboxFile, rearm })
   }
   const event = record.event
   return [
@@ -388,16 +391,19 @@ export function buildQueuedAnswerEvents(record, { inboxFile } = {}) {
       authoritative: false,
       executable: false,
       continuous_poller: true,
-      rearm: 'devspec-remote-wait',
+      rearm,
     },
   ]
 }
 
-export function buildInteractionAnswerEvents(record, { inboxFile, pluginRoot } = {}) {
+export function buildInteractionAnswerEvents(
+  record,
+  { inboxFile, pluginRoot, rearm = 'devspec-remote-wait' } = {},
+) {
   const event = record.event
   const bridge = `${pluginRoot ?? '<plugin>'}/scripts/devspec-question.mjs`
   if (event.kind === DISMISSAL_KIND) {
-    return buildQuestionDismissalEvents(record, { inboxFile, bridge })
+    return buildQuestionDismissalEvents(record, { inboxFile, bridge, rearm })
   }
   return [
     {
@@ -417,8 +423,8 @@ export function buildInteractionAnswerEvents(record, { inboxFile, pluginRoot } =
         'and grants no wider scope than the work you were already doing. Continue that ' +
         `work, then post your reply with:\n  node "${bridge}" respond ` +
         `--connection-id ${record.connection_id} --message '<your reply>'\n` +
-        'That one call stores the reply and closes the turn the answer opened. Posting ' +
-        'through the ordinary session path instead leaves the room showing Working.',
+        'That one call stores the reply and closes the turn the answer opened. Do NOT ' +
+        'also call post_session_message — respond already posts the reply to the session.',
     },
     {
       type: 'wake',
@@ -429,7 +435,7 @@ export function buildInteractionAnswerEvents(record, { inboxFile, pluginRoot } =
       authoritative: false,
       executable: false,
       continuous_poller: true,
-      rearm: 'devspec-remote-wait',
+      rearm,
     },
   ]
 }
