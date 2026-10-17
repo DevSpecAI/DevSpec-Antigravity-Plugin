@@ -623,7 +623,7 @@ export function loadState(
   }
   try {
     if (fs.existsSync(connectionsDir)) {
-      for (const file of fs.readdirSync(connectionsDir).filter((f) => f.endsWith('.json') && !f.endsWith('.turn-trail.json') && !f.endsWith('.trail-state.json') && !f.endsWith('.room.json'))) {
+      for (const file of fs.readdirSync(connectionsDir).filter((f) => f.endsWith('.json') && !f.startsWith('.') && !f.slice(0, -5).includes('.') && f !== 'legacy.json')) {
         try {
           const p = path.join(connectionsDir, file)
           const raw = JSON.parse(fs.readFileSync(p, 'utf8'))

@@ -19,11 +19,13 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { AGENT_NAME } from './agent-identity.mjs'
 import {
   closeAntigravityOnEnd,
   ownedByAnotherAntigravityProcess,
   ownedByAntigravityProcess,
 } from './close-on-end.mjs'
+import { LOADED_PLUGIN_VERSION } from './connection-version.mjs'
 import { formatInboxEntryForStream, formatSystemNoticeContent } from './devspec-remote-wait.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { loadState, writeTurnMarker } from './mirror-turn.mjs'
@@ -31,8 +33,10 @@ import {
   ensurePollerForConnection,
   listenerInfoPath,
   ownerAlive,
+  pollerRunning,
   readStateFile,
   resolveOwnerPid,
+  writeLocalBond,
   writeStateFile,
 } from './remote-control-state.mjs'
 import { ensurePrivateDir } from './private-state.mjs'
@@ -40,6 +44,197 @@ import { recordDeliveredBatchRequests } from './requests.mjs'
 import { autoConnectAtStartup, connectAtStartupEnabled } from './session-start.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
+
+export const POLLER_CHECK_INTERVAL_MS = 2_500
+export const POLLER_MISSES_BEFORE_REPAIR = 2
+export const REPAIR_BACKOFF_MS = [0, 5_000, 15_000, 30_000, 60_000]
+export const REPAIR_STABLE_MS = 60_000
+
+/**
+ * True when a connection state reflects a deliberate human or owner-process stop
+ * (`end_reason === "ui"`, `"ended_from_ui"`, `"local_stop"`, `"owner_gone"`, or
+ * `enabled === false` without a recoverable server timeout reason).
+ * Recoverable server-side timeouts (`idle_timeout` / `server_ended`) while the
+ * owning Antigravity process is still alive return `false` so the listener can
+ * self-repair the poller and re-register/re-attach the connection (item da592dee).
+ */
+export function isDeliberateConnectionEnd(state) {
+  if (!state) return false
+  if (state.ended_from_ui === true) return true
+  const reason = state.end_reason || null
+  if (
+    reason === 'ui' ||
+    reason === 'ended_from_ui' ||
+    reason === 'local_stop' ||
+    reason === 'owner_gone'
+  ) {
+    return true
+  }
+  if (state.enabled === false && reason !== 'idle_timeout' && reason !== 'server_ended') {
+    return true
+  }
+  return false
+}
+
+/**
+ * Decide whether the serving listener should repair a missing poller on this check tick.
+ * Requires `POLLER_MISSES_BEFORE_REPAIR` consecutive misses so a normal kill→respawn
+ * during `/devspec-remote` never triggers a redundant repair.
+ */
+export function reconcilePollerStep({
+  ownedAndActive,
+  pollerUp,
+  misses = 0,
+  now = Date.now(),
+  repairNotBefore = 0,
+} = {}) {
+  if (!ownedAndActive) return { repair: false, misses: 0 }
+  const nextMisses = pollerUp ? 0 : misses + 1
+  return {
+    repair: !pollerUp && nextMisses >= POLLER_MISSES_BEFORE_REPAIR && now >= repairNotBefore,
+    misses: nextMisses,
+  }
+}
+
+/**
+ * Self-repair a connection whose poller died while its owning Antigravity process
+ * is still alive (item da592dee):
+ * 1. Best-effort `register_connection` (and `attach_connection` if `state.session_id`
+ *    is set) so a connection that timed out on the server while the poller was down
+ *    is revived on the same `connection_id`, codename, and room with a fresh capability.
+ * 2. Re-enable local state and bond, then spawn `devspec-remote-poll.mjs` via
+ *    `ensurePollerForConnection`.
+ */
+export async function repairConnectionPoller({
+  connectionId,
+  state,
+  ownerPid,
+  cwd,
+  conversationId = null,
+  callMcp = mcpToolsCall,
+  ensurePollerFn = ensurePollerForConnection,
+  writeStateFn = writeStateFile,
+  writeBondFn = writeLocalBond,
+  isOwnerAlive = ownerAlive,
+} = {}) {
+  if (!connectionId || !state) return { ok: false, error: 'missing_state' }
+  const effectiveOwnerPid = Number.parseInt(String(ownerPid ?? state.owner_pid ?? ''), 10)
+  if (!Number.isInteger(effectiveOwnerPid) || effectiveOwnerPid <= 1 || !isOwnerAlive(effectiveOwnerPid)) {
+    return { ok: false, error: 'owner_not_alive' }
+  }
+  const effectiveCwd = state.cwd || cwd || process.cwd()
+  const effectiveLocalId =
+    conversationId || state.local_id || state.pending_local_id || null
+  let nextState = { ...state }
+
+  if (state.token && state.mcp_url) {
+    let negotiatedCapability =
+      typeof state.connection_capability === 'string' &&
+      state.connection_capability.startsWith('dvsc_')
+        ? state.connection_capability
+        : null
+    let negotiatedVersion = state.connection_capability_version || 1
+    try {
+      const regRes = await callMcp({
+        mcpUrl: state.mcp_url,
+        token: state.token,
+        name: 'register_connection',
+        ...(negotiatedCapability ? { connectionCapability: negotiatedCapability } : {}),
+        includeMeta: true,
+        onResultMeta: (meta) => {
+          const cap = meta?.devspec?.connection_capability
+          if (cap?.version === 1 && typeof cap.value === 'string') {
+            negotiatedCapability = cap.value
+            negotiatedVersion = cap.version
+          }
+        },
+        arguments: {
+          ...(effectiveLocalId ? { local_id: effectiveLocalId } : {}),
+          agent_name: state.agent_name || AGENT_NAME,
+          agent_version: LOADED_PLUGIN_VERSION,
+          cwd: effectiveCwd,
+          machine_hostname: os.hostname(),
+          ...(state.git_remote ? { git_remote: state.git_remote } : {}),
+          ...(state.project_id ? { project_id: state.project_id } : {}),
+          ...(state.session_codename ? { name: state.session_codename } : {}),
+          connection_capability_version: 1,
+          project_selection_version: 1,
+          ...(state.instruction_tiers_version && state.instruction_tiers_hash
+            ? {
+                known_instruction_tiers_version: state.instruction_tiers_version,
+                known_instruction_tiers_hash: state.instruction_tiers_hash,
+              }
+            : {}),
+        },
+        timeoutMs: 15_000,
+      })
+      const metaCap = regRes?.meta?.devspec?.connection_capability
+      if (metaCap?.version === 1 && typeof metaCap.value === 'string') {
+        negotiatedCapability = metaCap.value
+        negotiatedVersion = metaCap.version
+      }
+      if (state.session_id) {
+        await callMcp({
+          mcpUrl: state.mcp_url,
+          token: state.token,
+          name: 'attach_connection',
+          ...(negotiatedCapability ? { connectionCapability: negotiatedCapability } : {}),
+          arguments: {
+            connection_id: connectionId,
+            session_id: state.session_id,
+          },
+          timeoutMs: 15_000,
+        })
+      }
+    } catch {
+      /* best-effort: if offline, still spawn the poller so its retry loop takes over */
+    }
+    nextState = {
+      ...nextState,
+      enabled: true,
+      ended_from_ui: false,
+      end_reason: null,
+      owner_pid: effectiveOwnerPid,
+      ...(negotiatedCapability
+        ? {
+            connection_capability: negotiatedCapability,
+            connection_capability_version: negotiatedVersion,
+          }
+        : {}),
+      updated_at: new Date().toISOString(),
+    }
+    writeStateFn(connectionId, nextState)
+    if (effectiveLocalId && !String(effectiveLocalId).startsWith('agy-window:')) {
+      try {
+        writeBondFn(state.agent_name || AGENT_NAME, effectiveLocalId, {
+          status: 'live',
+          connection_id: connectionId,
+          session_id: nextState.session_id || null,
+          session_codename: nextState.session_codename || null,
+          cwd: effectiveCwd,
+          transcript_path: nextState.transcript_path || null,
+          enabled: true,
+          end_reason: null,
+        })
+      } catch {
+        /* non-fatal */
+      }
+    }
+  }
+
+  const poller = ensurePollerFn(connectionId, {
+    cwd: effectiveCwd,
+    ownerPid: effectiveOwnerPid,
+    sessionId: nextState.session_id || null,
+    reuseRunning: true,
+  })
+  return {
+    ok: Boolean(poller?.ok),
+    connection_id: connectionId,
+    poller,
+    state: nextState,
+  }
+}
 
 function inboxPathForConnection(connectionId, dir = CONNECTIONS_DIR) {
   return path.join(dir, `${connectionId}.inbox.jsonl`)
@@ -501,11 +696,14 @@ async function main() {
   // so once per distinct reason (and again when it recovers), so a stuck listener is
   // visible in its log instead of silently holding every room message (479607e6).
   let lastDeliveryError = null
+  let pollerMisses = 0
+  let pollerRepairs = 0
+  let repairNotBefore = 0
+  let pollerUpSince = null
+  let lastPollerCheckAt = 0
   let sawLive = Boolean(
     state &&
-      state.enabled !== false &&
-      state.ended_from_ui !== true &&
-      state.end_reason !== 'ui' &&
+      !isDeliberateConnectionEnd(state) &&
       (!ownerAnchor || ownedByAntigravityProcess(state, ownerAnchor)),
   )
 
@@ -515,7 +713,7 @@ async function main() {
       removeListenerMarker()
       process.exit(0)
     }
-    const live = readStateFile(connectionId)
+    let live = readStateFile(connectionId)
     if (live && ownerAnchor && ownedByAnotherAntigravityProcess(live, ownerAnchor)) {
       process.stderr.write(
         `devspec-remote-listen: connection ${connectionId} moved to another Antigravity process (${live.owner_pid}) — standing down\n`,
@@ -523,7 +721,7 @@ async function main() {
       removeListenerMarker()
       process.exit(0)
     }
-    if (live && (live.enabled === false || live.ended_from_ui === true || live.end_reason === 'ui')) {
+    if (live && isDeliberateConnectionEnd(live)) {
       if (!args.once) {
         const outcome = closeAntigravityOnEnd({
           state: live,
@@ -541,8 +739,60 @@ async function main() {
       removeListenerMarker()
       process.exit(0)
     }
-    if (live && (!ownerAnchor || ownedByAntigravityProcess(live, ownerAnchor))) {
+    const ownedAndActive = Boolean(
+      live &&
+        !isDeliberateConnectionEnd(live) &&
+        (!ownerAnchor || ownedByAntigravityProcess(live, ownerAnchor)),
+    )
+    if (ownedAndActive) {
       sawLive = true
+    }
+    if (!args.once && ownedAndActive && ownerAnchor && live?.token) {
+      const now = Date.now()
+      if (now - lastPollerCheckAt >= POLLER_CHECK_INTERVAL_MS) {
+        lastPollerCheckAt = now
+        const pollerUp = pollerRunning(connectionId)
+        if (pollerUp) {
+          pollerUpSince ??= now
+          if (now - pollerUpSince >= REPAIR_STABLE_MS) pollerRepairs = 0
+        } else {
+          pollerUpSince = null
+        }
+        const step = reconcilePollerStep({
+          ownedAndActive,
+          pollerUp,
+          misses: pollerMisses,
+          now,
+          repairNotBefore,
+        })
+        pollerMisses = step.misses
+        if (step.repair) {
+          const backoffIdx = Math.min(pollerRepairs + 1, REPAIR_BACKOFF_MS.length - 1)
+          repairNotBefore = Date.now() + REPAIR_BACKOFF_MS[backoffIdx]
+          pollerRepairs += 1
+          pollerMisses = 0
+          process.stderr.write(
+            `devspec-remote-listen: poller missing while Antigravity is alive — repairing (connection=${connectionId} attempt=${pollerRepairs})\n`,
+          )
+          try {
+            const repaired = await repairConnectionPoller({
+              connectionId,
+              state: live,
+              ownerPid: ownerAnchor,
+              cwd: live.cwd || cwd,
+              conversationId,
+            })
+            if (repaired?.state) live = repaired.state
+            process.stderr.write(
+              `devspec-remote-listen: poller repair ${repaired?.ok ? `succeeded (pid=${repaired.poller?.pid})` : 'failed'} (connection=${connectionId})\n`,
+            )
+          } catch (err) {
+            process.stderr.write(
+              `devspec-remote-listen: poller repair error (${err?.message || String(err)})\n`,
+            )
+          }
+        }
+      }
     }
     if (live?.local_id && live.local_id !== conversationId) {
       conversationId = live.local_id

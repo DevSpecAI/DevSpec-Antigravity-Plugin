@@ -41,7 +41,6 @@ import {
   ensurePollerForConnection,
   inferAntigravityTranscriptPath,
   ownerAlive,
-  reapDeadPollers,
   rebondConnectionToConversation,
   resolveOwnerPid,
   writeLocalBond,
@@ -493,7 +492,6 @@ export async function runSessionStart(
     writeStateFn = writeStateFile,
     writeBondFn = writeLocalBond,
     ensurePollerFn = ensurePollerForConnection,
-    reapPollersFn = reapDeadPollers,
     verifyAuthFn = verifyAndPinDevspecAuth,
     home = undefined,
   } = {},
@@ -525,12 +523,6 @@ export async function runSessionStart(
     tightenPrivateTree(privateStateRoot(effectiveHome))
   } catch {
     /* non-fatal: every write still lands owner-only */
-  }
-
-  try {
-    reapPollersFn({ agent: AGENT_NAME })
-  } catch {
-    /* non-fatal */
   }
 
   const conversationId = resolveHookConversationId(raw, env)

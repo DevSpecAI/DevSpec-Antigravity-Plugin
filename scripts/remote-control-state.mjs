@@ -295,6 +295,29 @@ function parseArgs(argv) {
 }
 
 /**
+ * True when a `/proc/<pid>/cmdline` argv is a `node …devspec-remote-poll.mjs`
+ * process for `connectionId`.
+ *
+ * Checks argv slots, not a space-joined string: a `bash -c "node …poll… --connection-id <id>"`
+ * wrapper contains the same substring in its single `-c` argument, and matching
+ * it caused `stopPollerForConnection` to SIGTERM the caller's own shell (item 7e35d818 / da592dee).
+ */
+export function isPollerArgv(argv, connectionId) {
+  if (!Array.isArray(argv) || !connectionId || connectionId.length < 8) return false
+  const bin = String(argv[0] || '').split(/[\\/]/).pop()
+  if (bin !== 'node' && bin !== 'node.exe') return false
+  let hasScript = false
+  let hasConn = false
+  for (let i = 1; i < argv.length; i++) {
+    const a = String(argv[i] || '')
+    if (a.split(/[\\/]/).pop() === 'devspec-remote-poll.mjs') hasScript = true
+    if (a === '--connection-id' && argv[i + 1] === connectionId) hasConn = true
+    else if (a === `--connection-id=${connectionId}`) hasConn = true
+  }
+  return hasScript && hasConn
+}
+
+/**
  * Poller PIDs for this connection — connection-scoped, never matches another
  * connection. Two sources, deduped: the pidfile the launcher records (all
  * platforms) and a Linux /proc cmdline scan (catches pollers with a stale pidfile).
@@ -321,26 +344,33 @@ function findPollerPidsForConnection(connectionId) {
     /* ignore */
   }
 
-  // /proc scan (Linux) — require the poller script AND connection id in the cmdline.
+  // /proc scan (Linux) — require exact poller argv for this connection id.
   try {
     for (const name of fs.readdirSync('/proc')) {
       if (!/^\d+$/.test(name)) continue
-      let cmd
+      let argv
       try {
-        cmd = fs.readFileSync(`/proc/${name}/cmdline`).toString().replace(/\0/g, ' ')
+        argv = fs.readFileSync(`/proc/${name}/cmdline`, 'utf8').split('\0')
       } catch {
         continue
       }
-      if (!cmd.includes('devspec-remote-poll')) continue
-      if (!cmd.includes(connectionId)) continue
-      if (!/\bnode\b/.test(cmd) && !cmd.includes('node ')) continue
-      pids.add(Number(name))
+      if (isPollerArgv(argv, connectionId)) pids.add(Number(name))
     }
   } catch {
     /* non-Linux or no /proc */
   }
 
   return [...pids]
+}
+
+/**
+ * Whether a poller is currently running for `connectionId` (item da592dee).
+ * Used by `devspec-remote-listen.mjs` to detect and self-repair a missing poller
+ * while the owning Antigravity process is still alive.
+ */
+export function pollerRunning(connectionId, { findPids = findPollerPidsForConnection } = {}) {
+  if (!connectionId || connectionId.length < 8) return false
+  return findPids(connectionId).length > 0
 }
 
 /**
@@ -707,13 +737,26 @@ export function ownerAlive(pid) {
   }
 }
 
+const CONNECTION_STATE_FILE_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/i
+
+/**
+ * True only for canonical `<connection_uuid>.json` state filenames.
+ * Excludes companion sidecars (`<id>.<session>.transcript-state.json`,
+ * `<id>.room.json`, `<id>.tiers.json`, `<id>.listener.json`, etc.) so they are
+ * never mistaken for connection state records (item da592dee).
+ */
+export function isConnectionStateFilename(name) {
+  return typeof name === 'string' && CONNECTION_STATE_FILE_RE.test(name)
+}
+
 /** Every per-connection state object on disk (raw). */
 export function scanConnectionStates(dir = CONNECTIONS_DIR) {
   const out = []
   try {
     if (!fs.existsSync(dir)) return out
     for (const f of fs.readdirSync(dir)) {
-      if (!f.endsWith('.json')) continue
+      if (!isConnectionStateFilename(f)) continue
       const s = readJson(path.join(dir, f))
       if (s && s.connection_id) out.push(s)
     }
@@ -721,97 +764,6 @@ export function scanConnectionStates(dir = CONNECTIONS_DIR) {
     /* ignore */
   }
   return out
-}
-
-/**
- * Legacy backstop threshold. A still-running poller whose connection state carries
- * NO recorded owner_pid can't be proven dead by owner-death — this was the exact
- * zombie gap (item 00bd4f6e). New pollers always record an owner_pid
- * (ensurePollerForConnection refuses to spawn without one), so a live no-owner_pid
- * state is a pre-fix artifact. We reap it only once its local state has been
- * untouched this long, so a freshly-active legacy poller is never killed.
- */
-const STALE_NO_OWNER_REAP_MS = 60 * 60 * 1000 // 1h
-
-/** Clear a dead connection's local capability from both state pointers. */
-function clearStoredConnectionCapability(connectionId) {
-  const perPath = connectionPath(connectionId)
-  const perState = readJson(perPath)
-  if (perState) writeJson(perPath, stripConnectionCapability(perState))
-  const legacy = readJson(LEGACY_PATH)
-  if (legacy?.connection_id === connectionId) {
-    writeJson(LEGACY_PATH, stripConnectionCapability(legacy))
-  }
-}
-
-/**
- * Reap PROVABLY-DEAD pollers — the connect-time / SessionStart backstop for the
- * self-terminating poller. A poller is reaped when its connection is provably dead
- * (state disabled, ended-from-UI, or its recorded owner process is gone), so a live
- * sibling terminal's poller is NEVER touched. As a legacy safety net, a poller with
- * NO recorded owner_pid (pre-owner-pid-contract artifact — new spawns always record
- * one) is reaped only once its local state has gone stale beyond STALE_NO_OWNER_REAP_MS,
- * so a freshly-active one is left alone. Injectable for tests.
- */
-export function reapDeadPollers({
-  agent = AGENT_NAME,
-  exceptConnectionId = null,
-  now = Date.now(),
-  staleNoOwnerReapMs = STALE_NO_OWNER_REAP_MS,
-  listStates = scanConnectionStates,
-  findPids = findPollerPidsForConnection,
-  isOwnerAlive = ownerAlive,
-  clearCapability = clearStoredConnectionCapability,
-  kill = (pid) => {
-    try {
-      process.kill(pid, 'SIGTERM')
-      return true
-    } catch {
-      return false
-    }
-  },
-} = {}) {
-  const reaped = []
-  for (const s of listStates()) {
-    if (!s || !s.connection_id) continue
-    if (exceptConnectionId && s.connection_id === exceptConnectionId) continue
-    if (agent && s.agent_name && String(s.agent_name).toLowerCase() !== String(agent).toLowerCase()) {
-      continue
-    }
-    const ownerPid = Number.isInteger(s.owner_pid) && s.owner_pid > 1 ? s.owner_pid : null
-    const ownerGone = ownerPid !== null && !isOwnerAlive(ownerPid)
-    const provablyDead = s.enabled === false || s.ended_from_ui === true || ownerGone
-
-    // Legacy backstop: with no owner_pid there is nothing to prove death by, so
-    // reap only when the connection is still nominally enabled but its local state
-    // has been untouched beyond the stale threshold (never a freshly-active one; a
-    // missing/unparsable updated_at is treated as "unknown → leave alone").
-    let staleNoOwner = false
-    if (!provablyDead && ownerPid === null && s.enabled !== false && s.ended_from_ui !== true) {
-      const t = Date.parse(s.updated_at || '')
-      if (Number.isFinite(t) && now - t >= staleNoOwnerReapMs) staleNoOwner = true
-    }
-
-    if (!provablyDead && !staleNoOwner) continue
-    clearCapability(s.connection_id)
-    const pids = findPids(s.connection_id)
-    if (!pids.length) continue
-    const killed = pids.filter((pid) => kill(pid))
-    reaped.push({
-      connection_id: s.connection_id,
-      agent_name: s.agent_name || null,
-      killed,
-      reason:
-        s.enabled === false
-          ? 'disabled'
-          : s.ended_from_ui
-            ? 'ended_from_ui'
-            : ownerGone
-              ? 'owner_gone'
-              : 'stale_no_owner',
-    })
-  }
-  return reaped
 }
 
 function agentSlug(name) {
@@ -1580,12 +1532,6 @@ export async function writeConnectionState({
 
   const wantPoller = state.auth_ok && !noPoller
   if (wantPoller) {
-    try {
-      const reaped = reapDeadPollers({ agent: agentName, exceptConnectionId: connectionId })
-      if (reaped.length) result.reaped = reaped
-    } catch {
-      /* non-fatal */
-    }
     const reuseRunning =
       !!prev.token &&
       prev.token === state.token &&
@@ -1674,7 +1620,7 @@ if (isMain) {
     try {
       if (fs.existsSync(CONNECTIONS_DIR)) {
         for (const f of fs.readdirSync(CONNECTIONS_DIR)) {
-          if (!f.endsWith('.json')) continue
+          if (!isConnectionStateFilename(f)) continue
           const s = readJson(path.join(CONNECTIONS_DIR, f))
           if (s) {
             out.push({
@@ -1932,19 +1878,6 @@ if (isMain) {
       : null
     process.stdout.write(JSON.stringify(printable, null, 2) + '\n')
     process.exit(s ? 0 : 1)
-  }
-
-  if (cmd === 'reap') {
-    // Connect-time / SessionStart backstop: SIGTERM provably-dead pollers only.
-    const agentName = args.agent || AGENT_NAME
-    const reaped = reapDeadPollers({
-      agent: agentName,
-      exceptConnectionId: args['except-connection'] || args['connection-id'] || null,
-    })
-    process.stdout.write(
-      JSON.stringify({ ok: true, agent: agentName, count: reaped.length, reaped }) + '\n',
-    )
-    process.exit(0)
   }
 
   if (cmd === 'ensure-poller' || cmd === 'start-poller') {
@@ -2206,12 +2139,6 @@ if (isMain) {
     // Default: start the continuous heartbeat poller after a successful write.
     const wantPoller = state.auth_ok && !args.noPoller
     if (wantPoller) {
-      try {
-        const reaped = reapDeadPollers({ agent: agentName, exceptConnectionId: connectionId })
-        if (reaped.length) result.reaped = reaped
-      } catch {
-        /* non-fatal */
-      }
       // Same token/url/owner → the live poller keeps serving this connection
       // (session attach/detach reaches it via the server heartbeat echo), so a
       // `write --session` never restarts it. Only a real identity change takes

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.17.6
+
+### Fix 1-hour idle drop-off, filter connection sidecar state files, and add listener poller self-repair
+
+- **Remove cross-connection poller reaper (`scripts/remote-control-state.mjs`, `scripts/session-start.mjs`).** Opening a new Antigravity window or running `writeConnectionState` / `session-start.mjs` previously ran `reapDeadPollers`, which scanned every `.json` file under `~/.devspec/remote-control/connections/`. Because companion sidecars such as `<connId>.<sessionId>.transcript-state.json` have no `owner_pid`, any session whose transcript sidecar had not been written for over an hour (`STALE_NO_OWNER_REAP_MS = 60m`) had its live `<connId>` poller killed by `stopPollerForConnection(connId)`. `reapDeadPollers` and the `reap` subcommand have been removed; each poller already self-terminates when its own `owner_pid` exits.
+- **Strict `<uuid>.json` connection state file filter (`scripts/remote-control-state.mjs`, `scripts/mirror-turn.mjs`).** Added `isConnectionStateFilename` (`CONNECTION_STATE_FILE_RE`) and applied it in `scanConnectionStates`, `listConnectionStates`, and `mirror-turn.mjs` so sidecar files (`.transcript-state.json`, `.read.json`, `.room.json`, `.tiers.json`, `.listener.json`, `.cursor.json`, etc.) are never parsed as connection state records.
+- **Exact argv poller matching (`scripts/remote-control-state.mjs`).** `findPollerPidsForConnection` now splits `/proc/<pid>/cmdline` on `\0` and checks `isPollerArgv(argv, connectionId)` rather than matching substrings in a space-joined command line, and exports `pollerRunning(connectionId)`.
+- **Automatic poller self-repair in the background listener (`scripts/devspec-remote-listen.mjs`).** While the owning Antigravity process and `devspec-remote-listen.mjs` remain alive and the connection has not been deliberately ended (`local_stop`, `ui`, `owner_gone`), the listener periodically checks `pollerRunning(connectionId)` and automatically re-registers, re-attaches the room session, refreshes `connection_capability`, and respawns the poller (`reconcilePollerStep`, `repairConnectionPoller`) if the poller ever exits unexpectedly.
+
 ## 0.17.5
 
 - `agy` makes any decision you could make in DevSpec's Review for you as soon as your request is clear: accepting or declining a proposed change (`decide_proposal`), answering on work that would undo a decision, saying a flagged record is still accurate, or settling a duplicate. It warns you once, up front, only if you seem unaware of a significant consequence, never asks you to confirm again, and tells you what happened and what you can do next. The rules' tool quick-reference lists each of these tools.
