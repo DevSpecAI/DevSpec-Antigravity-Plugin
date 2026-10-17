@@ -30,6 +30,7 @@ export const REQUEST_REF_TOOLS = new Set([
   'create_action_item',
   'create_automation',
   'create_resource',
+  'decide_proposal',
   'delete_automation',
   'fail_work_item',
   'import_instruction_rules',

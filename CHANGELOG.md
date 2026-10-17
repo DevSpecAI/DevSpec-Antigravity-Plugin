@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.17.5
+
+- `agy` makes any decision you could make in DevSpec's Review for you as soon as your request is clear: accepting or declining a proposed change (`decide_proposal`), answering on work that would undo a decision, saying a flagged record is still accurate, or settling a duplicate. It warns you once, up front, only if you seem unaware of a significant consequence, never asks you to confirm again, and tells you what happened and what you can do next. The rules' tool quick-reference lists each of these tools.
+- `decide_proposal` now carries who asked for it, like every other change the agent makes for someone.
+- Saving a folder's default project happens straight away when you asked for exactly that; otherwise `agy` warns once that the file can be shared.
+
 ## 0.17.4
 
 ### Single-post directed-question replies, JSON `keep_turn` batching, and `rearm: "already_armed"` on answer/dismissal wakes

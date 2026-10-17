@@ -13,15 +13,16 @@ Bring DevSpec into [Google Antigravity CLI](https://antigravity.google) (`agy`).
 ## What you can do with it
 
 - **⭐ Drive `agy` from your browser or phone (Remote Control).** Run `/antigravity-devspec-autopilot-extension:devspec-remote` in your terminal to connect this `agy` session to the DevSpec Agents page or attach it directly to a shared DevSpec session room. Teammates can follow along and add context in the same thread while server-verified owner and delegated commands drive the agent.
-- **Two-sided live transcript & subagent-aware turns.** Local prompts and final assistant responses are mirrored automatically from Antigravity's native `transcript.jsonl` (`PreInvocation` and `Stop` hooks). When Antigravity spawns background subagents (`invoke_subagent` / `send_message`), the plugin holds the remote turn open until all active subagents finish.
+- **Two-sided live transcript.** Your prompts and the agent's answers appear in the DevSpec room, and a turn stays open until any background subagents finish.
 - **Work a task end to end — or an ordered batch.** Point `agy` at an action item (or a list of items in order). It reserves the requested items, claims them one at a time, implements the change, runs checks, tags commits with `[devspec:<id>]`, and records implementation and criterion verdicts back to DevSpec.
+- **Decisions in Review, made for you.** Ask `agy` to make any decision you could make on DevSpec's Review page (accept or decline a proposed change, answer on work that would undo a decision, rule on a flag or a duplicate) and it does it as soon as your request is clear, then tells you what happened and what you can do next. It warns you once, up front, only if you seem unaware of a significant consequence, and never asks you to confirm again. Who may decide what is DevSpec's rule; if you can't, it says who can.
 - **Verified commit provenance.** Automatic `PreToolUse` and `PostToolUse` hooks observe new git commits, track `[devspec:<id>]` commit trailers against claimed work items, and guard implementation reporting against unverified commit SHAs.
 - **Coordinate in the room with plans, polls, and directed questions:**
   - **Shared session plans (`devspec-plan.mjs`):** For genuinely multi-phase work, `agy` maintains a revisioned session plan visible to everyone in the room and recoverable across context compaction or reconnects.
   - **Room polls (`devspec-poll.mjs`):** Create, update, end, retract, or supersede structured room polls (with optional recommendations and write-ins) without blocking the agent turn.
   - **Directed questions (`devspec-question.mjs`):** Ask a specific person a `text`, `single_select`, or `multi_select` question in the room. When they answer or dismiss it in DevSpec, the poller delivers the canonical interaction or dismissal event and re-opens the exact continuation channel.
 - **Automatic project grounding, pin checks & repo-link nudges.** Starting a session grounds `agy` with your project summary, conventions, and active work. Writing a `.devspec/project.json` pin is validated immediately, and adding a new git remote to a pinned greenfield folder nudges you once if the repository isn't linked in DevSpec yet.
-- **Live status bar & runtime telemetry.** `SessionStart` automatically configures `scripts/statusline.mjs` in `~/.gemini/antigravity-cli/settings.json` to render a concise DevSpec status bar (`DevSpec: local (/devspec-remote to connect) · <Project>` before connecting, or `DevSpec: <Codename> · <Project> · “<Session>” · automation “<name>” · working on “<title>” (<code>) · <model> (<context%>%)` when connected) with automatic session-title refresh (`scripts/session-title.mjs`) and forwards model and context-window telemetry on `heartbeat_connection`.
+- **Live status bar.** A one-line DevSpec status bar shows `DevSpec: local (/devspec-remote to connect) · <Project>` before connecting, and the agent's codename, project, session, current work and model once connected.
 
 ---
 
@@ -145,9 +146,8 @@ When connected to a DevSpec session, Antigravity negotiates per-connection capab
 
 Collaboration in a shared DevSpec room is safe by design:
 
-- DevSpec determines owner and delegated command authority and exact `@`-addressing on the server (`ingress_version: 1`, `delegated_scope_version: 1`, `active_plan_projection_version: 1`).
-- Delegated commands carry a server-owned project scope object and instruction; owner commands carry `null` scope.
-- Room chatter, other agents' messages, and projected active plans are materialized to `<connectionId>.transcript.jsonl` and `<connectionId>.room.json` as non-executable advisory context (`read-awareness only`), never as implicit commands or mutation authority.
+- DevSpec decides on its server who may send this agent a command, and records who asked for each piece of work.
+- Room chatter, other agents' messages and active plans are context for the agent, never commands.
 - Mutable runtime policy is governed by [`devspec://product/remote-ingress-contract`](devspec://product/remote-ingress-contract).
 
 ---
@@ -191,7 +191,7 @@ You rarely need to pass a project ID manually:
 
 ---
 
-## Plugin architecture & hooks (`v0.17.0`)
+## Plugin architecture & hooks
 
 All hooks are declared in `hooks.json` (mirrored in `hooks/hooks.json`), validated against Antigravity's strict hook JSON schemas (`scripts/hook-output.mjs`), and executed via dependency-free Node.js ESM scripts in `scripts/`:
 
@@ -220,15 +220,7 @@ DEVSPEC_V2_ROOT=/path/to/devspecv2 node --test scripts/*.test.mjs
 
 ## How this fits with the other DevSpec plugins
 
-Each coding agent has its own independent plugin repository tailored to its host runtime, speaking the same canonical contracts (`devspec://product/implementation-contract`, `devspec://product/remote-ingress-contract`, `devspec://product/interaction-event-contract`, and `devspec://product/question-dismissal-event-contract`):
-
-| Host | Config / Install | Remote Transport Family |
-|---|---|---|
-| **Antigravity CLI** (`agy`) | `~/.gemini/config/mcp_config.json` (`0600`) + `~/.gemini/config/plugins/antigravity-devspec-autopilot-extension` | Local poller + wait stream + local `.transcript.jsonl` / `.room.json` + native `transcript.jsonl` hooks |
-| **Claude Code** | `/plugin install devspec@devspec` | Local poller + persistent monitor + Claude hooks |
-| **Pi** | `pi install git:github.com/DevSpecAI/DevSpec-Pi` | In-process TypeScript extension + embedded MCP transport |
-| **Codex CLI** | `~/.codex/config.toml` | Local poller + app-server bridge |
-| **Gemini CLI** | `gemini-extension.json` | Local poller + `.toml` commands |
+Each supported coding agent has its own independent DevSpec plugin, built for its host, and all of them speak the same served contracts (`devspec://product/implementation-contract`, `devspec://product/remote-ingress-contract`).
 
 ---
 

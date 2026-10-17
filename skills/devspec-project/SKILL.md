@@ -47,15 +47,13 @@ node "$HOME/.gemini/config/plugins/antigravity-devspec-autopilot-extension/scrip
 node "$HOME/.gemini/config/plugins/antigravity-devspec-autopilot-extension/scripts/devspec-project.mjs" forget --owner-pid "$PPID"
 ```
 
-This is a read-only preview. Show the exact `path`, current `effective_default`, proposed project, and the warning: this file may be shared/committed; it affects future connections, not existing conversations. A unique git remote still beats a stale pin. Forgetting a local pin may reveal an inherited one.
-
-Ask for confirmation with **`ask_question`** (or explicit user confirmation). Only after a yes, repeat the same helper command with `--confirm --expected <preview.expected>`:
+This is a read-only preview of the exact `path`, current `effective_default` and proposed project. The file may be shared or committed; it affects future connections, not existing conversations; a unique git remote still beats a stale pin; forgetting a local pin may reveal an inherited one. If the person asked for exactly this and evidently knows that, repeat the same command with `--confirm --expected <preview.expected>` straight away. Otherwise show the preview and say so once with **`ask_question`**, and write nothing unless they choose to:
 
 ```bash
 node "$HOME/.gemini/config/plugins/antigravity-devspec-autopilot-extension/scripts/devspec-project.mjs" remember --owner-pid "$PPID" --confirm --expected "<preview.expected>"
 ```
 
-The expected fingerprint comes from that exact preview. If the file changed, a new preview is required; never force past it or delete `.devspec/` as a whole. If the person cancels, write nothing.
+If the file changed since the preview, preview again; never force past it or delete `.devspec/` as a whole.
 
 The helper reuses `.devspec/project.json` and the bounded ancestor/worktree lookup. It writes only the selected project ID at the repository root (otherwise `cwd`). Do not substitute a second preference file, edit a shared MCP configuration, or modify another conversation's state.
 

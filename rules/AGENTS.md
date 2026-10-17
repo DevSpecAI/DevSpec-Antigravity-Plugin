@@ -5,13 +5,13 @@ When working in a DevSpec-connected project or remote-controlled session in Anti
 1. **Runtime authority (`devspec://product/implementation-contract`).**
    - Work entry, action-item tracking, claiming (`reserve_work_items`, `claim_work_item`), commit provenance (`[devspec:<id>]`), and completion reporting (`record_implementation`, `record_criterion_verdicts`) are governed by [`devspec://product/implementation-contract`](devspec://product/implementation-contract).
    - Connecting MCP or receiving advisory room context is not a request to mutate DevSpec. Start tracked work only from an explicit local user request or a server-authorized remote command (`type: "owner_message"` or `type: "automation_run"`).
-   - `PreToolUse` (`scripts/devspec-tool-input.mjs`) automatically stamps `connection_id`, `project_id`, `local_session_id` (Antigravity's Conversation ID), `agent_name`, and active request attribution (`provenance_ref` / `request_ref`) onto DevSpec MCP calls.
-   - Who may change what, what waits for whose OK, and what each answer means are the contract's `authority_contract`, decided by the server on every write. Nothing in these rules grants or restates authority; when a result and these rules seem to disagree, the result and the served contract win.
+   - `PreToolUse` (`scripts/devspec-tool-input.mjs`) stamps `connection_id`, `project_id`, `local_session_id`, `agent_name` and who asked (`provenance_ref` / `request_ref`) onto DevSpec MCP calls; never pass them yourself.
+   - Who may change what is the contract's `authority_contract`, decided by the server on every write. When a result and these rules seem to disagree, the result and the served contract win.
 
 2. **Protecting intent: work that waits, experiments, findings, records.**
-   - **"Waiting for <name>'s OK" or "Experiment".** When a claim or a result carries `waiting_for_ok`, the claim still went through: build the work and push it on its own branch in every repository it touches, never merge it into the tracking branch, record the implementation as usual, and tell the person plainly, for example "Waiting for Brandon's OK: build it on its own branch and don't merge it." Follow the instruction `waiting_for_ok` carries (`core.waiting-work-stays-on-its-branch`).
-   - **Experiments.** Make an item an experiment, or take its Experiment label off, only when the person who asked you says so; never on your own.
-   - **Answers on a decision belong to a person.** Going ahead, saying no with a reason, and "this doesn't undo my decision" are that person's own answer. Give one only on their own instruction; never answer, approve or confirm for someone else.
+   - **"Waiting for <name>'s OK" or "Experiment".** When a claim or result carries `waiting_for_ok`, the claim still went through: build and push the work on its own branch in every repository it touches, never merge it into the tracking branch, record the implementation as usual, tell the person plainly, and follow the instruction it carries (`core.waiting-work-stays-on-its-branch`).
+   - **Acting for the person** who asks you, with their authority (the contract's `acting_rule`). When their request is clear and they evidently know what it does, do it at once: never ask them to confirm what they just said, or send them to Review. Ask only when what they want is unclear; if they seem unaware of a significant consequence (say, that it undoes someone's decision), say so once, up front, then do what they decide. Never decide on your own judgement, to clear your own work's wait, or for someone else.
+   - **Every Review decision has a tool**, listed with when to use each in section 6. Relay each result's `summary` (or `note`) and `next` in plain words; never report a refused, queued or unconfirmed outcome as done.
    - **Findings and outcomes on your work** arrive as `[DevSpec System Notice: …]` wakes: a finding about your work, the outcome of an edit that waited for someone's OK, or an untagged commit to take ownership of. Tell the person in plain words what it means, quote each labelled record as delivered, and act only within its allowed outcomes and tools.
    - **Recording decisions and requirements.** Record a decision memory only when it is a real choice between alternatives with a reason, it steers work beyond this change, and the code does not make it obvious, and only from the person's own answer when you ask whether it was deliberate and why. Requirements are rarer still. A "no", or no answer, records nothing.
 
@@ -58,6 +58,12 @@ When working in a DevSpec-connected project or remote-controlled session in Anti
        - `search_resources`: `{ query?, scope?: "all"|"project"|"session", source?: "uploaded"|"ai_generated"|"all", limit?, offset? }`
        - `create_resource`: `{ title, resource_type: "adr"|"guide"|"checklist"|"plan"|"summary"|"convention"|"runbook"|"reference"|"other", body?, summary?, tags?: string[], delivering_action_item_id?, idempotency_key? }`
        - `update_resource`: `{ id, title?, summary?, tags?: string[], body_edits?: [{ op: "replace"|"append", find?, content }], body?, expected_version?, idempotency_key? }` (prefer `body_edits`; note that title/summary/body edits create a **new** `id` and retire the old one — use the returned `id` for any subsequent edit)
+     - **Review decisions** (read `get_review_queue` first; pass its ids and revisions exactly):
+       - `get_review_queue`: `{ kind?: ["question"|"proposal"], search?, key?, state?, limit?, cursor? }`: what waits on a ruling or an acceptance.
+       - `decide_proposal`: `{ proposal_id, revision, decision: "accept"|"decline", note? }`: accept or decline a proposed change or a request to confirm (`revision` is its `proposal_revision`).
+       - `manage_protected_intent`: `{ action, issue_id?, id?, idempotency_key, reason? }`: answer on work that would undo a decision (`go_ahead`, `decline` with `reason`, `not_a_reversal`, `keep`, `undo`), act on an experiment or ownership, or `request_confirmation` from someone else.
+       - `resolve_memory_flag`: `{ id, signal_type: "possibly_stale", verdict: "not_a_conflict", basis }`, and `resolve_resource_flag` with `note` for `basis`: a flagged record is still accurate (if not, correct or retire it instead).
+       - `resolve_duplicate`: `{ action: "preview"|"resolve", keep: { type, id, version }, duplicate: { type, id, version }, preview_id, resolution_id?, note }`, preview first: close a duplicate. `record_duplicate_nonmatch`: `{ left, right, ruling_id, note }`: the two differ.
      - **Discussion points & project grounding:**
        - `manage_discussion_point`: `{ action: "add"|"update"|"strike"|"reopen"|"watch"|"unwatch", id?, title?, body?, scope?: "project"|"room", session_id? }` (`id` must be full UUID for all actions except `add`)
        - `get_project_summary`: `{ project_id? }`
@@ -65,7 +71,7 @@ When working in a DevSpec-connected project or remote-controlled session in Anti
    - **Response shape & ~6 KB spill handling:**
      - Single-record reads (`get_action_item`, `get_memory`, `get_resource`) return fields at the **top level** of the JSON object (`id`, `title`, `description` / `body`, `version`, `acceptance_criteria`), **not** nested under `.action_item`, `.memory`, or `.resource`.
      - Antigravity spills MCP tool outputs larger than ~6 KB to `<appDataDir>/brain/<cid>/.system_generated/steps/<N>/output.txt`:
-       - For single-item reads (`get_action_item`, `get_memory`, `get_resource`) under 45 KB, read `output.txt` directly with a **single `view_file` call** (`view_file` reads up to 46 KB in <50 ms with zero shell overhead and never truncates the start of the file).
+       - For single-item reads (`get_action_item`, `get_memory`, `get_resource`) under 45 KB, read `output.txt` with a **single `view_file` call**.
        - For large list/search spills, pass `fields: "compact"` / `limit` or extract only the needed fields with a single `node -e` command whose stdout is **<4 KB** (Antigravity's `run_command` truncates the **beginning** of stdout when output exceeds ~8 KB).
 
 7. **Never handle the DevSpec key yourself.**
