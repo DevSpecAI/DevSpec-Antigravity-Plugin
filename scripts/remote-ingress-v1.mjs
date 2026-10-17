@@ -40,6 +40,12 @@ export const SESSION_EVENTS_VERSION = 1
 export const SESSION_EVENTS_MAX = 2000
 export const REMOTE_INGRESS_SYSTEM_NOTICE_CONTRACT_VERSION = '1.4.0'
 export const REMOTE_INGRESS_SYSTEM_NOTICE_POLICY_VERSION = '2026-08-22.1'
+/**
+ * The shape version each notice carries in its own `version` field. It is not the
+ * channel version the poller negotiates (`SYSTEM_NOTICE_CHANNEL_VERSION` in
+ * devspec-remote-poll.mjs): channel version 2 adds the `server_notice` kind and
+ * changes no shape, so every notice is still `version: 1` (1fd34942).
+ */
 export const SYSTEM_NOTICE_VERSION = 1
 export const SENDER_STYLE_VERSION = 1
 export const REMOTE_INGRESS_SCOPE_CONTRACT_VERSION = '1.2.0'

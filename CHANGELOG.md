@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.17.3
+
+### Findings about the agent's own work reach it again
+
+- **The poller asks DevSpec for notice version 2, on `poll_connection` and on the push stream (`scripts/devspec-remote-poll.mjs`, `SYSTEM_NOTICE_CHANNEL_VERSION`).** DevSpec sends what it finds about the agent's own work (a change that would undo someone's decision, duplicates other work or breaks a requirement) and what happened to its pending edits only to a channel that asked for version 2. This version still asked for 1, so these went only to the person's notifications and the Agents page showed the agent as "Not receiving findings". Both notice kinds are read exactly as before: version 2 adds a kind and changes no notice's shape.
+
 ## 0.17.2
 
 ### Your DevSpec key stays off command lines, out of printed output, and in owner-only files
