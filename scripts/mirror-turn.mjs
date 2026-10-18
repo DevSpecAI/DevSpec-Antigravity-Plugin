@@ -886,7 +886,7 @@ function classifyDevspecDomainTool(toolName, args = {}) {
   if (!match) return null
   const verb = match[1]
   const id = unquoteTranscriptString(
-    effectiveArgs?.action_item_id || effectiveArgs?.id || effectiveArgs?.resource_id || '',
+    effectiveArgs?.task_id || effectiveArgs?.id || effectiveArgs?.resource_id || '',
   )
   const title = unquoteTranscriptString(
     effectiveArgs?.title ||
@@ -898,14 +898,14 @@ function classifyDevspecDomainTool(toolName, args = {}) {
   )
 
   const domainMap = {
-    create_action_item: { domain: 'action_item', action: 'created' },
-    update_action_item: { domain: 'action_item', action: 'updated' },
-    claim_work_item: { domain: 'action_item', action: 'claimed' },
-    reserve_work_items: { domain: 'action_item', action: 'reserved' },
-    verify_action_item: { domain: 'action_item', action: 'verified' },
-    get_action_item: { domain: 'action_item', action: 'inspected' },
-    get_action_items: { domain: 'action_item', action: 'listed' },
-    search_action_items: { domain: 'action_item', action: 'searched' },
+    create_task: { domain: 'task', action: 'created' },
+    update_task: { domain: 'task', action: 'updated' },
+    claim_work_item: { domain: 'task', action: 'claimed' },
+    reserve_work_items: { domain: 'task', action: 'reserved' },
+    verify_task: { domain: 'task', action: 'verified' },
+    get_task: { domain: 'task', action: 'inspected' },
+    get_tasks: { domain: 'task', action: 'listed' },
+    search_tasks: { domain: 'task', action: 'searched' },
     record_implementation: { domain: 'implementation', action: 'recorded' },
     record_criterion_verdicts: { domain: 'criterion', action: 'recorded verdicts' },
     record_memory: { domain: 'memory', action: 'recorded' },

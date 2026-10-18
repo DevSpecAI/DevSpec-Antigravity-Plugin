@@ -655,7 +655,7 @@ describe('Item 5 Parity: statusline.mjs rendering and telemetry', () => {
     assert.equal(protoStart.hookSpecificOutput, undefined)
   })
 
-  it('tracks session-title.mjs, claimed action item titles, and active automation runs across call_mcp_tool and helper scripts', async () => {
+  it('tracks session-title.mjs, claimed task titles, and active automation runs across call_mcp_tool and helper scripts', async () => {
     const { readSessionTitle, sessionTitleReadDue, UNTITLED_RETRY_MS } = await import(
       './session-title.mjs'
     )
@@ -714,7 +714,7 @@ describe('Item 5 Parity: statusline.mjs rendering and telemetry', () => {
     })
     assert.equal(fetchedTitle, 'Fix login redirect')
 
-    // 2. Claiming action item with title via Antigravity call_mcp_tool and rendering in statusline
+    // 2. Claiming task with title via Antigravity call_mcp_tool and rendering in statusline
     const home = makeTempHome()
     const provDir = path.join(home, 'prov')
     const env = { ...process.env, DEVSPEC_ANTIGRAVITY_STATE_DIR: provDir }
@@ -735,7 +735,7 @@ describe('Item 5 Parity: statusline.mjs rendering and telemetry', () => {
         tool_input: {
           ServerName: 'devspec',
           ToolName: 'claim_work_item',
-          Arguments: { action_item_id: itemId },
+          Arguments: { task_id: itemId },
         },
         tool_response: JSON.stringify({
           id: itemId,
@@ -807,7 +807,7 @@ describe('Item 5 Parity: statusline.mjs rendering and telemetry', () => {
         tool_input: {
           ServerName: 'devspec',
           ToolName: 'record_implementation',
-          Arguments: { action_item_id: itemId },
+          Arguments: { task_id: itemId },
         },
         tool_response: JSON.stringify({ id: itemId, lifecycle: 'done' }),
       },

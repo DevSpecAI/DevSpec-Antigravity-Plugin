@@ -527,7 +527,7 @@ export function formatSystemNoticeContent(notice) {
   const branchSuffix = notice?.branch ? ` on branch ${notice.branch}` : ''
   return [
     '[DevSpec System Notice: unlinked_commit_item_review]',
-    `Your push of commit ${notice?.commit_sha}${branchSuffix} did not carry a [devspec:<id>] tag, while you hold claimed item "${notice?.action_item_title}" (${notice?.action_item_id}).`,
+    `Your push of commit ${notice?.commit_sha}${branchSuffix} did not carry a [devspec:<id>] tag, while you hold claimed item "${notice?.task_title}" (${notice?.task_id}).`,
     `Prompt: ${notice?.prompt}`,
     `Allowed outcomes: ${Array.isArray(notice?.allowed_outcomes) ? notice.allowed_outcomes.join(', ') : ''}`,
     `Allowed tools: ${Array.isArray(notice?.allowed_tools) ? notice.allowed_tools.join(', ') : ''}`,
@@ -566,8 +566,8 @@ export function buildCanonicalSystemNoticeEvents(
           }
         : {
             commit_sha: notice.commit_sha,
-            action_item_id: notice.action_item_id,
-            action_item_title: notice.action_item_title,
+            task_id: notice.task_id,
+            task_title: notice.task_title,
             branch: notice.branch,
             prompt: notice.prompt,
             allowed_outcomes: notice.allowed_outcomes,

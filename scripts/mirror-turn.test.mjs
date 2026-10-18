@@ -778,7 +778,7 @@ describe('Antigravity native hook payload & transcript handling', () => {
                   ServerName: 'devspec',
                   ToolName: 'claim_work_item',
                   Arguments: {
-                    action_item_id: '4cbd20e0-1417-4c5f-9d99-28f5607bf296',
+                    task_id: '4cbd20e0-1417-4c5f-9d99-28f5607bf296',
                     agent_branch: 'agent/4cbd20e0-trail',
                   },
                 },
@@ -821,7 +821,7 @@ describe('Antigravity native hook payload & transcript handling', () => {
 
       const domainEv = extracted.events[2]
       assert.equal(domainEv.kind, 'domain')
-      assert.equal(domainEv.domain, 'action_item')
+      assert.equal(domainEv.domain, 'task')
       assert.equal(domainEv.action, 'claimed')
       assert.equal(domainEv.name, 'claim_work_item')
       assert.equal(domainEv.status, 'ok')

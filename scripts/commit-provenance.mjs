@@ -34,7 +34,7 @@ const UUID_RE = new RegExp(`^${UUID}$`, 'i')
 const REFERENCE_RE = new RegExp(`\\[devspec:(${UUID})\\]`, 'i')
 
 const CLAIM_VERB = 'claim_work_item'
-const GET_ITEM_VERB = 'get_action_item'
+const GET_ITEM_VERB = 'get_task'
 const RELEASE_VERBS = new Set(['record_implementation', 'fail_work_item', 'release_work_item'])
 const CLAIM_AUTOMATION_VERB = 'claim_automation_run'
 const RECORD_AUTOMATION_VERB = 'record_automation_run'
@@ -84,7 +84,7 @@ export function detectCommandDevspecVerb(command) {
     return null
   }
   const match =
-    /\b(claim_work_item|get_action_item|record_implementation|fail_work_item|release_work_item|claim_automation_run|record_automation_run)\b/.exec(
+    /\b(claim_work_item|get_task|record_implementation|fail_work_item|release_work_item|claim_automation_run|record_automation_run)\b/.exec(
       command,
     )
   return match ? match[1] : null
@@ -292,7 +292,7 @@ export function readClaimDetails(scope, options = {}) {
     }
   }
   return {
-    action_item_id: id,
+    task_id: id,
     work_claim_ref: workClaimRef,
     provenance_ref: provenanceRef,
   }
@@ -842,7 +842,7 @@ function recoveryText(claims) {
   return [
     'DevSpec: this commit has no [devspec:<id>] reference, so it would land unlinked.',
     'Recover without leaving this turn: reuse or create the smallest item that covers it',
-    '(search_action_items, or create_action_item with a one-line description — a thin',
+    '(search_tasks, or create_task with a one-line description — a thin',
     'last-mile item is fine), then add [devspec:<full-uuid>] to the commit message and retry.',
     `Authority: ${CONTRACT_URI}. Nothing else is blocked, and no other command is affected.`,
   ].join(' ')
@@ -867,7 +867,7 @@ function unresolvedReferenceText(reference) {
     `DevSpec: [devspec:${reference}] is well formed but resolves to no item in this project,`,
     'so this commit would read as linked and link to nothing.',
     'That is usually a correct short code with a wrong uuid tail, or an item belonging to a different project.',
-    'Recover without leaving this turn: confirm the id (get_action_item, or search_action_items),',
+    'Recover without leaving this turn: confirm the id (get_task, or search_tasks),',
     'correct the reference in the commit message and retry.',
     `Authority: ${CONTRACT_URI}. Nothing else is blocked, and no other command is affected.`,
   ].join(' ')
@@ -1191,7 +1191,7 @@ function extractItemTitle(value) {
   const candidates = [
     value.title,
     value.item?.title,
-    value.action_item?.title,
+    value.task?.title,
     value.details?.title,
     value.details?.item?.title,
   ]
@@ -1205,11 +1205,11 @@ function extractItemFieldsFromText(text, itemId) {
   if (typeof text !== 'string' || !text || !itemId) return null
   const esc = itemId.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')
   const r1 = new RegExp(
-    `"(?:action_item_)?id"\\s*:\\s*"${esc}"[\\s\\S]{0,600}?"title"\\s*:\\s*"((?:[^"\\\\]|\\\\.)+)"`,
+    `"(?:task_)?id"\\s*:\\s*"${esc}"[\\s\\S]{0,600}?"title"\\s*:\\s*"((?:[^"\\\\]|\\\\.)+)"`,
     'i',
   )
   const r2 = new RegExp(
-    `"title"\\s*:\\s*"((?:[^"\\\\]|\\\\.)+)"[\\s\\S]{0,600}?"(?:action_item_)?id"\\s*:\\s*"${esc}"`,
+    `"title"\\s*:\\s*"((?:[^"\\\\]|\\\\.)+)"[\\s\\S]{0,600}?"(?:task_)?id"\\s*:\\s*"${esc}"`,
     'i',
   )
   const m = r1.exec(text) || r2.exec(text)
@@ -1232,7 +1232,7 @@ function extractItemFieldsFromText(text, itemId) {
 function matchItemFromCandidateObject(value, targetId) {
   if (!value || typeof value !== 'object') return null
   const candidates = [value]
-  for (const listKey of ['items', 'action_items', 'results']) {
+  for (const listKey of ['items', 'tasks', 'results']) {
     if (Array.isArray(value[listKey])) {
       for (const el of value[listKey]) if (el && typeof el === 'object') candidates.push(el)
     }
@@ -1246,8 +1246,8 @@ function matchItemFromCandidateObject(value, targetId) {
     const rawId =
       typeof obj.id === 'string'
         ? obj.id
-        : typeof obj.action_item_id === 'string'
-          ? obj.action_item_id
+        : typeof obj.task_id === 'string'
+          ? obj.task_id
           : typeof obj.item?.id === 'string'
             ? obj.item.id
             : null
@@ -1300,7 +1300,7 @@ export function resolveLocalItemDetails(
       : null)
 
   // 1. Check Antigravity spilled step outputs (<brain>/<cid>/.system_generated/steps/*/output.txt),
-  // which contain both `title` and `work_claim_ref` from claim_work_item / get_action_item.
+  // which contain both `title` and `work_claim_ref` from claim_work_item / get_task.
   if (effectiveBrainDir) {
     const stepsDir = path.join(effectiveBrainDir, '.system_generated', 'steps')
     try {
@@ -1542,9 +1542,9 @@ function parseClaimResponse(
   if (texts.length === 0) {
     texts.push(...collectAntigravityStepTexts(input, { env, sessionId }))
   }
-  let requested = toolInput.action_item_id
+  let requested = toolInput.task_id
   if (!requested && command) {
-    const m = new RegExp(`action_item_id[\\\\'"\\s:]+(${UUID})`, 'i').exec(command)
+    const m = new RegExp(`task_id[\\\\'"\\s:]+(${UUID})`, 'i').exec(command)
     if (m) requested = m[1]
   }
   const requestedProvenanceRef = typeof toolInput.provenance_ref === 'string' ? toolInput.provenance_ref : null
@@ -1559,8 +1559,8 @@ function parseClaimResponse(
     const rawId =
       typeof value.id === 'string'
         ? value.id
-        : typeof value.action_item_id === 'string'
-          ? value.action_item_id
+        : typeof value.task_id === 'string'
+          ? value.task_id
           : typeof value.item?.id === 'string'
             ? value.item.id
             : null
@@ -1775,7 +1775,7 @@ function maybeNudge(scope, { env, now, platform }) {
   }
   const message =
     'DevSpec: no work item is claimed in this repository, so work done here has nothing to trace it to. ' +
-    'Claim one before you commit — search_action_items for an existing item, or create_action_item for a ' +
+    'Claim one before you commit — search_tasks for an existing item, or create_task for a ' +
     'thin last-mile one — and put [devspec:<full-uuid>] in the commit message. Editing is never blocked. ' +
     `Shown once per session. Authority: ${CONTRACT_URI}`
   stagePendingNudge(scope.sessionId, message, { env, now, platform })

@@ -115,7 +115,7 @@ describe('commit-provenance.mjs — claim/release tracking per conversation', ()
         cwd: repo,
         tool_name: 'mcp_devspec_claim_work_item',
         tool_input: {
-          action_item_id: ITEM,
+          task_id: ITEM,
           provenance_ref: PROV_REF,
         },
         tool_response: {
@@ -136,7 +136,7 @@ describe('commit-provenance.mjs — claim/release tracking per conversation', ()
     )
     assert.deepEqual(readClaims(scope(), { env }), [ITEM])
     assert.deepEqual(readClaimDetails(scope(), { env }), {
-      action_item_id: ITEM,
+      task_id: ITEM,
       work_claim_ref: CLAIM_REF,
       provenance_ref: PROV_REF,
     })
@@ -150,7 +150,7 @@ describe('commit-provenance.mjs — claim/release tracking per conversation', ()
         conversationId: CONVERSATION,
         cwd: repo,
         tool_name: 'mcp_devspec_release_work_item',
-        tool_input: { action_item_id: ITEM },
+        tool_input: { task_id: ITEM },
         tool_response: { content: [{ type: 'text', text: JSON.stringify({ id: ITEM, status: 'staged' }) }] },
       },
       { env },
@@ -163,7 +163,7 @@ describe('commit-provenance.mjs — claim/release tracking per conversation', ()
         conversationId: CONVERSATION,
         cwd: repo,
         tool_name: 'mcp_devspec_claim_work_item',
-        tool_input: { action_item_id: ITEM },
+        tool_input: { task_id: ITEM },
         tool_response: { content: [{ type: 'text', text: JSON.stringify({ id: ITEM }) }] },
       },
       { env },
@@ -175,7 +175,7 @@ describe('commit-provenance.mjs — claim/release tracking per conversation', ()
         conversationId: CONVERSATION,
         cwd: repo,
         tool_name: 'mcp_devspec_fail_work_item',
-        tool_input: { action_item_id: ITEM },
+        tool_input: { task_id: ITEM },
         tool_response: { content: [{ type: 'text', text: JSON.stringify({ id: ITEM, status: 'failed' }) }] },
       },
       { env },
@@ -188,7 +188,7 @@ describe('commit-provenance.mjs — claim/release tracking per conversation', ()
         conversationId: CONVERSATION,
         cwd: repo,
         tool_name: 'mcp_devspec_claim_work_item',
-        tool_input: { action_item_id: ITEM },
+        tool_input: { task_id: ITEM },
         tool_response: { content: [{ type: 'text', text: JSON.stringify({ id: ITEM }) }] },
       },
       { env },
@@ -200,7 +200,7 @@ describe('commit-provenance.mjs — claim/release tracking per conversation', ()
         conversationId: CONVERSATION,
         cwd: repo,
         tool_name: 'mcp_devspec_record_implementation',
-        tool_input: { action_item_id: ITEM },
+        tool_input: { task_id: ITEM },
         tool_response: { content: [{ type: 'text', text: JSON.stringify({ id: ITEM, lifecycle: 'implemented' }) }] },
       },
       { env },
@@ -214,7 +214,7 @@ describe('commit-provenance.mjs — claim/release tracking per conversation', ()
         conversationId: CONVERSATION,
         cwd: repo,
         tool_name: 'mcp_devspec_claim_work_item',
-        tool_input: { action_item_id: ITEM },
+        tool_input: { task_id: ITEM },
         tool_response: { content: [{ type: 'text', text: JSON.stringify({ id: ITEM }) }] },
       },
       { env },
@@ -273,7 +273,7 @@ describe('commit-provenance.mjs — claim/release tracking per conversation', ()
           conversationId: CONVERSATION,
           cwd: repo,
           tool_name: 'mcp_devspec_claim_work_item',
-          tool_input: { action_item_id: id },
+          tool_input: { task_id: id },
           tool_response: { content: [{ type: 'text', text: JSON.stringify({ id }) }] },
         },
         { env },
@@ -388,7 +388,7 @@ describe('unclaimed-edit provenance nudge lifecycle via PostInvocation', () => {
         conversationId: CONVERSATION,
         cwd: repo,
         tool_name: 'mcp_devspec_claim_work_item',
-        tool_input: { action_item_id: ITEM },
+        tool_input: { task_id: ITEM },
         tool_response: { content: [{ type: 'text', text: JSON.stringify({ id: ITEM }) }] },
       },
       { env },
@@ -408,14 +408,14 @@ describe('commit-observation.mjs — pre/post git commit observation', () => {
     local_id: CONVERSATION,
   }
 
-  it('snapshots git state before run_command git mutations and reports new commit SHAs via report_commit_provenance with active action_item_id and provenance_ref', async () => {
+  it('snapshots git state before run_command git mutations and reports new commit SHAs via report_commit_provenance with active task_id and provenance_ref', async () => {
     // Active claim in this conversation+repo
     handlePost(
       {
         conversationId: CONVERSATION,
         cwd: repo,
         tool_name: 'mcp_devspec_claim_work_item',
-        tool_input: { action_item_id: ITEM, provenance_ref: PROV_REF },
+        tool_input: { task_id: ITEM, provenance_ref: PROV_REF },
         tool_response: {
           content: [
             {
@@ -465,9 +465,9 @@ describe('commit-observation.mjs — pre/post git commit observation', () => {
     assert.equal(calls[0].arguments.connection_id, connState.connection_id)
     assert.equal(calls[0].arguments.commit_sha, git(['rev-parse', 'HEAD'], repo))
     assert.equal(calls[0].arguments.pinned_project_id, PROJECT)
-    assert.equal(calls[0].action_item_id, ITEM)
+    assert.equal(calls[0].task_id, ITEM)
     assert.equal(calls[0].provenance_ref, PROV_REF)
-    assert.equal(calls[0].arguments.action_item_id, ITEM)
+    assert.equal(calls[0].arguments.task_id, ITEM)
     assert.equal(calls[0].arguments.provenance_ref, PROV_REF)
     assert.match(calls[0].arguments.observation_id, /^[0-9a-f-]{36}$/)
   })
@@ -484,7 +484,7 @@ describe('commit-observation.mjs — pre/post git commit observation', () => {
         conversationId: CONVERSATION,
         cwd: repo,
         tool_name: 'mcp_devspec_claim_work_item',
-        tool_input: { action_item_id: ITEM, provenance_ref: PROV_REF },
+        tool_input: { task_id: ITEM, provenance_ref: PROV_REF },
         tool_response: {
           content: [{ type: 'text', text: JSON.stringify({ id: ITEM, provenance_ref: PROV_REF }) }],
         },
@@ -533,7 +533,7 @@ describe('commit-observation.mjs — pre/post git commit observation', () => {
     )
     assert.equal(calls.length, 1)
     assert.equal(calls[0].arguments.commit_sha, git(['rev-parse', 'HEAD'], repo))
-    assert.equal(calls[0].action_item_id, ITEM)
+    assert.equal(calls[0].task_id, ITEM)
     assert.equal(calls[0].provenance_ref, PROV_REF)
   })
 
@@ -567,7 +567,7 @@ describe('commit-observation.mjs — pre/post git commit observation', () => {
         workspacePaths: [repo],
         toolCall: {
           name: 'mcp_devspec_claim_work_item',
-          args: { action_item_id: ITEM, provenance_ref: PROV_REF },
+          args: { task_id: ITEM, provenance_ref: PROV_REF },
         },
       },
       { env },
@@ -592,7 +592,7 @@ describe('commit-observation.mjs — pre/post git commit observation', () => {
     )
   })
 
-  it('resolves action item title, work_claim_ref, and automation name in Antigravity when PostToolUse omits tool_response', () => {
+  it('resolves task title, work_claim_ref, and automation name in Antigravity when PostToolUse omits tool_response', () => {
     const testEnv = { ...env, HOME: sandbox }
     const brainDir = path.join(sandbox, '.gemini', 'antigravity-cli', 'brain', CONVERSATION)
     const stepDir = path.join(brainDir, '.system_generated', 'steps', '42')
@@ -610,7 +610,7 @@ describe('commit-observation.mjs — pre/post git commit observation', () => {
           args: {
             ServerName: 'devspec',
             ToolName: 'claim_work_item',
-            Arguments: { action_item_id: ITEM, agent_branch: 'feat/test' },
+            Arguments: { task_id: ITEM, agent_branch: 'feat/test' },
           },
         },
       },
@@ -627,7 +627,7 @@ describe('commit-observation.mjs — pre/post git commit observation', () => {
       path.join(stepDir, 'output.txt'),
       JSON.stringify({
         id: ITEM,
-        title: 'Status line action item title resolution',
+        title: 'Status line task title resolution',
         work_claim_ref: CLAIM_REF,
       }),
       { mode: 0o600 },
@@ -662,12 +662,12 @@ describe('commit-observation.mjs — pre/post git commit observation', () => {
     )
     assert.match(
       line,
-      /DevSpec: Curious Badger · DevSpec · “Remote Session” · working on “Status line action item title resolution” \(cdd7a494\)/,
+      /DevSpec: Curious Badger · DevSpec · “Remote Session” · working on “Status line task title resolution” \(cdd7a494\)/,
     )
     assert.deepEqual(readClaimedWorkItems(scope(), { env: testEnv }), [
       {
         id: ITEM,
-        title: 'Status line action item title resolution',
+        title: 'Status line task title resolution',
         work_claim_ref: CLAIM_REF,
         provenance_ref: null,
       },
@@ -682,7 +682,7 @@ describe('commit-observation.mjs — pre/post git commit observation', () => {
         toolCall: {
           name: 'run_command',
           args: {
-            CommandLine: `node -e "mcpToolsCall({ name: \\"record_implementation\\", arguments: { \\"action_item_id\\": \\"${ITEM}\\" } })"`,
+            CommandLine: `node -e "mcpToolsCall({ name: \\"record_implementation\\", arguments: { \\"task_id\\": \\"${ITEM}\\" } })"`,
             Cwd: repo,
           },
         },

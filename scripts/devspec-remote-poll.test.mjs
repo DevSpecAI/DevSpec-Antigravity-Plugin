@@ -1298,12 +1298,12 @@ describe('Parity 3: room transcript, 4-tier instruction files, repository contex
             notice_id: '66666666-6666-4666-8666-666666666666',
             topic: 'duplicate_detection',
             notice_type: 'potential_duplicate',
-            summary: 'Action item "Add retry backoff" may duplicate "Retry backoff on poll".',
+            summary: 'Task "Add retry backoff" may duplicate "Retry backoff on poll".',
             prompt: 'Inspect both items and call resolve_duplicate or record_duplicate_nonmatch.',
             records: [
               {
                 label: 'New item',
-                record_type: 'action_item',
+                record_type: 'task',
                 record_id: '77777777-7777-4777-8777-777777777777',
                 title: 'Add retry backoff',
                 text: 'Add retry backoff to poll loop.',

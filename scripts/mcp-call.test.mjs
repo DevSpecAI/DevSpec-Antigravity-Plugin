@@ -71,7 +71,7 @@ it('names this plugin and its running version on every DevSpec request the scrip
   const mcpUrl = `http://127.0.0.1:${server.address().port}/api/mcp`
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-header-wire-'))
   try {
-    await mcpToolsCall({ mcpUrl, token: 'dvs_fixture', name: 'get_action_item', arguments: {} })
+    await mcpToolsCall({ mcpUrl, token: 'dvs_fixture', name: 'get_task', arguments: {} })
     await mcpToolsCall({ mcpUrl, token: 'dvs_fixture', name: 'register_connection', arguments: {} })
     await mcpToolsCall({ mcpUrl, token: 'dvs_fixture', name: 'poll_connection', arguments: { connection_id: 'c' }, connectionCapability: 'dvsc_fixture', timeoutMs: 5_000 })
     // The token check reads its candidates from the Antigravity config under home.
@@ -90,7 +90,7 @@ it('names this plugin and its running version on every DevSpec request the scrip
   }
   const expected = `antigravity/${version}`
   assert.deepEqual(seen.slice(0, 4), [
-    { tool: 'get_action_item', plugin: expected, capability: null },
+    { tool: 'get_task', plugin: expected, capability: null },
     { tool: 'register_connection', plugin: expected, capability: null },
     { tool: 'poll_connection', plugin: expected, capability: 'dvsc_fixture' },
     { tool: 'verify_agent_connection', plugin: expected, capability: null },

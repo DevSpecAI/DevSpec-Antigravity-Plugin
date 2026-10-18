@@ -65,11 +65,11 @@ When woken by the background listener (`[DevSpec Remote Wake]` with `rearm: "alr
 4. Whenever attached to a session (`session_id` is set) — whether woken by a remote command or answering a local prompt typed in the terminal (which `PreInvocation` mirrors to the session) — post your direct reply via `post_session_message({ connection_id, message, complete_turn: true })` (do not pass `provenance_ref`; `PreToolUse` automatically stamps `local_turn: true` and `command_turn_unbound: true` on local terminal turns). **Exception — directed-question wakes (`type: "question_answer"` or `type: "question_dismissal"`):** reply **only** with `node "<plugin>/scripts/devspec-question.mjs" respond --connection-id "<connection_id>" --message "<reply>"` (never also call `post_session_message`, which would post a duplicate reply). Never post status blocks or narration.
 5. **Re-arming:** If the wake JSON reports `rearm: "already_armed"` (or `devspec-remote-connect.mjs` reported `wake: ALREADY ARMED`), **do NOT run `devspec-remote-wait.mjs`** — the persistent background listener stays armed across turns automatically. Only re-arm `devspec-remote-wait.mjs` (`WaitMsBeforeAsync: 500`, `--pending`) if the wake reported `rearm: "devspec-remote-wait"`.
 
-### 8a. Multi-item action-item ordering
+### 8a. Multi-item task ordering
 
-1. **`reserve_work_items({ action_item_ids: [...], connection_id })`** once, with ids in the requested work order.
+1. **`reserve_work_items({ task_ids: [...], connection_id })`** once, with ids in the requested work order.
 2. Read and report `skipped`; do not claim skipped ids.
-3. For each successfully reserved item **in order**, call **`claim_work_item({ action_item_id, agent_branch, connection_id, local_session_id })`** as you reach it.
+3. For each successfully reserved item **in order**, call **`claim_work_item({ task_id, agent_branch, connection_id, local_session_id })`** as you reach it.
 
 ### 8b. Shared session plans, polls, and directed questions
 

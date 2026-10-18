@@ -3,7 +3,7 @@
  * Best-effort direct-commit observations, never a Git gate (P4 / 3d1f5f9d).
  * Snapshots git state before `run_command` / `Bash` direct commit invocations and
  * reports newly created commit SHAs via `report_commit_provenance` along with
- * active `action_item_id` and `provenance_ref` context when available.
+ * active `task_id` and `provenance_ref` context when available.
  */
 import crypto from 'node:crypto'
 import fs from 'node:fs'
@@ -189,7 +189,7 @@ function resolveActiveClaimContext(sessionId, repoDir, state, commitMessage, env
   const scope = { sessionId, cwd: repoDir, repoRoot: canonicalRepo(repoDir) }
   const claim = readClaimDetails(scope, { env })
   const msgRef = referenceIn(commitMessage)
-  const actionItemId = claim?.action_item_id ?? msgRef ?? null
+  const taskId = claim?.task_id ?? msgRef ?? null
   let provenanceRef = claim?.provenance_ref ?? null
   if (!provenanceRef && state?.connection_id) {
     try {
@@ -206,7 +206,7 @@ function resolveActiveClaimContext(sessionId, repoDir, state, commitMessage, env
   if (!provenanceRef && typeof state?.last_command_delivery_id === 'string' && state.last_command_delivery_id) {
     provenanceRef = state.last_command_delivery_id
   }
-  return { action_item_id: actionItemId, provenance_ref: provenanceRef }
+  return { task_id: taskId, provenance_ref: provenanceRef }
 }
 
 export function handleBashPre(input, options = {}) {
@@ -321,14 +321,14 @@ export async function handleBashPost(input, options = {}) {
         observation_id: before.observationId,
         branch: before.branch.replace(/^refs\/heads\//, ''),
         ...(repository.remote ? { git_remote: repository.remote } : { pinned_project_id: repository.pin }),
-        ...(options.includeClaimArguments && activeClaim.action_item_id
-          ? { action_item_id: activeClaim.action_item_id }
+        ...(options.includeClaimArguments && activeClaim.task_id
+          ? { task_id: activeClaim.task_id }
           : {}),
         ...(options.includeClaimArguments && activeClaim.provenance_ref
           ? { provenance_ref: activeClaim.provenance_ref }
           : {}),
       },
-      ...(activeClaim.action_item_id ? { action_item_id: activeClaim.action_item_id } : {}),
+      ...(activeClaim.task_id ? { task_id: activeClaim.task_id } : {}),
       ...(activeClaim.provenance_ref ? { provenance_ref: activeClaim.provenance_ref } : {}),
       timeoutMs: options.timeoutMs ?? REPORT_TIMEOUT_MS,
     })

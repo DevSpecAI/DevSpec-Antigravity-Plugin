@@ -512,7 +512,7 @@ export function sessionActivityView(store) {
     note:
       'References to what this room produced or mentioned, and what happened to them ' +
       '(at = when it happened). Never how anything stands now: fetch a record with ' +
-      'get_action_item, get_memory or get_resource for that.',
+      'get_task, get_memory or get_resource for that.',
     list_readable: store.activity.available,
     last_read_at: store.activity.readAt,
     items: [...store.activity.seen.values()].map(({ kind, id, title, relation, creator }) => ({ kind, id, title, relation, creator })),

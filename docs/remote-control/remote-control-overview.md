@@ -22,7 +22,7 @@ A **session is optional**. Never invent a session because a cwd or another agent
 | Authority | Act only on complete exact-target canonical commands with the server-stamped authority/project-scope pair. Runtime policy: [`devspec://product/remote-ingress-contract`](devspec://product/remote-ingress-contract). |
 | Advisory | Typed canonical context and `active_session_plans` are materialized to local room files (`.transcript.jsonl` / `.room.json`) as read-awareness only — never carried across turns, never wake, execute, or grant plan mutation authority. |
 | Answers (attached) | Agent (or host bridge) posts **one direct answer** via `post_session_message({ connection_id })`. |
-| Answers (sessionless) | Use the explicit command or automation reporting path — never invent chat or infer action-item assignment. |
+| Answers (sessionless) | Use the explicit command or automation reporting path — never invent chat or infer task assignment. |
 | Activity | `report_pickup` → `report_keepalive` → `report_complete`. Server never infers Working. |
 | Chrome | Connect/status banners are **terminal-only**. Never post them into the session. |
 | Slash commands | Host UI commands (e.g. `/clear`) are **not** remote-control. Injecting `"/clear"` as prompt text does not run them. |

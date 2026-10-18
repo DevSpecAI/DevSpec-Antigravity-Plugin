@@ -692,10 +692,10 @@ const UNLINKED_COMMIT_NOTICE_OUTCOMES = [
   'defer_follow_up',
 ]
 const UNLINKED_COMMIT_NOTICE_TOOLS = [
-  'get_action_item',
-  'update_action_item',
-  'link_action_items',
-  'supersede_action_item',
+  'get_task',
+  'update_task',
+  'link_tasks',
+  'supersede_task',
 ]
 
 function exactStringTuple(value, expected) {
@@ -727,13 +727,13 @@ export function isSystemNoticeV1(value) {
   if (value.kind === 'unlinked_commit_item_review') {
     return (
       exactKeys(value, [
-        'version', 'kind', 'notice_id', 'commit_sha', 'action_item_id',
-        'action_item_title', 'branch', 'contract_uri', 'allowed_outcomes', 'allowed_tools',
+        'version', 'kind', 'notice_id', 'commit_sha', 'task_id',
+        'task_title', 'branch', 'contract_uri', 'allowed_outcomes', 'allowed_tools',
       ]) &&
       uuid(value.notice_id) &&
       typeof value.commit_sha === 'string' && FULL_LOWERCASE_SHA.test(value.commit_sha) &&
-      uuid(value.action_item_id) &&
-      nonempty(value.action_item_title) && value.action_item_title.length <= 500 &&
+      uuid(value.task_id) &&
+      nonempty(value.task_title) && value.task_title.length <= 500 &&
       nonempty(value.branch) && value.branch.length <= 500 &&
       exactStringTuple(value.allowed_outcomes, UNLINKED_COMMIT_NOTICE_OUTCOMES) &&
       exactStringTuple(value.allowed_tools, UNLINKED_COMMIT_NOTICE_TOOLS)
@@ -864,7 +864,7 @@ export function isRoomContextV1(value) {
 function activityEntry(value) {
   return (
     exactKeys(value, ['kind', 'id', 'title', 'status', 'relation', 'creator']) &&
-    ['action_item', 'memory', 'artifact'].includes(value.kind) &&
+    ['task', 'memory', 'artifact'].includes(value.kind) &&
     uuid(value.id) &&
     nonempty(value.title) &&
     nullable(value.status, nonempty) &&
@@ -905,7 +905,7 @@ function sessionEvent(value) {
   const base =
     typeof value.id === 'string' && value.id.length > 0 && value.id.length <= 200 &&
     datetime(value.at) &&
-    ['action_item', 'memory', 'artifact'].includes(value.kind) &&
+    ['task', 'memory', 'artifact'].includes(value.kind) &&
     uuid(value.record_id)
   if (!base) return false
   switch (value.event) {
@@ -917,7 +917,7 @@ function sessionEvent(value) {
       return exactKeys(value, [...EVENT_BASE_KEYS, 'message_id']) && uuid(value.message_id)
     case 'lifecycle_changed':
       return exactKeys(value, [...EVENT_BASE_KEYS, 'from', 'to']) &&
-        value.kind === 'action_item' && nonempty(value.from) && nonempty(value.to)
+        value.kind === 'task' && nonempty(value.from) && nonempty(value.to)
     case 'superseded':
       return exactKeys(value, [...EVENT_BASE_KEYS, 'by', 'actor']) &&
         nullable(value.by, uuid) && eventActor(value.actor)

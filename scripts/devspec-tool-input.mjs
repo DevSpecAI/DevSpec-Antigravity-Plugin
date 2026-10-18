@@ -47,15 +47,15 @@ const PROJECTLESS_TOOLS = new Set([
 ])
 
 const LOCAL_SESSION_ID_TOOLS = new Set([
-  'update_action_item',
+  'update_task',
   'claim_work_item',
   'record_implementation',
   'record_automation_run',
 ])
 
 const AGENT_NAME_TOOLS = new Set([
-  'create_action_item',
-  'surface_session_action_items',
+  'create_task',
+  'surface_session_tasks',
   'create_session',
   'post_session_message',
   'register_connection',

@@ -4,7 +4,7 @@
 
 [DevSpec](https://devspec.ai) is where your team, your knowledge, and your agents build software together — made for AI-native development from the ground up.
 
-Bring DevSpec into [Google Antigravity CLI](https://antigravity.google) (`agy`). Once configured, `agy` connects to your DevSpec projects so you can ground on shared team memory, work tracked action items end to end, coordinate in shared rooms with plans, polls, and directed questions, and steer your local `agy` session from your browser or phone.
+Bring DevSpec into [Google Antigravity CLI](https://antigravity.google) (`agy`). Once configured, `agy` connects to your DevSpec projects so you can ground on shared team memory, work tracked tasks end to end, coordinate in shared rooms with plans, polls, and directed questions, and steer your local `agy` session from your browser or phone.
 
 > **No DevSpec Launcher is installed by this plugin.** Use `agy` and its DevSpec connection skills normally. The launcher is a separate, optional browser-launch convenience with its own setup; this plugin does not bundle it, register its URL handler, or start its service. Check your [Agents settings in DevSpec](https://devspec.ai/settings/agents) for supported standalone launch targets and release availability.
 
@@ -14,7 +14,7 @@ Bring DevSpec into [Google Antigravity CLI](https://antigravity.google) (`agy`).
 
 - **⭐ Drive `agy` from your browser or phone (Remote Control).** Run `/antigravity-devspec-autopilot-extension:devspec-remote` in your terminal to connect this `agy` session to the DevSpec Agents page or attach it directly to a shared DevSpec session room. Teammates can follow along and add context in the same thread while server-verified owner and delegated commands drive the agent.
 - **Two-sided live transcript.** Your prompts and the agent's answers appear in the DevSpec room, and a turn stays open until any background subagents finish.
-- **Work a task end to end — or an ordered batch.** Point `agy` at an action item (or a list of items in order). It reserves the requested items, claims them one at a time, implements the change, runs checks, tags commits with `[devspec:<id>]`, and records implementation and criterion verdicts back to DevSpec.
+- **Work a task end to end — or an ordered batch.** Point `agy` at a task (or a list of items in order). It reserves the requested items, claims them one at a time, implements the change, runs checks, tags commits with `[devspec:<id>]`, and records implementation and criterion verdicts back to DevSpec.
 - **Decisions in Review, made for you.** Ask `agy` to make any decision you could make on DevSpec's Review page (accept or decline a proposed change, answer on work that would undo a decision, rule on a flag or a duplicate) and it does it as soon as your request is clear, then tells you what happened and what you can do next. It warns you once, up front, only if you seem unaware of a significant consequence, and never asks you to confirm again. Who may decide what is DevSpec's rule; if you can't, it says who can.
 - **Verified commit provenance.** Automatic `PreToolUse` and `PostToolUse` hooks observe new git commits, track `[devspec:<id>]` commit trailers against claimed work items, and guard implementation reporting against unverified commit SHAs.
 - **Coordinate in the room with plans, polls, and directed questions:**
@@ -157,7 +157,7 @@ Collaboration in a shared DevSpec room is safe by design:
 Only `devspec-remote` and `devspec-remote-stop` are packaged as skills because connecting and disconnecting orchestrate local background processes and state files. Every other DevSpec workflow uses the live DevSpec MCP tools directly — just ask in plain English:
 
 ```text
-Work on DevSpec action item 4f2a
+Work on DevSpec task 4f2a
 Work these DevSpec items in order: 4f2a, 9c1b, 2e7d
 Log a DevSpec item for the login redirect bug
 I just finished the caching fix — record it
@@ -166,7 +166,7 @@ What decisions or memories do we have about authentication?
 
 DevSpec's web app emits these exact prompts from its copy buttons:
 
-- **Single item or ordered batch:** When you ask Antigravity to work on one or more action items, it calls `reserve_work_items` in the requested order, claims each item one at a time with `claim_work_item`, implements and verifies the change, tags commits with `[devspec:<id>]`, and reports completion via `record_implementation` and `record_criterion_verdicts`.
+- **Single item or ordered batch:** When you ask Antigravity to work on one or more tasks, it calls `reserve_work_items` in the requested order, claims each item one at a time with `claim_work_item`, implements and verifies the change, tags commits with `[devspec:<id>]`, and reports completion via `record_implementation` and `record_criterion_verdicts`.
 - **Shared memory:** When Antigravity learns a durable architecture fact, convention, decision, or risk, it searches and updates team memory so future sessions and teammates stay grounded.
 
 ## Implementation contract

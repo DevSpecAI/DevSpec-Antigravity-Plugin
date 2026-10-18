@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.18.0
+
+Tasks cutover candidate; activation is held pending coordinated release.
+
+- Tool-input handling, claim/provenance readers, remote projections and installed rules use Tasks without old-tool aliases. The task creation reference uses Feature, Improvement, Bug, Investigation and General.
+- Existing commit-reference IDs and durable records remain intact; session joining and identity binding are unchanged.
+- Requires the matching Tasks server. Update the actual installed plugin checkout, including its rules, and restart Antigravity to refresh runtime instructions and tool schemas before resuming work.
+
 ## 0.17.7
 
 ### Strip stale `.old` self-update suffix in `resolveAgentApiCommand` instead of falling back to the `agentapi` wrapper

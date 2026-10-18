@@ -86,9 +86,9 @@ describe('PreToolUse mechanical input stamping (overwrite)', () => {
       const res = prepareDevspecToolInput(
         {
           conversationId: CONV_ID,
-          tool_name: 'mcp_devspec_update_action_item',
+          tool_name: 'mcp_devspec_update_task',
           tool_input: {
-            action_item_id: '98788aaf-9ce0-4299-a91c-ef4507bd2df0',
+            task_id: '98788aaf-9ce0-4299-a91c-ef4507bd2df0',
             status: 'in_progress',
           },
         },
@@ -107,7 +107,7 @@ describe('PreToolUse mechanical input stamping (overwrite)', () => {
     }
   })
 
-  it('stamps agent_name="Antigravity" and plugin_version on register_connection and create_action_item', () => {
+  it('stamps agent_name="Antigravity" and plugin_version on register_connection and create_task', () => {
     const fx = makeFixture()
     try {
       const reg = prepareDevspecToolInput(
@@ -316,8 +316,8 @@ describe('Multi-requester ambiguity guard & devspec-serve-request.mjs', () => {
       const deniedWrite = prepareDevspecToolInput(
         {
           conversationId: CONV_ID,
-          tool_name: 'mcp_devspec_update_action_item',
-          tool_input: { action_item_id: '98788aaf-9ce0-4299-a91c-ef4507bd2df0' },
+          tool_name: 'mcp_devspec_update_task',
+          tool_input: { task_id: '98788aaf-9ce0-4299-a91c-ef4507bd2df0' },
         },
         { home: fx.home, env: {} }
       )
@@ -351,8 +351,8 @@ describe('Multi-requester ambiguity guard & devspec-serve-request.mjs', () => {
       const allowedWrite = prepareDevspecToolInput(
         {
           conversationId: CONV_ID,
-          tool_name: 'mcp_devspec_update_action_item',
-          tool_input: { action_item_id: '98788aaf-9ce0-4299-a91c-ef4507bd2df0' },
+          tool_name: 'mcp_devspec_update_task',
+          tool_input: { task_id: '98788aaf-9ce0-4299-a91c-ef4507bd2df0' },
         },
         { home: fx.home, env: {} }
       )

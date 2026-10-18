@@ -28,7 +28,7 @@ Antigravity is **not** OpenCode-native inject and **not** the Codex app-server b
 | Local room state | `<connectionId>.transcript.jsonl`, `<connectionId>.room.json`, `<connectionId>.cursor.json` read on demand via `scripts/room-unread.mjs` |
 | Scripts | Owned and tested in this plugin; never copied from or synchronized with another host plugin |
 | Plans, Polls & Questions | Capability-backed `scripts/devspec-plan.mjs`, `scripts/devspec-poll.mjs`, and `scripts/devspec-question.mjs` are discovered on demand; no extra hot skill or broad allowlist |
-| Status & Telemetry | `scripts/statusline.mjs` + `scripts/session-title.mjs` render status bar (`local (/devspec-remote to connect)` before connecting; codename, project, refreshed session title, active automation, claimed action item title + short code, model + context% when connected) and record `<connectionId>.telemetry.json` attached to `heartbeat_connection` |
+| Status & Telemetry | `scripts/statusline.mjs` + `scripts/session-title.mjs` render status bar (`local (/devspec-remote to connect)` before connecting; codename, project, refreshed session title, active automation, claimed task title + short code, model + context% when connected) and record `<connectionId>.telemetry.json` attached to `heartbeat_connection` |
 
 ## Host limitation
 

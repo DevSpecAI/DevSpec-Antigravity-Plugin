@@ -718,7 +718,7 @@ describe('room-unread.mjs — mirrored local prompt & single-command wake waterm
         from: { label: 'Ali Price', kind: 'human' },
         to: 'Steady Jackal',
         state: 'active',
-        text: 'Please check the action items.',
+        text: 'Please check the tasks.',
       }
       fs.writeFileSync(
         paths.transcript,
@@ -732,7 +732,7 @@ describe('room-unread.mjs — mirrored local prompt & single-command wake waterm
         deliveredCommands: [
           {
             message_id: 'msg-remote-2',
-            content: { body: 'Please check the action items.' },
+            content: { body: 'Please check the tasks.' },
           },
         ],
         dir,
