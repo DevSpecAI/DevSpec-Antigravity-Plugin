@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.17.7
+
+### Strip stale `.old` self-update suffix in `resolveAgentApiCommand` instead of falling back to the `agentapi` wrapper
+
+- **Strip `.old` self-update suffixes and always invoke `agy agentapi` directly (`scripts/devspec-remote-listen.mjs`, `scripts/devspec-remote-connect.test.mjs`).** When `agy` self-updates in place, it renames the running binary to `agy.<id>.old` (or `agy.exe.<id>.old`) and removes the `.old` binary on the next launch. On Linux, whenever a pre-update `agy` session later runs a `run_command` tool call, `agy` rewrites `~/.gemini/antigravity-cli/bin/agentapi` with `exec "<os.Executable()>" agentapi "$@"` — which resolves via `/proc/self/exe` back to the deleted `agy.<id>.old` path and breaks wake delivery (`exit 127`) for any listener falling back to that wrapper. On Windows, `~/.gemini/antigravity-cli/bin/agentapi.bat` also cannot be executed directly via Node's `execFile` (`ENOENT`). `resolveAgentApiCommand` now drops the `~/.gemini/antigravity-cli/bin/agentapi` wrapper fallback altogether: when `ANTIGRAVITY_AGENTAPI_EXE` / `state.agentapi_exe` no longer exists on disk, it strips any `.\d+.old` / `.old` suffix (`stripSelfUpdateOldSuffix`) to invoke the live `agy` binary directly with `prefixArgs: ['agentapi']`, or falls back to `agy` (`prefixArgs: ['agentapi']`) on `PATH`.
+
 ## 0.17.6
 
 ### Fix 1-hour idle drop-off, filter connection sidecar state files, and add listener poller self-repair

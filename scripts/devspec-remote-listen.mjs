@@ -419,14 +419,21 @@ export function buildWakeDeliveryMessage(entry, opts = {}) {
  *
  * `ANTIGRAVITY_AGENTAPI_EXE` (and the state file's copy of it) names the binary the
  * agy process was started from. agy updates itself by renaming that running binary
- * to `agy.<n>.old`, and a later agy launch deletes it, while the long-lived agy
- * process and its env still name the old path. Every delivery then fails to spawn,
- * every later room message waits in the inbox, and the person has to type at the
- * terminal instead (item 479607e6, observed on connection baa40bfd: the stored path
- * was gone and two megabytes of inbox sat undelivered). A named path that no longer
- * exists is therefore skipped for the wrapper agy keeps pointing at its current
- * binary, then for `agentapi` on PATH.
+ * to `agy.<n>.old` (or `agy.exe.<n>.old`), and a later agy launch deletes it, while
+ * the long-lived agy process and its env still name the old path. Furthermore, on
+ * Linux every `run_command` tool call in a pre-update agy session rewrites the shared
+ * `~/.gemini/antigravity-cli/bin/agentapi` wrapper with `/proc/self/exe` (the deleted
+ * `agy.<n>.old` path), and on Windows `agentapi.bat` cannot be executed via Node's
+ * `execFile` (`ENOENT`). We therefore never invoke the `agentapi` shell/batch wrapper:
+ * when `explicitExe` no longer exists on disk, we strip any self-update `.old` suffix
+ * (`.\d+.old` or `.old`) to invoke the live `agy` binary at that path with
+ * `prefixArgs: ['agentapi']`, or fall back to `agy` on `PATH` with `prefixArgs: ['agentapi']`.
  */
+export function stripSelfUpdateOldSuffix(exePath) {
+  if (typeof exePath !== 'string') return ''
+  return exePath.replace(/\.(?:\d+\.)?old$/i, '')
+}
+
 export function resolveAgentApiCommand(mergedEnv, execFileImpl, explicitEnv, state, existsImpl = fs.existsSync) {
   const allowAgentApiExe =
     execFileImpl === execFile ||
@@ -438,12 +445,19 @@ export function resolveAgentApiCommand(mergedEnv, execFileImpl, explicitEnv, sta
     mergedEnv.ANTIGRAVITY_AGENTAPI_EXE.trim()
       ? mergedEnv.ANTIGRAVITY_AGENTAPI_EXE.trim()
       : null
-  if (explicitExe && (!path.isAbsolute(explicitExe) || existsImpl(explicitExe))) {
-    return { bin: explicitExe, prefixArgs: ['agentapi'] }
+  if (explicitExe) {
+    const isAbsoluteLike = path.isAbsolute(explicitExe) || path.win32.isAbsolute(explicitExe)
+    if (!isAbsoluteLike || existsImpl(explicitExe)) {
+      return { bin: explicitExe, prefixArgs: ['agentapi'] }
+    }
+    const liveExe = stripSelfUpdateOldSuffix(explicitExe)
+    if (liveExe && liveExe !== explicitExe && existsImpl(liveExe)) {
+      return { bin: liveExe, prefixArgs: ['agentapi'] }
+    }
+    return { bin: 'agy', prefixArgs: ['agentapi'] }
   }
-  const wrapperPath = path.join(os.homedir(), '.gemini', 'antigravity-cli', 'bin', 'agentapi')
-  if ((execFileImpl === execFile || explicitExe) && existsImpl(wrapperPath)) {
-    return { bin: wrapperPath, prefixArgs: [] }
+  if (execFileImpl === execFile) {
+    return { bin: 'agy', prefixArgs: ['agentapi'] }
   }
   return { bin: 'agentapi', prefixArgs: [] }
 }
