@@ -325,7 +325,7 @@ export function buildWakeDeliveryMessage(entry, opts = {}) {
       const body = typeof c?.content?.body === 'string' ? c.content.body.trim() : ''
       if (body) lines.push(`${sender} (${c?.authority?.kind || 'owner'}): ${body}`)
     }
-    const streamJson = formatInboxEntryForStream(entry, streamOpts)
+    const streamJson = formatInboxEntryForStream(entry, { ...streamOpts, includeBody: false })
     if (streamJson) lines.push(streamJson)
     return lines.join('\n\n')
   }
@@ -349,7 +349,7 @@ export function buildWakeDeliveryMessage(entry, opts = {}) {
       const formatted = formatSystemNoticeContent(notice)
       if (formatted) lines.push(formatted)
     }
-    const streamJson = formatInboxEntryForStream(entry, streamOpts)
+    const streamJson = formatInboxEntryForStream(entry, { ...streamOpts, includeContent: false })
     if (streamJson) lines.push(streamJson)
     return lines.join('\n\n')
   }
@@ -368,7 +368,7 @@ export function buildWakeDeliveryMessage(entry, opts = {}) {
   if (entry.type === 'interaction_answer' && entry.event) {
     const lines = [
       '[DevSpec Remote Wake]',
-      `Directed question ${entry.event.question_id} answered: ${JSON.stringify(entry.event.answer)}`,
+      `Directed question ${entry.event.question_id} answered.`,
     ]
     const streamJson = formatInboxEntryForStream(entry, streamOpts)
     if (streamJson) lines.push(streamJson)
@@ -409,7 +409,7 @@ export function buildWakeDeliveryMessage(entry, opts = {}) {
       lines.push(`${sender}: ${content}`)
     }
   }
-  const streamJson = formatInboxEntryForStream(entry, streamOpts)
+  const streamJson = formatInboxEntryForStream(entry, { ...streamOpts, includeBody: false })
   if (streamJson) lines.push(streamJson)
   return lines.join('\n\n')
 }

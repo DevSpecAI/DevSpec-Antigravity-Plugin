@@ -505,6 +505,38 @@ describe('devspec-remote-listen.mjs — canonical & legacy wake formatting', () 
     assert.match(canonicalWake, /"provenance_ref":\{"kind":"session_command","session_id":"7069bedd-878d-4c5a-b52c-b5cfc1bcd544","message_id":"msg-1"\}/)
     assert.match(canonicalWake, /"sender_response_style":\["Use numbered sections and clickable file links\."\]/)
     assert.match(canonicalWake, /"rearm":"already_armed"/)
+    assert.equal(
+      canonicalWake.split('Please continue.').length - 1,
+      1,
+      'command body must appear once in canonicalWake instead of 3 times',
+    )
+
+    const answerWake = buildWakeDeliveryMessage({
+      type: 'interaction_answer',
+      connection_id: CONN_ID,
+      session_id: SESS_ID,
+      disposition: 'delivered',
+      attempt_id: '7069bedd-878d-4c5a-b52c-b5cfc1bcd544',
+      event: {
+        kind: 'directed_question_answer',
+        event_id: '7069bedd-878d-4c5a-b52c-b5cfc1bcd544',
+        question_id: '7069bedd-878d-4c5a-b52c-b5cfc1bcd544',
+        response_id: '7069bedd-878d-4c5a-b52c-b5cfc1bcd544',
+        connection_id: CONN_ID,
+        session_id: SESS_ID,
+        response_kind: 'single_select',
+        prompt: 'Which option?',
+        answer: 'UniqueAnswerToken123',
+        answered_by: { user_id: '7069bedd-878d-4c5a-b52c-b5cfc1bcd544', display_name: 'Ali Price' },
+        answered_at: '2026-10-19T22:00:00.000Z',
+      },
+    })
+    assert.match(answerWake, /Directed question 7069bedd-878d-4c5a-b52c-b5cfc1bcd544 answered\./)
+    assert.equal(
+      answerWake.split('UniqueAnswerToken123').length - 1,
+      1,
+      'question answer must appear once inside the fenced context, not duplicated in the header',
+    )
 
     const autoWake = buildWakeDeliveryMessage({
       type: 'automation_run',

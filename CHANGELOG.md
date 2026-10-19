@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.18.3
+
+### Deduplicate `system_notice`, command, and question-answer wake payloads (`E2BIG` prevention)
+
+- **Single-copy `canonical_system_notices` wakes (`scripts/devspec-remote-wait.mjs`, `scripts/devspec-remote-listen.mjs`).** `buildCanonicalSystemNoticeEvents` no longer embeds the raw `notice` object or repeats full record `text` strings inside `records` metadata when `formatSystemNoticeContent(notice)` already renders them, and `buildWakeDeliveryMessage` omits duplicate `content` from the JSON line when the formatted notice is already emitted in the wake header — reducing multi-notice wake payloads by ~70% (1x instead of 4x) so batched findings do not exceed Linux `MAX_ARG_STRLEN` (`spawn E2BIG`) on `agy agentapi send-message`.
+- **Single-copy command and question-answer wakes (`scripts/devspec-remote-wait.mjs`, `scripts/devspec-remote-listen.mjs`).** `buildCanonicalCommandEvents` omits duplicate `content.body`, `project_scope`, and `sender_response_style` inside `message` metadata; `buildWakeDeliveryMessage` passes `includeBody: false` so command bodies are emitted once in the readable header rather than 3 times; and `interaction_answer` wake headers no longer dump unsanitized duplicate `JSON.stringify(entry.event.answer)` outside the `<devspec_question_answer_data>` fence.
+
 ## 0.18.1
 
 ### Rename plugin and install directory from `autopilot` to `devspec` with legacy directory fallback

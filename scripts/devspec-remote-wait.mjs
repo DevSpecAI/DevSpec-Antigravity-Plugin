@@ -544,7 +544,7 @@ export function formatSystemNoticeContent(notice) {
 
 export function buildCanonicalSystemNoticeEvents(
   batch,
-  { inboxFile, rearm = 'devspec-remote-wait' } = {},
+  { inboxFile, rearm = 'devspec-remote-wait', includeContent = true } = {},
 ) {
   const ingress = batch?.ingress
   const executeIds = new Set(Array.isArray(batch?.execute_notice_ids) ? batch.execute_notice_ids : [])
@@ -556,6 +556,9 @@ export function buildCanonicalSystemNoticeEvents(
   const events = []
 
   for (const notice of notices) {
+    const compactRecords = Array.isArray(notice.records)
+      ? notice.records.map(({ text: _text, ...meta }) => meta)
+      : []
     events.push({
       type: 'system_notice',
       kind: notice.kind,
@@ -564,9 +567,7 @@ export function buildCanonicalSystemNoticeEvents(
         ? {
             topic: notice.topic,
             notice_type: notice.notice_type,
-            summary: notice.summary,
-            prompt: notice.prompt,
-            records: notice.records,
+            records: compactRecords,
             allowed_outcomes: notice.allowed_outcomes,
             allowed_tools: notice.allowed_tools,
           }
@@ -575,18 +576,16 @@ export function buildCanonicalSystemNoticeEvents(
             task_id: notice.task_id,
             task_title: notice.task_title,
             branch: notice.branch,
-            prompt: notice.prompt,
             allowed_outcomes: notice.allowed_outcomes,
             allowed_tools: notice.allowed_tools,
           }),
-      content: formatSystemNoticeContent(notice),
+      ...(includeContent ? { content: formatSystemNoticeContent(notice) } : {}),
       session_id: sessionId,
       envelope_id: ingress?.envelope_id ?? null,
       inbox: inboxFile ?? null,
       authoritative: false,
       executable: true,
       authoritative_source: REMOTE_INGRESS_RESOURCE_URI,
-      notice,
     })
   }
 
@@ -615,7 +614,7 @@ export function buildCanonicalSystemNoticeEvents(
  */
 export function buildCanonicalCommandEvents(
   batch,
-  { inboxFile, unread = null, rearm = 'devspec-remote-wait' } = {},
+  { inboxFile, unread = null, rearm = 'devspec-remote-wait', includeBody = true } = {},
 ) {
   const ingress = batch?.ingress
   const executeIds = new Set(
@@ -638,12 +637,30 @@ export function buildCanonicalCommandEvents(
     const delegated = authorityKind === 'delegated'
     const senderStyle = Array.isArray(ingress?.sender_response_styles)
       ? (ingress.sender_response_styles.find((style) => style.message_id === command.message_id)?.notes ?? [])
-      : []
+      : Array.isArray(command?.sender_response_style)
+        ? command.sender_response_style
+        : []
     const body = typeof command.content?.body === 'string' ? command.content.body : ''
     if (batch.question_handoff?.source_message_id === command.message_id) {
       events.push(questionHandoffEvent(batch.question_handoff, { sessionId }))
     }
     const unreadTotal = unread ? (Number(unread.unread) || 0) + (Number(unread.updated) || 0) : null
+    const {
+      content: rawContent,
+      project_scope: _dupProjectScope,
+      sender_response_style: _dupSenderStyle,
+      ...commandRest
+    } = command && typeof command === 'object' ? command : {}
+    const messageMeta =
+      rawContent && typeof rawContent === 'object'
+        ? {
+            ...commandRest,
+            content: {
+              ...(Object.hasOwn(rawContent, 'mode') ? { mode: rawContent.mode } : {}),
+              ...(Object.hasOwn(rawContent, 'complete') ? { complete: rawContent.complete } : {}),
+            },
+          }
+        : commandRest
     events.push({
       type: 'owner_message',
       from: command.requester?.display_name ?? null,
@@ -655,13 +672,13 @@ export function buildCanonicalCommandEvents(
       message_id: command.message_id,
       unread: unreadTotal,
       body_chars: body.length,
-      body,
+      ...(includeBody ? { body } : {}),
       envelope_id: ingress?.envelope_id ?? null,
       session_id: sessionId,
       authoritative: true,
       executable: true,
       authoritative_source: REMOTE_INGRESS_RESOURCE_URI,
-      message: command,
+      message: messageMeta,
       ...(senderStyle.length > 0 ? { sender_response_style: senderStyle } : {}),
       ...(scopeAware ? { project_scope: command.project_scope } : {}),
       ...(delegated && scopeAware && command.project_scope?.instruction
@@ -772,7 +789,7 @@ export async function writeEventSequence(events, writeLine = stdoutLine) {
  */
 export function buildOwnerMessageEvents(
   batch,
-  { inboxFile, attachmentDir, writeFile, rearm = 'devspec-remote-wait' } = {},
+  { inboxFile, attachmentDir, writeFile, rearm = 'devspec-remote-wait', includeBody = true } = {},
 ) {
   const sessionId = batch?.session_id ?? null
   const messages = Array.isArray(batch?.messages) ? batch.messages : []
@@ -813,12 +830,20 @@ export function buildOwnerMessageEvents(
     const scopeAware = Boolean(m && typeof m === 'object' && Object.hasOwn(m, 'project_scope'))
     const scopeValid = scopeAware ? isRemoteCommandProjectScope(m.project_scope, m.authority?.kind) : false
     const delegated = scopeValid && m.authority?.kind === 'delegated'
+    const materialised = materialiseAttachments(m, { dir: attachmentDir, writeFile })
+    const messagePayload =
+      !includeBody && materialised && typeof materialised === 'object'
+        ? (() => {
+            const { content: _dupContent, ...rest } = materialised
+            return rest
+          })()
+        : materialised
     events.push({
       type: 'owner_message',
       session_id: sessionId,
       ...(scopeValid ? { project_scope: m.project_scope } : {}),
       ...(delegated ? { project_scope_instruction: m.project_scope.instruction } : {}),
-      message: materialiseAttachments(m, { dir: attachmentDir, writeFile }),
+      message: messagePayload,
     })
   }
 
@@ -851,6 +876,8 @@ export function formatInboxEntryForStream(
     home = os.homedir(),
     attachmentDir = null,
     writeFile = undefined,
+    includeBody = true,
+    includeContent = true,
   } = {},
 ) {
   if (!batch || typeof batch !== 'object') return ''
@@ -881,11 +908,12 @@ export function formatInboxEntryForStream(
       inboxFile,
       unread: computedUnread,
       rearm,
+      includeBody,
     })
   } else if (batch.type === 'canonical_control') {
     events = buildCanonicalControlEvents(batch, { inboxFile })
   } else if (batch.type === 'canonical_system_notices') {
-    events = buildCanonicalSystemNoticeEvents(batch, { inboxFile, rearm })
+    events = buildCanonicalSystemNoticeEvents(batch, { inboxFile, rearm, includeContent })
   } else if (batch.type === INTERACTION_ANSWER_RECORD_TYPE || batch.type === DISMISSAL_RECORD_TYPE) {
     events =
       batch.disposition === QUEUED
@@ -899,6 +927,7 @@ export function formatInboxEntryForStream(
       attachmentDir: attachmentDir || (effectiveConnId ? attachmentDirFor(effectiveConnId) : null),
       writeFile,
       rearm,
+      includeBody,
     })
   }
   return events.map((event) => JSON.stringify(event)).join('\n')
