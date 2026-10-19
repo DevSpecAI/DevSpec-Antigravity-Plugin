@@ -673,8 +673,16 @@ describe('canonical_system_notices delivery (server_notice & unlinked_commit_ite
       assert.equal(events[0].notice_type, 'reversal')
       assert.equal(events[0].session_id, null)
       assert.equal(events[0].records.length, 2)
+      assert.equal('text' in events[0].records[0], false)
+      assert.equal('notice' in events[0], false)
       assert.match(events[0].content, /Protected record \(existing decision\)/)
       assert.match(events[0].content, /All remote deliveries must use the canonical ingress envelope\./)
+      const serialized = events.map((e) => JSON.stringify(e)).join('\n')
+      assert.equal(
+        serialized.split('All remote deliveries must use the canonical ingress envelope.').length - 1,
+        1,
+        'record text must appear exactly once in serialized system_notice events',
+      )
       assert.equal(events[1].type, 'wake')
       assert.equal(events[1].reason, 'exact_connection_system_notice')
       assert.equal(events[1].session_id, null)

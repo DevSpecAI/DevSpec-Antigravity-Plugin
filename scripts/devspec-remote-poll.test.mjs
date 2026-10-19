@@ -1318,5 +1318,15 @@ describe('Parity 3: room transcript, 4-tier instruction files, repository contex
     assert.match(msg, /\[DevSpec Remote Wake\]/)
     assert.match(msg, /\[DevSpec System Notice: duplicate_detection \/ potential_duplicate\]/)
     assert.match(msg, /resolve_duplicate, record_duplicate_nonmatch/)
+    assert.equal(
+      msg.split('Add retry backoff to poll loop.').length - 1,
+      1,
+      'notice record text must appear once in buildWakeDeliveryMessage instead of 4 times',
+    )
+    assert.equal(
+      msg.split('Inspect both items and call resolve_duplicate or record_duplicate_nonmatch.').length - 1,
+      1,
+      'notice prompt must appear once in buildWakeDeliveryMessage',
+    )
   })
 })
