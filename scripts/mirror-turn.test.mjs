@@ -377,7 +377,7 @@ describe('Antigravity native hook payload & transcript handling', () => {
     const waiter = launchedAntigravityBackgroundWork(
       'default_api:run_command',
       {
-        CommandLine: 'node "/home/user/.gemini/config/plugins/antigravity-devspec-autopilot-extension/scripts/devspec-remote-wait.mjs" --connection-id "conn-1" --owner-pid "$PPID" --pending',
+        CommandLine: 'node "/home/user/.gemini/config/plugins/devspec/scripts/devspec-remote-wait.mjs" --connection-id "conn-1" --owner-pid "$PPID" --pending',
         WaitMsBeforeAsync: 500,
       },
       { output: 'Command sent to background with background task ID: task-wait-1' },

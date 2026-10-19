@@ -91,7 +91,7 @@ export function parseHookCwd(hookInput, fallbackCwd = process.cwd()) {
 
 /**
  * Remove any leftover untracked placeholder `mcp_config.json` inside the plugin
- * directory so Antigravity does not hang trying to connect `antigravity-devspec-autopilot-extension_devspec`.
+ * directory so Antigravity does not hang trying to connect `devspec_devspec`.
  */
 export function cleanupLegacyPluginMcpConfig({ pluginRoot = PLUGIN_ROOT } = {}) {
   if (!pluginRoot) return { removed: false, reason: 'no_plugin_root' }
@@ -172,7 +172,7 @@ export function ensureStatusLineConfigured({
  * or `.devspec/project.json` (`connect_at_startup: true`).
  * Defaults to `false` in Antigravity because `agy` only exposes `ANTIGRAVITY_CSRF_TOKEN` and
  * `ANTIGRAVITY_LS_ADDRESS` to child processes of the `run_command` tool (invoked by
- * `/antigravity-devspec-autopilot-extension:devspec-remote`), so connections registered at startup
+ * `/devspec-remote`), so connections registered at startup
  * before `/devspec-remote` is run cannot receive remote wakes via `agentapi`.
  */
 export function connectAtStartupEnabled(

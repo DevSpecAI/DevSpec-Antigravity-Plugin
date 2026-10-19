@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.18.1
+
+### Rename plugin and install directory from `autopilot` to `devspec` with legacy directory fallback
+
+- **Plugin identity and install directory (`plugin.json`, `package.json`, `README.md`, `docs/remote-control/remote-control-antigravity.md`):** Renamed `plugin.json` `name` from `devspec-autopilot` to `devspec`, removed `"autopilot"` from `package.json` keywords, and updated setup and update instructions to use `~/.gemini/config/plugins/devspec` and the short slash commands (`/devspec-remote`, `/devspec-remote-stop`, `/devspec-project`).
+- **Backwards-compatible script path fallback (`rules/AGENTS.md`, `skills/devspec-remote/SKILL.md`, `skills/devspec-remote-stop/SKILL.md`, `skills/devspec-project/SKILL.md`):** Skill and rule commands resolve `$HOME/.gemini/config/plugins/devspec` first and fall back to `$HOME/.gemini/config/plugins/antigravity-devspec-autopilot-extension` so existing installations continue working before the folder is renamed on disk.
+
 ## 0.18.0
 
 Tasks cutover candidate; activation is held pending coordinated release.

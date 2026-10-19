@@ -21,7 +21,7 @@ Antigravity is **not** OpenCode-native inject and **not** the Codex app-server b
 
 | Topic | Antigravity |
 |---|---|
-| Invoke remote | Explicit `/antigravity-devspec-autopilot-extension:devspec-remote` (`scripts/devspec-remote-connect.mjs`) captures `ANTIGRAVITY_CSRF_TOKEN` + `ANTIGRAVITY_LS_ADDRESS` from `run_command` and starts `scripts/devspec-remote-poll.mjs` + `scripts/devspec-remote-listen.mjs` (`agentapi` wake delivery, or `scripts/devspec-remote-wait.mjs` fallback) |
+| Invoke remote | Explicit `/devspec-remote` (`scripts/devspec-remote-connect.mjs`) captures `ANTIGRAVITY_CSRF_TOKEN` + `ANTIGRAVITY_LS_ADDRESS` from `run_command` and starts `scripts/devspec-remote-poll.mjs` + `scripts/devspec-remote-listen.mjs` (`agentapi` wake delivery, or `scripts/devspec-remote-wait.mjs` fallback) |
 | Plugin rules | `rules/AGENTS.md` loaded automatically by `agy` when the plugin is enabled; personal + project rules cached to `<connectionId>.rules.md` (`scripts/instruction-rules.mjs`) |
 | Bond id | Host conversation / session env or native hook stdin (`conversation_id` / `session_id`) — never invent an id that won’t survive the next turn |
 | Agent name | `Antigravity` via `agent-identity` (no silent fallback to another host’s name) |
