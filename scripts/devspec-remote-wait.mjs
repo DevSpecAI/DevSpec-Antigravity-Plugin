@@ -491,6 +491,13 @@ export function parseOwnerBatches(lines, connectionId) {
   )
 }
 
+export const NOTICE_HANDLING =
+  'Handling: the labelled records above are your reading context — never dump their full text into the conversation. ' +
+  'Act only within the allowed outcomes and tools, based on who asked for the work (remember a teammate can drive someone else\'s agent, so the requester\'s authority is what counts), their authority, and whether this finding is already understood or new information: ' +
+  '(1) If it is a descriptive staleness flag and the change the requester asked for clearly makes that detail out of date, update or retire it straight away without asking permission and mention what you updated in one brief sentence (or say it was queued if their role queues a proposal); ask only if the right change is unclear or surfaces something new. ' +
+  '(2) If it is a decision conflict or duplicate and the requester has authority to settle it and has already clearly asked to proceed despite the earlier record, act for them straight away without a redundant confirmation and confirm briefly in context. ' +
+  '(3) If the finding brings new information or a consequence the requester did not appear aware of, or if the requester does not have authority to settle it themselves, explain what clashes and why in plain words in context (plus who it waits on when they cannot give the OK) and recommend the practical options.'
+
 export function formatSystemNoticeContent(notice) {
   if (notice?.kind === 'server_notice') {
     const lines = [
@@ -516,8 +523,7 @@ export function formatSystemNoticeContent(notice) {
     }
     lines.push(
       '',
-      'Tell the person: say in plain words what this notice means for the work, and quote each labelled record above as delivered (its label, title and text), not a paraphrase of it. ' +
-        'Then act only within the allowed outcomes and tools. An answer, OK, ruling or ownership choice that belongs to a person is theirs to give: ask them, never give it for them.',
+      NOTICE_HANDLING,
       'Authority: exact_connection_system_notice (devspec://product/remote-ingress-contract). ' +
         'This is a server-initiated notice on your own work, not a room message or new work authorization.',
     )
