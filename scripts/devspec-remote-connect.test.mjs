@@ -29,8 +29,12 @@ import { formatRoomStateJson, shouldAssertTurnOnPollerInboxWrite } from './devsp
 import { capTrailForPreToolHook } from './devspec-tool-input.mjs'
 import { formatTiersForStartup, readTiersFor, storeTiers } from './instruction-tiers.mjs'
 import {
+  buildListenerSpawnEnv,
   discoverAntigravityLsAddress,
+  ensureListenerForConnection,
+  listenerInfoPath,
   resolveLocalAction,
+  stopListenerForConnection,
   writeLocalBond,
   writeStateFile,
 } from './remote-control-state.mjs'
@@ -1324,6 +1328,86 @@ describe('Wandering Otter zombie & Working status regression guards (item bbf7b6
       assert.ok(noticeHandoffContent.includes('Notice 12:'))
     } finally {
       fs.rmSync(handoffDir, { recursive: true, force: true })
+    }
+  })
+
+  it('prefers target connection state.ls_address, state.csrf_token, and state.local_id over caller-inherited ANTIGRAVITY_* env vars (item 31f469fe)', async () => {
+    // 1. deliverWakeViaAgentApi uses state.ls_address and state.csrf_token ahead of inherited env
+    const capturedEnvs = []
+    const res = await deliverWakeViaAgentApi({
+      conversationId: CONV_ID,
+      message: 'wake payload',
+      env: {
+        ANTIGRAVITY_LS_ADDRESS: 'localhost:42025',
+        ANTIGRAVITY_CSRF_TOKEN: 'spawner-stale-csrf',
+        ANTIGRAVITY_AGENTAPI_EXE: '/stale/spawner/agy',
+      },
+      state: {
+        connection_id: CONN_ID,
+        ls_address: 'localhost:36967',
+        csrf_token: 'target-conn-csrf',
+        agentapi_exe: '/target/conn/agy',
+      },
+      execFileImpl: (_bin, _args, opts, cb) => {
+        capturedEnvs.push(opts?.env || {})
+        cb(null, '{"status":"ok"}', '')
+      },
+      existsImpl: (file) => file === '/target/conn/agy',
+    })
+    assert.equal(res.ok, true)
+    assert.equal(capturedEnvs[0].ANTIGRAVITY_LS_ADDRESS, 'localhost:36967')
+    assert.equal(capturedEnvs[0].ANTIGRAVITY_CSRF_TOKEN, 'target-conn-csrf')
+    assert.equal(capturedEnvs[0].ANTIGRAVITY_AGENTAPI_EXE, '/target/conn/agy')
+
+    // 2. buildListenerSpawnEnv strips another window's session env vars and populates the target connection's values
+    const targetState = {
+      connection_id: CONN_ID,
+      local_id: CONV_ID,
+      owner_pid: process.pid,
+      ls_address: 'localhost:36967',
+      csrf_token: 'target-conn-csrf',
+      agentapi_exe: '/home/n3o/.local/bin/agy',
+    }
+    const cleanSpawnEnv = buildListenerSpawnEnv(targetState, {
+      env: {
+        PATH: process.env.PATH,
+        ANTIGRAVITY_LS_ADDRESS: 'localhost:42025',
+        ANTIGRAVITY_CSRF_TOKEN: 'spawner-csrf',
+        ANTIGRAVITY_CONVERSATION_ID: 'aaaea71c-aa90-4b01-8c93-c1d2c80d8bd1',
+        AGY_CONVERSATION_ID: 'aaaea71c-aa90-4b01-8c93-c1d2c80d8bd1',
+        ANTIGRAVITY_SOURCE_METADATA: '{"tool":"from-spawner"}',
+      },
+    })
+    assert.equal(cleanSpawnEnv.ANTIGRAVITY_LS_ADDRESS, 'localhost:36967')
+    assert.equal(cleanSpawnEnv.ANTIGRAVITY_CSRF_TOKEN, 'target-conn-csrf')
+    assert.equal(cleanSpawnEnv.ANTIGRAVITY_CONVERSATION_ID, CONV_ID)
+    assert.equal('AGY_CONVERSATION_ID' in cleanSpawnEnv, false)
+    assert.equal('ANTIGRAVITY_SOURCE_METADATA' in cleanSpawnEnv, false)
+
+    // 3. ensureListenerForConnection resolves localId / state.local_id and records it in listener.json
+    const connDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-listener-env-'))
+    try {
+      writeStateFile(CONN_ID, targetState, connDir)
+      const spawned = ensureListenerForConnection(CONN_ID, {
+        connDir,
+        ownerPid: process.pid,
+        reuseRunning: false,
+        env: {
+          ...process.env,
+          ANTIGRAVITY_LS_ADDRESS: 'localhost:42025',
+          ANTIGRAVITY_CSRF_TOKEN: 'spawner-csrf',
+          ANTIGRAVITY_CONVERSATION_ID: 'aaaea71c-aa90-4b01-8c93-c1d2c80d8bd1',
+        },
+      })
+      assert.equal(spawned.ok, true)
+      const listenerMeta = JSON.parse(
+        fs.readFileSync(listenerInfoPath(CONN_ID, connDir), 'utf8'),
+      )
+      assert.equal(listenerMeta.conversation_id, CONV_ID)
+      stopListenerForConnection(CONN_ID, connDir)
+    } finally {
+      stopListenerForConnection(CONN_ID, connDir)
+      fs.rmSync(connDir, { recursive: true, force: true })
     }
   })
 })
