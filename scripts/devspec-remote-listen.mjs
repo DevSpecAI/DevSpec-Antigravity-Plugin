@@ -39,11 +39,22 @@ import {
   writeLocalBond,
   writeStateFile,
 } from './remote-control-state.mjs'
-import { ensurePrivateDir } from './private-state.mjs'
+import { ensurePrivateDir, writePrivateText } from './private-state.mjs'
 import { recordDeliveredBatchRequests } from './requests.mjs'
 import { autoConnectAtStartup, connectAtStartupEnabled } from './session-start.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
+
+/**
+ * Linux `execve` caps each individual argv string at `MAX_ARG_STRLEN` (131,072 bytes).
+ * `deliverWakeViaAgentApi` passes the wake payload as a single CLI argument to
+ * `agy agentapi send-message <conversationId> <message>`. Wakes at or below 64 KB
+ * (half of `MAX_ARG_STRLEN`) travel inline for zero-latency reading; wakes above
+ * 64 KB write their complete uncut readable body to an owner-only (`0600`) local
+ * handoff file in the connection directory and carry the file path + canonical JSON
+ * metadata inline so `execFile` can never fail with `spawn E2BIG` (item 5019ecc9).
+ */
+export const MAX_INLINE_WAKE_BYTES = 65_536
 
 export const POLLER_CHECK_INTERVAL_MS = 2_500
 export const POLLER_MISSES_BEFORE_REPAIR = 2
@@ -287,12 +298,69 @@ export function parseListenArgs(argv = []) {
   return out
 }
 
+function sanitizeWakeToken(value, fallback = 'wake') {
+  const cleaned = String(value || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 96)
+  return cleaned || fallback
+}
+
+function finalizeWakeWithOptionalFileHandoff({
+  headerLines,
+  bodyLines,
+  summaryLine,
+  streamJson,
+  connectionId,
+  wakeId,
+  maxInlineBytes = MAX_INLINE_WAKE_BYTES,
+  handoffDir = CONNECTIONS_DIR,
+  writeHandoffFile = writePrivateText,
+}) {
+  const fullLines = [...headerLines, ...bodyLines]
+  if (streamJson) fullLines.push(streamJson)
+  const fullWake = fullLines.join('\n\n')
+  if (
+    bodyLines.length === 0 ||
+    !Number.isFinite(maxInlineBytes) ||
+    Buffer.byteLength(fullWake, 'utf8') <= maxInlineBytes
+  ) {
+    return fullWake
+  }
+
+  const bodyText = bodyLines.join('\n\n') + '\n'
+  const bodyBytes = Buffer.byteLength(bodyText, 'utf8')
+  const safeConn = sanitizeWakeToken(connectionId, 'connection')
+  const safeWake = sanitizeWakeToken(wakeId, String(Date.now()))
+  const filePath = path.join(handoffDir, `${safeConn}.wake-${safeWake}.txt`)
+  try {
+    writeHandoffFile(filePath, bodyText)
+  } catch {
+    return fullWake
+  }
+
+  const handoffLines = [
+    ...headerLines,
+    ...(summaryLine ? [summaryLine] : []),
+    `Wake payload file: ${filePath} (${bodyBytes} bytes)\n` +
+      `REQUIRED: This wake exceeds the ${maxInlineBytes}-byte inline threshold for the 128 KB OS command-line argument limit. ` +
+      `Read ${filePath} in full with view_file before acting or replying — the complete, uncut text is stored there.`,
+  ]
+  if (streamJson) handoffLines.push(streamJson)
+  return handoffLines.join('\n\n')
+}
+
 /**
  * Format an inbox entry (`owner_messages`, `canonical_commands`, `canonical_system_notices`,
  * `automation_run`, `interaction_answer`, or `question_dismissal`) into a wake prompt
  * suitable for `agentapi send-message` / `agentapi new-conversation`.
  * Includes both the `[DevSpec Remote Wake]` summary header and the full canonical
  * JSON lines from `formatInboxEntryForStream` (`rearm: "already_armed"`).
+ * When the assembled wake exceeds `MAX_INLINE_WAKE_BYTES` (64 KB), writes the complete
+ * uncut readable body to an owner-only (`0600`) local handoff file in `handoffDir`
+ * and replaces the inline body section with the handoff file path and a required-read
+ * instruction so `agentapi` never fails with `spawn E2BIG`.
  */
 export function buildWakeDeliveryMessage(entry, opts = {}) {
   if (!entry || typeof entry !== 'object') return null
@@ -301,6 +369,12 @@ export function buildWakeDeliveryMessage(entry, opts = {}) {
     ...opts,
     rearm: opts.rearm ?? 'already_armed',
   }
+  const effectiveConnId =
+    opts.connectionId ||
+    entry.connection_id ||
+    entry.ingress?.connection?.connection_id ||
+    entry.dispatch?.delivery_connection_id ||
+    null
 
   if (entry.type === 'canonical_commands') {
     const ingress = entry.ingress
@@ -315,19 +389,32 @@ export function buildWakeDeliveryMessage(entry, opts = {}) {
       ? ingress.commands.filter((c) => executeIds.size === 0 || executeIds.has(c?.message_id))
       : []
     if (commands.length === 0) return null
-    const lines = ['[DevSpec Remote Wake]']
-    if (entry.session_id) lines.push(`Session: ${entry.session_id}`)
-    if (entry.wake_context?.transcript) lines.push(`Room transcript: ${entry.wake_context.transcript}`)
-    if (entry.wake_context?.room_state) lines.push(`Room state: ${entry.wake_context.room_state}`)
-    if (entry.instruction_context_file) lines.push(`Instructions file: ${entry.instruction_context_file}`)
+    const headerLines = ['[DevSpec Remote Wake]']
+    if (entry.session_id) headerLines.push(`Session: ${entry.session_id}`)
+    if (entry.wake_context?.transcript) headerLines.push(`Room transcript: ${entry.wake_context.transcript}`)
+    if (entry.wake_context?.room_state) headerLines.push(`Room state: ${entry.wake_context.room_state}`)
+    if (entry.instruction_context_file) headerLines.push(`Instructions file: ${entry.instruction_context_file}`)
+    const bodyLines = []
+    const senders = []
     for (const c of commands) {
       const sender = c?.requester?.display_name || 'Owner'
+      const authKind = c?.authority?.kind || 'owner'
+      senders.push(`${sender} (${authKind})`)
       const body = typeof c?.content?.body === 'string' ? c.content.body.trim() : ''
-      if (body) lines.push(`${sender} (${c?.authority?.kind || 'owner'}): ${body}`)
+      if (body) bodyLines.push(`${sender} (${authKind}): ${body}`)
     }
     const streamJson = formatInboxEntryForStream(entry, { ...streamOpts, includeBody: false })
-    if (streamJson) lines.push(streamJson)
-    return lines.join('\n\n')
+    return finalizeWakeWithOptionalFileHandoff({
+      headerLines,
+      bodyLines,
+      summaryLine: `Command from ${senders.join(', ')} (${commands.length} message${commands.length === 1 ? '' : 's'}):`,
+      streamJson,
+      connectionId: effectiveConnId,
+      wakeId: ingress?.envelope_id || commands[0]?.message_id,
+      maxInlineBytes: opts.maxInlineBytes,
+      handoffDir: opts.handoffDir,
+      writeHandoffFile: opts.writeHandoffFile,
+    })
   }
 
   if (entry.type === 'canonical_system_notices') {
@@ -343,15 +430,28 @@ export function buildWakeDeliveryMessage(entry, opts = {}) {
       ? ingress.system_notices.filter((n) => executeIds.size === 0 || executeIds.has(n?.notice_id))
       : []
     if (notices.length === 0) return null
-    const lines = ['[DevSpec Remote Wake]']
-    if (entry.session_id) lines.push(`Session: ${entry.session_id}`)
+    const headerLines = ['[DevSpec Remote Wake]']
+    if (entry.session_id) headerLines.push(`Session: ${entry.session_id}`)
+    const bodyLines = []
     for (const notice of notices) {
       const formatted = formatSystemNoticeContent(notice)
-      if (formatted) lines.push(formatted)
+      if (formatted) bodyLines.push(formatted)
     }
     const streamJson = formatInboxEntryForStream(entry, { ...streamOpts, includeContent: false })
-    if (streamJson) lines.push(streamJson)
-    return lines.join('\n\n')
+    const topics = notices
+      .map((n) => (n?.topic && n?.notice_type ? `${n.topic}/${n.notice_type}` : n?.kind || 'notice'))
+      .join(', ')
+    return finalizeWakeWithOptionalFileHandoff({
+      headerLines,
+      bodyLines,
+      summaryLine: `[DevSpec System Notices: ${notices.length} notice${notices.length === 1 ? '' : 's'} (${topics})]`,
+      streamJson,
+      connectionId: effectiveConnId,
+      wakeId: ingress?.envelope_id || notices[0]?.notice_id,
+      maxInlineBytes: opts.maxInlineBytes,
+      handoffDir: opts.handoffDir,
+      writeHandoffFile: opts.writeHandoffFile,
+    })
   }
 
   if (entry.type === 'automation_run' && entry.dispatch) {
@@ -389,10 +489,11 @@ export function buildWakeDeliveryMessage(entry, opts = {}) {
   const msgs = Array.isArray(entry.messages) ? entry.messages : []
   if (msgs.length === 0) return null
 
-  const lines = ['[DevSpec Remote Wake]']
+  const headerLines = ['[DevSpec Remote Wake]']
   if (entry.session_id) {
-    lines.push(`Session: ${entry.session_id}`)
+    headerLines.push(`Session: ${entry.session_id}`)
   }
+  const bodyLines = []
   for (const m of msgs) {
     const sender =
       m?.author?.display_name ||
@@ -406,12 +507,21 @@ export function buildWakeDeliveryMessage(entry, opts = {}) {
           ? m.content.body.trim()
           : ''
     if (content) {
-      lines.push(`${sender}: ${content}`)
+      bodyLines.push(`${sender}: ${content}`)
     }
   }
   const streamJson = formatInboxEntryForStream(entry, { ...streamOpts, includeBody: false })
-  if (streamJson) lines.push(streamJson)
-  return lines.join('\n\n')
+  return finalizeWakeWithOptionalFileHandoff({
+    headerLines,
+    bodyLines,
+    summaryLine: `Owner message (${msgs.length} message${msgs.length === 1 ? '' : 's'}):`,
+    streamJson,
+    connectionId: effectiveConnId,
+    wakeId: msgs[0]?.id || entry.next_after_message_id,
+    maxInlineBytes: opts.maxInlineBytes,
+    handoffDir: opts.handoffDir,
+    writeHandoffFile: opts.writeHandoffFile,
+  })
 }
 
 /**
