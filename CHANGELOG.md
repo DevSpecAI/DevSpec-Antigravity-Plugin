@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.18.4
+
+### Local-file handoff (`MAX_INLINE_WAKE_BYTES = 65_536`) for >64 KB remote wakes
+
+- **Threshold-based local-file handoff (`scripts/devspec-remote-listen.mjs`, `scripts/devspec-remote-connect.test.mjs`).** `buildWakeDeliveryMessage` now enforces `MAX_INLINE_WAKE_BYTES = 65_536` (64 KB, half of Linux's 131,072-byte `MAX_ARG_STRLEN`). Wakes at or below 64 KB are delivered inline in a single turn with zero extra tool calls, while any wake exceeding 64 KB writes its complete, uncut readable body to an owner-only (`0600`) local file (`<connDir>/<connectionId>.wake-<wakeId>.txt`) and replaces the inline body section with the handoff file path, byte length, and a required-read instruction alongside the intact canonical JSON metadata lines.
+
 ## 0.18.3
 
 ### Deduplicate `system_notice`, command, and question-answer wake payloads (`E2BIG` prevention)

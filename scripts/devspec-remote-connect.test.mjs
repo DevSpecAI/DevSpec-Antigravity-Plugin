@@ -20,7 +20,11 @@ import {
   parseArgs as parseConnectArgs,
   renderStatusBlock,
 } from './devspec-remote-connect.mjs'
-import { buildWakeDeliveryMessage, deliverWakeViaAgentApi } from './devspec-remote-listen.mjs'
+import {
+  buildWakeDeliveryMessage,
+  deliverWakeViaAgentApi,
+  MAX_INLINE_WAKE_BYTES,
+} from './devspec-remote-listen.mjs'
 import { formatRoomStateJson, shouldAssertTurnOnPollerInboxWrite } from './devspec-remote-poll.mjs'
 import { capTrailForPreToolHook } from './devspec-tool-input.mjs'
 import { formatTiersForStartup, readTiersFor, storeTiers } from './instruction-tiers.mjs'
@@ -1186,6 +1190,140 @@ describe('Wandering Otter zombie & Working status regression guards (item bbf7b6
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
       fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('spills wake payloads exceeding MAX_INLINE_WAKE_BYTES (65536) to an owner-only local handoff file while keeping normal wakes inline', () => {
+    assert.equal(MAX_INLINE_WAKE_BYTES, 65_536)
+    const handoffDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-wake-handoff-'))
+    try {
+      // 1. Normal command wake <= 64 KB stays inline and writes no handoff file
+      const smallMsg = buildWakeDeliveryMessage(
+        {
+          type: 'canonical_commands',
+          session_id: SESS_ID,
+          execute_message_ids: ['msg-small-1'],
+          ingress: {
+            commands: [
+              {
+                message_id: 'msg-small-1',
+                requester: { display_name: 'Ali Price', user_id: 'u-1', kind: 'human' },
+                authority: { kind: 'owner', target_match: 'exact', executable: true },
+                content: { body: 'Please run tests and report back.' },
+                delivery: {
+                  provenance_ref: {
+                    kind: 'session_command',
+                    session_id: SESS_ID,
+                    message_id: 'msg-small-1',
+                  },
+                },
+              },
+            ],
+          },
+        },
+        { connectionId: CONN_ID, handoffDir },
+      )
+      assert.ok(smallMsg.includes('Please run tests and report back.'))
+      assert.equal(smallMsg.includes('Wake payload file:'), false)
+      assert.deepEqual(fs.readdirSync(handoffDir), [])
+
+      // 2. Large command wake > 64 KB writes full uncut body to 0600 handoff file and emits compact wake
+      const hugeBody = `START_MARKER_${'Detailed specification paragraph. '.repeat(2200)}_END_MARKER`
+      assert.ok(Buffer.byteLength(hugeBody, 'utf8') > MAX_INLINE_WAKE_BYTES)
+      const hugeCmdWake = buildWakeDeliveryMessage(
+        {
+          type: 'canonical_commands',
+          session_id: SESS_ID,
+          execute_message_ids: ['2a88bbf8-f04f-41ac-8c05-c1442b8ac43a'],
+          ingress: {
+            commands: [
+              {
+                message_id: '2a88bbf8-f04f-41ac-8c05-c1442b8ac43a',
+                requester: { display_name: 'Ali Price', user_id: 'u-1', kind: 'human' },
+                authority: { kind: 'owner', target_match: 'exact', executable: true },
+                content: { body: hugeBody },
+                delivery: {
+                  provenance_ref: {
+                    kind: 'session_command',
+                    session_id: SESS_ID,
+                    message_id: '2a88bbf8-f04f-41ac-8c05-c1442b8ac43a',
+                  },
+                },
+              },
+            ],
+          },
+        },
+        { connectionId: CONN_ID, handoffDir },
+      )
+      assert.ok(
+        Buffer.byteLength(hugeCmdWake, 'utf8') < 4096,
+        `expected compact wake (<4096 bytes), got ${Buffer.byteLength(hugeCmdWake, 'utf8')}`,
+      )
+      assert.equal(hugeCmdWake.includes('START_MARKER_'), false)
+      assert.match(hugeCmdWake, /Wake payload file: .*\.wake-2a88bbf8-f04f-41ac-8c05-c1442b8ac43a\.txt/)
+      assert.match(hugeCmdWake, /REQUIRED: This wake exceeds the 65536-byte inline threshold/)
+
+      const cmdHandoffPath = path.join(
+        handoffDir,
+        `${CONN_ID}.wake-2a88bbf8-f04f-41ac-8c05-c1442b8ac43a.txt`,
+      )
+      assert.equal(fs.existsSync(cmdHandoffPath), true)
+      const cmdHandoffContent = fs.readFileSync(cmdHandoffPath, 'utf8')
+      assert.ok(cmdHandoffContent.includes(hugeBody), 'handoff file must preserve 100% of huge body')
+      if (process.platform !== 'win32') {
+        const mode = fs.statSync(cmdHandoffPath).mode & 0o777
+        assert.equal(mode, 0o600)
+      }
+      // Verify canonical JSON metadata lines remain intact in the wake
+      const cmdJsonLines = hugeCmdWake
+        .split('\n')
+        .filter((line) => line.startsWith('{') && line.endsWith('}'))
+        .map((line) => JSON.parse(line))
+      assert.equal(cmdJsonLines.length, 2)
+      assert.equal(cmdJsonLines[0].type, 'owner_message')
+      assert.equal(cmdJsonLines[0].message_id, '2a88bbf8-f04f-41ac-8c05-c1442b8ac43a')
+      assert.equal(cmdJsonLines[1].type, 'wake')
+      assert.equal(cmdJsonLines[1].rearm, 'already_armed')
+
+      // 3. Large system_notice batch > 64 KB writes full uncut notices to 0600 handoff file
+      const hugeNotices = Array.from({ length: 12 }, (_, idx) => ({
+        notice_id: `notice-huge-${idx + 1}`,
+        kind: 'server_notice',
+        topic: 'memory',
+        notice_type: 'conflict_flag',
+        summary: `Notice ${idx + 1}: ${'Detailed finding context and record comparison. '.repeat(140)}`,
+        prompt: 'Act within the notice allowed outcomes.',
+        records: [
+          {
+            label: 'Flagged record',
+            record_type: 'memory',
+            record_id: `mem-${idx + 1}`,
+            title: `Memory ${idx + 1}`,
+            text: 'Record body text. '.repeat(80),
+          },
+        ],
+      }))
+      const hugeNoticeWake = buildWakeDeliveryMessage(
+        {
+          type: 'canonical_system_notices',
+          session_id: SESS_ID,
+          ingress: {
+            system_notices: hugeNotices,
+          },
+        },
+        { connectionId: CONN_ID, handoffDir },
+      )
+      assert.ok(
+        Buffer.byteLength(hugeNoticeWake, 'utf8') < 16_384,
+        `expected compact notice wake (<16KB), got ${Buffer.byteLength(hugeNoticeWake, 'utf8')}`,
+      )
+      const noticeHandoffPath = path.join(handoffDir, `${CONN_ID}.wake-notice-huge-1.txt`)
+      assert.equal(fs.existsSync(noticeHandoffPath), true)
+      const noticeHandoffContent = fs.readFileSync(noticeHandoffPath, 'utf8')
+      assert.ok(noticeHandoffContent.includes('Notice 1:'))
+      assert.ok(noticeHandoffContent.includes('Notice 12:'))
+    } finally {
+      fs.rmSync(handoffDir, { recursive: true, force: true })
     }
   })
 })
