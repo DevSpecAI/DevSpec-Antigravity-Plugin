@@ -622,13 +622,16 @@ export function deliverWakeViaAgentApi({
     PATH: basePath.includes(defaultBinDir)
       ? basePath
       : `${defaultBinDir}${path.delimiter}${basePath}`,
-    ...(state?.ls_address && !env.ANTIGRAVITY_LS_ADDRESS
+    // Always prefer the target connection's stored ls_address, csrf_token, and
+    // agentapi_exe over inherited process.env values so a listener restarted from
+    // another Antigravity window never dials the spawner's port (item 31f469fe).
+    ...(state?.ls_address
       ? { ANTIGRAVITY_LS_ADDRESS: state.ls_address }
       : {}),
-    ...(state?.csrf_token && !env.ANTIGRAVITY_CSRF_TOKEN
+    ...(state?.csrf_token
       ? { ANTIGRAVITY_CSRF_TOKEN: state.csrf_token }
       : {}),
-    ...(state?.agentapi_exe && !env.ANTIGRAVITY_AGENTAPI_EXE
+    ...(state?.agentapi_exe
       ? { ANTIGRAVITY_AGENTAPI_EXE: state.agentapi_exe }
       : {}),
   }
@@ -711,15 +714,22 @@ function sleep(ms) {
 async function main() {
   const args = parseListenArgs(process.argv.slice(2))
   const cwd = args.cwd || process.env.ANTIGRAVITY_WORKSPACE_DIR || process.cwd()
-  let conversationId =
-    args.conversationId ||
+  const fallbackEnvConversationId =
     process.env.ANTIGRAVITY_CONVERSATION_ID ||
     process.env.AGY_CONVERSATION_ID ||
     null
 
   let state = args.connectionId
     ? readStateFile(args.connectionId)
-    : loadState(conversationId)
+    : loadState(args.conversationId || fallbackEnvConversationId)
+
+  // Prefer the target connection's stored local_id ahead of an inherited
+  // ANTIGRAVITY_CONVERSATION_ID when --connection-id is passed (item 31f469fe).
+  let conversationId =
+    args.conversationId ||
+    state?.local_id ||
+    fallbackEnvConversationId ||
+    null
 
   if (!state?.connection_id && connectAtStartupEnabled(process.env, { cwd })) {
     try {
@@ -739,7 +749,7 @@ async function main() {
   }
 
   state = readStateFile(connectionId) || state
-  if (!conversationId && state?.local_id) {
+  if (!args.conversationId && state?.local_id) {
     conversationId = state.local_id
   }
 

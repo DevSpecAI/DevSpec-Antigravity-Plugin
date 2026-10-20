@@ -133,6 +133,46 @@ export function stopListenerForConnection(connectionId, connDir = CONNECTIONS_DI
   return { connection_id: connectionId, pid: Number.isInteger(pid) ? pid : null, killed }
 }
 
+export function buildListenerSpawnEnv(
+  state,
+  { env = process.env, ownerPid = null, conversationId = null } = {},
+) {
+  const baseEnv = env || process.env
+  const childEnv = { ...baseEnv }
+  if (!state) return childEnv
+
+  const effectiveConversationId = conversationId || state.local_id || null
+  const sameConversationAsCaller =
+    !state.local_id ||
+    !baseEnv?.ANTIGRAVITY_CONVERSATION_ID ||
+    state.local_id === baseEnv.ANTIGRAVITY_CONVERSATION_ID
+
+  delete childEnv.ANTIGRAVITY_LS_ADDRESS
+  delete childEnv.ANTIGRAVITY_CSRF_TOKEN
+  delete childEnv.ANTIGRAVITY_CONVERSATION_ID
+  delete childEnv.AGY_CONVERSATION_ID
+  delete childEnv.ANTIGRAVITY_SOURCE_METADATA
+
+  const targetLsAddress =
+    state.ls_address ||
+    discoverAntigravityLsAddress(ownerPid ?? state.owner_pid, {}) ||
+    (sameConversationAsCaller ? baseEnv?.ANTIGRAVITY_LS_ADDRESS : null) ||
+    null
+  const targetCsrfToken =
+    state.csrf_token ||
+    (sameConversationAsCaller ? baseEnv?.ANTIGRAVITY_CSRF_TOKEN : null) ||
+    null
+  const targetAgentApiExe = state.agentapi_exe || baseEnv?.ANTIGRAVITY_AGENTAPI_EXE || null
+
+  if (targetLsAddress) childEnv.ANTIGRAVITY_LS_ADDRESS = targetLsAddress
+  if (targetCsrfToken) childEnv.ANTIGRAVITY_CSRF_TOKEN = targetCsrfToken
+  if (targetAgentApiExe) childEnv.ANTIGRAVITY_AGENTAPI_EXE = targetAgentApiExe
+  if (effectiveConversationId) {
+    childEnv.ANTIGRAVITY_CONVERSATION_ID = String(effectiveConversationId)
+  }
+  return childEnv
+}
+
 export function ensureListenerForConnection(connectionId, opts = {}) {
   if (!connectionId || connectionId.length < 8) return { ok: false, error: 'missing connection id' }
   if (!fs.existsSync(LISTENER_SCRIPT)) {
@@ -149,11 +189,16 @@ export function ensureListenerForConnection(connectionId, opts = {}) {
       owner_pid: info?.owner_pid || null,
     }
   }
+  const state = readStateFile(connectionId, connDir)
   const resolveOwnerPidFn = opts.resolveOwnerPid || resolveOwnerPid
-  const ownerPid = resolveOwnerPidFn(opts.ownerPid, null)
+  const ownerPid = resolveOwnerPidFn(opts.ownerPid, state?.owner_pid || null)
   if (ownerPid === null) {
     return { ok: false, error: 'missing owner_pid for listener' }
   }
+  const effectiveConversationId =
+    opts.conversationId || opts.localId || state?.local_id || null
+  const effectiveCwd = opts.cwd || state?.cwd || process.cwd()
+
   stopListenerForConnection(connectionId, connDir)
   const logPath = path.join(connDir, `${connectionId}.listen.log`)
   let logFd
@@ -164,17 +209,25 @@ export function ensureListenerForConnection(connectionId, opts = {}) {
     return { ok: false, error: `could not open listen log: ${e.message}` }
   }
   const listenArgs = [LISTENER_SCRIPT, '--connection-id', connectionId, '--owner-pid', String(ownerPid)]
-  if (opts.conversationId) listenArgs.push('--conversation-id', String(opts.conversationId))
-  if (opts.cwd) listenArgs.push('--cwd', String(opts.cwd))
+  if (effectiveConversationId) {
+    listenArgs.push('--conversation-id', String(effectiveConversationId))
+  }
+  if (effectiveCwd) listenArgs.push('--cwd', String(effectiveCwd))
+
+  const childEnv = buildListenerSpawnEnv(state, {
+    env: opts.env || process.env,
+    ownerPid,
+    conversationId: effectiveConversationId,
+  })
 
   let child
   try {
     child = spawn(process.execPath, listenArgs, {
-      cwd: opts.cwd || process.cwd(),
+      cwd: effectiveCwd,
       detached: true,
       stdio: ['ignore', logFd, logFd],
       windowsHide: true,
-      env: opts.env || process.env,
+      env: childEnv,
     })
   } catch (e) {
     try {
@@ -196,7 +249,7 @@ export function ensureListenerForConnection(connectionId, opts = {}) {
     pid,
     owner_pid: ownerPid,
     connection_id: connectionId,
-    conversation_id: opts.conversationId || null,
+    conversation_id: effectiveConversationId,
     status: 'serving',
     started_at: new Date().toISOString(),
   }

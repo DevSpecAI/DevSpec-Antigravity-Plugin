@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.18.5
+
+### Prefer target connection's stored `ls_address`, `csrf_token`, and `local_id` over inherited environment in background listeners
+
+- **Target-connection `agentapi` credentials in `deliverWakeViaAgentApi` and `ensureListenerForConnection` (`scripts/devspec-remote-listen.mjs`, `scripts/remote-control-state.mjs`, `scripts/devspec-remote-connect.test.mjs`).** When a listener is restarted from another Antigravity window or helper script, the spawner's `ANTIGRAVITY_LS_ADDRESS`, `ANTIGRAVITY_CSRF_TOKEN`, and `ANTIGRAVITY_CONVERSATION_ID` previously rode along in `process.env` and overrode the target connection's own `<connectionId>.json` state (`state?.ls_address && !env.ANTIGRAVITY_LS_ADDRESS`). `deliverWakeViaAgentApi` now always prefers `state.ls_address`, `state.csrf_token`, and `state.agentapi_exe` when `state` provides them; `ensureListenerForConnection` strips caller-inherited session environment variables and populates `ANTIGRAVITY_*` from the target connection's stored state (accepting `opts.localId` or `state.local_id` when `opts.conversationId` is omitted); and `devspec-remote-listen.mjs` prefers `state.local_id` over `process.env.ANTIGRAVITY_CONVERSATION_ID` when `--connection-id` is passed.
+
 ## 0.18.4
 
 ### Local-file handoff (`MAX_INLINE_WAKE_BYTES = 65_536`) for >64 KB remote wakes
