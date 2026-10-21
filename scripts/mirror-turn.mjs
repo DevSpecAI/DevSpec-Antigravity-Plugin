@@ -1203,7 +1203,7 @@ export async function streamTurnTrailIfChanged(
     home = os.homedir(),
   } = {},
 ) {
-  if (!state?.connection_id || !state?.session_id) {
+  if (!state?.connection_id) {
     return { streamed: false, reason: 'not_attached' }
   }
   const connectionId = state.connection_id
@@ -1213,6 +1213,9 @@ export async function streamTurnTrailIfChanged(
   const marker = readTurnMarker(connectionId, connectionsDir)
   if (!marker || marker.held) {
     return { streamed: false, reason: 'no_active_turn' }
+  }
+  if (!state.session_id && !marker.remoteTurn) {
+    return { streamed: false, reason: 'not_attached' }
   }
   const tPath =
     normalizeTranscriptPath(state.transcript_path) ||
@@ -1272,7 +1275,7 @@ export async function streamTurnTrailIfChanged(
   const telemetry = readConnectionTelemetry(connectionId, { home })
   const postArgs = {
     connection_id: connectionId,
-    session_id: state.session_id,
+    ...(state.session_id ? { session_id: state.session_id } : {}),
     agent_name: AGENT_NAME,
     phase: 'trail',
     message: trail.markdown,

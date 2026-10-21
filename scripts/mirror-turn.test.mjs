@@ -893,6 +893,32 @@ describe('Antigravity native hook payload & transcript handling', () => {
       assert.equal(finalPost.arguments.complete_turn, true)
       assert.equal(finalPost.arguments.message, 'All checks passed and work item is claimed.')
       assert.equal(finalPost.arguments.trail_events.length, 4)
+
+      // Sessionless remote turn (e.g. automation run on unattached agent) streams trail without session_id
+      const sessionlessState = {
+        ...state,
+        session_id: null,
+      }
+      writeTurnMarker(connId, { startedAt: startedAt + 10, remoteTurn: true, held: false }, tmpDir)
+      calls.length = 0
+      const sessionlessRemoteStream = await streamTurnTrailIfChanged(sessionlessState, {
+        connectionsDir: tmpDir,
+        call: mockCall,
+      })
+      assert.equal(sessionlessRemoteStream.streamed, true)
+      assert.equal(calls.length, 1)
+      assert.equal(calls[0].arguments.connection_id, connId)
+      assert.equal(calls[0].arguments.session_id, undefined)
+      assert.equal(calls[0].arguments.phase, 'trail')
+
+      // Sessionless local turn does not stream trail
+      writeTurnMarker(connId, { startedAt: startedAt + 20, remoteTurn: false, held: false }, tmpDir)
+      const sessionlessLocalStream = await streamTurnTrailIfChanged(sessionlessState, {
+        connectionsDir: tmpDir,
+        call: mockCall,
+      })
+      assert.equal(sessionlessLocalStream.streamed, false)
+      assert.equal(sessionlessLocalStream.reason, 'not_attached')
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true })
     }
