@@ -57,7 +57,7 @@ When working in a DevSpec-connected project or remote-controlled session in Anti
      - **Resources / documents (`id` is UUID or 8-char short code — NOT `resource_id`; kind is `resource_type` — NOT `type`):**
        - `get_resource`: `{ id, start_line?, end_line?, search?, project_id? }` (for long documents, pass `start_line`/`end_line` or `search`)
        - `search_resources`: `{ query?, scope?: "all"|"project"|"session", source?: "uploaded"|"ai_generated"|"all", limit?, offset? }`
-       - `create_resource`: `{ title, resource_type: "adr"|"guide"|"checklist"|"plan"|"summary"|"convention"|"runbook"|"reference"|"other", body?, summary?, tags?: string[], delivering_task_id?, idempotency_key? }`
+       - `create_resource`: `{ title, resource_type: "guide"|"reference"|"runbook", body?, summary?, tags?: string[], delivering_task_id?, idempotency_key? }`
        - `update_resource`: `{ id, title?, summary?, tags?: string[], body_edits?: [{ op: "replace"|"append", find?, content }], body?, expected_version?, idempotency_key? }` (prefer `body_edits`; note that title/summary/body edits create a **new** `id` and retire the old one — use the returned `id` for any subsequent edit)
      - **Review decisions** (read `get_review_queue` first; pass its ids and revisions exactly):
        - `get_review_queue`: `{ kind?: ["question"|"proposal"], search?, key?, state?, limit?, cursor? }`: what waits on a ruling or an acceptance.
