@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.18.6
+
+### Task field partitioning guidance in `rules/AGENTS.md`
+
+- **Substantive field partitioning (`rules/AGENTS.md`).** Updated Section 6 (`create_task` / `update_task`) to instruct agents to place *why* the task exists, speaker attribution/quotes, and desired outcome in `intent`; write the complete product behaviour and architectural or technical mechanism in natural English in `description` (since duplicate and reversal screening reads `title`, `intent`, and `description`, never `ai_instructions`); keep `acceptance_criteria` as plain-prose checkable conditions; and place raw file paths, line numbers, code snippets, CSS classes, and file-by-file edit recipes in `ai_instructions`.
+
 ## 0.18.5
 
 ### Prefer target connection's stored `ls_address`, `csrf_token`, and `local_id` over inherited environment in background listeners
