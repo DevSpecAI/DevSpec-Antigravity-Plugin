@@ -8,9 +8,7 @@ import { describe, it } from 'node:test'
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const CONTRACT = 'devspec://product/implementation-contract'
 const CURRENT_SURFACES = [
-  'README.md',
-  'docs/remote-control/remote-control-antigravity.md',
-  'docs/remote-control/remote-control-overview.md',
+  'rules/AGENTS.md',
   'skills/devspec-remote/SKILL.md',
   'skills/devspec-remote-stop/SKILL.md',
   'scripts/devspec-remote-poll.mjs',
@@ -30,8 +28,6 @@ describe('MCP-served implementation contract', () => {
 
   it('keeps mutation-boundary behavior inside honest Antigravity host-limitation notes', () => {
     for (const relativePath of [
-      'README.md',
-      'docs/remote-control/remote-control-antigravity.md',
       'skills/devspec-remote/SKILL.md',
     ]) {
       const source = read(relativePath)
@@ -52,7 +48,7 @@ describe('MCP-served implementation contract', () => {
 
   it('contains no stale item-lifecycle restatements in current instruction surfaces', () => {
     // CHANGELOG.md is intentionally historical; its current release entry is checked below.
-    const current = CURRENT_SURFACES.map((file) => `${file}\n${read(file)}`).join('\n')
+    const current = [...CURRENT_SURFACES, 'README.md'].map((file) => `${file}\n${read(file)}`).join('\n')
     const stalePhrases = [
       'Nothing is ever sent work',
       'The batch closes itself',
@@ -83,13 +79,11 @@ describe('MCP-served implementation contract', () => {
 
   it('keeps Antigravity files independent rather than describing shared or synced tooling', () => {
     const independenceSurface = [
-      read('docs/remote-control/remote-control-antigravity.md'),
-      read('docs/remote-control/remote-control-overview.md'),
       read('scripts/devspec-remote-wait.mjs'),
       read('scripts/resolve-mcp-auth.mjs'),
     ].join('\n')
     assert.doesNotMatch(independenceSurface, /shares verbatim|SYNCED callers|cross-repo sync pipeline/)
-    assert.match(independenceSurface, /owns every plugin file|owns this script independently/i)
+    assert.match(independenceSurface, /owns every plugin file|owns every script in it|owns this script independently/i)
   })
 
   it('leaves PreInvocation on pre-invocation transport rather than inventing contract injection', () => {

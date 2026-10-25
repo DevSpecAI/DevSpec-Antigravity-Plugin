@@ -23,7 +23,7 @@ Multiple remotes may run on one machine (several Antigravity terminals).
    node "$PLUGIN_DIR/scripts/remote-control-state.mjs" resolve-local \
      --agent "Antigravity" --local-id "<local_id>"
    ```
-   (use its `connection_id`), or `~/.devspec/remote-control/connections/<uuid>.json`, or legacy `~/.devspec/remote-control.json`. If ambiguous, ask the user. Note its `session_id` (may be null = sessionless).
+   (use its `connection_id` and `session_id` from the helper's redacted output — never read the files under `~/.devspec/remote-control/` directly). If ambiguous, ask the user. Note its `session_id` (may be null = sessionless).
 
 2. **Mark the connection offline (this connection only)**, one path, attached or sessionless:
    ```bash

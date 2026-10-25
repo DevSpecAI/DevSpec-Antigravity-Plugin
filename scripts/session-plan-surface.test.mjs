@@ -52,6 +52,6 @@ describe('bounded Antigravity plan discovery and prompts', () => {
       assert.ok(poller.includes(field), field)
     }
     assert.match(poller, /active_session_plans/)
-    assert.match(read('docs/remote-control/remote-control-overview.md'), /read-awareness only/i)
+    assert.match(read('rules/AGENTS.md'), /read-awareness only/i)
   })
 })

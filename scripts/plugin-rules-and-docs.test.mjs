@@ -38,21 +38,12 @@ describe('Item 5 parity: rules/AGENTS.md, package version 0.15.0, and documentat
   it('documents ~/.gemini/config/mcp_config.json and why the plugin is required in README.md and has no non-existent agy flags', () => {
     const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8')
     assert.match(readme, /~\/\.gemini\/config\/mcp_config\.json/)
+    assert.match(readme, /https:\/\/api\.devspec\.ai\/api\/mcp/)
     assert.match(readme, /rules\/AGENTS\.md/)
     assert.match(readme, /Installing the plugin is required alongside the MCP server/)
     assert.match(readme, /local \(\/devspec-remote to connect\)/)
-    assert.match(readme, /devspec-remote-connect\.mjs/)
-    assert.match(readme, /room-unread\.mjs/)
+    assert.match(readme, /agy --dangerously-skip-permissions/)
+    assert.match(readme, /\/devspec-project/)
     assert.doesNotMatch(readme, /--install-plugin|--update-plugins/)
-
-    const antigravityDoc = fs.readFileSync(
-      path.join(ROOT, 'docs', 'remote-control', 'remote-control-antigravity.md'),
-      'utf8',
-    )
-    assert.match(antigravityDoc, /devspec-remote-connect\.mjs/)
-    assert.match(antigravityDoc, /room-transcript\.mjs/)
-    assert.match(antigravityDoc, /hook-output\.mjs/)
-    assert.match(antigravityDoc, /session-title\.mjs/)
-    assert.match(antigravityDoc, /rules\/AGENTS\.md/)
   })
 })

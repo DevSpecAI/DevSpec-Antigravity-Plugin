@@ -1,6 +1,6 @@
 {
   "name": "devspec-antigravity-plugin",
-  "version": "0.18.6",
+  "version": "0.18.7",
   "private": true,
   "type": "module",
   "description": "DevSpec skills and remote-control hooks for Antigravity.",

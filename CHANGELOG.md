@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.18.7
+
+### Customer-facing setup guide and `remote-control-state.mjs` stop skill
+
+- **Customer-facing `README.md`:** Updated installation, `https://api.devspec.ai/api/mcp` configuration, `agy --dangerously-skip-permissions` remote-control guidance, project selection (`/devspec-project`), and command reference to match the in-app setup flow while keeping runtime work authority pointed at `devspec://product/implementation-contract` in `rules/AGENTS.md` and `skills/devspec-remote/SKILL.md`.
+- **State helper in `skills/devspec-remote-stop/SKILL.md`:** Updated step 1 to resolve `connection_id` and `session_id` exclusively through `scripts/remote-control-state.mjs resolve-local` rather than reading files under `~/.devspec/remote-control/` directly.
+
 ## 0.18.6
 
 ### Task field partitioning guidance in `rules/AGENTS.md`
@@ -29,14 +36,12 @@
 
 ### Rename plugin and install directory from `autopilot` to `devspec` with legacy directory fallback
 
-- **Plugin identity and install directory (`plugin.json`, `package.json`, `README.md`, `docs/remote-control/remote-control-antigravity.md`):** Renamed `plugin.json` `name` from `devspec-autopilot` to `devspec`, removed `"autopilot"` from `package.json` keywords, and updated setup and update instructions to use `~/.gemini/config/plugins/devspec` and the short slash commands (`/devspec-remote`, `/devspec-remote-stop`, `/devspec-project`).
+- **Plugin identity and install directory (`plugin.json`, `package.json`, `README.md`):** Renamed `plugin.json` `name` from `devspec-autopilot` to `devspec`, removed `"autopilot"` from `package.json` keywords, and updated setup and update instructions to use `~/.gemini/config/plugins/devspec` and the short slash commands (`/devspec-remote`, `/devspec-remote-stop`, `/devspec-project`).
 - **Backwards-compatible script path fallback (`rules/AGENTS.md`, `skills/devspec-remote/SKILL.md`, `skills/devspec-remote-stop/SKILL.md`, `skills/devspec-project/SKILL.md`):** Skill and rule commands resolve `$HOME/.gemini/config/plugins/devspec` first and fall back to `$HOME/.gemini/config/plugins/antigravity-devspec-autopilot-extension` so existing installations continue working before the folder is renamed on disk.
 
 ## 0.18.0
 
-Tasks cutover candidate; activation is held pending coordinated release.
-
-- Tool-input handling, claim/provenance readers, remote projections and installed rules use Tasks without old-tool aliases. The task creation reference uses Feature, Improvement, Bug, Investigation and General.
+- Tool-input handling, claim/provenance readers, remote projections and installed rules use Tasks (`Feature`, `Improvement`, `Bug`, `Investigation` and `General`).
 - Existing commit-reference IDs and durable records remain intact; session joining and identity binding are unchanged.
 - Requires the matching Tasks server. Update the actual installed plugin checkout, including its rules, and restart Antigravity to refresh runtime instructions and tool schemas before resuming work.
 
@@ -112,7 +117,7 @@ Tasks cutover candidate; activation is held pending coordinated release.
 
 - **Make `/antigravity-devspec-autopilot-extension:devspec-remote` the explicit remote-control entrypoint (`scripts/session-start.mjs`, `scripts/statusline.mjs`):** Because Antigravity (`agy`) only exposes `ANTIGRAVITY_CSRF_TOKEN`, `ANTIGRAVITY_LS_ADDRESS`, and `ANTIGRAVITY_AGENTAPI_EXE` to child processes of the `run_command` tool (never to `statusLine` or `SessionStart`), connections registered automatically on window open before `/devspec-remote` was run had no `ANTIGRAVITY_CSRF_TOKEN` and could not receive remote wakes via `agentapi`. `connectAtStartupEnabled` in `scripts/session-start.mjs` now defaults to `false` (unless explicitly opted in via `DEVSPEC_CONNECT_AT_STARTUP=1` or `.devspec/project.json` `connect_at_startup: true`), and `renderStatusLine` in `scripts/statusline.mjs` no longer spawns background connections on window open.
 - **Clear `local (/devspec-remote to connect)` status bar indicator before connecting (`scripts/statusline.mjs`):** When an Antigravity terminal is opened in a linked DevSpec project or git repository before `/devspec-remote` has been run (`view.state === 'local'`), `readConnectionView` and `formatStatusLine` now display `DevSpec: local (/devspec-remote to connect) · <Project>` (resolving `<Project>` from `.devspec/project.json`, conversation selection, or the most recent connection in that workspace) instead of registering an unwakeable standby connection.
-- **Documentation alignment (`README.md`, `skills/devspec-remote/SKILL.md`, `docs/remote-control/remote-control-antigravity.md`):** Updated setup and remote-control documentation to clearly state that running `/antigravity-devspec-autopilot-extension:devspec-remote` is the way to connect an Antigravity terminal to DevSpec remote control.
+- **Documentation alignment (`README.md`, `skills/devspec-remote/SKILL.md`):** Updated setup and remote-control documentation to clearly state that running `/antigravity-devspec-autopilot-extension:devspec-remote` is the way to connect an Antigravity terminal to DevSpec remote control.
 
 ## 0.15.9
 
@@ -268,7 +273,7 @@ The README now sends you to **You → Coding agents** → **Create your token** 
 
 ### A test catches a DevSpec tool name the server no longer has
 
-A new test reads DevSpec's live tool list from a devspecv2 checkout beside this repo and fails if anything in this plugin names a DevSpec tool the server does not have. A tool renamed or retired on the server is then caught here, before an agent is told to call it in someone's session. With no checkout beside it the test skips; `DEVSPEC_V2_ROOT` names one. Nothing about how the plugin behaves has changed.
+A new test reads DevSpec's live tool list from a server checkout beside this repo and fails if anything in this plugin names a DevSpec tool the server does not have. A tool renamed or retired on the server is then caught here, before an agent is told to call it in someone's session. With no checkout beside it the test skips; `DEVSPEC_V2_ROOT` names one. Nothing about how the plugin behaves has changed.
 
 ## 0.11.2
 
@@ -360,7 +365,7 @@ at all.
 
 ### An agent reserves its work — nothing is dispatched to it any more
 
-The server retired `get_assignment`, `acknowledge_assignment` and `resolve_assignment`, along with `get_next_work_item` (DevSpec item 1e455001). Nothing dispatches work to an agent, so there was nothing left for them to do: no batch to receive, no receipt to give, nothing to close.
+The server retired `get_assignment`, `acknowledge_assignment` and `resolve_assignment`, along with `get_next_work_item`. Nothing dispatches work to an agent, so there was nothing left for them to do: no batch to receive, no receipt to give, nothing to close.
 
 One verb replaces them. **`reserve_work_items({ action_item_ids, connection_id })`** holds the ordered set you are about to work so no other agent takes one mid-run; then `claim_work_item` per item as you reach it. The batch closes itself when its last member is recorded, failed or released.
 
@@ -388,7 +393,7 @@ Brainstorm no longer asks whether you want it: it runs when the invocation asked
 
 ### A quiet connection stays up while the host process is alive
 
-- **Removed the 72h idle-disconnect.** The poller no longer stamps `idle_timeout` and exits after three quiet days. A connection lives as long as its Antigravity process, unless you End it or run `devspec-remote-stop`. Item `ce1758a3`.
+- **Removed the 72h idle-disconnect.** The poller no longer stamps `idle_timeout` and exits after three quiet days. A connection lives as long as its Antigravity process, unless you End it or run `devspec-remote-stop`.
 
 ## 0.4.0 - 2026-08-11
 
@@ -398,7 +403,7 @@ Brainstorm no longer asks whether you want it: it runs when the invocation asked
 
 - **The plugin no longer chooses its own work.** The four autopilot skills are deleted, and with them the `get_next_work_item` self-selection path; the server routes a staged batch to a connection and the plugin only works what it was handed.
 - **Unattended is a mode, not a command.** The dispatch-protocol section of `devspec-remote` (step 8a) now states the batch contract explicitly: batch rules override conversational rules for the duration of the batch, a member that cannot be done safely is failed loudly with `fail_work_item` (never stalled on a question nobody is there to answer), and the connection returns to ordinary available capacity when the batch resolves.
-- No replacement command or flag is created. Same deletion across the Claude Code, Cursor, OpenCode, Grok and Codex plugins under the same item (`3f2f390c`).
+- No replacement command or flag is created.
 
 ## 0.3.6 - 2026-08-04
 
@@ -411,8 +416,6 @@ DevSpec's `search_memories` changed today: it returns a **card** (title, one-lin
 - **No `allowed-tools:` gate here**, unlike the Claude Code plugin, so `get_memory` was already callable — this release is about the instructions, not about unblocking a refused tool call.
 
 Nothing else needs reinstalling for the DevSpec-side change: MCP tool definitions come from the server, so a reconnect picks up the renamed `body` parameter and the now-required `title` on `record_memory`.
-
-Item `93a851b5`.
 
 ## 0.3.0 - 2026-07-25
 
@@ -441,7 +444,7 @@ Item `93a851b5`.
 - **Answers:** when attached, post via `post_session_message({ connection_id })`. Sessionless: assignment / `report_progress` only — never invent a room.
 - **Stop hooks:** busy/heartbeat + optional local_prompt only — **no** full assistant mirror.
 - **`devspec-work --remote`:** defaults **sessionless**; optional `--session` / `--new` for a transcript.
-- Skills match DevSpecV2 delivery contract (ADR b98a39a9).
+- Skills match the DevSpec remote-control delivery contract.
 
 ## 0.1.x
 
