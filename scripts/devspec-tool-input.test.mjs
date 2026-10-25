@@ -102,6 +102,26 @@ describe('PreToolUse mechanical input stamping (overwrite)', () => {
       assert.equal(res.overwrite.local_session_id, CONV_ID)
       assert.equal(res.overwrite.request_ref, REQ_1)
       assert.equal(res.overwrite.provenance_ref, PROV_1)
+
+      // Also stamps connection_id when session_id is passed on create_task / update_task
+      // so request_ref never arrives without the connection_id that carries it.
+      const createWithSession = prepareDevspecToolInput(
+        {
+          conversationId: CONV_ID,
+          tool_name: 'mcp_devspec_create_task',
+          tool_input: {
+            title: 'Task from session',
+            intent: 'Track session work',
+            session_id: SESS_ID,
+          },
+        },
+        { home: fx.home, env: {} }
+      )
+      assert.equal(createWithSession.decision, 'allow')
+      assert.equal(createWithSession.overwrite.connection_id, CONN_ID)
+      assert.equal(createWithSession.overwrite.session_id, SESS_ID)
+      assert.equal(createWithSession.overwrite.request_ref, REQ_1)
+      assert.equal(createWithSession.overwrite.provenance_ref, PROV_1)
     } finally {
       fx.cleanup()
     }

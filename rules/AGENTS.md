@@ -52,9 +52,10 @@ When working in a DevSpec-connected project or remote-controlled session in Anti
      - **Shared memory (`id` is UUID or 8-char short code — NOT `memory_id`):**
        - `get_memory`: `{ id, project_id? }`
        - `search_memories`: `{ query, type?: "decision"|"convention"|"insight"|"risk"|"all", limit?, offset?, include_superseded? }`
-       - `record_memory`: `{ type: "decision"|"convention"|"insight"|"risk", title, body, summary?, state?: "in_discussion"|"decided", tags?: string[], affected_files?: string[], delivering_task_id?, idempotency_key? }`
-       - `supersede_memory`: `{ id, title, body, summary?, state?: "in_discussion"|"decided", tags?: string[], affected_files?: string[], delivering_task_id?, expected_version?, idempotency_key? }` (`title` is **required** even when unchanged)
-       - `update_memory`: `{ id, title?, body?, summary?, state?: "in_discussion"|"decided", tags?: string[], affected_files?: string[], delivering_task_id?, expected_version?, idempotency_key?, preview_ack? }`
+       - `record_memory`: `{ type: "decision"|"convention"|"insight"|"risk", title, body, summary?, ai_instructions?, state?: "in_discussion"|"decided", tags?: string[], affected_files?: string[], delivering_task_id?, idempotency_key? }`
+       - `supersede_memory`: `{ id, title, body, summary?, ai_instructions?, state?: "in_discussion"|"decided", tags?: string[], affected_files?: string[], delivering_task_id?, expected_version?, idempotency_key? }` (`title` is **required** even when unchanged)
+       - `update_memory`: `{ id, title?, body?, summary?, ai_instructions?, state?: "in_discussion"|"decided", tags?: string[], affected_files?: string[], delivering_task_id?, expected_version?, idempotency_key?, preview_ack? }`
+       - **Memory field partitioning (`record_memory` / `update_memory` / `supersede_memory`):** Put the human-readable rule and rationale in `body` (duplicate and reversal screening reads `title`, `summary`, and `body`, never `ai_instructions`). Put code-level implementation pointers (file paths, function/symbol names, database columns, CSS classes, code snippets) in `ai_instructions`.
      - **Resources / documents (`id` is UUID or 8-char short code — NOT `resource_id`; kind is `resource_type` — NOT `type`):**
        - `get_resource`: `{ id, start_line?, end_line?, search?, project_id? }` (for long documents, pass `start_line`/`end_line` or `search`)
        - `search_resources`: `{ query?, scope?: "all"|"project"|"session", source?: "uploaded"|"ai_generated"|"all", limit?, offset? }`

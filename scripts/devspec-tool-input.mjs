@@ -31,7 +31,7 @@ import {
   writeExplicitReplyMarker,
 } from './mirror-turn.mjs'
 import { inferAntigravityTranscriptPath, readStateFile } from './remote-control-state.mjs'
-import { stampRequest } from './request-ref.mjs'
+import { PROVENANCE_REF_TOOLS, REQUEST_REF_TOOLS, stampRequest } from './request-ref.mjs'
 import { readRequestState } from './requests.mjs'
 import { prePostHoldObject } from './room-unread.mjs'
 import { readConnectionTelemetry } from './statusline.mjs'
@@ -218,7 +218,10 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
     connectionId &&
     !CONNECTION_SUBJECT.test(verb) &&
     next.connection_id === undefined &&
-    next.session_id === undefined
+    (next.session_id === undefined ||
+      REQUEST_REF_TOOLS.has(verb) ||
+      PROVENANCE_REF_TOOLS.has(verb) ||
+      verb === 'surface_session_tasks')
   ) {
     next.connection_id = connectionId
   }

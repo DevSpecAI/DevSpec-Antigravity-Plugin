@@ -100,7 +100,11 @@ export function stampRequest(
   let next = own
   const ref = requestRefForWrite(state, agent)
   if (ref && REQUEST_REF_TOOLS.has(toolName)) {
-    next = { ...next, request_ref: ref }
+    next = {
+      ...next,
+      ...(next.connection_id === undefined ? { connection_id: connectionId } : {}),
+      request_ref: ref,
+    }
   }
   if (next.provenance_ref === undefined && PROVENANCE_REF_TOOLS.has(toolName)) {
     const provRef =
