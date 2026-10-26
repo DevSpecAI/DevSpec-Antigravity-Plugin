@@ -549,7 +549,7 @@ export function pendingNudgeNotice({ input = {}, env = process.env } = {}) {
  * ------------------------------------------------------------------ */
 
 export function simpleGitCommit(command, { onInvocation } = {}) {
-  if (typeof command !== 'string' || command.length === 0 || command.length > 8192) return null
+  if (typeof command !== 'string' || command.length === 0) return null
 
   const segments = [[]]
   let word = ''
@@ -686,7 +686,7 @@ function readablePrefix(prefix) {
 const HEREDOC_DELIMITER = /^[A-Za-z_][A-Za-z0-9_]*$/
 
 export function heredocGitCommit(command, options = {}) {
-  if (typeof command !== 'string' || command.length === 0 || command.length > 8192) return null
+  if (typeof command !== 'string' || command.length === 0) return null
   if (command.includes('`')) return null
 
   const open = command.indexOf("<<'")
@@ -839,11 +839,14 @@ function recoveryText(claims) {
       'Then retry the commit. Nothing else is blocked.',
     ].join(' ')
   }
+  // Since item ab6a3960 the write gate refuses a thin task: create_task needs a real
+  // description and the reason behind it, so this must never suggest a one-liner.
   return [
     'DevSpec: this commit has no [devspec:<id>] reference, so it would land unlinked.',
-    'Recover without leaving this turn: reuse or create the smallest item that covers it',
-    '(search_tasks, or create_task with a one-line description — a thin',
-    'last-mile item is fine), then add [devspec:<full-uuid>] to the commit message and retry.',
+    'Recover without leaving this turn: search_tasks for the task this work belongs to and reuse it;',
+    'if none covers it, create_task for the smallest adequate task, with a real description of the change',
+    'and the reason it is needed (the server refuses a thin one). When to create one is the',
+    "contract's work_entry_contract. Then add [devspec:<full-uuid>] to the commit message and retry.",
     `Authority: ${CONTRACT_URI}. Nothing else is blocked, and no other command is affected.`,
   ].join(' ')
 }
@@ -1014,7 +1017,14 @@ function collectResponseTexts(response) {
   return texts
 }
 
+// The local lookups below (claim titles, automation names, a step's work_claim_ref)
+// run inside every hook call, under Antigravity's per-hook timeout (hooks.json), and
+// read host files that grow without limit: spilled step outputs, logs, the inbox.
+// So each looks only at the recent part: the newest step outputs, the tail of a log.
+// They are best-effort hints — a miss falls back to what the server says — and they
+// never shorten anything shown to the model or posted to the room.
 const MAX_LOCAL_OUTPUT_BYTES = 512 * 1024
+const RECENT_STEP_OUTPUTS_SCANNED = 50
 
 function readSmallTextFile(filePath, maxBytes = MAX_LOCAL_OUTPUT_BYTES) {
   if (typeof filePath !== 'string' || !filePath) return null
@@ -1309,7 +1319,7 @@ export function resolveLocalItemDetails(
           .readdirSync(stepsDir)
           .filter((d) => /^\d+$/.test(d))
           .sort((a, b) => Number(b) - Number(a))
-          .slice(0, 50)
+          .slice(0, RECENT_STEP_OUTPUTS_SCANNED)
         for (const stepName of stepDirs) {
           const outFile = path.join(stepsDir, stepName, 'output.txt')
           const txt = readSmallTextFile(outFile)
@@ -1488,7 +1498,7 @@ export function resolveLocalAutomationDetails(
           .readdirSync(stepsDir)
           .filter((d) => /^\d+$/.test(d))
           .sort((a, b) => Number(b) - Number(a))
-          .slice(0, 40)
+          .slice(0, RECENT_STEP_OUTPUTS_SCANNED)
         for (const stepName of stepDirs) {
           const outFile = path.join(stepsDir, stepName, 'output.txt')
           const txt = readSmallTextFile(outFile)
@@ -1774,9 +1784,10 @@ function maybeNudge(scope, { env, now, platform }) {
     return null
   }
   const message =
-    'DevSpec: no work item is claimed in this repository, so work done here has nothing to trace it to. ' +
-    'Claim one before you commit — search_tasks for an existing item, or create_task for a ' +
-    'thin last-mile one — and put [devspec:<full-uuid>] in the commit message. Editing is never blocked. ' +
+    'DevSpec: no task is claimed in this repository, so work done here has nothing to trace it to. ' +
+    'Before you commit, search_tasks for the task this work belongs to and claim it; if none covers it, ' +
+    "create the smallest adequate one with a real description and reason (the contract's work_entry_contract " +
+    'says when), and put [devspec:<full-uuid>] in the commit message. Editing is never blocked. ' +
     `Shown once per session. Authority: ${CONTRACT_URI}`
   stagePendingNudge(scope.sessionId, message, { env, now, platform })
   return nudge(message)

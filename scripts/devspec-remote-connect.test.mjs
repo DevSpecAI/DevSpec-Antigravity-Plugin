@@ -26,7 +26,7 @@ import {
   MAX_INLINE_WAKE_BYTES,
 } from './devspec-remote-listen.mjs'
 import { formatRoomStateJson, shouldAssertTurnOnPollerInboxWrite } from './devspec-remote-poll.mjs'
-import { capTrailForPreToolHook } from './devspec-tool-input.mjs'
+import { fitTrailToHookLine, HOOK_STDOUT_LIMIT_BYTES, toProtoPreToolResult } from './devspec-tool-input.mjs'
 import { formatTiersForStartup, readTiersFor, storeTiers } from './instruction-tiers.mjs'
 import {
   buildListenerSpawnEnv,
@@ -1125,7 +1125,7 @@ describe('Wandering Otter zombie & Working status regression guards (item bbf7b6
     }
   })
 
-  it('discoverAntigravityLsAddress matches the HTTP port and skips the earlier HTTPS port in cli-*.log, and capTrailForPreToolHook keeps trail under 24KB', () => {
+  it('discoverAntigravityLsAddress matches the HTTP port and skips the earlier HTTPS port in cli-*.log', () => {
     const procRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-proc-'))
     const fdDir = path.join(procRoot, '4242', 'fd')
     fs.mkdirSync(fdDir, { recursive: true })
@@ -1144,20 +1144,48 @@ describe('Wandering Otter zombie & Working status regression guards (item bbf7b6
     } finally {
       fs.rmSync(procRoot, { recursive: true, force: true })
     }
+  })
 
-    const hugeEvents = Array.from({ length: 80 }, (_, idx) => ({
-      seq: idx + 1,
-      kind: 'thinking',
-      text: 'Thinking step '.repeat(250),
-      label: `Step ${idx + 1}`,
-    }))
-    const hugeMarkdown = Array.from({ length: 80 }, (_, idx) => `> 💭 Step ${idx + 1} ${'x'.repeat(120)}`).join('\n')
-    const capped = capTrailForPreToolHook(hugeEvents, hugeMarkdown)
-    const serializedBytes = Buffer.byteLength(
-      JSON.stringify({ work_trail: capped.markdown, trail_events: capped.events }),
-      'utf8',
-    )
-    assert.ok(serializedBytes <= 24_000, `expected <= 24000 bytes, got ${serializedBytes}`)
+  describe('fitTrailToHookLine (the 64 KiB line Antigravity reads from a hook)', () => {
+    const lineBytes = (args, wrap = (value) => value) =>
+      Buffer.byteLength(`${JSON.stringify(toProtoPreToolResult({ decision: 'allow', overwrite: wrap(args) }))}\n`, 'utf8')
+    const thinking = (seq, chars) => ({ seq, kind: 'thinking', label: `Step ${seq}`, text: `t${seq} `.padEnd(chars, 'x') })
+
+    it('passes a trail that fits through untouched, long steps included', () => {
+      const args = { message: 'Done.', work_trail: '> 💭 Step 1', trail_events: [thinking(1, 3_000)] }
+      assert.deepEqual(fitTrailToHookLine(args), args)
+    })
+
+    it('leaves out the oldest whole events first and never cuts a step', () => {
+      const events = Array.from({ length: 80 }, (_, idx) => thinking(idx + 1, 3_500))
+      const args = { message: 'Done.', work_trail: '> 💭 summary', trail_events: events }
+      const fitted = fitTrailToHookLine(args)
+      assert.ok(lineBytes(fitted) < HOOK_STDOUT_LIMIT_BYTES)
+      assert.ok(fitted.trail_events.length > 0 && fitted.trail_events.length < events.length)
+      assert.equal(fitted.trail_events.at(-1).seq, 80, 'the newest step is kept')
+      for (const event of fitted.trail_events) assert.deepEqual(event, events[event.seq - 1])
+      assert.equal(fitted.work_trail, '> 💭 summary')
+      assert.equal(fitted.message, 'Done.')
+    })
+
+    it('measures the line as written, including a stringified Arguments wrapper', () => {
+      const wrap = (value) => ({ ServerName: 'devspec', ToolName: 'post_session_message', Arguments: JSON.stringify(value) })
+      const events = Array.from({ length: 60 }, (_, idx) => thinking(idx + 1, 2_000))
+      const fitted = fitTrailToHookLine({ message: 'Done.', trail_events: events, work_trail: 'x' }, wrap)
+      assert.ok(lineBytes(fitted, wrap) < HOOK_STDOUT_LIMIT_BYTES)
+    })
+
+    it('shortens the markdown from its oldest steps, saying how many, when no event fits', () => {
+      const events = [thinking(1, 70_000)]
+      const markdown = Array.from({ length: 2_000 }, (_, idx) => `> 💭 Step ${idx + 1} ${'y'.repeat(60)}`).join('\n')
+      const fitted = fitTrailToHookLine({ message: 'Done.', work_trail: markdown, trail_events: events })
+      assert.ok(lineBytes(fitted) < HOOK_STDOUT_LIMIT_BYTES)
+      assert.equal(fitted.trail_events, undefined)
+      const [note, ...kept] = fitted.work_trail.split('\n')
+      assert.match(note, /^> … \d+ earlier steps not shown here/)
+      assert.equal(Number(note.match(/\d+/)[0]) + kept.length, 2_000)
+      assert.equal(kept.at(-1), markdown.split('\n').at(-1))
+    })
   })
 
   it('v0.16.0: renderStatusLine shows local (/devspec-remote to connect) · <Project> when opened in a DevSpec project before /devspec-remote is run', async () => {

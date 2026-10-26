@@ -23,6 +23,10 @@ import { ensurePrivateDir } from './private-state.mjs'
 import { readLocalBond, readStateFile } from './remote-control-state.mjs'
 
 export const READ_STATE_VERSION = 1
+// One page of unread messages per run. Antigravity's run_command drops the START of
+// stdout beyond roughly 7.5 KB, so a longer page would lose its oldest messages and
+// the header naming what remains. Nothing is cut: the rest comes on the next page,
+// which the footer names (`remaining`, `next`).
 export const READER_PAGE_CHARS = 6000
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url)

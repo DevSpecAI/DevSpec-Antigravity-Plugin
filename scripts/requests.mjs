@@ -635,7 +635,7 @@ export function servableCarried(state, carried) {
 export function describeCarried(entry) {
   if (entry.kind === 'none') return "- nobody's request (your own initiative): --none"
   if (entry.kind === 'unstated') {
-    return '- something DevSpec could not identify (DevSpec then works out who asked, and asks a person to confirm when it cannot): --unstated'
+    return "- something DevSpec could not identify (the write is recorded as unattributed; how it is judged is the contract's requester_rule): --unstated"
   }
   if (entry.kind === 'typed_prompt') return '- the prompt your owner typed at this terminal: --terminal'
   return `- the room command with message_id ${entry.message_id ?? '(unknown)'}: --message-id ${entry.message_id ?? '<id>'}`

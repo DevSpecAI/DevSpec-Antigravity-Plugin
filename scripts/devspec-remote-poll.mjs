@@ -82,14 +82,12 @@ import {
   questionEventStartVersion,
 } from './question-dismissal-events.mjs'
 import {
-  emptyCanonicalContextCarry,
   isActiveSessionPlansProjectionV1,
   isRemoteCommandProjectScope,
   isSessionActivityV1,
   isSessionEventsV1,
   isSessionPollsProjection,
   isStillToDiscussProjectionV1,
-  mergeCanonicalContextCarry,
   normalizeRemoteIngressV1,
   REMOTE_INGRESS_RESOURCE_URI,
   ROOM_CONTEXT_VERSION,
@@ -295,27 +293,6 @@ const ATTENDED_CADENCE = { waitMs: 25_000, tier: 'attended', checkTier: 'respons
 const IDLE_CADENCE = { waitMs: 30_000, tier: 'idle', checkTier: 'responsive' }
 const POLL_HTTP_GRACE_MS = 15_000
 const MAX_TURN_MS = 10 * 60 * 1000
-
-const MAX_ADVISORY_CARRY_COUNT = 20
-const MAX_ADVISORY_CARRY_CHARS = 12_000
-
-export function trimAdvisoryCarry(
-  messages,
-  { maxCount = MAX_ADVISORY_CARRY_COUNT, maxChars = MAX_ADVISORY_CARRY_CHARS } = {},
-) {
-  if (!Array.isArray(messages) || messages.length === 0) return { kept: [], dropped: 0 }
-  const kept = []
-  let chars = 0
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i]
-    const len = typeof m?.content === 'string' ? m.content.length : 0
-    if (kept.length >= maxCount) break
-    if (chars + len > maxChars && kept.length > 0) break
-    kept.unshift(m)
-    chars += len
-  }
-  return { kept, dropped: messages.length - kept.length }
-}
 
 function turnMarkerPath(connectionId, dir = CONNECTIONS_DIR) {
   return path.join(dir, `${connectionId}.turn`)
@@ -1108,54 +1085,6 @@ export function buildPollConnectionArguments({
     ...(catchUp ? { catch_up: true } : {}),
     ...(agentStats ? { agent_stats: agentStats } : {}),
   }
-}
-
-/**
- * Legacy helper retained for unit test compatibility (`devspec-remote-poll.test.mjs`).
- */
-export function normalizePollDelivery(res, connectionId) {
-  if (!res || typeof res !== 'object') return { ok: false, error: 'empty poll response' }
-  if (res.changed !== true) return { ok: true, changed: false, commands: [], context: [], activeSessionPlans: null }
-  const normalized = normalizeRemoteIngressV1(res, connectionId)
-  if (!normalized.ok) return normalized
-  const env = normalized.envelope
-  const carry = mergeCanonicalContextCarry(emptyCanonicalContextCarry(), env)
-  const context = Object.values(carry.context).flat()
-  return {
-    ok: true,
-    changed: true,
-    envelope: env,
-    commands: normalized.commands,
-    context,
-    activeSessionPlans: env.active_session_plans ?? null,
-  }
-}
-
-export function automationRunCommandText(d, connectionId = null) {
-  const connId = connectionId || d?.delivery_connection_id || '<your_connection_id>'
-  const permission =
-    d.permission === 'can_push'
-      ? 'You MAY edit, commit and push.'
-      : d.permission === 'can_commit'
-        ? 'You MAY edit and commit locally, but MUST NOT push.'
-        : 'This automation is LOOK ONLY — investigate and report, do not edit, commit or push anything.'
-
-  return [
-    `▶️ Automation run dispatched to this connection: "${d.automation_name}" (run ${d.run_id}).`,
-    d.trigger_kind === 'pressed'
-      ? 'Someone pressed Run.'
-      : d.trigger_kind === 'scheduled'
-        ? 'This run started on a schedule.'
-        : 'This run started because of an event.',
-    `Owner: ${d.owner?.display_name || 'the owner'}`,
-    '',
-    'What to do:',
-    `1. claim_automation_run({ run_id: "${d.run_id}", connection_id: "${connId}", provider: "antigravity" }) — always pass connection_id and provider (and model if the automation names one). If claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
-    '2. Follow the instruction returned by that claim, in this repo.',
-    `3. record_automation_run({ run_id: "${d.run_id}", connection_id: "${connId}", ... }) — report status, a verdict for EACH acceptance criterion WITH evidence, and whatever the run produced as artifacts.`,
-    '',
-    `Permission: ${permission}`,
-  ].join('\n')
 }
 
 // ---------------------------------------------------------------------------
