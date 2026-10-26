@@ -8,7 +8,7 @@ Connect [Google Antigravity CLI](https://antigravity.google/product/antigravity-
 
 - **[Antigravity CLI](https://antigravity.google/download#antigravity-cli)** (`agy`)
 - **Node.js 18 or later** (`node --version` — install from [nodejs.org](https://nodejs.org/en/download) if needed) and **`git`** on your `PATH`
-- A **[DevSpec](https://devspec.ai)** access token (`dvs_…`) with **Read & write** access from your [Agents settings](https://app.devspec.ai/settings/agents) page
+- A **[DevSpec](https://devspec.ai)** access token (`dvs_…`) with **Read & write** access from your [Agent setup](https://app.devspec.ai/settings/agents) page
 
 ## Setup
 
@@ -30,7 +30,7 @@ irm https://antigravity.google/cli/install.ps1 | iex
 
 ### 2. Add your DevSpec token to `mcp_config.json`
 
-Open `~/.gemini/config/mcp_config.json` (`%USERPROFILE%\.gemini\config\mcp_config.json` on Windows) in a text editor and merge in the `devspec` entry with your `dvs_…` token from [Agents settings](https://app.devspec.ai/settings/agents):
+Open `~/.gemini/config/mcp_config.json` (`%USERPROFILE%\.gemini\config\mcp_config.json` on Windows) in a text editor and merge in the `devspec` entry with your `dvs_…` token from [Agent setup](https://app.devspec.ai/settings/agents):
 
 ```json
 {

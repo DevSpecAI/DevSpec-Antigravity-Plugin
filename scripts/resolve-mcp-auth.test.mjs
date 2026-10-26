@@ -193,6 +193,7 @@ describe('resolveDevspecMcpAuth (Antigravity)', { concurrency: false }, () => {
     // "Authorization: Bearer dvs_..."`, which puts the key in that process's argv.
     for (const message of [posix, windows]) {
       assert.doesNotMatch(message, /`agy mcp add[^`]*Bearer/)
+      assert.match(message, /Connect your agent step on DevSpec's Agent setup page/)
     }
   })
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.18.8
+
+### New DevSpec settings page names
+
+- DevSpec's personal settings page where you create or reveal your token is now called **Agent setup**, and the project settings page for agent execution rules is now **Agent rules**. The missing-token message from `scripts/resolve-mcp-auth.mjs` now points at the **Connect your agent** step on the Agent setup page, and `README.md` links use the new name. URLs are unchanged.
+
 ## 0.18.7
 
 ### Customer-facing setup guide and `remote-control-state.mjs` stop skill
