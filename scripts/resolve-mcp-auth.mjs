@@ -44,7 +44,7 @@ export function formatMissingAuthMessage(platform = process.platform) {
       ? '%USERPROFILE%\\.gemini\\config\\mcp_config.json (or %USERPROFILE%\\.gemini\\antigravity-cli\\mcp_config.json)'
       : '~/.gemini/config/mcp_config.json (or ~/.gemini/antigravity-cli/mcp_config.json)'
   const ownerOnly = platform === 'win32' ? '' : ', keep that file readable only by you (`chmod 600`)'
-  return `DevSpec is not configured properly: put your "dvs_..." token in ${configPath} under mcpServers.devspec.headers.Authorization ("Bearer dvs_...")${ownerOnly}, then restart agy. The Connect a tool step on DevSpec's Agents settings page has the entry ready to paste. Do not pass the token to \`agy mcp add --header\`: that puts it on a command line and in your shell history.`
+  return `DevSpec is not configured properly: put your "dvs_..." token in ${configPath} under mcpServers.devspec.headers.Authorization ("Bearer dvs_...")${ownerOnly}, then restart agy. The Connect your agent step on DevSpec's Agent setup page has the entry ready to paste. Do not pass the token to \`agy mcp add --header\`: that puts it on a command line and in your shell history.`
 }
 
 /**
