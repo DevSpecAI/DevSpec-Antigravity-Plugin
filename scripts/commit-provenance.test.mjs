@@ -355,7 +355,7 @@ describe('unclaimed-edit provenance nudge lifecycle via PostInvocation', () => {
     const preOut = await handlePre(editPayload, { env })
     assert.ok(preOut)
     assert.equal(preOut.hookSpecificOutput?.permissionDecision, undefined)
-    assert.match(preOut.systemMessage, /no work item is claimed/i)
+    assert.match(preOut.systemMessage, /no task is claimed/i)
 
     // PostInvocation injects the staged nudge as an ephemeralMessage
     const invOut = await runPostInvocation(JSON.stringify({ conversationId: CONVERSATION }), { env })
@@ -363,8 +363,8 @@ describe('unclaimed-edit provenance nudge lifecycle via PostInvocation', () => {
     assert.equal(Array.isArray(invOut.injectSteps), true)
     assert.equal(invOut.injectSteps.length, 1)
     assert.equal(typeof invOut.injectSteps[0].ephemeralMessage, 'string')
-    assert.match(invOut.injectSteps[0].ephemeralMessage, /no work item is claimed/i)
-    assert.match(invOut.additionalContext, /no work item is claimed/i)
+    assert.match(invOut.injectSteps[0].ephemeralMessage, /no task is claimed/i)
+    assert.match(invOut.additionalContext, /no task is claimed/i)
 
     // Subsequent PostInvocation and edits in the same session+repo stay quiet
     assert.equal(await runPostInvocation(JSON.stringify({ conversationId: CONVERSATION }), { env }), null)

@@ -51,21 +51,26 @@ function serverCheckout() {
   }
 }
 
-let serverTools = null
-/** The server's tools, each with the names of its input parameters. */
-function serverToolParams(root) {
-  if (serverTools) return serverTools
+let serverSchemas = null
+/** The server's tools, each with its input schema. */
+function serverToolSchemas(root) {
+  if (serverSchemas) return serverSchemas
   const tsx = path.join(root, 'node_modules/.bin/tsx')
   assert.ok(fs.existsSync(tsx), `${root} has no node_modules/.bin/tsx; run npm ci there`)
   const script = `import { getMcpAllTools } from ${JSON.stringify(path.join(root, DEFINITIONS))}
-process.stdout.write(JSON.stringify(getMcpAllTools().map((tool) => [tool.name, Object.keys(tool.inputSchema?.properties ?? {})])))`
+process.stdout.write(JSON.stringify(getMcpAllTools().map((tool) => [tool.name, tool.inputSchema ?? {}])))`
   const out = execFileSync(tsx, ['--tsconfig=apps/web/tsconfig.json', '-e', script], {
     cwd: root,
     encoding: 'utf8',
     maxBuffer: 16 * 1024 * 1024,
   })
-  serverTools = new Map(JSON.parse(out))
-  return serverTools
+  serverSchemas = new Map(JSON.parse(out))
+  return serverSchemas
+}
+/** The server's tools, each with the names of its input parameters. */
+function serverToolParams(root) {
+  const schemas = serverToolSchemas(root)
+  return new Map([...schemas].map(([name, schema]) => [name, Object.keys(schema.properties ?? {})]))
 }
 function serverToolNames(root) {
   return new Set(serverToolParams(root).keys())
@@ -102,12 +107,16 @@ function pairedServer(t, read = serverToolNames) {
 
 describe('DevSpec tools this plugin names', () => {
   it('are all tools the server has', (t) => {
-    const server = pairedServer(t)
-    if (!server) return
+    const tools = pairedServer(t, serverToolParams)
+    if (!tools) return
+    // Prose also names a tool's parameters the same way ("connect them via
+    // `parent_task_id`"). A name the server has as a parameter is not a missing
+    // tool; a name it has as neither still fails, so retired tools stay caught.
+    const parameters = new Set([...tools.values()].flat())
     const found = referencedNames()
     for (const name of MUST_FIND) assert.ok(found.has(name), `the scan did not find ${name}: it is broken, not clean`)
     const unknown = [...found]
-      .filter(([name]) => !server.has(name) && !NOT_DEVSPEC_TOOLS.has(name))
+      .filter(([name]) => !tools.has(name) && !parameters.has(name) && !NOT_DEVSPEC_TOOLS.has(name))
       .map(([name, files]) => `${name} (${[...files].sort().join(', ')})`)
     assert.deepEqual(unknown, [], `named here, but the server has no such tool:\n  ${unknown.join('\n  ')}`)
   })
@@ -140,5 +149,89 @@ describe('the tools PreToolUse stamps with the request a write serves', () => {
     const tools = pairedServer(t, serverToolParams)
     if (!tools) return
     assert.deepEqual([...PROVENANCE_REF_TOOLS].sort(), taking(tools, 'provenance_ref'))
+  })
+})
+
+// rules/AGENTS.md tells the agent to call DevSpec tools from the shapes it gives,
+// without reading their schema files (Antigravity loads MCP schemas lazily, so each
+// read is a step). That makes those shapes the agent's schema, so they must match
+// the server's: no parameter the tool lacks, every required one present and not
+// marked optional, and only values the server allows. Nested object shapes, and
+// arrays of them, are checked the same way (item 1df99dd4).
+const RULES_FILE = 'rules/AGENTS.md'
+const SHAPE_ENTRY = /`([a-z][a-z0-9]*(?:_[a-z0-9]+)+)`: `(\{[^`]*\})`/g
+// A scan that finds none of these is broken, not clean.
+const MUST_SHAPE = ['create_task', 'record_criterion_verdicts', 'manage_protected_intent', 'update_memory']
+
+function splitTopLevel(body) {
+  const parts = []
+  let depth = 0
+  let quoted = false
+  let current = ''
+  for (const ch of body) {
+    if (ch === '"') quoted = !quoted
+    if (!quoted && '{[('.includes(ch)) depth++
+    if (!quoted && '}])'.includes(ch)) depth--
+    if (ch === ',' && depth === 0 && !quoted) {
+      parts.push(current.trim())
+      current = ''
+    } else current += ch
+  }
+  if (current.trim()) parts.push(current.trim())
+  return parts
+}
+
+function quotedValues(type) {
+  return [...type.matchAll(/"([^"]+)"/g)].map((match) => match[1])
+}
+
+function shapeProblems(shape, schema, where) {
+  const problems = []
+  const properties = schema?.properties ?? {}
+  const body = shape.trim().replace(/^\{/, '').replace(/\}$/, '').trim()
+  const given = new Map()
+  for (const part of body ? splitTopLevel(body) : []) {
+    const match = /^([a-z][a-z0-9_]*)(\?)?(?:\s*:\s*([\s\S]+))?$/.exec(part)
+    if (!match) {
+      problems.push(`${where}: cannot read "${part}"`)
+      continue
+    }
+    const [, name, optional, type = ''] = match
+    given.set(name, { optional: Boolean(optional) })
+    const property = properties[name]
+    if (!property) {
+      problems.push(`${where}.${name}: the server has no such parameter`)
+      continue
+    }
+    if (type.startsWith('{')) problems.push(...shapeProblems(type, property, `${where}.${name}`))
+    else if (type.startsWith('[{')) problems.push(...shapeProblems(type.slice(1, -1), property.items, `${where}.${name}[]`))
+    else if (type.startsWith('"') || type.startsWith('["')) {
+      const allowed = type.startsWith('[') ? property.items?.enum : property.enum
+      for (const value of quotedValues(type)) {
+        if (!allowed?.includes(value)) problems.push(`${where}.${name}: the server does not allow "${value}"`)
+      }
+    }
+  }
+  for (const name of schema?.required ?? []) {
+    if (!given.has(name)) problems.push(`${where}.${name}: required by the server but missing`)
+    else if (given.get(name).optional) problems.push(`${where}.${name}: required by the server but marked optional`)
+  }
+  return problems
+}
+
+describe('the call shapes rules/AGENTS.md gives', () => {
+  it('match the server input schemas', (t) => {
+    const schemas = pairedServer(t, serverToolSchemas)
+    if (!schemas) return
+    const rules = fs.readFileSync(path.join(ROOT, RULES_FILE), 'utf8')
+    const entries = [...rules.matchAll(SHAPE_ENTRY)]
+    const named = new Set(entries.map(([, tool]) => tool))
+    for (const tool of MUST_SHAPE) assert.ok(named.has(tool), `found no shape for ${tool}: the scan is broken, not clean`)
+    const problems = []
+    for (const [, tool, shape] of entries) {
+      if (!schemas.has(tool)) problems.push(`${tool}: the server has no such tool`)
+      else problems.push(...shapeProblems(shape, schemas.get(tool), tool))
+    }
+    assert.deepEqual(problems, [], `${RULES_FILE} gives call shapes the server would refuse:\n  ${problems.join('\n  ')}`)
   })
 })

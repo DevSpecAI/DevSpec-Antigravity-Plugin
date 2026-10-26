@@ -52,6 +52,43 @@ const mode = MODES.has(process.argv[2]) ? process.argv[2] : 'stop'
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 
+/**
+ * The most the server accepts in one post_session_message `message` (the maxLength in
+ * its input schema). A mirrored reply or prompt longer than that is posted up to it
+ * with a note saying how much more there is and where it is — never cut silently.
+ */
+export const POST_MESSAGE_MAX_CHARS = 100_000
+
+export function fitPostMessage(text) {
+  const value = String(text ?? '')
+  if (value.length <= POST_MESSAGE_MAX_CHARS) return value
+  const noteFor = (left) => `\n\n… ${left} more characters are not shown here; the full text is in the Antigravity conversation.`
+  let kept = POST_MESSAGE_MAX_CHARS - noteFor(value.length).length
+  kept -= noteFor(value.length - kept).length - noteFor(value.length).length
+  return `${value.slice(0, kept)}${noteFor(value.length - kept)}`
+}
+
+/**
+ * The server stores each trail event's text, args and result clamped to 4,000
+ * characters with a visible ellipsis (packages/core/src/messages/trail-events.ts in
+ * DevSpecV2). The trail is re-sent whole each time it changes during a turn, so
+ * anything past that point is bytes the server discards: clamp at the same point, the
+ * same visible way.
+ */
+export const TRAIL_FIELD_MAX_CHARS = 4_000
+
+function clampTrailField(text) {
+  const value = String(text ?? '')
+  return value.length > TRAIL_FIELD_MAX_CHARS ? `${value.slice(0, TRAIL_FIELD_MAX_CHARS - 1)}…` : value
+}
+
+/**
+ * Each tool call is one line of the trail's markdown list, with a short excerpt of
+ * its arguments so the line can be scanned; the call's full arguments travel in its
+ * trail event. A longer excerpt ends with a visible ellipsis.
+ */
+const TRAIL_LINE_ARGS_CHARS = 140
+
 // Turn marker — the connected agent is the SOLE authority for the "working" state.
 // PreInvocation / UserPromptSubmit (turn start) writes it; Stop (turn end) clears it.
 // The long-lived poller reads it (by connection_id) to re-assert busy on heartbeats
@@ -926,8 +963,8 @@ function classifyDevspecDomainTool(toolName, args = {}) {
     verb,
     domain: mapped.domain,
     action: mapped.action,
-    ...(title ? { title: String(title).slice(0, 200) } : {}),
-    ...(id ? { id: String(id).slice(0, 80) } : {}),
+    ...(title ? { title: String(title) } : {}),
+    ...(id ? { id: String(id) } : {}),
     effectiveArgs,
   }
 }
@@ -979,9 +1016,9 @@ function normalizeCanonicalToolEvent(toolName, args = {}) {
       (k) => k !== 'toolAction' && k !== 'toolSummary',
     )
     if (keys.length > 0) {
-      const compactObj = {}
-      for (const k of keys.slice(0, 4)) compactObj[k] = effectiveArgs[k]
-      argsPreview = redactSecretsFromText(JSON.stringify(compactObj)).slice(0, 300)
+      const shown = {}
+      for (const k of keys) shown[k] = effectiveArgs[k]
+      argsPreview = clampTrailField(redactSecretsFromText(JSON.stringify(shown)))
     }
   } catch {
     argsPreview = ''
@@ -1066,7 +1103,7 @@ export function extractAntigravityTrailFromTranscript(
 
     if (typeof step.thinking === 'string' && step.thinking.trim()) {
       const summary = summarizeThinkingText(step.thinking, 220)
-      const fullThinking = redactSecretsFromText(step.thinking.trim()).slice(0, 4000)
+      const fullThinking = clampTrailField(redactSecretsFromText(step.thinking.trim()))
       if (summary && fullThinking) {
         seq++
         events.push({
@@ -1174,7 +1211,9 @@ export function extractAntigravityTrailFromTranscript(
         ...(occurredAt ? { occurredAt } : {}),
         step_index: step.step_index ?? null,
       })
-      const shortArgs = argsText ? ` — \`${argsText.replace(/\s+/g, ' ').slice(0, 140)}\`` : ''
+      const oneLine = argsText ? argsText.replace(/\s+/g, ' ') : ''
+      const excerpt = oneLine.length > TRAIL_LINE_ARGS_CHARS ? `${oneLine.slice(0, TRAIL_LINE_ARGS_CHARS - 1)}…` : oneLine
+      const shortArgs = excerpt ? ` — \`${excerpt}\`` : ''
       bullets.push(`✓ \`${canonicalName}\`${shortArgs} → ${action}`)
     }
   }
@@ -1435,7 +1474,7 @@ export function prepareAgentMirrorText(text) {
   if (!t) return null
   if (t.includes(REMOTE_STATUS_BANNER)) t = stripRemoteControlBanner(t).trim()
   if (!t || isOperationalChrome(t)) return null
-  return t.slice(0, 12000)
+  return fitPostMessage(t)
 }
 
 export function patchOwnState(connectionId, patch, connectionsDir = CONNECTIONS_DIR) {
@@ -1652,7 +1691,7 @@ export async function handleMirrorTurn(
       !skipMirror &&
       !isRemoteWakeInput
     ) {
-      const cleaned = String(text).trim().slice(0, 12000)
+      const cleaned = fitPostMessage(String(text).trim())
       if (cleaned) {
         const postArgs = {
           message: cleaned,
