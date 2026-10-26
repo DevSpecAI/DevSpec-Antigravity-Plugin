@@ -5,13 +5,20 @@ import { fileURLToPath } from 'node:url'
 import { describe, it } from 'node:test'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+// Antigravity caps each rule file at 24,000 bytes and truncates anything past that
+// on line boundaries — its own customization guide, under "Size Limits and Context
+// Budget". A rules file over it would lose its last sections without any error.
+const ANTIGRAVITY_RULE_FILE_MAX_BYTES = 24_000
 
 describe('Item 5 parity: rules/AGENTS.md, package version 0.15.0, and documentation accuracy', () => {
-  it('bundles rules/AGENTS.md under the 24KB Antigravity rule cap with core DevSpec contracts and scripts', () => {
+  it("bundles rules/AGENTS.md within Antigravity's per-file rule limit, with core DevSpec contracts and scripts", () => {
     const rulesPath = path.join(ROOT, 'rules', 'AGENTS.md')
     assert.ok(fs.existsSync(rulesPath), 'rules/AGENTS.md must exist so agy loads plugin rules automatically')
     const content = fs.readFileSync(rulesPath, 'utf8')
-    assert.ok(Buffer.byteLength(content, 'utf8') < 24_000, 'rules/AGENTS.md must stay under the 24KB per-file cap')
+    assert.ok(
+      Buffer.byteLength(content, 'utf8') <= ANTIGRAVITY_RULE_FILE_MAX_BYTES,
+      `rules/AGENTS.md is ${Buffer.byteLength(content, 'utf8')} bytes; Antigravity truncates a rule file past ${ANTIGRAVITY_RULE_FILE_MAX_BYTES}`,
+    )
     assert.match(content, /devspec:\/\/product\/implementation-contract/)
     assert.match(content, /devspec:\/\/product\/remote-ingress-contract/)
     assert.match(content, /devspec-remote-connect\.mjs/)

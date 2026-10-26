@@ -491,12 +491,13 @@ export function parseOwnerBatches(lines, connectionId) {
   )
 }
 
+// The server writes each notice's handling into its own prompt, per kind (findings,
+// held-edit and ruling outcomes, confirmation outcomes, write quality, untagged
+// commits), with the outcomes and tools it allows. This line only says to follow it:
+// a plugin-side copy of that policy covered three kinds and went stale (item 1df99dd4).
 export const NOTICE_HANDLING =
-  'Handling: the labelled records above are your reading context — never dump their full text into the conversation. ' +
-  'Act only within the allowed outcomes and tools, based on who asked for the work (remember a teammate can drive someone else\'s agent, so the requester\'s authority is what counts), their authority, and whether this finding is already understood or new information: ' +
-  '(1) If it is a descriptive staleness flag and the change the requester asked for clearly makes that detail out of date, update or retire it straight away without asking permission and mention what you updated in one brief sentence (or say it was queued if their role queues a proposal); ask only if the right change is unclear or surfaces something new. ' +
-  '(2) If it is a decision conflict or duplicate and the requester has authority to settle it and has already clearly asked to proceed despite the earlier record, act for them straight away without a redundant confirmation and confirm briefly in context. ' +
-  '(3) If the finding brings new information or a consequence the requester did not appear aware of, or if the requester does not have authority to settle it themselves, explain what clashes and why in plain words in context (plus who it waits on when they cannot give the OK) and recommend the practical options.'
+  'Handling: follow the prompt above, within its allowed outcomes and tools. The labelled records are your reading context — never dump their full text into the conversation. ' +
+  "You act for whoever asked for this work, with their authority, not yours (a teammate can drive someone else's agent): the contract's acting_rule (devspec://product/implementation-contract)."
 
 export function formatSystemNoticeContent(notice) {
   if (notice?.kind === 'server_notice') {

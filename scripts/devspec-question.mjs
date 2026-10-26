@@ -53,7 +53,10 @@ const RESPONSE_KINDS = new Set(['text', 'single_select', 'multi_select'])
 const MAX_PROMPT_CODE_POINTS = 4000
 const MAX_OPTION_CODE_POINTS = 200
 const MAX_OPTIONS = 20
-const MAX_REPLY_CHARS = 12_000
+// The most the server accepts in one post_session_message `message` (its input
+// schema's maxLength). A longer reply is refused here with the limit, so the agent
+// can shorten it or split it, rather than being cut short without anyone knowing.
+const MAX_REPLY_CHARS = 100_000
 
 export function parseArgs(argv) {
   const out = { command: null, connectionId: null, input: null, message: null, keepTurn: false }
@@ -279,13 +282,18 @@ async function main() {
     const raw = args.message ?? fs.readFileSync(0, 'utf8')
     const message = String(raw).trim()
     if (!message) throw new Error('respond requires a non-empty --message (or stdin)')
+    if (message.length > MAX_REPLY_CHARS) {
+      throw new Error(
+        `respond --message is ${message.length} characters; DevSpec accepts at most ${MAX_REPLY_CHARS} in one reply. Shorten it, or post the rest with post_session_message.`,
+      )
+    }
     const result = await mcpToolsCall({
       ...options,
       name: 'post_session_message',
       arguments: respondArguments({
         connectionId: args.connectionId,
         continuation,
-        message: message.slice(0, MAX_REPLY_CHARS),
+        message,
       }),
     })
     finishQuestionRespondTurn(args.connectionId)

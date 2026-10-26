@@ -180,6 +180,8 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
   const connState = connectionId ? readStateFile(connectionId, connDir) : null
 
   let next = { ...toolInput }
+  // Set when this hook attaches the trail itself; a trail the model passed is never trimmed here.
+  let trailAttached = false
   if (verb === 'post_session_message' && next.provenance_ref !== undefined) {
     delete next.provenance_ref
   }
@@ -328,12 +330,8 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
             { sinceMs: turnMarker?.startedAt ?? null, stopAtReply: true },
           )
           if (markdown && events.length > 0) {
-            const capped = capTrailForPreToolHook(events, markdown)
-            next = {
-              ...next,
-              ...(capped.markdown ? { work_trail: capped.markdown } : {}),
-              ...(capped.events.length > 0 ? { trail_events: capped.events } : {}),
-            }
+            next = { ...next, work_trail: markdown, trail_events: events }
+            trailAttached = true
           }
         } catch {
           /* non-fatal */
@@ -349,39 +347,15 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
     JSON.stringify(next) !== JSON.stringify(toolInput)
   if (!changed) return {}
 
-  let finalOverwrite = wrapped
-    ? {
-        ...rawToolInput,
-        [argumentsKey || 'Arguments']: argumentsWasString ? JSON.stringify(next) : next,
-      }
-    : next
-
-  // Antigravity reads PreToolUse stdout with Go's bufio.Scanner (64 KB MaxScanTokenSize).
-  // If auto-attached trail fields push the serialized hook output past 48 KB, trim them
-  // so the hook never fails with `bufio.Scanner: token too long`.
-  if (
-    verb === 'post_session_message' &&
-    !toolInput.work_trail &&
-    !toolInput.trail_events &&
-    (next.work_trail || next.trail_events) &&
-    Buffer.byteLength(JSON.stringify(finalOverwrite), 'utf8') > 48_000
-  ) {
-    const trimmedNext = { ...next }
-    delete trimmedNext.trail_events
-    if (
-      trimmedNext.work_trail &&
-      Buffer.byteLength(JSON.stringify(trimmedNext), 'utf8') > 44_000
-    ) {
-      delete trimmedNext.work_trail
-    }
-    next = trimmedNext
-    finalOverwrite = wrapped
+  const wrapArgs = (args) =>
+    wrapped
       ? {
           ...rawToolInput,
-          [argumentsKey || 'Arguments']: argumentsWasString ? JSON.stringify(next) : next,
+          [argumentsKey || 'Arguments']: argumentsWasString ? JSON.stringify(args) : args,
         }
-      : next
-  }
+      : args
+  if (trailAttached) next = fitTrailToHookLine(next, wrapArgs)
+  const finalOverwrite = wrapArgs(next)
 
   return {
     decision: 'allow',
@@ -394,46 +368,67 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
 }
 
 /**
- * Cap `trail_events` and `work_trail` attached during `PreToolUse` so serialized
- * hook stdout stays well under Antigravity's 64 KB `bufio.Scanner` token limit.
+ * Antigravity reads each hook's stdout with Go's bufio.Scanner, whose default token
+ * limit (bufio.MaxScanTokenSize) is 64 KiB: a longer line fails the hook ("token too
+ * long") and the call goes out with nothing this hook stamped (item bbf7b679). The
+ * trail attached to a session reply is the only part that grows without limit, so it
+ * is the part that gives way, measured against the line actually written.
  */
-export function capTrailForPreToolHook(
-  events = [],
-  markdown = '',
-  { maxTrailBytes = 24_000, maxEvents = 40 } = {},
-) {
-  const compactEvents = (Array.isArray(events) ? events : []).map((ev) => {
-    if (!ev || typeof ev !== 'object') return ev
-    if (ev.kind === 'thinking' && typeof ev.text === 'string' && ev.text.length > 500) {
-      return { ...ev, text: `${ev.text.slice(0, 499)}…` }
-    }
-    if (typeof ev.args === 'string' && ev.args.length > 200) {
-      return { ...ev, args: `${ev.args.slice(0, 199)}…` }
-    }
-    return ev
-  })
-  let keptEvents =
-    compactEvents.length > maxEvents ? compactEvents.slice(-maxEvents) : compactEvents
-  let keptMarkdown = String(markdown || '')
-  if (keptMarkdown.length > 8_000) {
-    const lines = keptMarkdown.split('\n')
-    const tail = []
-    let chars = 0
-    for (let i = lines.length - 1; i >= 0; i--) {
-      if (chars + lines[i].length + 1 > 7_500 && tail.length > 0) break
-      tail.unshift(lines[i])
-      chars += lines[i].length + 1
-    }
-    keptMarkdown = `> … (${lines.length - tail.length} earlier steps)\n${tail.join('\n')}`
+export const HOOK_STDOUT_LIMIT_BYTES = 64 * 1024
+
+function hookLineBytes(overwrite) {
+  return Buffer.byteLength(`${JSON.stringify(toProtoPreToolResult({ decision: 'allow', overwrite }))}\n`, 'utf8')
+}
+
+/** The largest count in [0, total] that `fits`, given that fitting only gets easier as the count falls. */
+function largestFitting(total, fits) {
+  let low = 0
+  let high = total
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2)
+    if (fits(mid)) low = mid
+    else high = mid - 1
   }
-  while (
-    keptEvents.length > 1 &&
-    Buffer.byteLength(JSON.stringify({ work_trail: keptMarkdown, trail_events: keptEvents }), 'utf8') >
-      maxTrailBytes
-  ) {
-    keptEvents = keptEvents.slice(Math.ceil(keptEvents.length / 3))
+  return low
+}
+
+/**
+ * Fit an attached trail into the hook's one line, without cutting any single step.
+ * Oldest events go first: the server merges trail events by seq and keeps the ones it
+ * already holds for this turn (streamed while the turn ran), so leaving them out of
+ * this reply loses nothing it has. Only if no event fits does the markdown give way,
+ * from its oldest steps, with a note saying how many were left out; only if even one
+ * line cannot fit is the trail left off this reply.
+ */
+export function fitTrailToHookLine(args, wrapArgs = (value) => value, limit = HOOK_STDOUT_LIMIT_BYTES) {
+  const fits = (candidate) => hookLineBytes(wrapArgs(candidate)) < limit
+  if (fits(args)) return args
+  const events = Array.isArray(args.trail_events) ? args.trail_events : []
+  const withEvents = (kept) => {
+    const candidate = { ...args }
+    if (kept > 0) candidate.trail_events = events.slice(events.length - kept)
+    else delete candidate.trail_events
+    return candidate
   }
-  return { events: keptEvents, markdown: keptMarkdown }
+  const keptEvents = largestFitting(events.length, (kept) => fits(withEvents(kept)))
+  if (keptEvents > 0 || fits(withEvents(0))) return withEvents(keptEvents)
+
+  const base = withEvents(0)
+  const lines = String(args.work_trail || '').split('\n')
+  const withLines = (kept) => {
+    const candidate = { ...base }
+    const left = lines.length - kept
+    candidate.work_trail = [
+      `> … ${left} earlier ${left === 1 ? 'step' : 'steps'} not shown here (Antigravity limits how much a hook can pass on; every step remains in the Antigravity conversation)`,
+      ...lines.slice(left),
+    ].join('\n')
+    return candidate
+  }
+  const keptLines = largestFitting(lines.length - 1, (kept) => fits(withLines(kept)))
+  if (keptLines > 0) return withLines(keptLines)
+  const bare = { ...base }
+  delete bare.work_trail
+  return bare
 }
 
 export async function runDevspecToolInput(raw = '', options = {}) {

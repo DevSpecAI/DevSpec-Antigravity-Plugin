@@ -1,10 +1,21 @@
 # Changelog
 
-## 0.18.8
+## 0.18.10
 
 ### New DevSpec settings page names
 
 - DevSpec's personal settings page where you create or reveal your token is now called **Agent setup**, and the project settings page for agent execution rules is now **Agent rules**. The missing-token message from `scripts/resolve-mcp-auth.mjs` now points at the **Connect your agent** step on the Agent setup page, and `README.md` links use the new name. URLs are unchanged.
+
+## 0.18.9
+
+### Agents follow DevSpec's current rules, and nothing is cut short without saying so
+
+- **A refused commit points to a fix that works.** When a commit is refused for having no task, the agent is now told to reuse the task the work belongs to, or create one with a real description and the reason behind it. It used to suggest a deliberately thin task, which DevSpec now refuses, so the agent got stuck mid-commit.
+- **Work waiting for someone's OK lands once it has it.** The agent keeps such work on its own branch until the OK arrives, then merges as the notice says, so the task can finish. Before, it was told never to merge that work at all.
+- **Accurate tool shapes.** The quick reference the agent works from now matches what DevSpec accepts, including asking someone to confirm, answering a request to confirm, and recording a criterion met by a better route. A self-check now fails if any shape drifts from the server.
+- **Every kind of notice is handled.** The agent follows the handling that comes with each notice about its work, including outcomes of work that waited for an OK, answered requests to confirm, and content flagged after it was written.
+- **Nothing is cut silently.** Long replies and prompts mirrored into a DevSpec room are posted whole up to what DevSpec accepts, with a note if anything had to be left out. A long reply to a question is refused with the limit instead of being cut. Work steps in the activity list are no longer shortened beyond what DevSpec itself keeps. When a reply's work summary is too big for what Antigravity lets a hook pass on, older steps are left out first, and the summary says how many were left out.
+- **Long commit commands are checked too.** A commit command over 8,192 characters used to skip the task-reference check entirely.
 
 ## 0.18.7
 

@@ -48,7 +48,7 @@ export function nudgeText({ projectName, remote }) {
   const name = projectName ? `"${projectName}"` : 'its DevSpec project'
   return [
     `DevSpec: this folder belongs to the DevSpec project ${name}, but the repository it now points at (${remote}) is not linked to that project yet.`,
-    `Tell the person: in DevSpec, open the project's Settings → Integrations → Repositories and add this repository.`,
+    `Tell the person: in DevSpec, open the project's Settings → Repositories and add this repository.`,
     `Until then DevSpec cannot read the code or connect its commits to the project's work, and the folder is recognised only by its .devspec/project.json file.`,
   ].join(' ')
 }

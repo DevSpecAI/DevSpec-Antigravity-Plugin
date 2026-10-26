@@ -19,6 +19,17 @@ import { pluginHeaders, versionedConnectionArguments } from './connection-versio
 /** HTTP statuses that describe a transient condition, not a verdict on the request. */
 const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 502, 503, 504])
 
+// A failed response's body can be a whole HTML error page, so an error message quotes
+// the start of it and says how much it left out; the full body stays on the error as
+// `body` for whoever handles it.
+const ERROR_BODY_EXCERPT_CHARS = 400
+
+function bodyExcerpt(text) {
+  const value = String(text ?? '')
+  if (value.length <= ERROR_BODY_EXCERPT_CHARS) return value
+  return `${value.slice(0, ERROR_BODY_EXCERPT_CHARS)}… (${value.length - ERROR_BODY_EXCERPT_CHARS} more characters)`
+}
+
 /**
  * Read the server's typed failure contract off a non-OK response body (DevSpec
  * item 798e2375). A validation outage answers 503 with
@@ -144,8 +155,8 @@ export async function mcpRequest({
 
   const text = await res.text()
   if (!res.ok) {
-    const err = new Error(`MCP HTTP ${res.status}: ${text.slice(0, 400)}`)
-    Object.assign(err, readServerFailure(res.status, text))
+    const err = new Error(`MCP HTTP ${res.status}: ${bodyExcerpt(text)}`)
+    Object.assign(err, readServerFailure(res.status, text), { body: text })
     throw err
   }
 
@@ -168,7 +179,7 @@ export async function mcpRequest({
   }
 
   if (!payload) {
-    throw new Error(`Unparseable MCP response: ${text.slice(0, 200)}`)
+    throw Object.assign(new Error(`Unparseable MCP response: ${bodyExcerpt(text)}`), { body: text })
   }
   if (payload.error) {
     throw new Error(payload.error.message || JSON.stringify(payload.error))

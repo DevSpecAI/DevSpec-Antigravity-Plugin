@@ -8,6 +8,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { FIXTURE_ID, fixtureEnvelope, fixturePollResponse } from './remote-ingress-test-fixtures.mjs'
+import { normalizeRemoteIngressV1 } from './remote-ingress-v1.mjs'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -15,7 +16,6 @@ import {
   isDeliverableCommand,
   hasValidCommandProjectScope,
   buildPollConnectionArguments,
-  normalizePollDelivery,
   REMOTE_INGRESS_VERSION,
   DELEGATED_SCOPE_VERSION,
   ACTIVE_PLAN_PROJECTION_VERSION,
@@ -24,13 +24,11 @@ import {
   installStopSignalHandlers,
   resolveServerAttachment,
   verbForTurnTransition,
-  trimAdvisoryCarry,
   pollTerminalReason,
   emptyTurnBackoffMs,
   errorBackoffMs,
   unansweredCommands,
   splitRoomWindow,
-  automationRunCommandText,
   PUSH_HEALTHY_MS,
   nextPushReconnectDelayMs,
   pushChannelUrl,
@@ -227,25 +225,26 @@ describe('buildPollConnectionArguments (delegated scope negotiation)', () => {
   })
 })
 
-describe('normalizePollDelivery (strict 1.3 active-plan delivery)', () => {
+// The poller hands each poll's ingress to normalizeRemoteIngressV1 (consumeCanonicalIngress).
+describe('poll ingress normalisation (strict 1.3 active-plan delivery)', () => {
   it('accepts the current revision and exposes all-room plans as advisory only', () => {
-    const accepted = normalizePollDelivery(fixturePollResponse(), FIXTURE_ID.connection)
+    const accepted = normalizeRemoteIngressV1(fixturePollResponse().ingress, FIXTURE_ID.connection)
     assert.equal(accepted.ok, true)
     assert.equal(accepted.commands.length, 1)
-    assert.equal(accepted.activeSessionPlans.advisory, true)
-    assert.equal(accepted.activeSessionPlans.plans[0].revision, 7)
+    assert.equal(accepted.envelope.active_session_plans.advisory, true)
+    assert.equal(accepted.envelope.active_session_plans.plans[0].revision, 7)
   })
 
   it('keeps replay/read awareness inert', () => {
     const envelope = fixtureEnvelope({ wakeKind: 'history_reseed', deliveryState: 'reseed' })
-    const accepted = normalizePollDelivery(fixturePollResponse({ envelope }), FIXTURE_ID.connection)
+    const accepted = normalizeRemoteIngressV1(fixturePollResponse({ envelope }).ingress, FIXTURE_ID.connection)
     assert.equal(accepted.ok, true)
     assert.deepEqual(accepted.commands, [])
-    assert.ok(accepted.activeSessionPlans)
+    assert.ok(accepted.envelope.active_session_plans)
   })
 
   it('fails closed instead of consulting top-level legacy command arrays', () => {
-    const accepted = normalizePollDelivery({ changed: true, commands: [command()] }, FIXTURE_ID.connection)
+    const accepted = normalizeRemoteIngressV1({ changed: true, commands: [command()] }, FIXTURE_ID.connection)
     assert.equal(accepted.ok, false)
   })
 })
@@ -294,55 +293,6 @@ describe('cadenceFor (hold length, not interval)', () => {
       ].map(([attached, turnActive]) => cadenceFor({ attached, turnActive }).tier),
     )
     assert.deepEqual([...tiers].sort(), ['attended', 'idle'])
-  })
-})
-
-/**
- * The advisory carry buffer. A long-poll answers the instant anything lands, so the
- * room and the command that needs it arrive in SEPARATE responses — this buffer is
- * what makes "the room arrives with the command" true rather than nominally true.
- */
-describe('trimAdvisoryCarry', () => {
-  const msg = (id, len = 10) => ({ id, content: 'x'.repeat(len) })
-
-  it('keeps everything inside budget, oldest-first order preserved', () => {
-    const { kept, dropped } = trimAdvisoryCarry([msg('a'), msg('b'), msg('c')])
-    assert.deepEqual(kept.map((m) => m.id), ['a', 'b', 'c'])
-    assert.equal(dropped, 0)
-  })
-
-  it('drops the OLDEST when over the count budget — nearest context survives', () => {
-    const { kept, dropped } = trimAdvisoryCarry([msg('a'), msg('b'), msg('c')], { maxCount: 2 })
-    assert.deepEqual(kept.map((m) => m.id), ['b', 'c'])
-    assert.equal(dropped, 1)
-  })
-
-  it('drops the oldest when over the character budget', () => {
-    const { kept, dropped } = trimAdvisoryCarry([msg('a', 100), msg('b', 100), msg('c', 100)], {
-      maxChars: 250,
-    })
-    assert.deepEqual(kept.map((m) => m.id), ['b', 'c'])
-    assert.equal(dropped, 1)
-  })
-
-  it('keeps a single over-budget message rather than delivering nothing', () => {
-    const { kept } = trimAdvisoryCarry([msg('huge', 50_000)], { maxChars: 100 })
-    assert.deepEqual(kept.map((m) => m.id), ['huge'])
-  })
-
-  it('handles empty and malformed input without throwing', () => {
-    assert.deepEqual(trimAdvisoryCarry([]), { kept: [], dropped: 0 })
-    assert.deepEqual(trimAdvisoryCarry(null), { kept: [], dropped: 0 })
-    assert.equal(trimAdvisoryCarry([{ id: 'no-content' }]).kept.length, 1)
-  })
-
-  it('THE 1-2-3 CASE: three separate arrivals still reach the command together', () => {
-    // Each untargeted message came back in its own long-poll response.
-    let carry = []
-    for (const n of ['1', '2', '3']) {
-      carry = trimAdvisoryCarry([...carry, { id: n, content: n }]).kept
-    }
-    assert.deepEqual(carry.map((m) => m.content), ['1', '2', '3'])
   })
 })
 
@@ -673,29 +623,6 @@ describe('installStopSignalHandlers (item b9e02835)', () => {
   })
 })
 
-describe('automationRunCommandText (explicit connection_id on claim & record)', () => {
-  it('includes explicit connection_id in both claim_automation_run and record_automation_run', () => {
-    const text = automationRunCommandText(
-      {
-        run_id: 'run-9999',
-        automation_name: 'Nightly Security Audit',
-        trigger_kind: 'scheduled',
-        permission: 'look_only',
-        owner: { display_name: 'N3O' },
-      },
-      ME,
-    )
-    assert.match(
-      text,
-      /claim_automation_run\(\{ run_id: "run-9999", connection_id: "conn-mine-1111", provider: "antigravity" \}\)/,
-    )
-    assert.match(
-      text,
-      /record_automation_run\(\{ run_id: "run-9999", connection_id: "conn-mine-1111", \.\.\. \}\)/,
-    )
-  })
-})
-
 describe('SSE push channel (parseSseFrame, pushChannelUrl, nextPushReconnectDelayMs, openPushChannel)', () => {
   it('builds /connection-stream URL with version query parameters', () => {
     const url = pushChannelUrl('https://api.devspec.ai/api/mcp/', ME)
@@ -926,9 +853,27 @@ describe('session-start auto-connect, cached instruction tiers, and sidecar wake
     fs.rmSync(tmpHome, { recursive: true, force: true })
   })
 
-  it('detects connectAtStartupEnabled from env or .devspec/project.json', () => {
-    assert.equal(connectAtStartupEnabled({ DEVSPEC_CONNECT_AT_STARTUP: '1' }), true)
-    assert.equal(connectAtStartupEnabled({ DEVSPEC_CONNECT_AT_STARTUP: '0' }), false)
+  // Hermetic: a key in this machine's own Antigravity config must not decide the
+  // answer, so every case names its home, folder and key (item 1df99dd4).
+  it('detects connectAtStartupEnabled from env or .devspec/project.json, and only with a key to connect with', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-startup-'))
+    const at = { cwd: tmp, home: tmp }
+    try {
+      assert.equal(
+        connectAtStartupEnabled({ HOME: tmp, DEVSPEC_CONNECT_AT_STARTUP: '1', DEVSPEC_MCP_TOKEN: 'dvs_startup_key' }, at),
+        true,
+      )
+      assert.equal(connectAtStartupEnabled({ HOME: tmp, DEVSPEC_CONNECT_AT_STARTUP: '1' }, at), false, 'no key: nothing to connect with')
+      assert.equal(
+        connectAtStartupEnabled({ HOME: tmp, DEVSPEC_CONNECT_AT_STARTUP: '0', DEVSPEC_MCP_TOKEN: 'dvs_startup_key' }, at),
+        false,
+      )
+      fs.mkdirSync(path.join(tmp, '.devspec'))
+      fs.writeFileSync(path.join(tmp, '.devspec', 'project.json'), JSON.stringify({ connect_at_startup: true }))
+      assert.equal(connectAtStartupEnabled({ HOME: tmp, DEVSPEC_MCP_TOKEN: 'dvs_startup_key' }, at), true)
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
   })
 
   it('auto-connects on SessionStart when DEVSPEC_CONNECT_AT_STARTUP=1 and injects cached tiers', async () => {
