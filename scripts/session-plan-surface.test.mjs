@@ -38,7 +38,7 @@ describe('bounded Antigravity plan discovery and prompts', () => {
   it('does not inject plan prompts before connection and provides revisioned resume/end/adoption after connection', () => {
     const hooks = JSON.parse(read('hooks.json'))
     assert.deepEqual(hooks['devspec-remote-control-mirror'].PreInvocation, [{
-      type: 'command', command: 'node "./scripts/pre-invocation.mjs"', timeout: 10,
+      type: 'command', command: 'node ./scripts/pre-invocation.mjs', timeout: 10,
     }])
     const remote = read('skills/devspec-remote/SKILL.md')
     for (const phrase of ['On reconnect', 'expected_revision', 'explicit `plan_id`', 'Another owner\'s plan is read-only', 'Closing a plan does not end remote control']) {

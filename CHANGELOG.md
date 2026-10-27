@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.21.2
+
+### The plugin works on native Windows again, and CI checks it there
+
+- **Hooks ran nowhere on native Windows.** agy runs hook commands through `cmd /c` on Windows, and a quoted path reaches node with its quotes still on (measured with agy 1.4.8). Every hook in `hooks.json` named its script as `node "./scripts/…"`, so every hook failed, and agy fails the tool call a failed PreToolUse hook was for: with the plugin installed, no tool call could run. Hook commands are now `node ./scripts/…`, which both `sh -c` and `cmd /c` run from the plugin folder. `scripts/hooks-json.test.mjs` keeps it that way.
+- **Full commit tracking stays off on native Windows, for a measured reason.** agy runs each command there with PowerShell, and a PowerShell line in front of it does reach git. But on Windows agy checks your permission rules against the rewritten command, and matches a PowerShell command whole: any added line would stop your allow rules from matching, so every command would ask, and could take commands past your deny rules. The stand-in never changes a permission decision, so it adds nothing on Windows. Native Windows keeps the simpler check that reads the command: a single-line `git commit -m` in a folder with a `.devspec/project.json` pin. The README and the agent's rules now say the pin is needed.
+- **CI.** A GitHub Actions workflow runs on Linux and on native Windows: the stand-in's unit tests, then the real agy (1.4.8, pinned by SHA-512) with this plugin installed, driven by a scripted model and a stand-in DevSpec, with no account or key. On both platforms it checks that the plugin's hooks run; that what your rules allow still runs, what they deny is still denied and anything else still asks, exactly as without the plugin; and that a commit in a project repository is tagged with its one claimed task and reported (any commit on Linux, a single-line one in a pinned folder on Windows).
+
 ## 0.21.1
 
 ### Which setups get full commit tracking

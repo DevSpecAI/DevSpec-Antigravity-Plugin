@@ -3,21 +3,21 @@
     "SessionStart": [
       {
         "type": "command",
-        "command": "node \"./scripts/session-start.mjs\"",
+        "command": "node ./scripts/session-start.mjs",
         "timeout": 30
       }
     ],
     "PreInvocation": [
       {
         "type": "command",
-        "command": "node \"./scripts/pre-invocation.mjs\"",
+        "command": "node ./scripts/pre-invocation.mjs",
         "timeout": 10
       }
     ],
     "PostInvocation": [
       {
         "type": "command",
-        "command": "node \"./scripts/post-invocation.mjs\"",
+        "command": "node ./scripts/post-invocation.mjs",
         "timeout": 15
       }
     ],
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"./scripts/devspec-tool-input.mjs\"",
+            "command": "node ./scripts/devspec-tool-input.mjs",
             "timeout": 10
           }
         ]
@@ -39,7 +39,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"./scripts/post-tool-dispatch.mjs\"",
+            "command": "node ./scripts/post-tool-dispatch.mjs",
             "timeout": 15
           }
         ]
@@ -48,7 +48,7 @@
     "Stop": [
       {
         "type": "command",
-        "command": "node \"./scripts/mirror-turn.mjs\" stop",
+        "command": "node ./scripts/mirror-turn.mjs stop",
         "timeout": 30
       }
     ]
