@@ -12,6 +12,10 @@
  * 4. Mechanically stamps `connection_id`, `project_id`, `local_session_id`,
  *    `provenance_ref`, `request_ref`, `agent_name`, and `plugin_version` into
  *    `overwrite` (and `hookSpecificOutput.updatedInput`) when unambiguous.
+ * 5. Makes a `post_session_message` that replies to DevSpec notices a notice reply
+ *    (`system_notice_ids`, notice-reply.mjs): the model's ids as an array, or the
+ *    turn's own notices when every wake of the turn was a notice; no trail and no
+ *    local-turn flags on it, and it never counts as the reply to a command.
  */
 
 import fs from 'node:fs'
@@ -24,12 +28,15 @@ import { handlePre } from './commit-provenance.mjs'
 import { versionedConnectionArguments } from './connection-version.mjs'
 import { launchGuard, resolveOwnConnectionId } from './launch-guard.mjs'
 import {
+  currentTurnNoticeIds,
   extractAntigravityTrailFromTranscript,
   parseTranscriptPath,
   readTurnMarker,
+  recordNoticeReply,
   resolveHookConversationId,
   writeExplicitReplyMarker,
 } from './mirror-turn.mjs'
+import { normalizeNoticeIds, postCanTakeTurnNotices } from './notice-reply.mjs'
 import { inferAntigravityTranscriptPath, readStateFile } from './remote-control-state.mjs'
 import { PROVENANCE_REF_TOOLS, REQUEST_REF_TOOLS, stampRequest } from './request-ref.mjs'
 import { readRequestState } from './requests.mjs'
@@ -185,6 +192,28 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
   if (verb === 'post_session_message' && next.provenance_ref !== undefined) {
     delete next.provenance_ref
   }
+
+  // A reply to DevSpec notices (notice-reply.mjs): the ids the model passed, as an
+  // array whatever shape its host's tool schema gave them; or, in a turn every wake of
+  // which was a notice, those notices' ids on a post that is aimed at nothing else.
+  let noticeReply = false
+  if (verb === 'post_session_message') {
+    if (next.system_notice_ids !== undefined) {
+      next.system_notice_ids = normalizeNoticeIds(next.system_notice_ids)
+      noticeReply = true
+    } else if (connectionId && postCanTakeTurnNotices(next)) {
+      const turnNotices = currentTurnNoticeIds(connectionId, { dir: connDir, connectionState: connState })
+      if (turnNotices) {
+        next.system_notice_ids = turnNotices
+        noticeReply = true
+      }
+    }
+    // It goes into the room the connection is attached to, so it needs the
+    // connection even when the model named a room.
+    if (noticeReply && connectionId && next.connection_id === undefined) {
+      next.connection_id = connectionId
+    }
+  }
   const effectiveCwd =
     (Array.isArray(input.workspacePaths) && input.workspacePaths[0]) ||
     input.cwd ||
@@ -262,6 +291,27 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
   }
   next = versionedConnectionArguments(verb, request.args)
 
+  // 8a. A reply to DevSpec notices is bound to no turn: it takes no trail and no
+  //     local-turn flags (the server refuses both on it), and it is not the turn's
+  //     reply, so a command being worked still gets its own answer. Only the host's
+  //     telemetry rides along, as on every answer.
+  if (verb === 'post_session_message' && noticeReply) {
+    const targetConnId = next.connection_id || connectionId
+    if (targetConnId) {
+      recordNoticeReply(targetConnId, connDir)
+      const telemetry = readConnectionTelemetry(targetConnId, { home })
+      if (telemetry) {
+        if (!next.agent_stats) next = { ...next, agent_stats: telemetry }
+        if (telemetry.model?.id) {
+          next = {
+            ...next,
+            model: { providerID: telemetry.model.provider || 'google', modelID: telemetry.model.id },
+          }
+        }
+      }
+    }
+  }
+
   // 8. For explicit session replies (non-trail, non-needs_input, non-local_prompt):
   //    record the explicit reply marker, stamp local-turn unbound flags when answering
   //    a local terminal prompt, stamp live mechanical telemetry (`agent_stats` and
@@ -270,6 +320,7 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
   //    Antigravity transcript if not already supplied.
   if (
     verb === 'post_session_message' &&
+    !noticeReply &&
     next.phase !== 'trail' &&
     next.phase !== 'needs_input' &&
     next.turn_kind !== 'local_prompt'

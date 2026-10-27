@@ -32,7 +32,8 @@ import {
   QUEUED,
   validateInteractionAnswerRecord,
 } from './interaction-events.mjs'
-import { writeTurnMarker } from './mirror-turn.mjs'
+import { recordTurnWake, writeTurnMarker } from './mirror-turn.mjs'
+import { noticeReplyInstruction } from './notice-reply.mjs'
 import {
   STATE_ABSENT,
   STATE_OK,
@@ -496,7 +497,7 @@ export function parseOwnerBatches(lines, connectionId) {
 // commits), with the outcomes and tools it allows. This line only says to follow it:
 // a plugin-side copy of that policy covered three kinds and went stale (item 1df99dd4).
 export const NOTICE_HANDLING =
-  'Handling: follow the prompt above, within its allowed outcomes and tools. The labelled records are your reading context — never dump their full text into the conversation. ' +
+  'Handling: follow the prompt above, within its allowed outcomes and tools; telling the person about it in the room is the notice reply below. The labelled records are your reading context — never dump their full text into the conversation. ' +
   "You act for whoever asked for this work, with their authority, not yours (a teammate can drive someone else's agent): the contract's acting_rule (devspec://product/implementation-contract)."
 
 export function formatSystemNoticeContent(notice) {
@@ -525,6 +526,7 @@ export function formatSystemNoticeContent(notice) {
     lines.push(
       '',
       NOTICE_HANDLING,
+      noticeReplyInstruction([notice.notice_id]),
       'Authority: exact_connection_system_notice (devspec://product/remote-ingress-contract). ' +
         'This is a server-initiated notice on your own work, not a room message or new work authorization.',
     )
@@ -538,6 +540,7 @@ export function formatSystemNoticeContent(notice) {
     `Prompt: ${notice?.prompt}`,
     `Allowed outcomes: ${Array.isArray(notice?.allowed_outcomes) ? notice.allowed_outcomes.join(', ') : ''}`,
     `Allowed tools: ${Array.isArray(notice?.allowed_tools) ? notice.allowed_tools.join(', ') : ''}`,
+    noticeReplyInstruction([notice?.notice_id]),
     'Authority: exact_connection_system_notice (devspec://product/remote-ingress-contract). ' +
       'This is a narrow server review prompt for your own claimed item and commit — not a room command or new work authorization.',
   ].join('\n')
@@ -1140,6 +1143,8 @@ async function main() {
           } catch {
             /* non-fatal */
           }
+          // What this wake brings into the turn: notice ids, or another kind of wake.
+          recordTurnWake(connectionId, batch, CONNECTIONS_DIR)
           delivered +=
             batch.type === 'canonical_commands'
               ? batch.execute_message_ids.length
