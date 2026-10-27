@@ -60,6 +60,7 @@ describe('Item 5 parity: rules/AGENTS.md, package version 0.15.0, and documentat
     assert.match(readme, /rules\/AGENTS\.md/)
     assert.match(readme, /Installing the plugin is required alongside the MCP server/)
     assert.match(readme, /local \(\/devspec-remote to connect\)/)
+    assert.match(readme, /agy plugin install https:\/\/github\.com\/DevSpecAI\/DevSpec-Antigravity-Plugin/)
     assert.match(readme, /agy --dangerously-skip-permissions/)
     assert.match(readme, /\/devspec-project/)
     assert.doesNotMatch(readme, /--install-plugin|--update-plugins/)

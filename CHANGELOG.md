@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.5
+
+- Documented the one-line `agy plugin install https://github.com/DevSpecAI/DevSpec-Antigravity-Plugin` install and update command in `README.md` (retaining manual `git clone` / `git pull` as an optional fallback) and added `displayName`, `description`, `version`, `author`, `homepage`, and `repository` metadata to `plugin.json`.
+
 ## 0.21.4
 
 - Canonical production MCP endpoint fallback (`https://api.devspec.ai/api/mcp`) is now used consistently across `resolve-mcp-auth.mjs`, `remote-control-state.mjs`, `mirror-turn.mjs`, and `devspec-project.mjs` whenever an MCP config entry omits `serverUrl`.
