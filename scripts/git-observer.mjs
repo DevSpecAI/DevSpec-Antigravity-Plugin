@@ -51,13 +51,10 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { resolveOwnConnectionId } from './launch-guard.mjs'
-import { resolveHookConversationId } from './mirror-turn.mjs'
 import { ensurePrivateDir, readPrivateJson, writePrivateJson } from './private-state.mjs'
 import { readStateFile } from './remote-control-state.mjs'
 import { readClaims, recoveryText, scopeFrom } from './commit-provenance.mjs'
-import { devspecFolderMarker } from './devspec-scope.mjs'
-import { projectRepositoryKeys } from './repository-context.mjs'
+import { connectedProject } from './commit-scope.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const FULL_SHA = /^[0-9a-f]{40}$/
@@ -271,16 +268,6 @@ function toolArgs(input) {
   return args && typeof args === 'object' && !Array.isArray(args) ? args : null
 }
 
-/** The live connection this hook's conversation is bound to, or null. */
-export function boundConnectionFor(input, { env = process.env, home = os.homedir() } = {}) {
-  const conversationId = resolveHookConversationId(input, env)
-  const connectionId = resolveOwnConnectionId(conversationId, { home })
-  if (!connectionId) return null
-  const state = readStateFile(connectionId, path.join(home, '.devspec', 'remote-control', 'connections'))
-  if (!state || state.enabled === false || state.connection_id !== connectionId) return null
-  return { connectionId, conversationId, state }
-}
-
 function pruneEnvelopes(dir, now) {
   try {
     const files = fs.readdirSync(dir).filter((name) => name.endsWith('.json'))
@@ -308,22 +295,15 @@ function pruneEnvelopes(dir, now) {
  * What the stand-in needs to tag or stop a commit in this command (item 31ef3d3c),
  * written beside the envelope as `stamps/<observation>.json`: the tasks claimed in
  * this conversation, the project's repositories as remote identities, the project id
- * (for a pin), the repository the conversation's folder marks for DevSpec (as before),
- * and the two recovery texts. No connection id, key or other credential goes in it.
+ * (for a pin naming it), and the two recovery texts. The stand-in decides scope from
+ * those alone (commit-scope.mjs, item cdd7f0f3). No connection id, key or other
+ * credential goes in it.
  * When the claims cannot be read, nothing is written and the stand-in only observes.
  */
-function writeStampFile(input, bound, dir, observationId, { env, home, now }) {
+function writeStampFile(input, project, dir, observationId, { env, home, now }) {
   try {
     const scope = scopeFrom(input, env)
     const claims = readClaims(scope, { env, now })
-    let marked = []
-    try {
-      if (devspecFolderMarker(scope.cwd, { home: env.USERPROFILE || env.HOME || home, mainWorktree: scope.mainWorktree })) {
-        marked = [scope.repoRoot]
-      }
-    } catch {
-      marked = []
-    }
     const stamps = path.join(dir, 'stamps')
     ensurePrivateDir(stamps, privateRoot(home))
     writePrivateJson(
@@ -331,9 +311,8 @@ function writeStampFile(input, bound, dir, observationId, { env, home, now }) {
       {
         v: 1,
         claims,
-        project_id: typeof bound.state.project_id === 'string' ? bound.state.project_id : null,
-        repositories: projectRepositoryKeys(bound.connectionId, { dir: path.join(home, '.devspec', 'remote-control', 'connections') }),
-        marked_repos: marked,
+        project_id: project.projectId,
+        repositories: project.repositories,
         messages: { unclaimed: recoveryText([]), several: claims.length > 1 ? recoveryText(claims) : null },
         created_at: now,
       },
@@ -356,7 +335,7 @@ export function prepareGitObservation(input, { env = process.env, home = os.home
     const toolInput = args ?? toolArgs(input)
     const command = toolInput?.CommandLine
     if (typeof command !== 'string' || !command.trim() || stripObserverPrefix(command).observed) return null
-    const bound = boundConnectionFor(input, { env, home })
+    const bound = connectedProject(input, { env, home })
     if (!bound) return null
     const generation = ensureGeneration(bound.connectionId, { home, env })
     if (!generation) return null

@@ -90,7 +90,7 @@ beforeEach(() => {
   fs.mkdirSync(connDir, { recursive: true, mode: 0o700 })
   fs.writeFileSync(
     path.join(connDir, `${CONN}.json`),
-    JSON.stringify({ connection_id: CONN, enabled: true, agent_name: 'Antigravity', local_id: CONV, token: 'dvs_test', mcp_url: serverUrl, connection_capability: 'cap-test' }),
+    JSON.stringify({ connection_id: CONN, enabled: true, agent_name: 'Antigravity', local_id: CONV, project_id: PIN, token: 'dvs_test', mcp_url: serverUrl, connection_capability: 'cap-test' }),
     { mode: 0o600 },
   )
   env = { PATH: process.env.PATH, HOME: home, GIT_CONFIG_NOSYSTEM: '1', DEVSPEC_ANTIGRAVITY_STATE_DIR: path.join(home, 'provenance') }

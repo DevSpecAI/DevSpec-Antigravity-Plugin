@@ -35,8 +35,8 @@ export function makeHome(root, { plugin = true, settings = {} } = {}) {
   return { home, pluginDir }
 }
 
-/** A git repository to work in, with the project's remote, optionally pinned to the project. */
-export function makeRepo(root, { pin = false } = {}) {
+/** A git repository to work in, with the project's remote and no pin. */
+export function makeRepo(root) {
   const repo = path.join(root, 'work')
   fs.mkdirSync(repo, { recursive: true })
   const git = (...args) => {
@@ -49,12 +49,8 @@ export function makeRepo(root, { pin = false } = {}) {
   git('config', 'user.email', 'e2e@example.invalid')
   git('config', 'commit.gpgsign', 'false')
   git('remote', 'add', 'origin', PROJECT_REMOTE)
-  fs.appendFileSync(path.join(repo, '.git', 'info', 'exclude'), '.agents/\n.devspec/\n')
+  fs.appendFileSync(path.join(repo, '.git', 'info', 'exclude'), '.agents/\n')
   git('commit', '-q', '--allow-empty', '-m', 'start')
-  if (pin) {
-    fs.mkdirSync(path.join(repo, '.devspec'), { recursive: true })
-    fs.writeFileSync(path.join(repo, '.devspec', 'project.json'), JSON.stringify({ project_id: PROJECT_ID }))
-  }
   return { repo, git }
 }
 

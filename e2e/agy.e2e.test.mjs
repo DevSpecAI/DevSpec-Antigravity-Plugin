@@ -13,7 +13,7 @@
  *   task and reported to DevSpec. On Linux and macOS the git stand-in does this for any
  *   commit; on native Windows agy runs commands in PowerShell, the stand-in is off (it
  *   would change permission decisions there), and the simpler check that reads the
- *   command tags a single-line `git commit -m` in a pinned folder.
+ *   command tags a single-line `git commit -m` in a repository the project tracks.
  */
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -28,7 +28,23 @@ const AGY = process.env.AGY_BIN || (process.env.AGY_E2E === '1' ? await fetchAgy
 const skip = AGY ? false : 'set AGY_E2E=1 (downloads the pinned agy) or AGY_BIN=<agy> to run'
 const windows = process.platform === 'win32'
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-agy-e2e-'))
-after(() => fs.rmSync(scratch, { recursive: true, force: true, maxRetries: 5 }))
+// The plugin's remote poller for a bound test connection can still be writing its
+// state for a moment after agy exits (seen on the Linux runner as ENOTEMPTY), so the
+// scratch folder is removed with patience; a leftover temp folder fails no check.
+after(async () => {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      fs.rmSync(scratch, { recursive: true, force: true })
+      return
+    } catch (error) {
+      if (attempt >= 20) {
+        console.warn(`could not remove ${scratch}: ${error.message}`)
+        return
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500))
+    }
+  }
+})
 const fresh = (name) => {
   const dir = path.join(scratch, name)
   fs.mkdirSync(dir, { recursive: true })
@@ -81,8 +97,8 @@ describe(`agy ${windows ? 'on native Windows' : `on ${process.platform}`} with t
     try {
       const root = fresh('commit')
       const { home, pluginDir } = makeHome(root)
-      // The simpler check on Windows acts only in a folder pinned to the project.
-      const { repo, git } = makeRepo(root, { pin: windows })
+      // No pin: on both platforms the repository is the project's by its origin.
+      const { repo, git } = makeRepo(root)
       bindConversation(repo, pluginDir, devspec.url)
       const commands = ['git commit -q --allow-empty -m "e2e single line"']
       if (!windows) commands.push("git commit -q --allow-empty -F - <<'MSG'\ne2e multi-line\n\nBody line.\nMSG")
