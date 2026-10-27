@@ -19,7 +19,9 @@ import { handleBashPost } from './commit-observation.mjs'
 import { handlePost, stagePendingNudge } from './commit-provenance.mjs'
 import { resolveOwnConnectionId } from './launch-guard.mjs'
 import {
+  currentTurnNoticeIds,
   explicitReplyMarkerPath,
+  isNoticeReplyToolCall,
   isRemotePlumbingToolCall,
   isSessionReplyToolCall,
   loadState,
@@ -100,7 +102,14 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
   //    or refresh/re-assert .turn on non-plumbing work tools and stream live mid-turn
   //    progress trail (`phase: 'trail'`) when attached to a session.
   const now = Date.now()
-  if (connectionId && isSessionReplyToolCall(toolName, toolInput)) {
+  // A reply to DevSpec notices is not the turn's reply (notice-reply.mjs): marking it
+  // as one would stop a command being worked from getting its own answer at Stop.
+  const noticeReply =
+    connectionId &&
+    isNoticeReplyToolCall(toolName, toolInput, {
+      turnNotices: currentTurnNoticeIds(connectionId, { dir: connectionsDir, connectionState: state }),
+    })
+  if (connectionId && !noticeReply && isSessionReplyToolCall(toolName, toolInput)) {
     try {
       const p = explicitReplyMarkerPath(connectionId, connectionsDir)
       fs.writeFileSync(p, JSON.stringify({ at: now }), { mode: 0o600 })

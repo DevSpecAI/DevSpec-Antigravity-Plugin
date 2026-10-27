@@ -44,6 +44,13 @@ import {
   requestsWithWorkPending,
   rotateRequestLog,
 } from './requests.mjs'
+import {
+  mergeTurnWake,
+  postCanTakeTurnNotices,
+  turnNoticeIds,
+  turnWakeFromEntry,
+  turnWakeFromText,
+} from './notice-reply.mjs'
 import { recordMirroredLocalPrompt } from './room-unread.mjs'
 import { readConnectionTelemetry } from './statusline.mjs'
 
@@ -135,6 +142,44 @@ export function writeTurnMarker(connectionId, extra = {}, dir = CONNECTIONS_DIR)
     /* non-fatal — the immediate busy heartbeat below still fires */
   }
   return payload
+}
+
+/**
+ * Mark the turn remote and record what one delivered inbox entry brought into it
+ * (notice-reply.mjs): its notice ids, or that something other than a notice woke it.
+ * The listener and the wait script call this for each entry they deliver.
+ */
+export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR) {
+  if (!connectionId) return null
+  const wake = turnWakeFromEntry(entry)
+  const existing = readTurnMarker(connectionId, dir)
+  // A notice is not a command: one that arrives during a turn typed at the terminal
+  // leaves it a local turn, so that turn's answer keeps its local-turn flags.
+  const remote = existing && wake?.noticeIds ? {} : { remoteTurn: true }
+  return writeTurnMarker(connectionId, { ...remote, ...mergeTurnWake(existing, wake) }, dir)
+}
+
+/**
+ * The notices the current turn is about when the plugin can tell for certain, else
+ * null (`turnNoticeIds` in notice-reply.mjs). Read fresh each time it is asked.
+ */
+export function currentTurnNoticeIds(
+  connectionId,
+  { dir = CONNECTIONS_DIR, connectionState = null, marker = undefined } = {},
+) {
+  if (!connectionId) return null
+  return turnNoticeIds({
+    marker: marker === undefined ? readTurnMarker(connectionId, dir) : marker,
+    requestState: readRequestState(connectionId, { dir }),
+    connectionState,
+  })
+}
+
+/** Note on the turn marker that a reply to its notices went out (for the Stop fallback). */
+export function recordNoticeReply(connectionId, dir = CONNECTIONS_DIR, now = Date.now()) {
+  if (!connectionId || !readTurnMarker(connectionId, dir)) return false
+  writeTurnMarker(connectionId, { noticeReplyAt: now, preserveExplicitReply: true }, dir)
+  return true
 }
 
 export function ownedWorkPath(connectionId, dir = CONNECTIONS_DIR) {
@@ -855,10 +900,13 @@ export function isSessionReplyToolCall(toolName, args = {}) {
     name.endsWith(':post_session_message') ||
     name.endsWith('__post_session_message')
   ) {
+    // A reply to a DevSpec notice (system_notice_ids) answers no command, so it is not
+    // the turn's reply: the command still needs its own answer (notice-reply.mjs).
     return (
       effectiveArgs?.phase !== 'trail' &&
       effectiveArgs?.phase !== 'needs_input' &&
-      effectiveArgs?.turn_kind !== 'local_prompt'
+      effectiveArgs?.turn_kind !== 'local_prompt' &&
+      effectiveArgs?.system_notice_ids === undefined
     )
   }
   if (name === 'run_command' || name === 'default_api:run_command' || name === 'Bash') {
@@ -871,6 +919,18 @@ export function isSessionReplyToolCall(toolName, args = {}) {
     }
   }
   return false
+}
+
+/**
+ * Whether a DevSpec `post_session_message` call is a reply to DevSpec notices: it names
+ * them itself, or PreToolUse gave it `turnNotices` (the turn's notices, from
+ * `currentTurnNoticeIds`) because nothing else in the turn could be its subject.
+ */
+export function isNoticeReplyToolCall(toolName, args = {}, { turnNotices = null } = {}) {
+  const { effectiveName: name, effectiveArgs } = unwrapMcpCallArgs(toolName, args)
+  if (!/(?:^|:|__|_)post_session_message$/.test(name)) return false
+  if (effectiveArgs?.system_notice_ids !== undefined) return true
+  return Boolean(turnNotices) && postCanTakeTurnNotices(effectiveArgs)
 }
 
 export function isRemotePlumbingToolCall(toolName, args = {}) {
@@ -1255,6 +1315,11 @@ export async function streamTurnTrailIfChanged(
   }
   if (!state.session_id && !marker.remoteTurn) {
     return { streamed: false, reason: 'not_attached' }
+  }
+  // A turn woken only by DevSpec notices has no command turn to carry a trail: the
+  // server would file it under the previous command (notice-reply.mjs).
+  if (currentTurnNoticeIds(connectionId, { dir: connectionsDir, connectionState: state, marker })) {
+    return { streamed: false, reason: 'notice_turn' }
   }
   const tPath =
     normalizeTranscriptPath(state.transcript_path) ||
@@ -1724,11 +1789,20 @@ export async function handleMirrorTurn(
 
     const turnActive = modeArg === 'user_prompt'
     if (turnActive) {
+      // What woke the turn (notice-reply.mjs): the wake's own notice ids, or that a
+      // person or a command did. The listener records the same as it delivers; both
+      // write, so neither ordering of the two loses it.
+      const wake = isRemoteWakeInput
+        ? turnWakeFromText(rawStepContent || text)
+        : fromAPerson
+          ? { otherWake: true }
+          : null
       const markerExtra = {
         held: false,
         remoteTurn: Boolean(isRemoteWakeInput),
         localPromptMirrored: Boolean(localPromptMirrored),
         ...(admittedLocalTurn ? { localTurn: admittedLocalTurn } : {}),
+        ...mergeTurnWake(readTurnMarker(connectionId, connectionsDir), wake),
       }
       if (typeof latestStep?.step_index === 'number') {
         markerExtra.lastStepIndex = latestStep.step_index
@@ -1757,6 +1831,13 @@ export async function handleMirrorTurn(
       }
 
       const hadExplicitReply = consumeExplicitReplyMarker(connectionId, connectionsDir)
+      // Read before the marker goes: a turn woken only by DevSpec notices ends with a
+      // reply to those notices, never with an answer filed under an earlier command.
+      const turnNotices = currentTurnNoticeIds(connectionId, {
+        dir: connectionsDir,
+        connectionState: state,
+        marker,
+      })
       clearTurnMarker(connectionId, connectionsDir)
 
       // Session fallback reply: if this turn ran on an attached session (either a remote wake
@@ -1769,7 +1850,45 @@ export async function handleMirrorTurn(
         !isRemoteTurn &&
           (marker?.localPromptMirrored || marker?.localTurn || state?.local_turn),
       )
-      if (!hadExplicitReply && sessionId && (isRemoteTurn || isLocalMirroredTurn || hadStreamedTrail)) {
+      if (turnNotices) {
+        // The model's last words on the notices, as a reply to them: bound to no
+        // command turn, so no trail, no complete_turn and no local-turn flags, which
+        // a notice reply refuses (notice-reply.mjs). Skipped when it already replied.
+        const replyText =
+          !hadExplicitReply && !marker?.noticeReplyAt && sessionId
+            ? (text ? prepareAgentMirrorText(text) : null) ||
+              extractLatestAssistantReplyFromTranscript(effectiveTranscriptPath, {
+                sinceMs: marker?.startedAt ?? null,
+              })
+            : null
+        if (replyText) {
+          const telemetry = connectionId ? readConnectionTelemetry(connectionId) : null
+          try {
+            await call({
+              mcpUrl,
+              token,
+              name: 'post_session_message',
+              arguments: {
+                connection_id: connectionId,
+                agent_name: agentName,
+                message: replyText,
+                system_notice_ids: turnNotices,
+                ...(telemetry ? { agent_stats: telemetry } : {}),
+                ...(telemetry?.model?.id
+                  ? {
+                      model: {
+                        providerID: telemetry.model.provider || 'google',
+                        modelID: telemetry.model.id,
+                      },
+                    }
+                  : {}),
+              },
+            })
+          } catch {
+            /* non-fatal fallback */
+          }
+        }
+      } else if (!hadExplicitReply && sessionId && (isRemoteTurn || isLocalMirroredTurn || hadStreamedTrail)) {
         let trail = { markdown: '', events: [] }
         if (effectiveTranscriptPath && fs.existsSync(effectiveTranscriptPath)) {
           try {

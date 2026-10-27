@@ -308,6 +308,9 @@ function readTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
   }
 }
 
+// The poller marks a turn only for a command, an automation run or an answered
+// question, so each call also says `otherWake`: that turn was not woken by DevSpec
+// notices alone, and its posts are never stamped as notice replies (notice-reply.mjs).
 function writeTurnMarker(connectionId, extra = { remoteTurn: true }) {
   if (!connectionId) return
   writeTurnMarkerWithExtra(connectionId, extra, CONNECTIONS_DIR)
@@ -1816,7 +1819,7 @@ async function main() {
     patchState({ interaction_continuation: interactionContinuation })
     pendingInteractionAck = questionEventAck(event)
     if (shouldAssertTurnOnPollerInboxWrite(connectionId, readState(connectionId))) {
-      writeTurnMarker(connectionId, { remoteTurn: true })
+      writeTurnMarker(connectionId, { remoteTurn: true, otherWake: true })
     }
     process.stdout.write(
       JSON.stringify({
@@ -2131,7 +2134,7 @@ async function main() {
         }) + '\n',
       )
       if (shouldAssertTurnOnPollerInboxWrite(connectionId, readState(connectionId))) {
-        writeTurnMarker(connectionId, { remoteTurn: true })
+        writeTurnMarker(connectionId, { remoteTurn: true, otherWake: true })
       }
       patchState({ last_owner_wake_at: new Date().toISOString() })
       if (persisted.handedOff) {
@@ -2201,7 +2204,7 @@ async function main() {
         }) + '\n',
       )
       if (shouldAssertTurnOnPollerInboxWrite(connectionId, readState(connectionId))) {
-        writeTurnMarker(connectionId, { remoteTurn: true })
+        writeTurnMarker(connectionId, { remoteTurn: true, otherWake: true })
       }
     }
     return { ok: true, delivered: persisted.appended > 0 }

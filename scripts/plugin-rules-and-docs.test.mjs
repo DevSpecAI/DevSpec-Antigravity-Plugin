@@ -31,6 +31,9 @@ describe('Item 5 parity: rules/AGENTS.md, package version 0.15.0, and documentat
     assert.match(content, /update_resource/)
     assert.match(content, /manage_discussion_point/)
     assert.match(content, /complete_turn:\s*true/)
+    // A reply about a DevSpec notice is a notice reply, never a command answer (fdc96b30).
+    assert.match(content, /system_notice_ids/)
+    assert.match(content, /semantics\.notice_reply/)
     assert.match(content, /never pass `provenance_ref`/)
     assert.match(content, /wake: ALREADY ARMED/)
     assert.match(content, /rearm:\s*"already_armed"/)

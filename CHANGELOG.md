@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.19.0
+
+### Replies to DevSpec notices reach the room as replies to the notice
+
+DevSpec sends the agent notices about its own work (a finding, the outcome of work that waited for someone's OK, a review of an untagged commit), and many of them ask it to tell you. Until now that message went into the room as a plain post, and when no request of yours was open DevSpec filed it as a late answer to whatever you last asked, quoting that request. Someone following from their phone could read it as an answer to the wrong thing, or miss it.
+
+- **A notice reply is labelled as one.** The agent now tells you about a notice with DevSpec's reply-to-a-notice post: the room shows it as the agent's own message replying to that notice, never as an answer to anyone's request.
+- **It never touches your request.** If a notice arrives while the agent is working on something you asked, it can tell you about the notice in a separate message, and your request still ends with its own answer. A notice reply never finishes, closes or is filed under a request.
+- **No ids typed from memory.** Every notice the agent receives ends with the exact message to send, with the notice's id in it. When everything that woke the agent was a notice, the plugin adds the ids itself, and if the agent finishes without posting, its last words go into the room as a reply to those notices. Work steps are no longer streamed into the room for such a turn, because DevSpec would file them under your previous request.
+- **Older tool lists still work.** If Antigravity still holds the tool list from before DevSpec added notice replies and the agent sends the ids as text, the plugin turns them into the list DevSpec expects.
+- **Refusals say why.** If DevSpec refuses a notice reply, the agent sees DevSpec's reason; when it is not attached to a room, it tells you in the terminal instead.
+- **Agent rules.** `rules/AGENTS.md` and the `devspec-remote` skill describe the notice reply and point at `semantics.notice_reply` in DevSpec's remote ingress contract rather than restating it. The rules file stays inside Antigravity's 24,000-byte limit for a rule file.
+
 ## 0.18.10
 
 ### New DevSpec settings page names
