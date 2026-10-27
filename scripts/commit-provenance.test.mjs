@@ -293,6 +293,55 @@ describe('commit-provenance.mjs — claim/release tracking per conversation', ()
     assert.match(ambiguous.reason, new RegExp(OTHER))
   })
 
+  it('asks the model to type a tag only when several tasks are claimed: otherwise it claims and retries, and the tag is added', async () => {
+    const run = (command) =>
+      runDevspecToolInput(
+        JSON.stringify({ conversationId: CONVERSATION, cwd: repo, tool_name: 'run_command', tool_input: { CommandLine: command, Cwd: repo } }),
+        { env },
+      )
+    const asksToTypeATag = /\[devspec:<(?:full-)?uuid>\]|add \[devspec|put \[devspec/i
+
+    // No claim: find or create the task, claim it, retry the same commit.
+    const unclaimed = await run('git commit -m "feat: the work"')
+    assert.equal(unclaimed.decision, 'deny')
+    assert.match(unclaimed.reason, /claim_work_item/)
+    assert.match(unclaimed.reason, /retry the same commit/i)
+    assert.match(unclaimed.reason, /added for you/)
+    assert.doesNotMatch(unclaimed.reason, asksToTypeATag)
+
+    // Claimed: retrying that exact commit is stamped by the plugin, nothing typed.
+    handlePost(
+      {
+        conversationId: CONVERSATION,
+        cwd: repo,
+        tool_name: 'mcp_devspec_claim_work_item',
+        tool_input: { task_id: ITEM },
+        tool_response: { content: [{ type: 'text', text: JSON.stringify({ id: ITEM }) }] },
+      },
+      { env },
+    )
+    const retried = await run('git commit -m "feat: the work"')
+    assert.equal(retried.decision, 'allow')
+    assert.equal(retried.overwrite.CommandLine, `git commit -m "feat: the work [devspec:${ITEM}]"`)
+
+    // One claim, but a message the stamp cannot extend: quote it and retry, still nothing typed.
+    const unquoted = await run('git commit -m wip')
+    assert.equal(unquoted.decision, 'deny')
+    assert.match(unquoted.reason, /in quotes after -m/)
+    assert.match(unquoted.reason, /added for you/)
+    assert.doesNotMatch(unquoted.reason, asksToTypeATag)
+    assert.equal(unquoted.reason.includes(ITEM), false, 'no id handed over to be typed')
+
+    // The edit nudge says the same as the refusal.
+    const nudged = await handlePre(
+      { conversationId: 'b0b0b0b0-1111-4222-8333-444444444444', cwd: repo, tool_name: 'replace_file_content', tool_input: { TargetFile: path.join(repo, 'x.js') } },
+      { env },
+    )
+    assert.match(nudged.systemMessage, /claim_work_item/)
+    assert.match(nudged.systemMessage, /added for you/)
+    assert.doesNotMatch(nudged.systemMessage, asksToTypeATag)
+  })
+
   it('supports heredoc commit parsing, simple git push detection, and online validation', async () => {
     assert.equal(isSimpleGitPush('git push origin staging'), true)
     assert.equal(
