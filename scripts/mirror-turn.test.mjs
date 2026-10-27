@@ -18,7 +18,20 @@ import {
   isOperationalChrome,
   prepareAgentMirrorText,
   explicitReplyMarkerPath,
+  writeExplicitReplyMarker,
   consumeExplicitReplyMarker,
+  parseTranscriptPath,
+  normalizeTranscriptPath,
+  syncStateTranscriptPath,
+  extractUserRequestText,
+  extractLatestTranscriptStep,
+  launchedAntigravityBackgroundWork,
+  handleMirrorTurn,
+  recordOwnedLaunch,
+  writeTurnMarker,
+  readTurnMarker,
+  extractAntigravityTrailFromTranscript,
+  streamTurnTrailIfChanged,
 } from './mirror-turn.mjs'
 
 describe('resolveHookConversationId', () => {
@@ -247,3 +260,668 @@ describe('explicit-reply marker (double-post guard, item b9fb49a9)', () => {
     assert.equal(path.dirname(p), path.join(os.homedir(), '.devspec', 'remote-control', 'connections'))
   })
 })
+
+describe('Antigravity native hook payload & transcript handling', () => {
+  it('resolves Antigravity conversationId and transcriptPath from stdin JSON', () => {
+    const raw = JSON.stringify({
+      conversationId: 'ca2d5a24-57ea-4252-90d0-82d4dd2504d1',
+      transcriptPath: '/tmp/brain/ca2d5a24/.system_generated/logs/transcript.jsonl',
+    })
+    assert.equal(resolveHookConversationId(raw, {}), 'ca2d5a24-57ea-4252-90d0-82d4dd2504d1')
+    assert.equal(
+      parseTranscriptPath(raw),
+      '/tmp/brain/ca2d5a24/.system_generated/logs/transcript.jsonl',
+    )
+  })
+
+  it('extracts user prompt from <USER_REQUEST> wrapper in Antigravity transcript.jsonl', () => {
+    const wrapped = '<USER_REQUEST>\nFix the hook schema\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nfoo\n</ADDITIONAL_METADATA>'
+    assert.equal(extractUserRequestText(wrapped), 'Fix the hook schema')
+  })
+
+  it('mirrors USER_INPUT on PreInvocation once, skips mid-turn PLANNER_RESPONSE, and holds Stop on subagent launch', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-mirror-test-'))
+    const connId = '11111111-2222-4333-8444-555555555555'
+    const convId = 'ca2d5a24-57ea-4252-90d0-82d4dd2504d1'
+    const transcriptFile = path.join(tmpDir, 'transcript.jsonl')
+    try {
+      fs.writeFileSync(
+        path.join(tmpDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          session_id: '22222222-3333-4444-8555-666666666666',
+          local_id: convId,
+          agent_name: 'Antigravity',
+          token: 'dvs_test',
+          mcp_url: 'https://fixture.invalid/api/mcp',
+        }),
+      )
+      fs.writeFileSync(
+        transcriptFile,
+        JSON.stringify({
+          step_index: 1,
+          type: 'USER_INPUT',
+          source: 'USER_EXPLICIT',
+          content: '<USER_REQUEST>\nShip parity item 1\n</USER_REQUEST>',
+        }) + '\n',
+      )
+
+      const calls = []
+      const mockCall = async (req) => {
+        calls.push(req)
+        return { ok: true }
+      }
+
+      const hookInput = JSON.stringify({
+        conversationId: convId,
+        transcriptPath: transcriptFile,
+      })
+
+      // 1st PreInvocation: mirrors local_prompt + sets busy: true
+      const first = await handleMirrorTurn('user_prompt', hookInput, {
+        env: {},
+        connectionsDir: tmpDir,
+        legacyPath: path.join(tmpDir, 'legacy.json'),
+        call: mockCall,
+      })
+      assert.equal(first.ok, true)
+      assert.equal(calls.length, 2)
+      assert.equal(calls[0].name, 'post_session_message')
+      assert.equal(calls[0].arguments.message, 'Ship parity item 1')
+      assert.equal(calls[1].name, 'heartbeat_connection')
+      assert.equal(calls[1].arguments.busy, true)
+
+      // Append PLANNER_RESPONSE (mid-turn tool step) -> next PreInvocation is deduplicated
+      fs.appendFileSync(
+        transcriptFile,
+        JSON.stringify({
+          step_index: 2,
+          type: 'PLANNER_RESPONSE',
+          source: 'MODEL',
+          content: '',
+        }) + '\n',
+      )
+      const second = await handleMirrorTurn('user_prompt', hookInput, {
+        env: {},
+        connectionsDir: tmpDir,
+        legacyPath: path.join(tmpDir, 'legacy.json'),
+        call: mockCall,
+      })
+      assert.equal(second.skipped, 'mid_turn_pre_invocation')
+      assert.equal(calls.length, 2)
+
+      // Launch a subagent in this turn -> Stop holds the turn open
+      const launch = launchedAntigravityBackgroundWork(
+        'invoke_subagent',
+        { Subagents: [{ Role: 'Researcher' }] },
+        { output: '{"conversationId":"subagent-uuid-1"}' },
+      )
+      assert.equal(launch?.id, 'subagent-uuid-1')
+      recordOwnedLaunch(connId, launch, { dir: tmpDir })
+
+      const heldStop = await handleMirrorTurn('stop', hookInput, {
+        env: {},
+        connectionsDir: tmpDir,
+        legacyPath: path.join(tmpDir, 'legacy.json'),
+        call: mockCall,
+      })
+      assert.equal(heldStop.held, true)
+      assert.equal(readTurnMarker(connId, tmpDir)?.held, true)
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('ignores devspec-remote-wait.mjs and devspec-remote-listen.mjs background launches so Stop is not held open', () => {
+    const waiter = launchedAntigravityBackgroundWork(
+      'default_api:run_command',
+      {
+        CommandLine: 'node "/home/user/.gemini/config/plugins/devspec/scripts/devspec-remote-wait.mjs" --connection-id "conn-1" --owner-pid "$PPID" --pending',
+        WaitMsBeforeAsync: 500,
+      },
+      { output: 'Command sent to background with background task ID: task-wait-1' },
+    )
+    assert.equal(waiter, null)
+
+    const listener = launchedAntigravityBackgroundWork(
+      'run_command',
+      {
+        CommandLine: 'node scripts/devspec-remote-listen.mjs --connection-id conn-1',
+      },
+      { output: 'TaskId: task-listen-1' },
+    )
+    assert.equal(listener, null)
+
+    const realBg = launchedAntigravityBackgroundWork(
+      'default_api:run_command',
+      {
+        CommandLine: 'npm run build',
+        toolSummary: 'Run build in background',
+      },
+      { output: 'Command sent to background with background task ID: task-build-1' },
+    )
+    assert.deepEqual(realBg, {
+      id: 'task-build-1',
+      kind: 'command',
+      label: 'Run build in background',
+    })
+  })
+
+  it('normalizes transcript_full.jsonl to compact transcript.jsonl when sibling exists and avoids rewriting state on PostInvocation', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-transcript-norm-'))
+    try {
+      const compactPath = path.join(tmpDir, 'transcript.jsonl')
+      const fullPath = path.join(tmpDir, 'transcript_full.jsonl')
+      fs.writeFileSync(compactPath, '{}\n')
+      fs.writeFileSync(fullPath, '{}\n')
+
+      assert.equal(normalizeTranscriptPath(fullPath), compactPath)
+      assert.equal(
+        parseTranscriptPath(JSON.stringify({ transcriptPath: fullPath })),
+        compactPath,
+      )
+
+      const connId = '33333333-4444-4555-8666-777777777777'
+      const convId = 'ca2d5a24-57ea-4252-90d0-82d4dd2504d1'
+      const stateFile = path.join(tmpDir, `${connId}.json`)
+      const state = {
+        enabled: true,
+        connection_id: connId,
+        local_id: convId,
+        transcript_path: compactPath,
+      }
+      fs.writeFileSync(stateFile, JSON.stringify(state, null, 2))
+
+      // PreInvocation passes transcript_full.jsonl -> normalizes to compactPath, no rewrite needed
+      assert.equal(
+        syncStateTranscriptPath(state, fullPath, convId, { connectionsDir: tmpDir, env: {} }),
+        false,
+      )
+      // PostInvocation passes null transcriptPath -> preserves existing compactPath, no rewrite needed
+      assert.equal(
+        syncStateTranscriptPath(state, null, convId, { connectionsDir: tmpDir, env: {} }),
+        false,
+      )
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('posts a fallback post_session_message with work_trail on Stop when a remote turn ends without an explicit reply, and skips when explicit reply was posted', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-fallback-reply-'))
+    try {
+      const connId = '44444444-5555-4666-8777-888888888888'
+      const convId = 'conv-remote-fallback-1'
+      const sessId = 'sess-remote-fallback-1'
+      const transcriptPath = path.join(tmpDir, 'transcript.jsonl')
+
+      fs.writeFileSync(
+        path.join(tmpDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          session_id: sessId,
+          local_id: convId,
+          agent_name: 'Antigravity',
+          token: 'dvs_test_tok',
+          mcp_url: 'https://api.devspec.ai/api/mcp',
+          transcript_path: transcriptPath,
+        }),
+      )
+
+      const startedAt = Date.parse('2026-10-14T22:00:00.000Z')
+      fs.writeFileSync(
+        transcriptPath,
+        [
+          JSON.stringify({
+            step_index: 1,
+            type: 'SYSTEM_MESSAGE',
+            created_at: '2026-10-14T22:00:01.000Z',
+            content: '{"event":"wake","command_count":1}',
+          }),
+          JSON.stringify({
+            step_index: 2,
+            type: 'PLANNER_RESPONSE',
+            created_at: '2026-10-14T22:00:03.000Z',
+            thinking: 'Checking the status of the repository.',
+            tool_calls: [
+              {
+                name: 'view_file',
+                args: {
+                  AbsolutePath: '"/tmp/readme.md"',
+                  toolAction: '"Viewing readme.md"',
+                  toolSummary: '"View readme.md"',
+                },
+              },
+            ],
+          }),
+          JSON.stringify({
+            step_index: 3,
+            type: 'PLANNER_RESPONSE',
+            created_at: '2026-10-14T22:00:06.000Z',
+            content: 'Everything in readme.md looks clean and up to date.',
+          }),
+        ].join('\n') + '\n',
+      )
+
+      writeTurnMarker(connId, { startedAt, remoteTurn: true, held: false }, tmpDir)
+
+      const calls = []
+      const stopRes = await handleMirrorTurn(
+        'stop',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        {
+          env: {},
+          connectionsDir: tmpDir,
+          legacyPath: path.join(tmpDir, 'legacy.json'),
+          call: async (req) => {
+            calls.push(req)
+            return { ok: true }
+          },
+        },
+      )
+      assert.equal(stopRes.ok, true)
+      const postCall = calls.find((c) => c.name === 'post_session_message')
+      assert.ok(postCall, 'posts fallback reply on Stop when no explicit post_session_message was called')
+      assert.equal(postCall.arguments.connection_id, connId)
+      assert.equal(postCall.arguments.session_id, sessId)
+      assert.equal(
+        postCall.arguments.message,
+        'Everything in readme.md looks clean and up to date.',
+      )
+      assert.match(postCall.arguments.work_trail, /Viewing readme\.md/)
+      assert.equal(postCall.arguments.trail_events.length, 2)
+
+      // Now verify that when writeExplicitReplyMarker was called during the turn, Stop does NOT post a duplicate reply
+      calls.length = 0
+      writeTurnMarker(connId, { startedAt, remoteTurn: true, held: false }, tmpDir)
+      writeExplicitReplyMarker(connId, tmpDir)
+      await handleMirrorTurn(
+        'stop',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        {
+          env: {},
+          connectionsDir: tmpDir,
+          legacyPath: path.join(tmpDir, 'legacy.json'),
+          call: async (req) => {
+            calls.push(req)
+            return { ok: true }
+          },
+        },
+      )
+      assert.equal(calls.find((c) => c.name === 'post_session_message'), undefined)
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('admits local terminal turns (startLocalTurn + openRequest typed_prompt), posts symmetric fallback reply on Stop with local_turn + command_turn_unbound, and closes the local turn and request', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-local-turn-symmetry-'))
+    try {
+      const { readRequestState, recordDeliveredBatchRequests } = await import('./requests.mjs')
+      const connId = '55555555-6666-4777-8888-999999999999'
+      const convId = 'conv-local-symmetry-1'
+      const sessId = '66666666-7777-4888-8999-aaaaaaaaaaaa'
+      const attachId = '77777777-8888-4999-8aaa-bbbbbbbbbbbb'
+      const attachedAt = '2026-10-15T12:00:00.000Z'
+      const transcriptPath = path.join(tmpDir, 'transcript.jsonl')
+
+      fs.writeFileSync(
+        path.join(tmpDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          session_id: sessId,
+          local_id: convId,
+          agent_name: 'Antigravity',
+          token: 'dvs_test_tok',
+          mcp_url: 'https://api.devspec.ai/api/mcp',
+          connection_capability: 'cap_secret_v1',
+          speech_attachment_id: attachId,
+          attached_at: attachedAt,
+          transcript_path: transcriptPath,
+        }),
+      )
+
+      fs.writeFileSync(
+        transcriptPath,
+        [
+          JSON.stringify({
+            step_index: 1,
+            type: 'USER_INPUT',
+            source: 'USER_EXPLICIT',
+            created_at: '2026-10-15T12:00:01.000Z',
+            content: '<USER_REQUEST>\nUpdate the memory from the terminal\n</USER_REQUEST>',
+          }),
+        ].join('\n') + '\n',
+      )
+
+      let admittedAttemptId = null
+      let openedRequestId = null
+      const calls = []
+      const mockCall = async (req) => {
+        calls.push(req)
+        if (req.name === 'report_pickup') {
+          admittedAttemptId = req.arguments.attempt_id
+          return {
+            connection_id: connId,
+            attempt_id: req.arguments.attempt_id,
+            expected_session_id: sessId,
+            status: 'working',
+          }
+        }
+        if (req.name === 'report_request') {
+          if (req.arguments.action === 'open') {
+            openedRequestId = req.arguments.request_id
+            return {
+              request_id: req.arguments.request_id,
+              status: 'open',
+              requested_by_user_id: 'a1111111-1111-4111-8111-111111111111',
+            }
+          }
+          if (req.arguments.action === 'close') {
+            return { status: 'closed' }
+          }
+        }
+        return { ok: true }
+      }
+
+      // 1. PreInvocation on local terminal prompt: admits local turn, opens typed_prompt request, mirrors prompt
+      const preRes = await handleMirrorTurn(
+        'user_prompt',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        {
+          env: {},
+          connectionsDir: tmpDir,
+          legacyPath: path.join(tmpDir, 'legacy.json'),
+          call: mockCall,
+        },
+      )
+      assert.equal(preRes.ok, true)
+      const pickupCall = calls.find((c) => c.name === 'report_pickup')
+      assert.ok(pickupCall, 'calls report_pickup for local turn admission')
+      assert.equal(pickupCall.arguments.local_turn, true)
+      assert.equal(pickupCall.arguments.local_activity_version, 1)
+      assert.equal(pickupCall.connectionCapability, 'cap_secret_v1')
+
+      const reqCall = calls.find((c) => c.name === 'report_request')
+      assert.ok(reqCall, 'calls report_request to open typed_prompt request')
+      assert.equal(reqCall.arguments.kind, 'typed_prompt')
+
+      const promptMirrorCall = calls.find(
+        (c) => c.name === 'post_session_message' && c.arguments.turn_kind === 'local_prompt',
+      )
+      assert.ok(promptMirrorCall, 'mirrors local user prompt to session')
+      assert.equal(promptMirrorCall.arguments.message, 'Update the memory from the terminal')
+
+      const reqStateDuringTurn = readRequestState(connId, { dir: tmpDir })
+      assert.equal(reqStateDuringTurn.current, openedRequestId)
+      assert.equal(reqStateDuringTurn.open.get(openedRequestId)?.kind, 'typed_prompt')
+
+      // 2. Append assistant reply in transcript without explicit post_session_message -> Stop mirrors fallback reply symmetrically
+      fs.appendFileSync(
+        transcriptPath,
+        JSON.stringify({
+          step_index: 2,
+          type: 'PLANNER_RESPONSE',
+          source: 'MODEL',
+          created_at: new Date(Date.now() + 1000).toISOString(),
+          content: 'I updated the memory as requested from the terminal.',
+        }) + '\n',
+      )
+
+      calls.length = 0
+      const stopRes = await handleMirrorTurn(
+        'stop',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        {
+          env: {},
+          connectionsDir: tmpDir,
+          legacyPath: path.join(tmpDir, 'legacy.json'),
+          call: mockCall,
+        },
+      )
+      assert.equal(stopRes.ok, true)
+      const fallbackReply = calls.find((c) => c.name === 'post_session_message')
+      assert.ok(fallbackReply, 'posts symmetric fallback reply on Stop for mirrored local terminal turn')
+      assert.equal(fallbackReply.arguments.connection_id, connId)
+      assert.equal(fallbackReply.arguments.session_id, sessId)
+      assert.equal(fallbackReply.arguments.command_turn_unbound, true)
+      assert.equal(fallbackReply.arguments.local_turn, true)
+      assert.equal(fallbackReply.arguments.complete_turn, true)
+      assert.equal(
+        fallbackReply.arguments.message,
+        'I updated the memory as requested from the terminal.',
+      )
+
+      const completeCall = calls.find((c) => c.name === 'report_complete')
+      assert.ok(completeCall, 'completes the local turn attempt via report_complete')
+      assert.equal(completeCall.arguments.attempt_id, admittedAttemptId)
+
+      const reqStateAfterStop = readRequestState(connId, { dir: tmpDir })
+      assert.equal(reqStateAfterStop.open.size, 0, 'closes the typed_prompt request on Stop')
+
+      // 3. Verify recordDeliveredBatchRequests sets op: 'current' when devspec-remote-wait delivers a command batch
+      const cmdReqId = '99999999-aaaa-4bbb-8ccc-dddddddddddd'
+      const cmdMsgId = 'aaaaaaaa-bbbb-4ccc-8ddd-ffffffffffff'
+      const cmdProvRef = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff'
+      fs.appendFileSync(
+        path.join(tmpDir, `${connId}.requests.jsonl`),
+        JSON.stringify({
+          op: 'open',
+          id: cmdReqId,
+          kind: 'command',
+          message_id: cmdMsgId,
+          provenance_ref: cmdProvRef,
+          requested_by: 'a1111111-1111-4111-8111-111111111111',
+        }) + '\n',
+      )
+      recordDeliveredBatchRequests(
+        connId,
+        [
+          {
+            type: 'owner_message',
+            message: { id: cmdMsgId, provenance_ref: cmdProvRef },
+          },
+        ],
+        { dir: tmpDir },
+      )
+      const reqStateAfterWake = readRequestState(connId, { dir: tmpDir })
+      assert.equal(reqStateAfterWake.current, cmdReqId)
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('extracts Pi-style thinking/tool/domain/subagent trail events without command obfuscation, streams mid-turn phase:trail, and finalizes cleanly on Stop', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-pi-trail-'))
+    try {
+      const connId = '88888888-9999-4aaa-8bbb-cccccccccccc'
+      const convId = 'conv-pi-trail-1'
+      const sessId = '99999999-aaaa-4bbb-8ccc-dddddddddddd'
+      const transcriptPath = path.join(tmpDir, 'transcript.jsonl')
+
+      const state = {
+        enabled: true,
+        connection_id: connId,
+        session_id: sessId,
+        local_id: convId,
+        agent_name: 'Antigravity',
+        token: 'dvs_test_tok',
+        mcp_url: 'https://api.devspec.ai/api/mcp',
+        transcript_path: transcriptPath,
+      }
+      fs.writeFileSync(path.join(tmpDir, `${connId}.json`), JSON.stringify(state))
+
+      const startedAt = Date.parse('2026-10-15T20:00:00.000Z')
+      fs.writeFileSync(
+        transcriptPath,
+        [
+          JSON.stringify({
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            created_at: '2026-10-15T20:00:02.000Z',
+            thinking: 'First paragraph of reasoning.\n\nSecond paragraph checking git status and token dvs_secret123456789.',
+            tool_calls: [
+              {
+                name: 'default_api:run_command',
+                args: {
+                  CommandLine: 'git status --short && echo dvs_secret123456789',
+                  Cwd: '/repo',
+                  toolAction: 'Checking git status',
+                },
+              },
+              {
+                name: 'default_api:call_mcp_tool',
+                args: {
+                  ServerName: 'devspec',
+                  ToolName: 'claim_work_item',
+                  Arguments: {
+                    task_id: '4cbd20e0-1417-4c5f-9d99-28f5607bf296',
+                    agent_branch: 'agent/4cbd20e0-trail',
+                  },
+                },
+              },
+              {
+                name: 'default_api:invoke_subagent',
+                args: {
+                  Subagents: [
+                    {
+                      Role: 'Test Runner',
+                      TypeName: 'self',
+                      Model: 'inherit',
+                      Prompt: 'Run the test suite and verify exit code.',
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+        ].join('\n') + '\n',
+      )
+
+      const extracted = extractAntigravityTrailFromTranscript(
+        fs.readFileSync(transcriptPath, 'utf8'),
+        { sinceMs: startedAt },
+      )
+      // 1 thinking event (containing full redacted text) + 1 bash tool + 1 domain (claim_work_item) + 1 subagent = 4 trail events
+      assert.equal(extracted.events.length, 4)
+      assert.equal(extracted.events[0].kind, 'thinking')
+      assert.match(extracted.events[0].text, /First paragraph of reasoning\./)
+      assert.match(extracted.events[0].text, /token \[REDACTED\]\./)
+
+      const bashEv = extracted.events[1]
+      assert.equal(bashEv.kind, 'tool')
+      assert.equal(bashEv.name, 'bash')
+      assert.equal(bashEv.status, 'ok')
+      // Command is NOT obfuscated, only the secret token is redacted
+      assert.equal(bashEv.args, 'git status --short && echo [REDACTED]')
+      assert.equal(bashEv.result, 'Checking git status')
+
+      const domainEv = extracted.events[2]
+      assert.equal(domainEv.kind, 'domain')
+      assert.equal(domainEv.domain, 'task')
+      assert.equal(domainEv.action, 'claimed')
+      assert.equal(domainEv.name, 'claim_work_item')
+      assert.equal(domainEv.status, 'ok')
+      assert.equal(domainEv.id, '4cbd20e0-1417-4c5f-9d99-28f5607bf296')
+
+      const subEv = extracted.events[3]
+      assert.equal(subEv.kind, 'subagent')
+      assert.equal(subEv.name, 'invoke_subagent')
+      assert.equal(subEv.status, 'ok')
+      assert.equal(subEv.children.length, 1)
+      assert.equal(subEv.children[0].agent, 'Test Runner')
+      assert.equal(subEv.children[0].status, 'running')
+
+      assert.match(extracted.markdown, /git status --short && echo \[REDACTED\]/)
+
+      // Stream mid-turn trail via streamTurnTrailIfChanged
+      writeTurnMarker(connId, { startedAt, remoteTurn: true, held: false }, tmpDir)
+      const calls = []
+      const mockCall = async (req) => {
+        calls.push(req)
+        return { ok: true }
+      }
+
+      const firstStream = await streamTurnTrailIfChanged(state, {
+        connectionsDir: tmpDir,
+        call: mockCall,
+      })
+      assert.equal(firstStream.streamed, true)
+      assert.equal(calls.length, 1)
+      assert.equal(calls[0].name, 'post_session_message')
+      assert.equal(calls[0].arguments.phase, 'trail')
+      assert.equal(calls[0].arguments.message, extracted.markdown)
+      assert.equal(calls[0].arguments.trail_events.length, 4)
+
+      // Immediate second call with unchanged transcript is skipped
+      const duplicateStream = await streamTurnTrailIfChanged(state, {
+        connectionsDir: tmpDir,
+        call: mockCall,
+      })
+      assert.equal(duplicateStream.streamed, false)
+      assert.equal(duplicateStream.reason, 'unchanged')
+      assert.equal(calls.length, 1)
+
+      // Append final assistant answer and run Stop -> finalizes turn with complete_turn: true + work_trail + trail_events
+      fs.appendFileSync(
+        transcriptPath,
+        JSON.stringify({
+          step_index: 2,
+          type: 'PLANNER_RESPONSE',
+          created_at: '2026-10-15T20:00:05.000Z',
+          content: 'All checks passed and work item is claimed.',
+        }) + '\n',
+      )
+
+      calls.length = 0
+      const stopRes = await handleMirrorTurn(
+        'stop',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        {
+          env: {},
+          connectionsDir: tmpDir,
+          legacyPath: path.join(tmpDir, 'legacy.json'),
+          call: mockCall,
+        },
+      )
+      assert.equal(stopRes.ok, true)
+      const finalPost = calls.find((c) => c.name === 'post_session_message')
+      assert.ok(finalPost, 'finalizes streamed trail on Stop')
+      assert.equal(finalPost.arguments.complete_turn, true)
+      assert.equal(finalPost.arguments.message, 'All checks passed and work item is claimed.')
+      assert.equal(finalPost.arguments.trail_events.length, 4)
+
+      // Sessionless remote turn (e.g. automation run on unattached agent) streams trail without session_id
+      const sessionlessState = {
+        ...state,
+        session_id: null,
+      }
+      writeTurnMarker(connId, { startedAt: startedAt + 10, remoteTurn: true, held: false }, tmpDir)
+      calls.length = 0
+      const sessionlessRemoteStream = await streamTurnTrailIfChanged(sessionlessState, {
+        connectionsDir: tmpDir,
+        call: mockCall,
+      })
+      assert.equal(sessionlessRemoteStream.streamed, true)
+      assert.equal(calls.length, 1)
+      assert.equal(calls[0].arguments.connection_id, connId)
+      assert.equal(calls[0].arguments.session_id, undefined)
+      assert.equal(calls[0].arguments.phase, 'trail')
+
+      // Sessionless local turn does not stream trail
+      writeTurnMarker(connId, { startedAt: startedAt + 20, remoteTurn: false, held: false }, tmpDir)
+      const sessionlessLocalStream = await streamTurnTrailIfChanged(sessionlessState, {
+        connectionsDir: tmpDir,
+        call: mockCall,
+      })
+      assert.equal(sessionlessLocalStream.streamed, false)
+      assert.equal(sessionlessLocalStream.reason, 'not_attached')
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+})
+

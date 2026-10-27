@@ -4,18 +4,30 @@
  * Run: node --test hooks/scripts/remote-control-state.test.mjs
  */
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { describe, it } from 'node:test'
+import {
+  isDeliberateConnectionEnd,
+  POLLER_MISSES_BEFORE_REPAIR,
+  reconcilePollerStep,
+  repairConnectionPoller,
+} from './devspec-remote-listen.mjs'
 import {
   detectLocalId,
   ensurePollerForConnection,
+  isConnectionStateFilename,
+  isPollerArgv,
   isRecoverableEndReason,
   mintLocalId,
   negotiateConnectionCapability,
   ownerAlive,
-  reapDeadPollers,
+  pollerRunning,
   resolveLocalAction,
   resolveOwnerPid,
   resolveOwnerPidAutoWindows,
+  scanConnectionStates,
 } from './remote-control-state.mjs'
 
 describe('detectLocalId', () => {
@@ -380,128 +392,209 @@ describe('ownerAlive', () => {
   })
 })
 
-describe('reapDeadPollers (connection-native)', () => {
-  const agent = 'Claude Code'
-  // A poller "runs" for every connection by default in these tests.
-  const findPidsAll = (cid) => [`pid-${cid}`]
-  const noneAlive = () => false
-  const allAlive = () => true
+describe('isPollerArgv and pollerRunning (item da592dee)', () => {
+  const cid = '7d171d96-9f11-4ffe-84f2-430d0e9d8928'
 
-  function run(states, opts = {}) {
-    const killed = []
-    const cleared = []
-    const reaped = reapDeadPollers({
-      agent,
-      listStates: () => states,
-      findPids: opts.findPids || findPidsAll,
-      isOwnerAlive: opts.isOwnerAlive || allAlive,
-      clearCapability: (connectionId) => cleared.push(connectionId),
-      kill: (pid) => {
-        killed.push(pid)
-        return true
+  it('matches exact node devspec-remote-poll.mjs argv for the target connection', () => {
+    assert.equal(
+      isPollerArgv(
+        ['/usr/bin/node', '/plugins/scripts/devspec-remote-poll.mjs', '--connection-id', cid, '--owner-pid', '1234'],
+        cid,
+      ),
+      true,
+    )
+    assert.equal(
+      isPollerArgv(
+        ['node.exe', 'C:\\plugins\\scripts\\devspec-remote-poll.mjs', `--connection-id=${cid}`],
+        cid,
+      ),
+      true,
+    )
+  })
+
+  it('rejects a shell wrapper or another connection id', () => {
+    assert.equal(
+      isPollerArgv(
+        ['/bin/bash', '-c', `node /plugins/scripts/devspec-remote-poll.mjs --connection-id ${cid}`],
+        cid,
+      ),
+      false,
+    )
+    assert.equal(
+      isPollerArgv(
+        ['/usr/bin/node', '/plugins/scripts/devspec-remote-poll.mjs', '--connection-id', 'other-conn-id-1234'],
+        cid,
+      ),
+      false,
+    )
+    assert.equal(isPollerArgv([], cid), false)
+    assert.equal(isPollerArgv(['/usr/bin/node', '/plugins/scripts/devspec-remote-poll.mjs'], 'short'), false)
+  })
+
+  it('pollerRunning reports true when a poller pid is found and false otherwise', () => {
+    assert.equal(pollerRunning(cid, { findPids: () => [4242] }), true)
+    assert.equal(pollerRunning(cid, { findPids: () => [] }), false)
+    assert.equal(pollerRunning('short', { findPids: () => [4242] }), false)
+  })
+})
+
+describe('isConnectionStateFilename and scanConnectionStates sidecar filtering (item da592dee)', () => {
+  const cid = '7d171d96-9f11-4ffe-84f2-430d0e9d8928'
+  const sid = '08b72fbf-42b8-484b-a963-75689b90b219'
+
+  it('accepts only <uuid>.json and rejects companion sidecars', () => {
+    assert.equal(isConnectionStateFilename(`${cid}.json`), true)
+    assert.equal(isConnectionStateFilename(`${cid}.${sid}.transcript-state.json`), false)
+    assert.equal(isConnectionStateFilename(`${cid}.${sid}.read.json`), false)
+    assert.equal(isConnectionStateFilename(`${cid}.room.json`), false)
+    assert.equal(isConnectionStateFilename(`${cid}.tiers.json`), false)
+    assert.equal(isConnectionStateFilename(`${cid}.listener.json`), false)
+    assert.equal(isConnectionStateFilename(`.tiers-abc.txt`), false)
+  })
+
+  it('scanConnectionStates ignores .transcript-state.json and other sidecars even when they contain connection_id', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-scan-states-'))
+    try {
+      fs.writeFileSync(
+        path.join(tmpDir, `${cid}.json`),
+        JSON.stringify({
+          connection_id: cid,
+          agent_name: 'Antigravity',
+          enabled: true,
+          owner_pid: 1979424,
+          updated_at: '2026-10-17T16:15:18.308Z',
+        }),
+      )
+      // Sidecar written by room-transcript.mjs: has connection_id and old updated_at, no owner_pid.
+      fs.writeFileSync(
+        path.join(tmpDir, `${cid}.${sid}.transcript-state.json`),
+        JSON.stringify({
+          version: 1,
+          connection_id: cid,
+          session_id: sid,
+          complete: true,
+          updated_at: '2026-10-17T15:14:21.741Z',
+        }),
+      )
+      fs.writeFileSync(
+        path.join(tmpDir, `${cid}.room.json`),
+        JSON.stringify({ connection_id: cid, session_id: sid }),
+      )
+      fs.writeFileSync(
+        path.join(tmpDir, `${cid}.listener.json`),
+        JSON.stringify({ pid: 9999, connection_id: cid }),
+      )
+
+      const states = scanConnectionStates(tmpDir)
+      assert.equal(states.length, 1)
+      assert.equal(states[0].connection_id, cid)
+      assert.equal(states[0].owner_pid, 1979424)
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('devspec-remote-listen poller self-repair (item da592dee)', () => {
+  const cid = '7d171d96-9f11-4ffe-84f2-430d0e9d8928'
+  const sid = '08b72fbf-42b8-484b-a963-75689b90b219'
+  const convId = '686d1ee1-76d2-4d5b-b819-a1e2a4c1f784'
+
+  it('distinguishes deliberate connection ends from live or server-idle-timeout states', () => {
+    assert.equal(isDeliberateConnectionEnd({ enabled: true, end_reason: null }), false)
+    assert.equal(isDeliberateConnectionEnd({ enabled: false, end_reason: 'idle_timeout' }), false)
+    assert.equal(isDeliberateConnectionEnd({ enabled: false, end_reason: 'server_ended' }), false)
+    assert.equal(isDeliberateConnectionEnd({ enabled: false, end_reason: 'ui', ended_from_ui: true }), true)
+    assert.equal(isDeliberateConnectionEnd({ enabled: false, end_reason: 'local_stop' }), true)
+    assert.equal(isDeliberateConnectionEnd({ enabled: false, end_reason: 'owner_gone' }), true)
+    assert.equal(isDeliberateConnectionEnd({ enabled: false, end_reason: null }), true)
+  })
+
+  it('reconcilePollerStep waits for POLLER_MISSES_BEFORE_REPAIR consecutive misses and respects backoff', () => {
+    const s1 = reconcilePollerStep({ ownedAndActive: true, pollerUp: false, misses: 0, now: 1000 })
+    assert.deepEqual(s1, { repair: false, misses: 1 })
+
+    const s2 = reconcilePollerStep({
+      ownedAndActive: true,
+      pollerUp: false,
+      misses: POLLER_MISSES_BEFORE_REPAIR - 1,
+      now: 2000,
+    })
+    assert.deepEqual(s2, { repair: true, misses: POLLER_MISSES_BEFORE_REPAIR })
+
+    const backoffBlocked = reconcilePollerStep({
+      ownedAndActive: true,
+      pollerUp: false,
+      misses: POLLER_MISSES_BEFORE_REPAIR - 1,
+      now: 2000,
+      repairNotBefore: 5000,
+    })
+    assert.equal(backoffBlocked.repair, false)
+
+    const recovered = reconcilePollerStep({ ownedAndActive: true, pollerUp: true, misses: 2, now: 6000 })
+    assert.deepEqual(recovered, { repair: false, misses: 0 })
+  })
+
+  it('repairConnectionPoller re-registers, re-attaches session, refreshes capability, and respawns poller', async () => {
+    const mcpCalls = []
+    let writtenState = null
+    let writtenBond = null
+    let pollerSpawnOpts = null
+
+    const result = await repairConnectionPoller({
+      connectionId: cid,
+      ownerPid: process.pid,
+      cwd: '/repo',
+      conversationId: convId,
+      state: {
+        connection_id: cid,
+        session_id: sid,
+        session_codename: 'Bold Lizard',
+        agent_name: 'Antigravity',
+        local_id: convId,
+        project_id: '24c4abaa-2cb9-496a-8492-cf1f1aa1090b',
+        enabled: false,
+        end_reason: 'idle_timeout',
+        token: 'dvs_test',
+        mcp_url: 'https://example.test/api/mcp',
+        owner_pid: process.pid,
       },
-      ...opts.args,
+      callMcp: async (req) => {
+        mcpCalls.push(req)
+        if (req.name === 'register_connection') {
+          req.onResultMeta?.({
+            devspec: {
+              connection_capability: { version: 1, value: 'dvsc_repaired_cap' },
+            },
+          })
+          return { data: { connection_id: cid } }
+        }
+        return { data: { ok: true } }
+      },
+      writeStateFn: (_id, next) => {
+        writtenState = next
+      },
+      writeBondFn: (_agent, _localId, bond) => {
+        writtenBond = bond
+      },
+      ensurePollerFn: (_id, opts) => {
+        pollerSpawnOpts = opts
+        return { ok: true, pid: 7777 }
+      },
     })
-    return { reaped, killed, cleared }
-  }
 
-  it('reaps a disabled connection and clears its capability', () => {
-    const { reaped, killed, cleared } = run([
-      { connection_id: 'c-disabled', agent_name: agent, enabled: false },
-    ])
-    assert.equal(reaped.length, 1)
-    assert.equal(reaped[0].reason, 'disabled')
-    assert.deepEqual(killed, ['pid-c-disabled'])
-    assert.deepEqual(cleared, ['c-disabled'])
-  })
-
-  it('reaps an owner-gone connection (owner_pid recorded but dead)', () => {
-    const { reaped } = run(
-      [{ connection_id: 'c-orphan', agent_name: agent, enabled: true, owner_pid: 4242 }],
-      { isOwnerAlive: noneAlive },
-    )
-    assert.equal(reaped.length, 1)
-    assert.equal(reaped[0].reason, 'owner_gone')
-  })
-
-  it('reaps an ended-from-ui connection', () => {
-    const { reaped } = run([
-      { connection_id: 'c-ui', agent_name: agent, enabled: true, ended_from_ui: true, owner_pid: 10 },
-    ])
-    assert.equal(reaped.length, 1)
-    assert.equal(reaped[0].reason, 'ended_from_ui')
-  })
-
-  it('NEVER reaps a live connection (enabled + owner alive)', () => {
-    const { reaped, killed } = run(
-      [{ connection_id: 'c-live', agent_name: agent, enabled: true, owner_pid: 999 }],
-      { isOwnerAlive: allAlive },
-    )
-    assert.equal(reaped.length, 0)
-    assert.deepEqual(killed, [])
-  })
-
-  it('does NOT reap a no-owner_pid connection with no/fresh timestamp (unknown → leave alone)', () => {
-    // No updated_at → staleness unknown → not reaped.
-    const noStamp = run([{ connection_id: 'c-legacy', agent_name: agent, enabled: true }])
-    assert.equal(noStamp.reaped.length, 0)
-    // Fresh updated_at → clearly active → not reaped.
-    const fresh = run(
-      [
-        {
-          connection_id: 'c-legacy-fresh',
-          agent_name: agent,
-          enabled: true,
-          updated_at: '2026-07-20T11:59:00.000Z',
-        },
-      ],
-      { args: { now: Date.parse('2026-07-20T12:00:00.000Z') } },
-    )
-    assert.equal(fresh.reaped.length, 0)
-  })
-
-  it('reaps a STALE no-owner_pid connection (legacy backstop — zombie gap 00bd4f6e)', () => {
-    const { reaped, killed } = run(
-      [
-        {
-          connection_id: 'c-legacy-stale',
-          agent_name: agent,
-          enabled: true,
-          updated_at: '2026-07-20T10:00:00.000Z', // 2h before `now`, threshold 1h
-        },
-      ],
-      { args: { now: Date.parse('2026-07-20T12:00:00.000Z') } },
-    )
-    assert.equal(reaped.length, 1)
-    assert.equal(reaped[0].reason, 'stale_no_owner')
-    assert.deepEqual(killed, ['pid-c-legacy-stale'])
-  })
-
-  it('skips the exceptConnectionId (the one we are about to (re)use)', () => {
-    const { reaped } = run(
-      [{ connection_id: 'c-keep', agent_name: agent, enabled: false }],
-      { args: { exceptConnectionId: 'c-keep' } },
-    )
-    assert.equal(reaped.length, 0)
-  })
-
-  it('only reaps this agent — a different agent is left alone', () => {
-    const { reaped } = run([
-      { connection_id: 'c-other', agent_name: 'Grok Build', enabled: false },
-      { connection_id: 'c-mine', agent_name: agent, enabled: false },
-    ])
+    assert.equal(result.ok, true)
+    assert.equal(result.poller.pid, 7777)
     assert.deepEqual(
-      reaped.map((r) => r.connection_id),
-      ['c-mine'],
+      mcpCalls.map((c) => c.name),
+      ['register_connection', 'attach_connection'],
     )
-  })
-
-  it('clears capability for dead state even when no poller remains to reap', () => {
-    const { reaped, cleared } = run([{ connection_id: 'c-nopoller', agent_name: agent, enabled: false }], {
-      findPids: () => [],
-    })
-    assert.equal(reaped.length, 0)
-    assert.deepEqual(cleared, ['c-nopoller'])
+    assert.equal(writtenState.enabled, true)
+    assert.equal(writtenState.end_reason, null)
+    assert.equal(writtenState.connection_capability, 'dvsc_repaired_cap')
+    assert.equal(writtenBond.status, 'live')
+    assert.equal(pollerSpawnOpts.sessionId, sid)
+    assert.equal(pollerSpawnOpts.ownerPid, process.pid)
   })
 })
 

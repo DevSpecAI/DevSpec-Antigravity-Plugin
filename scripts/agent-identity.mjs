@@ -9,3 +9,11 @@
  * plugin; impossible to drift.
  */
 export const AGENT_NAME = 'Antigravity'
+
+/**
+ * This plugin's id in the `x-devspec-plugin: <id>/<version>` header it sends on
+ * every DevSpec MCP request (item 7a01644a; contract on DevSpec item 2295e089). It
+ * is DevSpec's provider id for this host, the same token the server's provider enum
+ * uses. The header is built in connection-version.mjs, beside the version.
+ */
+export const PLUGIN_ID = 'antigravity'

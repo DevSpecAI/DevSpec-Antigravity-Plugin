@@ -17,20 +17,74 @@
  *
  * Lookup order:
  * 1. DEVSPEC_MCP_TOKEN / DEVSPEC_TOKEN (+ DEVSPEC_MCP_URL) — explicit override.
- * 2. opts.hostToken — an explicitly supplied host bearer.
+ * 2. opts.hostToken — the bearer a caller already resolved with `hostTokenFromEnv`
+ *    (an in-process value; no command takes a key as an argument).
  * 3. Antigravity MCP config — `~/.gemini/antigravity-cli/mcp_config.json` then
  *    `<cwd>/.gemini/antigravity-cli/mcp_config.json`.
  * 4. Project `.mcp.json` (cwd and parents) — fallback for non-standard setups.
  *
- * Prints JSON: { ok, token?, mcp_url?, source?, error? }
- * Never prints the full token in human logs — only to stdout JSON for piping.
+ * Run as a command it prints JSON: { ok, token_fingerprint?, mcp_url?, source?, error? }.
+ * It never prints the key itself (item b17cb7d7): whatever a command prints ends up
+ * in agent transcripts and terminal logs, and agents built `curl -H "Authorization:
+ * Bearer …"` command lines out of it. Scripts that need the key import
+ * `resolveDevspecMcpAuth` and keep it in memory.
  */
 
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { pluginHeaders } from './connection-version.mjs'
+import { readPrivateJson, writePrivateJson } from './private-state.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
-const DEFAULT_PROD_URL = 'https://api.devspec.ai/api/mcp'
+export const DEFAULT_PROD_URL = 'https://api.devspec.ai/api/mcp'
+
+export function formatMissingAuthMessage(platform = process.platform) {
+  const configPath =
+    platform === 'win32'
+      ? '%USERPROFILE%\\.gemini\\config\\mcp_config.json (or %USERPROFILE%\\.gemini\\antigravity-cli\\mcp_config.json)'
+      : '~/.gemini/config/mcp_config.json (or ~/.gemini/antigravity-cli/mcp_config.json)'
+  const ownerOnly = platform === 'win32' ? '' : ', keep that file readable only by you (`chmod 600`)'
+  return `DevSpec is not configured properly: put your "dvs_..." token in ${configPath} under mcpServers.devspec.headers.Authorization ("Bearer dvs_...")${ownerOnly}, then restart agy. The Connect your agent step on DevSpec's Agent setup page has the entry ready to paste. Do not pass the token to \`agy mcp add --header\`: that puts it on a command line and in your shell history.`
+}
+
+/**
+ * How a key is shown wherever this plugin reports one: the same first twelve
+ * characters DevSpec shows for it under Access tokens, so a person can tell which key
+ * is configured, and nothing an attacker could use. Never the key itself.
+ */
+export function tokenFingerprint(token) {
+  if (typeof token !== 'string' || !token.trim()) return null
+  return `${token.trim().slice(0, 12)}…`
+}
+
+/** An auth result with the key replaced by its fingerprint, for printing. */
+export function printableAuth(result) {
+  if (!result || typeof result !== 'object') return result
+  const { token, ...rest } = result
+  return token ? { ...rest, token_fingerprint: tokenFingerprint(token) } : rest
+}
+
+export function isValidConfigToken(token) {
+  if (typeof token !== 'string') return false
+  const trimmed = token.trim()
+  if (!trimmed) return false
+  if (!trimmed.startsWith('dvs_')) return false
+  if (/^dvs_your(?:_|$)/i.test(trimmed)) return false
+  if (trimmed.includes('YOUR_') || trimmed.includes('<YOUR') || /^dvs_<.*>$/i.test(trimmed)) return false
+  return true
+}
+
+function isNonPlaceholderToken(token) {
+  if (typeof token !== 'string') return false
+  const trimmed = token.trim()
+  if (!trimmed) return false
+  if (/^dvs_your(?:_|$)/i.test(trimmed)) return false
+  if (trimmed.includes('YOUR_') || trimmed.includes('<YOUR') || /^<.*>$/.test(trimmed) || /^\$\{.*\}$/.test(trimmed)) {
+    return false
+  }
+  return true
+}
 
 function readJson(file) {
   try {
@@ -51,15 +105,70 @@ function extractBearer(headers) {
 function fromServerEntry(entry) {
   if (!entry || typeof entry !== 'object') return null
   const url = entry.url || entry.serverUrl || entry.server_url || null
-  const token = extractBearer(entry.headers) || entry.token || null
+  const rawToken = extractBearer(entry.headers) || entry.token || null
+  const token = isValidConfigToken(rawToken) ? rawToken.trim() : null
   if (!url && !token) return null
-  return { mcp_url: url || DEFAULT_PROD_URL, token: token || null }
+  return { mcp_url: url || DEFAULT_PROD_URL, token }
 }
 
 /** Pull the `devspec` server entry out of a parsed MCP-config JSON object. */
 function devspecEntry(j) {
   const servers = j?.mcpServers || j?.mcp?.servers || {}
   return servers.devspec || servers.DevSpec || servers['devspec-mcp']
+}
+
+export function pinnedAuthPath(home = os.homedir()) {
+  return path.join(home, '.devspec', 'auth.json')
+}
+
+export function readPinnedAuth({ home = os.homedir() } = {}) {
+  const file = pinnedAuthPath(home)
+  // Private-state read: a copy left at a looser mode by an earlier version is
+  // tightened before it is read.
+  const parsed = readPrivateJson(file)
+  if (!parsed || !isValidConfigToken(parsed.token)) return null
+  return {
+    token: parsed.token.trim(),
+    mcp_url: (typeof parsed.mcp_url === 'string' && parsed.mcp_url.trim()) || DEFAULT_PROD_URL,
+    verified_at: typeof parsed.verified_at === 'string' ? parsed.verified_at : null,
+    source: file,
+  }
+}
+
+export function writePinnedAuth(
+  { token, mcp_url = DEFAULT_PROD_URL, verified_at = new Date().toISOString() } = {},
+  { home = os.homedir() } = {},
+) {
+  if (!isValidConfigToken(token)) return null
+  const file = pinnedAuthPath(home)
+  try {
+    const payload = {
+      token: token.trim(),
+      mcp_url: (typeof mcp_url === 'string' && mcp_url.trim()) || DEFAULT_PROD_URL,
+      verified_at,
+    }
+    // 0600 in a 0700 ~/.devspec, written aside and renamed (item b17cb7d7).
+    writePrivateJson(file, payload, { root: path.dirname(file) })
+    return { ...payload, source: file }
+  } catch {
+    return null
+  }
+}
+
+export function readPiAuth({ home = os.homedir() } = {}) {
+  if (!home) return null
+  const file = path.join(home, '.pi', 'agent', 'devspec', 'auth.json')
+  const parsed = readJson(file)
+  if (!parsed || !isValidConfigToken(parsed.token)) return null
+  const url =
+    (typeof parsed.mcp_url === 'string' && parsed.mcp_url.trim()) ||
+    (typeof parsed.url === 'string' && parsed.url.trim()) ||
+    DEFAULT_PROD_URL
+  return {
+    token: parsed.token.trim(),
+    mcp_url: url,
+    source: file,
+  }
 }
 
 function walkMcpJson(startDir) {
@@ -79,22 +188,39 @@ function walkMcpJson(startDir) {
   return null
 }
 
+function antigravityConfigCandidates(cwd = process.cwd(), home = os.homedir()) {
+  const resolvedCwd = path.resolve(cwd || process.cwd())
+  const files = [
+    path.join(home, '.gemini', 'config', 'mcp_config.json'),
+    path.join(home, '.gemini', 'antigravity-cli', 'mcp_config.json'),
+    path.join(resolvedCwd, '.gemini', 'config', 'mcp_config.json'),
+    path.join(resolvedCwd, '.gemini', 'antigravity-cli', 'mcp_config.json'),
+  ]
+  const out = []
+  for (const file of files) {
+    const got = fromServerEntry(devspecEntry(readJson(file)))
+    if (got) out.push({ ...got, source: file })
+  }
+  return out
+}
+
 /**
  * Antigravity's own MCP config — user-home first so every folder sees the same
  * token, then an optional project `<cwd>/.gemini/antigravity-cli/mcp_config.json`.
- * First one carrying a token wins. Never `~/.claude.json`.
+ * If a verified pinned token in `~/.devspec/auth.json` matches one of the candidates,
+ * that verified candidate wins. Never `~/.claude.json`.
  */
-function antigravityConfigAuth(cwd = process.cwd()) {
-  const rel = ['.gemini', 'antigravity-cli', 'mcp_config.json']
-  const candidates = [
-    path.join(os.homedir(), ...rel),
-    path.join(path.resolve(cwd || process.cwd()), ...rel),
-  ]
+function antigravityConfigAuth(cwd = process.cwd(), { home = os.homedir() } = {}) {
+  const candidates = antigravityConfigCandidates(cwd, home)
+  const pinned = readPinnedAuth({ home })
+  if (pinned?.token) {
+    const matching = candidates.find((c) => c.token === pinned.token)
+    if (matching) return matching
+  }
   let urlOnly = null
-  for (const file of candidates) {
-    const got = fromServerEntry(devspecEntry(readJson(file)))
-    if (got?.token) return { ...got, source: file }
-    if (got?.mcp_url && !urlOnly) urlOnly = { ...got, source: file }
+  for (const got of candidates) {
+    if (got.token) return got
+    if (got.mcp_url && !urlOnly) urlOnly = got
   }
   return urlOnly
 }
@@ -109,30 +235,76 @@ function antigravityConfigAuth(cwd = process.cwd()) {
  * Named `hostTokenFromEnv` because this plugin's poller, mirror, and state helpers
  * import the symbol. Antigravity owns and tests every one of those callers locally.
  */
-export function hostTokenFromEnv(env = process.env) {
+export function hostTokenFromEnv(env = process.env, { cwd = process.cwd(), home = os.homedir() } = {}) {
   const envTok = env.DEVSPEC_MCP_TOKEN || env.DEVSPEC_TOKEN
-  if (typeof envTok === 'string' && envTok.trim()) return envTok.trim()
-  return antigravityConfigAuth()?.token || null
+  if (isNonPlaceholderToken(envTok)) return envTok.trim()
+  const pinned = readPinnedAuth({ home })
+  const piAuth = readPiAuth({ home })
+  const agCandidates = antigravityConfigCandidates(cwd, home)
+  const fromProject = walkMcpJson(cwd)
+  const allCandidates = [...agCandidates, ...(fromProject ? [fromProject] : []), ...(piAuth ? [piAuth] : [])].filter((c) => c.token)
+  if (pinned?.token && allCandidates.some((c) => c.token === pinned.token)) {
+    return pinned.token
+  }
+  return antigravityConfigAuth(cwd, { home })?.token || pinned?.token || piAuth?.token || null
 }
 
 export function resolveDevspecMcpAuth(cwd = process.cwd(), opts = {}) {
-  const envToken = process.env.DEVSPEC_MCP_TOKEN || process.env.DEVSPEC_TOKEN || null
-  const envUrl = process.env.DEVSPEC_MCP_URL || null
+  const env = opts.env || process.env
+  const home = opts.home || os.homedir()
+  const rawEnvToken = env.DEVSPEC_MCP_TOKEN || env.DEVSPEC_TOKEN || null
+  const envToken = isNonPlaceholderToken(rawEnvToken) ? rawEnvToken.trim() : null
+  const envUrl = env.DEVSPEC_MCP_URL || null
+
+  const ag = antigravityConfigAuth(cwd, { home })
+  const fromProject = walkMcpJson(cwd)
+  const pinned = readPinnedAuth({ home })
+  const piAuth = readPiAuth({ home })
+
   if (envToken) {
-    return { ok: true, token: envToken, mcp_url: envUrl || DEFAULT_PROD_URL, source: 'env' }
+    return {
+      ok: true,
+      token: envToken,
+      mcp_url:
+        envUrl ||
+        ag?.mcp_url ||
+        fromProject?.mcp_url ||
+        pinned?.mcp_url ||
+        piAuth?.mcp_url ||
+        DEFAULT_PROD_URL,
+      source: 'env',
+    }
   }
 
-  const ag = antigravityConfigAuth(cwd)
-  const fromProject = walkMcpJson(cwd)
-
-  const hostToken =
-    typeof opts.hostToken === 'string' && opts.hostToken.trim() ? opts.hostToken.trim() : null
+  const hostToken = isNonPlaceholderToken(opts.hostToken) ? opts.hostToken.trim() : null
   if (hostToken) {
     return {
       ok: true,
       token: hostToken,
-      mcp_url: envUrl || ag?.mcp_url || fromProject?.mcp_url || DEFAULT_PROD_URL,
+      mcp_url: envUrl || ag?.mcp_url || fromProject?.mcp_url || pinned?.mcp_url || piAuth?.mcp_url || DEFAULT_PROD_URL,
       source: 'host',
+    }
+  }
+
+  // If a pinned verified token matches a project or Antigravity config candidate, prefer it.
+  if (pinned?.token) {
+    const agCandidates = antigravityConfigCandidates(cwd, home).filter((c) => c.token)
+    const matchingAg = agCandidates.find((c) => c.token === pinned.token)
+    if (matchingAg) {
+      return {
+        ok: true,
+        token: matchingAg.token,
+        mcp_url: envUrl || matchingAg.mcp_url || fromProject?.mcp_url || DEFAULT_PROD_URL,
+        source: matchingAg.source,
+      }
+    }
+    if (fromProject?.token === pinned.token) {
+      return {
+        ok: true,
+        token: fromProject.token,
+        mcp_url: envUrl || fromProject.mcp_url || ag?.mcp_url || DEFAULT_PROD_URL,
+        source: fromProject.source,
+      }
     }
   }
 
@@ -155,29 +327,148 @@ export function resolveDevspecMcpAuth(cwd = process.cwd(), opts = {}) {
     }
   }
 
+  if (pinned?.token) {
+    return {
+      ok: true,
+      token: pinned.token,
+      mcp_url: envUrl || pinned.mcp_url || ag?.mcp_url || fromProject?.mcp_url || DEFAULT_PROD_URL,
+      source: pinned.source,
+    }
+  }
+
+  if (piAuth?.token) {
+    return {
+      ok: true,
+      token: piAuth.token,
+      mcp_url: envUrl || piAuth.mcp_url || ag?.mcp_url || fromProject?.mcp_url || DEFAULT_PROD_URL,
+      source: piAuth.source,
+    }
+  }
+
   const urlOnly = ag?.mcp_url ? ag : fromProject
   if (urlOnly?.mcp_url) {
     return {
       ok: false,
       mcp_url: envUrl || urlOnly.mcp_url,
       source: urlOnly.source,
-      error:
-        'Found a DevSpec MCP URL but no Bearer token. Add your dvs_ token to ~/.gemini/antigravity-cli/mcp_config.json (mcpServers.devspec.headers.Authorization), or set DEVSPEC_MCP_TOKEN.',
+      error: formatMissingAuthMessage(opts.platform),
     }
   }
 
   return {
     ok: false,
     mcp_url: envUrl || DEFAULT_PROD_URL,
-    error:
-      'No DevSpec MCP token found. Add your dvs_ token to ~/.gemini/antigravity-cli/mcp_config.json (mcpServers.devspec), or set DEVSPEC_MCP_TOKEN.',
+    error: formatMissingAuthMessage(opts.platform),
+  }
+}
+
+async function defaultVerifyToken({ mcpUrl, token }) {
+  const res = await fetch(mcpUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/event-stream',
+      Authorization: `Bearer ${token}`,
+      ...pluginHeaders(),
+    },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: { name: 'verify_agent_connection', arguments: {} },
+    }),
+  })
+  if (!res.ok) return false
+  const text = await res.text()
+  const json = JSON.parse(text)
+  if (json?.error || json?.result?.isError) return false
+  return true
+}
+
+/**
+ * Collect candidate DevSpec tokens across Antigravity config files, pinned auth,
+ * and project `.mcp.json`, verify them against `verify_agent_connection`, and pin
+ * the first working token to `~/.devspec/auth.json`.
+ */
+export async function verifyAndPinDevspecAuth(
+  cwd = process.cwd(),
+  {
+    env = process.env,
+    home = os.homedir(),
+    platform = process.platform,
+    verifyToken = defaultVerifyToken,
+  } = {},
+) {
+  const envUrl = env.DEVSPEC_MCP_URL || null
+  const rawEnvToken = env.DEVSPEC_MCP_TOKEN || env.DEVSPEC_TOKEN || null
+  if (isNonPlaceholderToken(rawEnvToken)) {
+    const token = rawEnvToken.trim()
+    const mcp_url = envUrl || DEFAULT_PROD_URL
+    return { ok: true, token, mcp_url, source: 'env', verified: true }
+  }
+
+  const agCandidates = antigravityConfigCandidates(cwd, home).filter((c) => c.token)
+  const pinned = readPinnedAuth({ home })
+  const piAuth = readPiAuth({ home })
+  const fromProject = walkMcpJson(cwd)
+  const rawList = [
+    ...agCandidates,
+    ...(pinned?.token ? [pinned] : []),
+    ...(piAuth?.token ? [piAuth] : []),
+    ...(fromProject?.token ? [fromProject] : []),
+  ]
+
+  const seen = new Set()
+  const candidates = []
+  for (const item of rawList) {
+    if (!item?.token || seen.has(item.token)) continue
+    seen.add(item.token)
+    candidates.push({
+      token: item.token,
+      mcp_url: envUrl || item.mcp_url || DEFAULT_PROD_URL,
+      source: item.source,
+    })
+  }
+
+  if (candidates.length === 0) {
+    return {
+      ok: false,
+      mcp_url: envUrl || DEFAULT_PROD_URL,
+      error: formatMissingAuthMessage(platform),
+    }
+  }
+
+  for (const candidate of candidates) {
+    let valid = false
+    try {
+      valid = Boolean(await verifyToken({ mcpUrl: candidate.mcp_url, token: candidate.token }))
+    } catch {
+      valid = false
+    }
+    if (valid) {
+      writePinnedAuth({ token: candidate.token, mcp_url: candidate.mcp_url }, { home })
+      return {
+        ok: true,
+        token: candidate.token,
+        mcp_url: candidate.mcp_url,
+        source: candidate.source,
+        verified: true,
+      }
+    }
+  }
+
+  return {
+    ok: false,
+    mcp_url: candidates[0].mcp_url,
+    error: formatMissingAuthMessage(platform),
   }
 }
 
 // CLI
-if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith('resolve-mcp-auth.mjs')) {
+if (isEntryPoint(import.meta.url)) {
   // Reflect the same host-token preference the write path uses, for diagnostics.
+  // The key is reported by its fingerprint only.
   const result = resolveDevspecMcpAuth(process.cwd(), { hostToken: hostTokenFromEnv(process.env) })
-  process.stdout.write(JSON.stringify(result) + '\n')
+  process.stdout.write(JSON.stringify(printableAuth(result)) + '\n')
   process.exit(result.ok ? 0 : 1)
 }

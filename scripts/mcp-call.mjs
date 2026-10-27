@@ -14,22 +14,81 @@
  * deliberate abort from a network failure. Omitting them keeps the original behaviour.
  */
 
-export async function mcpToolsCall({
+import { pluginHeaders, versionedConnectionArguments } from './connection-version.mjs'
+
+/** HTTP statuses that describe a transient condition, not a verdict on the request. */
+const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 502, 503, 504])
+
+// A failed response's body can be a whole HTML error page, so an error message quotes
+// the start of it and says how much it left out; the full body stays on the error as
+// `body` for whoever handles it.
+const ERROR_BODY_EXCERPT_CHARS = 400
+
+function bodyExcerpt(text) {
+  const value = String(text ?? '')
+  if (value.length <= ERROR_BODY_EXCERPT_CHARS) return value
+  return `${value.slice(0, ERROR_BODY_EXCERPT_CHARS)}… (${value.length - ERROR_BODY_EXCERPT_CHARS} more characters)`
+}
+
+/**
+ * Read the server's typed failure contract off a non-OK response body (DevSpec
+ * item 798e2375). A validation outage answers 503 with
+ * `{code:'auth_validation_unavailable', retryable:true, credential_type}`; a
+ * genuinely rejected credential answers 401 with
+ * `{code:'invalid_api_token'|'invalid_connection_capability', retryable:false}`.
+ */
+export function readServerFailure(status, bodyText) {
+  const out = {
+    status: Number.isInteger(status) ? status : null,
+    serverCode: null,
+    retryable: null,
+    credentialType: null,
+  }
+  const text = typeof bodyText === 'string' ? bodyText : ''
+  const start = text.indexOf('{')
+  if (start < 0) return out
+  let body = null
+  try {
+    body = JSON.parse(text.slice(start))
+  } catch {
+    body = null
+  }
+  if (!body || typeof body !== 'object') return out
+  if (typeof body.code === 'string') out.serverCode = body.code
+  if (typeof body.retryable === 'boolean') out.retryable = body.retryable
+  if (body.credential_type === 'api_token' || body.credential_type === 'connection_capability') {
+    out.credentialType = body.credential_type
+  }
+  return out
+}
+
+/**
+ * Should this failure be tried again?
+ */
+export function isRetryableHttpFailure(err) {
+  if (!err || typeof err !== 'object') return false
+  if (err.code === 'owner_gone' || err.code === 'timeout') return false
+  if (err.transport === true) return true
+  if (err.retryable === false) return false
+  if (err.retryable === true) return true
+  return RETRYABLE_HTTP_STATUSES.has(err.status)
+}
+
+export async function mcpRequest({
   mcpUrl,
   token,
-  name,
-  arguments: toolArgs,
+  method,
+  params = {},
+  connectionCapability = null,
   timeoutMs = 0,
   isAlive = null,
   aliveCheckMs = 2_000,
-  connectionCapability = null,
-  includeMeta = false,
 }) {
   const body = {
     jsonrpc: '2.0',
     id: Date.now(),
-    method: 'tools/call',
-    params: { name, arguments: toolArgs || {} },
+    method,
+    params,
   }
 
   const controller = new AbortController()
@@ -63,10 +122,16 @@ export async function mcpToolsCall({
   try {
     res = await fetch(mcpUrl, {
       method: 'POST',
+      // Every DevSpec request the plugin's own scripts make (poller, wait, listen,
+      // connect, mirror-turn, plan/question bridges) goes through here, so this is
+      // where they say which plugin they are. Antigravity's own MCP client sends the
+      // same header from the user's mcp_config.json, which host-mcp-header.mjs keeps
+      // current (item 7a01644a).
       headers: {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
         Accept: 'application/json, text/event-stream',
+        ...pluginHeaders(),
         ...(connectionCapability
           ? { 'x-devspec-connection-capability': connectionCapability }
           : {}),
@@ -76,11 +141,13 @@ export async function mcpToolsCall({
     })
   } catch (e) {
     if (abortCode) {
-      const err = new Error(`MCP call ${name} aborted: ${abortCode}`)
+      const err = new Error(`MCP request ${method} aborted: ${abortCode}`)
       err.code = abortCode
       throw err
     }
-    throw e
+    const err = e instanceof Error ? e : new Error(String(e))
+    err.transport = true
+    throw err
   } finally {
     if (timeoutTimer) clearTimeout(timeoutTimer)
     if (aliveTimer) clearInterval(aliveTimer)
@@ -88,7 +155,9 @@ export async function mcpToolsCall({
 
   const text = await res.text()
   if (!res.ok) {
-    throw new Error(`MCP HTTP ${res.status}: ${text.slice(0, 400)}`)
+    const err = new Error(`MCP HTTP ${res.status}: ${bodyExcerpt(text)}`)
+    Object.assign(err, readServerFailure(res.status, text), { body: text })
+    throw err
   }
 
   // Parse JSON or SSE-ish responses
@@ -96,7 +165,6 @@ export async function mcpToolsCall({
   try {
     payload = JSON.parse(text)
   } catch {
-    // SSE: lines like data: {...}
     for (const line of text.split('\n')) {
       const trimmed = line.trim()
       if (trimmed.startsWith('data:')) {
@@ -111,30 +179,77 @@ export async function mcpToolsCall({
   }
 
   if (!payload) {
-    throw new Error(`Unparseable MCP response: ${text.slice(0, 200)}`)
+    throw Object.assign(new Error(`Unparseable MCP response: ${bodyExcerpt(text)}`), { body: text })
   }
   if (payload.error) {
     throw new Error(payload.error.message || JSON.stringify(payload.error))
   }
 
+  return payload.result ?? payload
+}
+
+export class McpToolRefusalError extends Error {
+  constructor(message, details = null) {
+    super(message)
+    this.name = 'McpToolRefusalError'
+    this.details = details
+  }
+}
+
+export async function mcpToolsCall({
+  mcpUrl,
+  token,
+  name,
+  arguments: toolArgs,
+  connectionCapability = null,
+  onResultMeta = null,
+  includeMeta = false,
+  timeoutMs = 0,
+  isAlive = null,
+  aliveCheckMs = 2_000,
+}) {
+  const result = await mcpRequest({
+    mcpUrl,
+    token,
+    method: 'tools/call',
+    params: { name, arguments: versionedConnectionArguments(name, toolArgs || {}) },
+    connectionCapability,
+    timeoutMs,
+    isAlive,
+    aliveCheckMs,
+  })
+  if (typeof onResultMeta === 'function' && result?._meta) onResultMeta(result._meta)
+
   // tools/call result content is usually { content: [{ type:'text', text:'...' }], isError? }
-  const content = payload.result?.content
+  const content = result?.content
   if (Array.isArray(content)) {
     const textParts = content
       .filter((c) => c && c.type === 'text' && typeof c.text === 'string')
       .map((c) => c.text)
     const joined = textParts.join('\n')
-    if (payload.result?.isError) {
-      throw new Error(joined || 'MCP tool error')
+    if (result?.isError) {
+      let details = result.structuredContent ?? null
+      if (!details) {
+        try {
+          details = JSON.parse(joined)
+        } catch {
+          /* older plain refusal */
+        }
+      }
+      throw new McpToolRefusalError(joined || 'MCP tool error', details)
     }
     let data
     try {
       data = JSON.parse(joined)
     } catch {
-      data = { raw: joined, result: payload.result }
+      data = { raw: joined, result }
     }
-    return includeMeta ? { data, meta: payload.result?._meta ?? null } : data
+    return includeMeta ? { data, meta: result?._meta ?? null } : data
   }
-  const data = payload.result ?? payload
-  return includeMeta ? { data, meta: payload.result?._meta ?? null } : data
+  return includeMeta ? { data: result, meta: result?._meta ?? null } : result
+}
+
+export async function mcpToolsList(options) {
+  const result = await mcpRequest({ ...options, method: 'tools/list', params: {} })
+  return Array.isArray(result?.tools) ? result.tools : []
 }

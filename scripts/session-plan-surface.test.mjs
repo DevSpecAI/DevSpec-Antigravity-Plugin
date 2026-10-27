@@ -8,9 +8,9 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const read = (file) => fs.readFileSync(path.join(ROOT, file), 'utf8')
 
 describe('bounded Antigravity plan discovery and prompts', () => {
-  it('keeps only the two connection skills and discovers plan mechanics on demand', () => {
+  it('keeps only the connection and project skills and discovers plan mechanics on demand', () => {
     const skills = fs.readdirSync(path.join(ROOT, 'skills')).sort()
-    assert.deepEqual(skills, ['devspec-remote', 'devspec-remote-stop'])
+    assert.deepEqual(skills, ['devspec-project', 'devspec-remote', 'devspec-remote-stop'])
     const remote = read('skills/devspec-remote/SKILL.md')
     assert.match(remote, /devspec-plan\.mjs" --schema/)
     assert.match(remote, /do not keep a local plan skill or broad static MCP allowlist hot/i)
@@ -37,8 +37,8 @@ describe('bounded Antigravity plan discovery and prompts', () => {
 
   it('does not inject plan prompts before connection and provides revisioned resume/end/adoption after connection', () => {
     const hooks = JSON.parse(read('hooks.json'))
-    assert.deepEqual(hooks['devspec-remote-control-mirror'].UserPromptSubmit, [{
-      type: 'command', command: 'node "./scripts/mirror-turn.mjs" user_prompt', timeout: 30,
+    assert.deepEqual(hooks['devspec-remote-control-mirror'].PreInvocation, [{
+      type: 'command', command: 'node ./scripts/pre-invocation.mjs', timeout: 10,
     }])
     const remote = read('skills/devspec-remote/SKILL.md')
     for (const phrase of ['On reconnect', 'expected_revision', 'explicit `plan_id`', 'Another owner\'s plan is read-only', 'Closing a plan does not end remote control']) {
@@ -52,6 +52,6 @@ describe('bounded Antigravity plan discovery and prompts', () => {
       assert.ok(poller.includes(field), field)
     }
     assert.match(poller, /active_session_plans/)
-    assert.match(read('docs/remote-control/remote-control-overview.md'), /read-awareness only/i)
+    assert.match(read('rules/AGENTS.md'), /read-awareness only/i)
   })
 })

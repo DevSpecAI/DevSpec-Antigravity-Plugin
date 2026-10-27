@@ -33,7 +33,7 @@
  * Usage:
  *   node remote-control-state.mjs write --connection-id <uuid> [--session <uuid>]
  *       [--agent "Antigravity"] [--project-id <uuid>] [--cwd <path>] [--codename "Colorful Possum"]
- *       [--title "…"] [--local-id <id>] [--owner-pid <pid>] [--host-token <bearer>] [--no-poller]
+ *       [--title "…"] [--local-id <id>] [--owner-pid <pid>] [--no-poller]
  *   node remote-control-state.mjs ensure-poller --connection-id <uuid> [--session <uuid>] [--owner-pid <pid>]
  *   node remote-control-state.mjs disable --connection-id <uuid>
  *   node remote-control-state.mjs disable-local [--agent "Antigravity"] [--local-id <id>]
@@ -47,7 +47,13 @@
  *       [--max-age-minutes 30] [--force-new]
  *     → action: already_live | reconnect | register | create_and_attach
  *   node remote-control-state.mjs stop-poller --connection-id <uuid>
- *   node remote-control-state.mjs resolve-auth
+ *   node remote-control-state.mjs resolve-auth   (reports the key by fingerprint only)
+ *
+ * No command takes the DevSpec key as an argument and none prints it (item b17cb7d7):
+ * a command line is readable by every local account, and whatever a command prints
+ * lands in agent transcripts. The key is read from Antigravity's MCP config
+ * (`resolve-mcp-auth.mjs`). Every file here that holds it is written through
+ * `private-state.mjs`: 0600, in a 0700 directory, a looser existing file replaced.
  */
 
 import crypto from 'node:crypto'
@@ -56,19 +62,36 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
+import {
+  resolveDevspecMcpAuth,
+  hostTokenFromEnv,
+  printableAuth,
+  tokenFingerprint,
+} from './resolve-mcp-auth.mjs'
+import {
+  ensurePrivateDir,
+  openPrivateAppend,
+  readPrivateJson,
+  writePrivateJson,
+  writePrivateText,
+} from './private-state.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import {
   applyConnectionCapabilityRotation,
   stripConnectionCapability,
 } from './connection-capability-state.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
+import { processStartTime } from './close-on-end.mjs'
+import { saveConversationProject } from './conversation-project.mjs'
+import { findProjectPin, gitRemoteOrigin } from './devspec-scope.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 const DEVSPEC_DIR = path.join(os.homedir(), '.devspec')
 const LEGACY_PATH = path.join(DEVSPEC_DIR, 'remote-control.json')
 const CONNECTIONS_DIR = path.join(DEVSPEC_DIR, 'remote-control', 'connections')
 const THIS_DIR = path.dirname(fileURLToPath(import.meta.url))
 const POLLER_SCRIPT = path.join(THIS_DIR, 'devspec-remote-poll.mjs')
+const LISTENER_SCRIPT = path.join(THIS_DIR, 'devspec-remote-listen.mjs')
 
 function pollerPidPath(connectionId) {
   return path.join(CONNECTIONS_DIR, `${connectionId}.poll.pid`)
@@ -77,27 +100,218 @@ function pollerPidPath(connectionId) {
 function pollerLogPath(connectionId) {
   return path.join(CONNECTIONS_DIR, `${connectionId}.poll.log`)
 }
+
+export function listenerInfoPath(connectionId, connDir = CONNECTIONS_DIR) {
+  return path.join(connDir, `${connectionId}.listener.json`)
+}
+
+export function isListenerAlive(connectionId, connDir = CONNECTIONS_DIR) {
+  if (!connectionId) return false
+  const info = readJson(listenerInfoPath(connectionId, connDir))
+  const pid = Number(info?.pid)
+  if (!Number.isInteger(pid) || pid <= 1) return false
+  return ownerAlive(pid)
+}
+
+export function stopListenerForConnection(connectionId, connDir = CONNECTIONS_DIR) {
+  const file = listenerInfoPath(connectionId, connDir)
+  const info = readJson(file)
+  const pid = Number(info?.pid)
+  let killed = false
+  if (Number.isInteger(pid) && pid > 1) {
+    try {
+      process.kill(pid, 'SIGTERM')
+      killed = true
+    } catch {
+      /* already gone */
+    }
+  }
+  try {
+    fs.rmSync(file, { force: true })
+  } catch {
+    /* ignore */
+  }
+  return { connection_id: connectionId, pid: Number.isInteger(pid) ? pid : null, killed }
+}
+
+export function buildListenerSpawnEnv(
+  state,
+  { env = process.env, ownerPid = null, conversationId = null } = {},
+) {
+  const baseEnv = env || process.env
+  const childEnv = { ...baseEnv }
+  if (!state) return childEnv
+
+  const effectiveConversationId = conversationId || state.local_id || null
+  const sameConversationAsCaller =
+    !state.local_id ||
+    !baseEnv?.ANTIGRAVITY_CONVERSATION_ID ||
+    state.local_id === baseEnv.ANTIGRAVITY_CONVERSATION_ID
+
+  delete childEnv.ANTIGRAVITY_LS_ADDRESS
+  delete childEnv.ANTIGRAVITY_CSRF_TOKEN
+  delete childEnv.ANTIGRAVITY_CONVERSATION_ID
+  delete childEnv.AGY_CONVERSATION_ID
+  delete childEnv.ANTIGRAVITY_SOURCE_METADATA
+
+  const targetLsAddress =
+    state.ls_address ||
+    discoverAntigravityLsAddress(ownerPid ?? state.owner_pid, {}) ||
+    (sameConversationAsCaller ? baseEnv?.ANTIGRAVITY_LS_ADDRESS : null) ||
+    null
+  const targetCsrfToken =
+    state.csrf_token ||
+    (sameConversationAsCaller ? baseEnv?.ANTIGRAVITY_CSRF_TOKEN : null) ||
+    null
+  const targetAgentApiExe = state.agentapi_exe || baseEnv?.ANTIGRAVITY_AGENTAPI_EXE || null
+
+  if (targetLsAddress) childEnv.ANTIGRAVITY_LS_ADDRESS = targetLsAddress
+  if (targetCsrfToken) childEnv.ANTIGRAVITY_CSRF_TOKEN = targetCsrfToken
+  if (targetAgentApiExe) childEnv.ANTIGRAVITY_AGENTAPI_EXE = targetAgentApiExe
+  if (effectiveConversationId) {
+    childEnv.ANTIGRAVITY_CONVERSATION_ID = String(effectiveConversationId)
+  }
+  return childEnv
+}
+
+export function ensureListenerForConnection(connectionId, opts = {}) {
+  if (!connectionId || connectionId.length < 8) return { ok: false, error: 'missing connection id' }
+  if (!fs.existsSync(LISTENER_SCRIPT)) {
+    return { ok: false, error: `listener script missing: ${LISTENER_SCRIPT}` }
+  }
+  const connDir = opts.connDir || CONNECTIONS_DIR
+  if (opts.reuseRunning && isListenerAlive(connectionId, connDir)) {
+    const info = readJson(listenerInfoPath(connectionId, connDir))
+    return {
+      ok: true,
+      reused: true,
+      connection_id: connectionId,
+      pid: info?.pid || null,
+      owner_pid: info?.owner_pid || null,
+    }
+  }
+  const state = readStateFile(connectionId, connDir)
+  const resolveOwnerPidFn = opts.resolveOwnerPid || resolveOwnerPid
+  const ownerPid = resolveOwnerPidFn(opts.ownerPid, state?.owner_pid || null)
+  if (ownerPid === null) {
+    return { ok: false, error: 'missing owner_pid for listener' }
+  }
+  const effectiveConversationId =
+    opts.conversationId || opts.localId || state?.local_id || null
+  const effectiveCwd = opts.cwd || state?.cwd || process.cwd()
+
+  stopListenerForConnection(connectionId, connDir)
+  const logPath = path.join(connDir, `${connectionId}.listen.log`)
+  let logFd
+  try {
+    // Owner-only, including a log an earlier version created 0664.
+    logFd = openPrivateAppend(logPath)
+  } catch (e) {
+    return { ok: false, error: `could not open listen log: ${e.message}` }
+  }
+  const listenArgs = [LISTENER_SCRIPT, '--connection-id', connectionId, '--owner-pid', String(ownerPid)]
+  if (effectiveConversationId) {
+    listenArgs.push('--conversation-id', String(effectiveConversationId))
+  }
+  if (effectiveCwd) listenArgs.push('--cwd', String(effectiveCwd))
+
+  const childEnv = buildListenerSpawnEnv(state, {
+    env: opts.env || process.env,
+    ownerPid,
+    conversationId: effectiveConversationId,
+  })
+
+  let child
+  try {
+    child = spawn(process.execPath, listenArgs, {
+      cwd: effectiveCwd,
+      detached: true,
+      stdio: ['ignore', logFd, logFd],
+      windowsHide: true,
+      env: childEnv,
+    })
+  } catch (e) {
+    try {
+      fs.closeSync(logFd)
+    } catch {
+      /* ignore */
+    }
+    return { ok: false, error: `listener spawn failed: ${e.message}` }
+  }
+  try {
+    fs.closeSync(logFd)
+  } catch {
+    /* ignore */
+  }
+  child.unref()
+  const pid = child.pid
+  if (!pid) return { ok: false, error: 'listener spawn returned no pid' }
+  const payload = {
+    pid,
+    owner_pid: ownerPid,
+    connection_id: connectionId,
+    conversation_id: effectiveConversationId,
+    status: 'serving',
+    started_at: new Date().toISOString(),
+  }
+  writeJson(listenerInfoPath(connectionId, connDir), payload)
+  return { ok: true, connection_id: connectionId, pid, owner_pid: ownerPid }
+}
+
+export function knownInstructionTiersFor(connectionId, connDir = CONNECTIONS_DIR) {
+  if (!connectionId) return null
+  const state = readStateFile(connectionId, connDir)
+  if (
+    state?.instruction_tiers_version === 1 &&
+    typeof state.instruction_tiers_hash === 'string' &&
+    /^sha256:[a-f0-9]{64}$/.test(state.instruction_tiers_hash)
+  ) {
+    return { version: 1, hash: state.instruction_tiers_hash }
+  }
+  return null
+}
 const LOCAL_DIR = path.join(DEVSPEC_DIR, 'remote-control', 'local')
 
 /** Default window for stop → remote again in the same local conversation. */
 const DEFAULT_RECONNECT_MAX_AGE_MINUTES = 30
 
-function connectionPath(connectionId) {
-  return path.join(CONNECTIONS_DIR, `${connectionId}.json`)
+function connectionPath(connectionId, connDir = CONNECTIONS_DIR) {
+  return path.join(connDir, `${connectionId}.json`)
 }
 
+/** State that may hold the key: tightened to 0600 before it is read. */
 function readJson(filePath) {
-  try {
-    if (!fs.existsSync(filePath)) return null
-    return JSON.parse(fs.readFileSync(filePath, 'utf8'))
-  } catch {
-    return null
-  }
+  return readPrivateJson(filePath)
 }
 
+/**
+ * Connection state holds the bearer the connection registered with (the poller,
+ * listener and mirror authenticate as that one token, item 74b29c76), Antigravity's
+ * CSRF token and the connection capability. Written 0600 aside and renamed, so a
+ * looser existing file is replaced, in a 0700 directory.
+ */
 function writeJson(filePath, state) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true })
-  fs.writeFileSync(filePath, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 })
+  writePrivateJson(filePath, state)
+}
+
+export function readStateFile(connectionId, connDir = CONNECTIONS_DIR) {
+  if (!connectionId) return null
+  return readJson(connectionPath(connectionId, connDir))
+}
+
+export function writeStateFile(idOrState, stateOrDir = CONNECTIONS_DIR, maybeDir = CONNECTIONS_DIR) {
+  if (idOrState && typeof idOrState === 'object') {
+    const connId = idOrState.connection_id
+    if (!connId) return null
+    const dir = typeof stateOrDir === 'string' ? stateOrDir : CONNECTIONS_DIR
+    const next = { ...idOrState, connection_id: connId }
+    writeJson(connectionPath(connId, dir), next)
+    return next
+  }
+  if (!idOrState || !stateOrDir || typeof stateOrDir !== 'object') return null
+  const next = { ...stateOrDir, connection_id: idOrState }
+  writeJson(connectionPath(idOrState, maybeDir), next)
+  return next
 }
 
 function parseArgs(argv) {
@@ -115,12 +329,14 @@ function parseArgs(argv) {
     else if (a === '--title') out.title = argv[++i]
     else if (a === '--local-id' || a === '--local_id' || a === '--conversation-id') {
       out['local-id'] = argv[++i]
+    } else if (a === '--transcript-path' || a === '--transcript_path') {
+      out['transcript-path'] = argv[++i]
+    } else if (a === '--event') {
+      out.event = argv[++i]
     } else if (a === '--max-age-minutes' || a === '--max_age_minutes') {
       out['max-age-minutes'] = argv[++i]
     } else if (a === '--owner-pid') {
       out['owner-pid'] = argv[++i]
-    } else if (a === '--host-token' || a === '--host_token') {
-      out['host-token'] = argv[++i]
     } else if (a === '--except-connection' || a === '--except-session') {
       out['except-connection'] = argv[++i]
     } else if (a === '--no-poller' || a === '--skip-poller') {
@@ -130,6 +346,29 @@ function parseArgs(argv) {
     } else out._.push(a)
   }
   return out
+}
+
+/**
+ * True when a `/proc/<pid>/cmdline` argv is a `node …devspec-remote-poll.mjs`
+ * process for `connectionId`.
+ *
+ * Checks argv slots, not a space-joined string: a `bash -c "node …poll… --connection-id <id>"`
+ * wrapper contains the same substring in its single `-c` argument, and matching
+ * it caused `stopPollerForConnection` to SIGTERM the caller's own shell (item 7e35d818 / da592dee).
+ */
+export function isPollerArgv(argv, connectionId) {
+  if (!Array.isArray(argv) || !connectionId || connectionId.length < 8) return false
+  const bin = String(argv[0] || '').split(/[\\/]/).pop()
+  if (bin !== 'node' && bin !== 'node.exe') return false
+  let hasScript = false
+  let hasConn = false
+  for (let i = 1; i < argv.length; i++) {
+    const a = String(argv[i] || '')
+    if (a.split(/[\\/]/).pop() === 'devspec-remote-poll.mjs') hasScript = true
+    if (a === '--connection-id' && argv[i + 1] === connectionId) hasConn = true
+    else if (a === `--connection-id=${connectionId}`) hasConn = true
+  }
+  return hasScript && hasConn
 }
 
 /**
@@ -159,26 +398,121 @@ function findPollerPidsForConnection(connectionId) {
     /* ignore */
   }
 
-  // /proc scan (Linux) — require the poller script AND connection id in the cmdline.
+  // /proc scan (Linux) — require exact poller argv for this connection id.
   try {
     for (const name of fs.readdirSync('/proc')) {
       if (!/^\d+$/.test(name)) continue
-      let cmd
+      let argv
       try {
-        cmd = fs.readFileSync(`/proc/${name}/cmdline`).toString().replace(/\0/g, ' ')
+        argv = fs.readFileSync(`/proc/${name}/cmdline`, 'utf8').split('\0')
       } catch {
         continue
       }
-      if (!cmd.includes('devspec-remote-poll')) continue
-      if (!cmd.includes(connectionId)) continue
-      if (!/\bnode\b/.test(cmd) && !cmd.includes('node ')) continue
-      pids.add(Number(name))
+      if (isPollerArgv(argv, connectionId)) pids.add(Number(name))
     }
   } catch {
     /* non-Linux or no /proc */
   }
 
   return [...pids]
+}
+
+/**
+ * Whether a poller is currently running for `connectionId` (item da592dee).
+ * Used by `devspec-remote-listen.mjs` to detect and self-repair a missing poller
+ * while the owning Antigravity process is still alive.
+ */
+export function pollerRunning(connectionId, { findPids = findPollerPidsForConnection } = {}) {
+  if (!connectionId || connectionId.length < 8) return false
+  return findPids(connectionId).length > 0
+}
+
+/**
+ * Linux /proc owner-pid self-resolution. Walks parent process ancestry up to maxHops
+ * looking for the owning Antigravity host process (`agy`, `antigravity`, or
+ * `language_server_*`) so callers inside subshells or hooks that cannot rely on
+ * `$PPID` still anchor the poller to the real Antigravity process.
+ */
+export function resolveOwnerPidAutoLinux(
+  startPid = process.pid,
+  { maxHops = 12, procRoot = '/proc' } = {},
+) {
+  if (process.platform !== 'linux' && procRoot === '/proc') return null
+  let pid = Number.parseInt(String(startPid), 10)
+  if (!Number.isInteger(pid) || pid <= 1) return null
+  let fallbackLsPid = null
+  for (let i = 0; i < maxHops && pid > 1; i++) {
+    let statusText = ''
+    try {
+      statusText = fs.readFileSync(path.join(procRoot, String(pid), 'status'), 'utf8')
+    } catch {
+      break
+    }
+    const nameMatch = statusText.match(/^Name:\s*(.+)$/m)
+    const ppidMatch = statusText.match(/^PPid:\s*(\d+)$/m)
+    const comm = (nameMatch?.[1] || '').trim()
+    let cmdline = ''
+    try {
+      cmdline = fs
+        .readFileSync(path.join(procRoot, String(pid), 'cmdline'), 'utf8')
+        .replace(/\0/g, ' ')
+        .trim()
+    } catch {
+      /* ignore */
+    }
+    if (
+      /^(agy|antigravity)$/i.test(comm) ||
+      /(^|[\s/])(agy|antigravity)(\s|$)/i.test(cmdline)
+    ) {
+      return pid
+    }
+    if (
+      /^language_server_[a-z0-9_.-]+$/i.test(comm) ||
+      /(^|[\s/])language_server_[a-z0-9_.-]+(\s|$)/i.test(cmdline)
+    ) {
+      fallbackLsPid = pid
+    }
+    const nextPid = Number.parseInt(ppidMatch?.[1] || '', 10)
+    if (!Number.isInteger(nextPid) || nextPid <= 1 || nextPid === pid) break
+    pid = nextPid
+  }
+  return fallbackLsPid
+}
+
+/**
+ * Discover Antigravity's local language server HTTP address (`localhost:<port>`)
+ * from `env.ANTIGRAVITY_LS_ADDRESS` or by inspecting the `cli-*.log` file open on
+ * `ownerPid`'s stdout/stderr file descriptors (`/proc/<ownerPid>/fd/1` or `fd/2`).
+ */
+export function discoverAntigravityLsAddress(
+  ownerPid,
+  env = process.env,
+  { procRoot = '/proc' } = {},
+) {
+  if (typeof env?.ANTIGRAVITY_LS_ADDRESS === 'string' && env.ANTIGRAVITY_LS_ADDRESS.trim()) {
+    return env.ANTIGRAVITY_LS_ADDRESS.trim()
+  }
+  const pid = Number.parseInt(String(ownerPid ?? ''), 10)
+  if (!Number.isInteger(pid) || pid <= 1) return null
+  for (const fd of ['1', '2']) {
+    try {
+      const target = fs.readlinkSync(path.join(procRoot, String(pid), 'fd', fd))
+      if (!target || !target.endsWith('.log') || !fs.existsSync(target)) continue
+      const fdNum = fs.openSync(target, 'r')
+      try {
+        const buf = Buffer.alloc(16384)
+        const bytes = fs.readSync(fdNum, buf, 0, buf.length, 0)
+        const text = buf.subarray(0, bytes).toString('utf8')
+        const m = text.match(/Language server listening on (?:random )?port at (\d+) for HTTP(?!S)\b/i)
+        if (m && m[1]) return `localhost:${m[1]}`
+      } finally {
+        fs.closeSync(fdNum)
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return null
 }
 
 /**
@@ -190,8 +524,8 @@ function findPollerPidsForConnection(connectionId) {
  * an orphan sentinel, not a resolvable process). node.exe itself, unlike the MSYS
  * shell, IS a genuine Win32 process, so `process.pid` (this script's own pid) is a
  * real, queryable anchor — walk its Win32_Process ancestry until we reach the owning
- * `claude.exe`, however many shell layers sit in between. A single short-lived
- * PowerShell call does the whole walk (fast: one process spawn, no polling).
+ * host process (`agy.exe`, `antigravity.exe`, or `claude.exe`), however many shell
+ * layers sit in between. A single short-lived PowerShell call does the whole walk.
  */
 export function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 12, timeoutMs = 4000 } = {}) {
   if (process.platform !== 'win32') return null
@@ -202,7 +536,7 @@ export function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 1
     `for ($i = 0; $i -lt ${maxHops}; $i++) {`,
     '  $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction SilentlyContinue',
     '  if (-not $proc) { break }',
-    "  if ($proc.Name -ieq 'claude.exe') { Write-Output $proc.ProcessId; break }",
+    "  if ($proc.Name -ieq 'agy.exe' -or $proc.Name -ieq 'antigravity.exe' -or $proc.Name -ieq 'claude.exe') { Write-Output $proc.ProcessId; break }",
     '  if (-not $proc.ParentProcessId -or $proc.ParentProcessId -eq $p) { break }',
     '  $p = $proc.ParentProcessId',
     '}',
@@ -222,15 +556,32 @@ export function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 1
 
 /**
  * Resolve the effective owner-pid for this call: an explicit, valid `--owner-pid`
- * always wins (any platform); otherwise attempt the Windows self-resolution above;
- * otherwise fall back to a previously-recorded value (still better than nothing on
- * a platform/setup where auto-resolution isn't available). Returns null if none.
+ * always wins (any platform), except when `$PPID` inside Antigravity's `run_command`
+ * tool is `language_server_*` or an intermediate shell (`bash`/`sh`/`zsh`/`dash`),
+ * in which case we walk up to the owning `agy` process so `statusLine`, hooks, and
+ * `run_command` all share the exact same window `owner_pid`.
  */
 export function resolveOwnerPid(explicitArg, prevValue) {
   const explicit = Number.parseInt(String(explicitArg ?? ''), 10)
-  if (Number.isInteger(explicit) && explicit > 1) return explicit
-  const auto = resolveOwnerPidAutoWindows()
-  if (auto) return auto
+  if (Number.isInteger(explicit) && explicit > 1) {
+    if (process.platform === 'linux') {
+      try {
+        const statusText = fs.readFileSync(`/proc/${explicit}/status`, 'utf8')
+        const comm = (statusText.match(/^Name:\s*(.+)$/m)?.[1] || '').trim()
+        if (/^(language_server_[a-z0-9_.-]+|bash|sh|dash|zsh)$/i.test(comm)) {
+          const normalized = resolveOwnerPidAutoLinux(explicit)
+          if (normalized) return normalized
+        }
+      } catch {
+        /* explicit pid not in /proc (e.g. synthetic test pid) — keep explicit */
+      }
+    }
+    return explicit
+  }
+  const autoLinux = resolveOwnerPidAutoLinux()
+  if (autoLinux) return autoLinux
+  const autoWin = resolveOwnerPidAutoWindows()
+  if (autoWin) return autoWin
   const prev = Number.parseInt(String(prevValue ?? ''), 10)
   return Number.isInteger(prev) && prev > 1 ? prev : null
 }
@@ -317,7 +668,7 @@ export function ensurePollerForConnection(connectionId, opts = {}) {
   }
 
   const stopped = stopPollerForConnection(connectionId)
-  fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
+  ensurePrivateDir(CONNECTIONS_DIR)
 
   const logPath = pollerLogPath(connectionId)
   const pidPath = pollerPidPath(connectionId)
@@ -327,7 +678,8 @@ export function ensurePollerForConnection(connectionId, opts = {}) {
 
   let logFd
   try {
-    logFd = fs.openSync(logPath, 'a')
+    // Owner-only, including a log an earlier version created 0664.
+    logFd = openPrivateAppend(logPath)
   } catch (e) {
     return { ok: false, error: `could not open poll log: ${e.message}`, stopped }
   }
@@ -363,7 +715,7 @@ export function ensurePollerForConnection(connectionId, opts = {}) {
   const pid = child.pid
   if (!pid) return { ok: false, error: 'spawn returned no pid', stopped }
   try {
-    fs.writeFileSync(pidPath, `${pid}\n`, { mode: 0o600 })
+    writePrivateText(pidPath, `${pid}\n`)
   } catch (e) {
     return { ok: false, error: `wrote poller but failed pid file: ${e.message}`, pid, log: logPath, stopped }
   }
@@ -416,12 +768,14 @@ function disableConnectionState(connectionId, { agent = null, localId = null } =
   }
   const bonds = markBondsStoppedForConnection(connectionId, 'local_stop')
   const killResult = stopPollerForConnection(connectionId)
+  const listenerResult = stopListenerForConnection(connectionId)
   return {
     ok: true,
     enabled: false,
     connection_id: connectionId,
     path: perPath,
     poller: killResult,
+    listener: listenerResult,
     bonds_stopped: bonds.length,
   }
 }
@@ -437,111 +791,33 @@ export function ownerAlive(pid) {
   }
 }
 
+const CONNECTION_STATE_FILE_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/i
+
+/**
+ * True only for canonical `<connection_uuid>.json` state filenames.
+ * Excludes companion sidecars (`<id>.<session>.transcript-state.json`,
+ * `<id>.room.json`, `<id>.tiers.json`, `<id>.listener.json`, etc.) so they are
+ * never mistaken for connection state records (item da592dee).
+ */
+export function isConnectionStateFilename(name) {
+  return typeof name === 'string' && CONNECTION_STATE_FILE_RE.test(name)
+}
+
 /** Every per-connection state object on disk (raw). */
-function scanConnectionStates() {
+export function scanConnectionStates(dir = CONNECTIONS_DIR) {
   const out = []
   try {
-    if (!fs.existsSync(CONNECTIONS_DIR)) return out
-    for (const f of fs.readdirSync(CONNECTIONS_DIR)) {
-      if (!f.endsWith('.json')) continue
-      const s = readJson(path.join(CONNECTIONS_DIR, f))
+    if (!fs.existsSync(dir)) return out
+    for (const f of fs.readdirSync(dir)) {
+      if (!isConnectionStateFilename(f)) continue
+      const s = readJson(path.join(dir, f))
       if (s && s.connection_id) out.push(s)
     }
   } catch {
     /* ignore */
   }
   return out
-}
-
-/**
- * Legacy backstop threshold. A still-running poller whose connection state carries
- * NO recorded owner_pid can't be proven dead by owner-death — this was the exact
- * zombie gap (item 00bd4f6e). New pollers always record an owner_pid
- * (ensurePollerForConnection refuses to spawn without one), so a live no-owner_pid
- * state is a pre-fix artifact. We reap it only once its local state has been
- * untouched this long, so a freshly-active legacy poller is never killed.
- */
-const STALE_NO_OWNER_REAP_MS = 60 * 60 * 1000 // 1h
-
-/** Clear a dead connection's local capability from both state pointers. */
-function clearStoredConnectionCapability(connectionId) {
-  const perPath = connectionPath(connectionId)
-  const perState = readJson(perPath)
-  if (perState) writeJson(perPath, stripConnectionCapability(perState))
-  const legacy = readJson(LEGACY_PATH)
-  if (legacy?.connection_id === connectionId) {
-    writeJson(LEGACY_PATH, stripConnectionCapability(legacy))
-  }
-}
-
-/**
- * Reap PROVABLY-DEAD pollers — the connect-time / SessionStart backstop for the
- * self-terminating poller. A poller is reaped when its connection is provably dead
- * (state disabled, ended-from-UI, or its recorded owner process is gone), so a live
- * sibling terminal's poller is NEVER touched. As a legacy safety net, a poller with
- * NO recorded owner_pid (pre-owner-pid-contract artifact — new spawns always record
- * one) is reaped only once its local state has gone stale beyond STALE_NO_OWNER_REAP_MS,
- * so a freshly-active one is left alone. Injectable for tests.
- */
-export function reapDeadPollers({
-  agent = AGENT_NAME,
-  exceptConnectionId = null,
-  now = Date.now(),
-  staleNoOwnerReapMs = STALE_NO_OWNER_REAP_MS,
-  listStates = scanConnectionStates,
-  findPids = findPollerPidsForConnection,
-  isOwnerAlive = ownerAlive,
-  clearCapability = clearStoredConnectionCapability,
-  kill = (pid) => {
-    try {
-      process.kill(pid, 'SIGTERM')
-      return true
-    } catch {
-      return false
-    }
-  },
-} = {}) {
-  const reaped = []
-  for (const s of listStates()) {
-    if (!s || !s.connection_id) continue
-    if (exceptConnectionId && s.connection_id === exceptConnectionId) continue
-    if (agent && s.agent_name && String(s.agent_name).toLowerCase() !== String(agent).toLowerCase()) {
-      continue
-    }
-    const ownerPid = Number.isInteger(s.owner_pid) && s.owner_pid > 1 ? s.owner_pid : null
-    const ownerGone = ownerPid !== null && !isOwnerAlive(ownerPid)
-    const provablyDead = s.enabled === false || s.ended_from_ui === true || ownerGone
-
-    // Legacy backstop: with no owner_pid there is nothing to prove death by, so
-    // reap only when the connection is still nominally enabled but its local state
-    // has been untouched beyond the stale threshold (never a freshly-active one; a
-    // missing/unparsable updated_at is treated as "unknown → leave alone").
-    let staleNoOwner = false
-    if (!provablyDead && ownerPid === null && s.enabled !== false && s.ended_from_ui !== true) {
-      const t = Date.parse(s.updated_at || '')
-      if (Number.isFinite(t) && now - t >= staleNoOwnerReapMs) staleNoOwner = true
-    }
-
-    if (!provablyDead && !staleNoOwner) continue
-    clearCapability(s.connection_id)
-    const pids = findPids(s.connection_id)
-    if (!pids.length) continue
-    const killed = pids.filter((pid) => kill(pid))
-    reaped.push({
-      connection_id: s.connection_id,
-      agent_name: s.agent_name || null,
-      killed,
-      reason:
-        s.enabled === false
-          ? 'disabled'
-          : s.ended_from_ui
-            ? 'ended_from_ui'
-            : ownerGone
-              ? 'owner_gone'
-              : 'stale_no_owner',
-    })
-  }
-  return reaped
 }
 
 function agentSlug(name) {
@@ -558,8 +834,13 @@ function sanitizeLocalId(id) {
   return s || null
 }
 
-function localBondPath(agent, localId) {
-  return path.join(LOCAL_DIR, agentSlug(agent), `${localId}.json`)
+function resolveLocalDir(rcOrLocalDir = LOCAL_DIR) {
+  if (!rcOrLocalDir || typeof rcOrLocalDir !== 'string') return LOCAL_DIR
+  return path.basename(rcOrLocalDir) === 'local' ? rcOrLocalDir : path.join(rcOrLocalDir, 'local')
+}
+
+export function localBondPath(agent, localId, rcOrLocalDir = LOCAL_DIR) {
+  return path.join(resolveLocalDir(rcOrLocalDir), agentSlug(agent), `${localId}.json`)
 }
 
 /**
@@ -580,15 +861,21 @@ function localBondPath(agent, localId) {
  * MAX_TURN_MS (1h). Live bug: Working / bouncing dots stuck after every remote reply
  * (Grok item a6b3f881, Claude item 87117120 — same root cause, both plugins).
  *
- * Tools with no per-conversation id at all (Cursor, Antigravity) correctly resolve
- * null here and are disambiguated by selectBoundState's single-connection fallback.
+ * Antigravity hooks receive `conversationId` and `transcriptPath` on stdin JSON,
+ * and subprocesses may carry `DEVSPEC_REMOTE_LOCAL_ID` or `ANTIGRAVITY_CONVERSATION_ID`.
+ * Note: `ANTIGRAVITY_TRAJECTORY_ID` is a per-trajectory UUID (distinct from the
+ * conversation ID) and is intentionally NOT used as `local_id`.
  */
 export function detectLocalId(args = {}, env = process.env) {
-  const fromArg = sanitizeLocalId(args['local-id'] || args.localId || args.local_id)
+  const fromArg = sanitizeLocalId(
+    args['local-id'] || args.localId || args.local_id || args.conversationId || args.conversation_id,
+  )
   if (fromArg) return { local_id: fromArg, source: 'arg' }
 
   const envPairs = [
     ['DEVSPEC_REMOTE_LOCAL_ID', env.DEVSPEC_REMOTE_LOCAL_ID],
+    ['ANTIGRAVITY_CONVERSATION_ID', env.ANTIGRAVITY_CONVERSATION_ID],
+    ['CONVERSATION_ID', env.CONVERSATION_ID],
     ['CODEX_THREAD_ID', env.CODEX_THREAD_ID],
     ['CLAUDE_CODE_SESSION_ID', env.CLAUDE_CODE_SESSION_ID],
     ['CLAUDE_SESSION_ID', env.CLAUDE_SESSION_ID],
@@ -600,6 +887,32 @@ export function detectLocalId(args = {}, env = process.env) {
     if (id) return { local_id: id, source: `env:${name}` }
   }
   return { local_id: null, source: null }
+}
+
+/**
+ * Infer the Antigravity conversation transcript path from a conversation UUID.
+ * Antigravity stores conversation transcripts at:
+ *   `<appDataDir>/brain/<conversationId>/.system_generated/logs/transcript.jsonl`
+ */
+export function inferAntigravityTranscriptPath(localId, env = process.env) {
+  const id = sanitizeLocalId(localId)
+  if (!id) return null
+  const appDataDir =
+    env.ANTIGRAVITY_APP_DATA_DIR || path.join(os.homedir(), '.gemini', 'antigravity-cli')
+  const candidate = path.join(
+    appDataDir,
+    'brain',
+    id,
+    '.system_generated',
+    'logs',
+    'transcript.jsonl',
+  )
+  try {
+    if (fs.existsSync(candidate)) return candidate
+  } catch {
+    /* ignore */
+  }
+  return null
 }
 
 export function mintLocalId() {
@@ -629,13 +942,25 @@ export function isRecoverableEndReason(endReason) {
   )
 }
 
-function readLocalBond(agent, localId) {
+export function readLocalBond(agentOrLocalId, localIdOrDir = null, maybeDir = LOCAL_DIR) {
+  // Support both readLocalBond(agent, localId, dir?) and readLocalBond(localId, dir?)
+  const isPathSecond =
+    typeof localIdOrDir === 'string' && (localIdOrDir.includes('/') || localIdOrDir.includes('\\'))
+  const agent = isPathSecond || localIdOrDir === null ? AGENT_NAME : agentOrLocalId
+  const localId = isPathSecond || localIdOrDir === null ? agentOrLocalId : localIdOrDir
+  const dir = isPathSecond ? localIdOrDir : maybeDir
   if (!localId) return null
-  return readJson(localBondPath(agent, localId))
+  return readJson(localBondPath(agent, localId, dir))
 }
 
-function writeLocalBond(agent, localId, patch) {
-  const p = localBondPath(agent, localId)
+export function writeLocalBond(agentOrLocalId, localIdOrPatch, patchOrDir = null, maybeDir = LOCAL_DIR) {
+  // Support both writeLocalBond(agent, localId, patch, dir?) and writeLocalBond(localId, patch, dir?)
+  const isPatchSecond = localIdOrPatch && typeof localIdOrPatch === 'object'
+  const agent = isPatchSecond ? AGENT_NAME : agentOrLocalId
+  const localId = isPatchSecond ? agentOrLocalId : localIdOrPatch
+  const patch = isPatchSecond ? localIdOrPatch : patchOrDir || {}
+  const dir = isPatchSecond ? (typeof patchOrDir === 'string' ? patchOrDir : LOCAL_DIR) : maybeDir
+  const p = localBondPath(agent, localId, dir)
   const prev = readJson(p) || {}
   const next = {
     ...prev,
@@ -650,12 +975,21 @@ function writeLocalBond(agent, localId, patch) {
 }
 
 /** Mark every local bond that points at connectionId as stopped. */
-function markBondsStoppedForConnection(connectionId, endReason = 'local_stop') {
+export function markBondsStoppedForConnection(
+  connectionId,
+  endReason = 'local_stop',
+  {
+    localDir = LOCAL_DIR,
+    endedFromUi = endReason === 'ui' || endReason === 'ended_from_ui',
+    now = new Date().toISOString(),
+  } = {},
+) {
   const updated = []
   try {
-    if (!fs.existsSync(LOCAL_DIR)) return updated
-    for (const agentDir of fs.readdirSync(LOCAL_DIR)) {
-      const dir = path.join(LOCAL_DIR, agentDir)
+    const resolvedDir = resolveLocalDir(localDir)
+    if (!fs.existsSync(resolvedDir)) return updated
+    for (const agentDir of fs.readdirSync(resolvedDir)) {
+      const dir = path.join(resolvedDir, agentDir)
       let st
       try {
         st = fs.statSync(dir)
@@ -671,8 +1005,10 @@ function markBondsStoppedForConnection(connectionId, endReason = 'local_stop') {
         const next = {
           ...b,
           status: 'stopped',
+          enabled: false,
+          ended_from_ui: Boolean(endedFromUi),
           end_reason: endReason || b.end_reason || 'local_stop',
-          updated_at: new Date().toISOString(),
+          updated_at: now,
         }
         writeJson(p, next)
         updated.push({ path: p, local_id: b.local_id, agent_name: b.agent_name })
@@ -697,11 +1033,14 @@ function markBondsStoppedForConnection(connectionId, endReason = 'local_stop') {
 export function resolveLocalAction({
   agent = AGENT_NAME,
   localId = null,
+  ownerPid = null,
   forceNew = false,
   maxAgeMinutes = DEFAULT_RECONNECT_MAX_AGE_MINUTES,
   now = Date.now(),
   readBond = readLocalBond,
   readConnection = (id) => readJson(connectionPath(id)),
+  listStates = scanConnectionStates,
+  rebond = rebondConnectionToConversation,
 } = {}) {
   const agentName = agent || AGENT_NAME
   const maxAgeMs =
@@ -728,13 +1067,100 @@ export function resolveLocalAction({
     }
   }
 
-  const bond = localId ? readBond(agentName, localId) : null
-  if (!localId || !bond || !bond.connection_id) {
+  let effectiveLocalId = localId
+  let bond = effectiveLocalId ? readBond(agentName, effectiveLocalId) : null
+  // If this conversation has no bond yet, check if this exact Antigravity window
+  // (owner_pid) already auto-connected at startup with local_id === null (or agy-window:<pid>).
+  if (
+    effectiveLocalId &&
+    (!bond || !bond.connection_id) &&
+    Number.isInteger(Number(ownerPid)) &&
+    Number(ownerPid) > 1
+  ) {
+    const matchingStartup = listStates().find(
+      (s) =>
+        s &&
+        s.enabled !== false &&
+        !s.ended_from_ui &&
+        (!s.local_id || String(s.local_id).startsWith('agy-window:')) &&
+        String(s.agent_name || '').toLowerCase() === String(agentName).toLowerCase() &&
+        Number(s.owner_pid) === Number(ownerPid),
+    )
+    if (matchingStartup?.connection_id) {
+      const pendingLocalId =
+        matchingStartup.pending_local_id ||
+        (String(matchingStartup.local_id || '').startsWith('agy-window:')
+          ? matchingStartup.local_id
+          : null)
+      rebond({
+        agent: agentName,
+        connectionId: matchingStartup.connection_id,
+        localId: effectiveLocalId,
+        keepPendingLocalId: Boolean(pendingLocalId),
+      })
+      bond = readBond(agentName, effectiveLocalId)
+      if (!bond || !bond.connection_id) {
+        bond = {
+          status: matchingStartup.enabled === false ? 'stopped' : 'live',
+          connection_id: matchingStartup.connection_id,
+          agent_name: matchingStartup.agent_name || agentName,
+          local_id: effectiveLocalId,
+          session_id: matchingStartup.session_id || null,
+          session_codename:
+            matchingStartup.session_codename || matchingStartup.codename || null,
+          title: matchingStartup.title || null,
+          end_reason: matchingStartup.end_reason || null,
+          updated_at: matchingStartup.updated_at || null,
+        }
+      }
+    }
+  } else if (
+    !effectiveLocalId &&
+    Number.isInteger(Number(ownerPid)) &&
+    Number(ownerPid) > 1
+  ) {
+    // When invoked from a run_command shell where ANTIGRAVITY_CONVERSATION_ID is not
+    // in process.env, reuse the active connection already bound to this window's owner_pid.
+    const candidates = listStates().filter(
+      (s) =>
+        s &&
+        !s.ended_from_ui &&
+        String(s.agent_name || '').toLowerCase() === String(agentName).toLowerCase() &&
+        Number(s.owner_pid) === Number(ownerPid),
+    )
+    const matchingOwnerConn =
+      candidates.find((s) => s.enabled !== false && s.local_id) ||
+      candidates.find((s) => s.enabled !== false) ||
+      candidates.find((s) => s.local_id) ||
+      null
+    if (matchingOwnerConn?.connection_id) {
+      if (matchingOwnerConn.local_id && !String(matchingOwnerConn.local_id).startsWith('agy-window:')) {
+        effectiveLocalId = matchingOwnerConn.local_id
+        bond = readBond(agentName, effectiveLocalId)
+      }
+      if (!bond || !bond.connection_id) {
+        bond = {
+          status: matchingOwnerConn.enabled === false ? 'stopped' : 'live',
+          connection_id: matchingOwnerConn.connection_id,
+          agent_name: matchingOwnerConn.agent_name || agentName,
+          local_id: effectiveLocalId || matchingOwnerConn.pending_local_id || null,
+          session_id: matchingOwnerConn.session_id || null,
+          session_codename:
+            matchingOwnerConn.session_codename || matchingOwnerConn.codename || null,
+          title: matchingOwnerConn.title || null,
+          end_reason: matchingOwnerConn.end_reason || null,
+          updated_at: matchingOwnerConn.updated_at || null,
+        }
+      }
+    }
+  }
+
+  if (!bond || !bond.connection_id) {
     return {
       ok: true,
       action: 'register',
       found: false,
-      local_id: localId || null,
+      local_id: effectiveLocalId || null,
       agent_name: agentName,
       connection_id: null,
       session_id: null,
@@ -745,7 +1171,7 @@ export function resolveLocalAction({
       cursor_after_message_id: null,
       age_ms: null,
       max_age_minutes: clampMax,
-      note: !localId
+      note: !effectiveLocalId
         ? 'No local conversation id — register a fresh sessionless connection. Never rejoin by cwd/repo.'
         : 'No connection bond for this conversation — register a fresh sessionless connection.',
     }
@@ -761,7 +1187,7 @@ export function resolveLocalAction({
   const base = {
     ok: true,
     found: true,
-    local_id: localId,
+    local_id: effectiveLocalId || conn.local_id || null,
     agent_name: bond.agent_name || agentName,
     connection_id: bond.connection_id,
     session_id: bond.session_id || conn.session_id || null,
@@ -825,34 +1251,47 @@ export async function negotiateConnectionCapability({
   mcpUrl,
   token,
   projectId,
+  gitRemote = null,
   localId,
   connectionId,
+  connectionCapability = null,
   agentName = AGENT_NAME,
   cwd = process.cwd(),
   call = mcpToolsCall,
+  onProjectId = null,
 } = {}) {
-  if (!mcpUrl || !token || !projectId || !localId || !connectionId) {
+  if (!mcpUrl || !token || (!projectId && !gitRemote) || !localId || !connectionId) {
     return { ok: false, error: 'capability negotiation requires MCP auth, project-id, local-id, and connection-id' }
   }
   try {
+    let callbackMeta = null
     const result = await call({
       mcpUrl,
       token,
       name: 'register_connection',
+      ...(connectionCapability ? { connectionCapability } : {}),
       arguments: {
-        project_id: projectId,
+        ...(projectId ? { project_id: projectId } : {}),
+        ...(gitRemote ? { git_remote: gitRemote } : {}),
         local_id: localId,
         agent_name: agentName,
         cwd,
         connection_capability_version: 1,
       },
       includeMeta: true,
+      onResultMeta: (meta) => {
+        callbackMeta = meta
+      },
       timeoutMs: 15_000,
     })
-    if (result?.data?.connection_id !== connectionId) {
+    const data = result?.data && typeof result.data === 'object' ? result.data : result
+    if (data?.connection_id !== connectionId) {
       return { ok: false, error: 'capability negotiation returned a different connection bond' }
     }
-    const capability = result?.meta?.devspec?.connection_capability
+    if (typeof onProjectId === 'function' && typeof data?.project_id === 'string' && data.project_id) {
+      onProjectId(data.project_id)
+    }
+    const capability = (callbackMeta || result?.meta)?.devspec?.connection_capability
     if (capability?.version !== 1 || typeof capability.value !== 'string' || !capability.value.startsWith('dvsc_')) {
       return { ok: false, error: 'server did not return connection capability version 1 in MCP result _meta' }
     }
@@ -862,26 +1301,335 @@ export async function negotiateConnectionCapability({
   }
 }
 
+/**
+ * Move a live connection onto a new conversation of the SAME Antigravity process
+ * (e.g. when a new conversation starts or resumes under a startup listener).
+ */
+export function rebondConnectionToConversation({
+  agent = AGENT_NAME,
+  connectionId,
+  localId,
+  transcriptPath = null,
+  env = process.env,
+  connDir = CONNECTIONS_DIR,
+  rcDir = LOCAL_DIR,
+  home = os.homedir(),
+  keepPendingLocalId = false,
+} = {}) {
+  const id = sanitizeLocalId(localId)
+  if (!connectionId || !id) return { ok: false, reason: 'missing_ids' }
+  const perPath = connectionPath(connectionId, connDir)
+  const state = readJson(perPath)
+  if (!state || state.enabled === false) return { ok: false, reason: 'connection_not_live' }
+  const agentName = agent || state.agent_name || AGENT_NAME
+  const resolvedTranscriptPath =
+    (typeof transcriptPath === 'string' && transcriptPath.trim() ? transcriptPath.trim() : null) ||
+    inferAntigravityTranscriptPath(id, env) ||
+    state.transcript_path ||
+    null
+  const bond = writeLocalBond(
+    agentName,
+    id,
+    {
+      status: 'live',
+      connection_id: connectionId,
+      session_id: state.session_id ?? null,
+      session_codename: state.session_codename ?? null,
+      title: state.title ?? null,
+      project_id: state.project_id ?? null,
+      ...(state.project_name ? { project_name: state.project_name } : {}),
+      cwd: state.cwd ?? null,
+      end_reason: null,
+      cursor_after_message_id: state.cursor_after_message_id || null,
+      transcript_path: resolvedTranscriptPath,
+    },
+    rcDir,
+  )
+  if (state.project_id && state.project_name && state.mcp_url) {
+    try {
+      saveConversationProject(
+        id,
+        state.mcp_url,
+        { id: state.project_id, name: state.project_name },
+        'folder',
+        { home },
+      )
+    } catch {
+      /* non-fatal */
+    }
+  }
+  const lsAddress =
+    env?.ANTIGRAVITY_LS_ADDRESS ||
+    state.ls_address ||
+    discoverAntigravityLsAddress(state.owner_pid, env) ||
+    null
+  const pendingLocalId = keepPendingLocalId
+    ? state.pending_local_id ||
+      (String(state.local_id || '').startsWith('agy-window:') ? state.local_id : null)
+    : null
+  const nextState = {
+    ...state,
+    local_id: id,
+    ...(pendingLocalId ? { pending_local_id: pendingLocalId } : {}),
+    transcript_path: resolvedTranscriptPath,
+    ...(lsAddress ? { ls_address: lsAddress } : {}),
+    ...(env?.ANTIGRAVITY_CSRF_TOKEN ? { csrf_token: env.ANTIGRAVITY_CSRF_TOKEN } : {}),
+    ...(env?.ANTIGRAVITY_AGENTAPI_EXE ? { agentapi_exe: env.ANTIGRAVITY_AGENTAPI_EXE } : {}),
+    updated_at: new Date().toISOString(),
+  }
+  if (!pendingLocalId) delete nextState.pending_local_id
+  writeJson(perPath, nextState)
+  return {
+    ok: true,
+    connection_id: connectionId,
+    local_id: id,
+    transcript_path: resolvedTranscriptPath,
+    bond_path: localBondPath(agentName, id, rcDir),
+    bond,
+  }
+}
+
+/**
+ * Shared connection state + bond + poller + listener writer used by
+ * `devspec-remote-connect.mjs`, `session-start.mjs`, and `remote-control-state.mjs write`.
+ */
+export async function writeConnectionState({
+  connectionId,
+  sessionId: explicitSessionId = null,
+  agent = AGENT_NAME,
+  projectId: explicitProjectId = null,
+  projectName: explicitProjectName = null,
+  cwd = process.cwd(),
+  localId: explicitLocalId = null,
+  ownerPid: explicitOwnerPid = null,
+  codename = null,
+  title = null,
+  instructionTiers = null,
+  connectionCapability = null,
+  noPoller = false,
+  env = process.env,
+  home = os.homedir(),
+  transcriptPath: explicitTranscriptPath = null,
+} = {}) {
+  const connDir = path.join(home, '.devspec', 'remote-control', 'connections')
+  const rcDir = path.join(home, '.devspec', 'remote-control')
+  const legacyPath = path.join(home, '.devspec', 'remote-control.json')
+  const prev = readJson(connectionPath(connectionId, connDir)) || {}
+  const agentName = agent || prev.agent_name || AGENT_NAME
+  const detected = detectLocalId({ 'local-id': explicitLocalId }, env)
+  const localId = detected.local_id || prev.local_id || null
+  const transcriptPath =
+    explicitTranscriptPath ||
+    prev.transcript_path ||
+    inferAntigravityTranscriptPath(localId, env) ||
+    null
+  const sessionId =
+    typeof explicitSessionId === 'string' && explicitSessionId.length >= 8
+      ? explicitSessionId
+      : prev.session_id ?? null
+  const ownerPid = resolveOwnerPid(explicitOwnerPid, prev.owner_pid)
+  const hostToken = hostTokenFromEnv(env, { cwd, home })
+  const auth = resolveDevspecMcpAuth(cwd, { hostToken, env, home })
+  let projectId =
+    explicitProjectId || prev.project_id || findProjectPin(cwd, { home })?.project_id || null
+  const projectName = explicitProjectName || prev.project_name || null
+  const gitRemote = gitRemoteOrigin(cwd)
+
+  let capability = null
+  if (typeof connectionCapability === 'string' && connectionCapability.startsWith('dvsc_')) {
+    capability = { ok: true, version: 1, value: connectionCapability }
+  } else if (auth.ok && localId) {
+    capability = await negotiateConnectionCapability({
+      mcpUrl: auth.mcp_url || prev.mcp_url,
+      token: auth.token || prev.token,
+      projectId,
+      gitRemote,
+      localId,
+      connectionId,
+      connectionCapability:
+        typeof prev.connection_capability === 'string' &&
+        prev.connection_capability.startsWith('dvsc_')
+          ? prev.connection_capability
+          : null,
+      agentName,
+      cwd,
+      onProjectId: (resolvedId) => {
+        if (!projectId && resolvedId) projectId = resolvedId
+      },
+    })
+  } else if (typeof prev.connection_capability === 'string' && prev.connection_capability.startsWith('dvsc_')) {
+    capability = {
+      ok: true,
+      version: prev.connection_capability_version || 1,
+      value: prev.connection_capability,
+    }
+  } else {
+    capability = { ok: false, error: auth.error || 'MCP auth or local_id unavailable' }
+  }
+
+  const lsAddress =
+    env.ANTIGRAVITY_LS_ADDRESS ||
+    prev.ls_address ||
+    discoverAntigravityLsAddress(ownerPid, env) ||
+    null
+
+  const state = {
+    ...applyConnectionCapabilityRotation(prev, capability),
+    enabled: true,
+    connection_id: connectionId,
+    session_id: sessionId,
+    agent_name: agentName,
+    local_id: localId && !String(localId).startsWith('agy-window:') ? localId : null,
+    pending_local_id:
+      localId && String(localId).startsWith('agy-window:') ? localId : null,
+    transcript_path: transcriptPath,
+    owner_pid: ownerPid,
+    owner_started:
+      (ownerPid ? processStartTime(ownerPid) : null) ?? prev.owner_started ?? null,
+    project_id: projectId,
+    ...(projectName ? { project_name: projectName } : {}),
+    mcp_url: auth.mcp_url || prev.mcp_url || 'https://api.devspec.ai/api/mcp',
+    token: auth.token || prev.token || undefined,
+    auth_source: auth.source || auth.error || prev.auth_source || null,
+    auth_ok: !!auth.ok || !!prev.auth_ok,
+    cwd,
+    ...(gitRemote ? { git_remote: gitRemote } : {}),
+    session_codename: codename || prev.session_codename || prev.codename || null,
+    title: title || prev.title || null,
+    ...(title && sessionId
+      ? { session_title: title, session_title_for: sessionId }
+      : {}),
+    ...(instructionTiers?.hash && instructionTiers?.version
+      ? {
+          instruction_tiers_version: instructionTiers.version,
+          instruction_tiers_hash: instructionTiers.hash,
+        }
+      : {}),
+    ...(lsAddress ? { ls_address: lsAddress } : {}),
+    ...(env.ANTIGRAVITY_CSRF_TOKEN ? { csrf_token: env.ANTIGRAVITY_CSRF_TOKEN } : {}),
+    ...(env.ANTIGRAVITY_AGENTAPI_EXE ? { agentapi_exe: env.ANTIGRAVITY_AGENTAPI_EXE } : {}),
+    ended_from_ui: false,
+    end_reason: null,
+    updated_at: new Date().toISOString(),
+  }
+  if (!state.pending_local_id) delete state.pending_local_id
+
+  const perPath = connectionPath(connectionId, connDir)
+  writeJson(perPath, state)
+  writeJson(legacyPath, state)
+
+  let bond = null
+  if (localId) {
+    bond = writeLocalBond(
+      agentName,
+      localId,
+      {
+        status: 'live',
+        connection_id: connectionId,
+        session_id: sessionId,
+        session_codename: state.session_codename,
+        title: state.title,
+        project_id: projectId,
+        ...(projectName ? { project_name: projectName } : {}),
+        cwd,
+        end_reason: null,
+        cursor_after_message_id: prev.cursor_after_message_id || null,
+        transcript_path: transcriptPath,
+      },
+      rcDir,
+    )
+    if (projectId && projectName && state.mcp_url) {
+      try {
+        saveConversationProject(
+          localId,
+          state.mcp_url,
+          { id: projectId, name: projectName },
+          'conversation',
+          { home },
+        )
+      } catch {
+        /* non-fatal */
+      }
+    }
+  }
+
+  const result = {
+    ok: true,
+    path: perPath,
+    legacy_path: legacyPath,
+    connection_id: state.connection_id,
+    session_id: state.session_id,
+    session_codename: state.session_codename,
+    title: state.title,
+    mcp_url: state.mcp_url,
+    auth_ok: state.auth_ok,
+    auth_source: state.auth_source,
+    token_present: !!state.token,
+    local_id: localId,
+    owner_pid: ownerPid,
+    transcript_path: transcriptPath,
+    bond_path: bond ? localBondPath(agentName, localId, rcDir) : null,
+    project_id: projectId,
+    project_name: projectName,
+    agentapi_ready: Boolean(state.ls_address && state.csrf_token),
+    plan_capability: {
+      ok: capability.ok,
+      version: capability.ok ? capability.version : null,
+      error: capability.ok ? null : capability.error,
+    },
+  }
+  if (!state.auth_ok) result.warning = auth.error
+  if (!localId) {
+    result.warning_local =
+      'No --local-id / conversation env; soft-reconnect and already_live will not work until write is called with a local id.'
+  }
+
+  const wantPoller = state.auth_ok && !noPoller
+  if (wantPoller) {
+    const reuseRunning =
+      !!prev.token &&
+      prev.token === state.token &&
+      (prev.mcp_url || null) === (state.mcp_url || null) &&
+      (Number(prev.owner_pid) || null) === (Number(state.owner_pid) || null) &&
+      (prev.connection_capability || null) === (state.connection_capability || null)
+    const poller = ensurePollerForConnection(connectionId, {
+      cwd,
+      ownerPid,
+      sessionId,
+      reuseRunning,
+    })
+    result.poller = poller
+    if (!poller.ok) {
+      result.warning_poller = poller.error
+    }
+    const listener = ensureListenerForConnection(connectionId, {
+      cwd,
+      ownerPid,
+      conversationId: localId,
+      reuseRunning: true,
+      connDir,
+      env,
+    })
+    result.listener = listener
+  } else if (noPoller) {
+    result.poller = { ok: true, skipped: true, reason: 'no-poller' }
+  }
+  return result
+}
+
 // --- CLI entry (skipped when imported for tests) ---
-const isMain =
-  Boolean(process.argv[1]) &&
-  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
+const isMain = isEntryPoint(import.meta.url)
 
 if (isMain) {
   const args = parseArgs(process.argv.slice(2))
   const cmd = args._[0] || 'read'
 
   if (cmd === 'resolve-auth') {
-    const hostToken =
-      (typeof args['host-token'] === 'string' && args['host-token'].trim()
-        ? args['host-token'].trim()
-        : null) || hostTokenFromEnv(process.env)
-    const auth = resolveDevspecMcpAuth(args.cwd || process.cwd(), { hostToken })
-    if (process.argv.includes('--mask') && auth.token) {
-      auth.token_preview = auth.token.slice(0, 8) + '…' + auth.token.slice(-4)
-      delete auth.token
-    }
-    process.stdout.write(JSON.stringify(auth, null, 2) + '\n')
+    // Diagnostics only: the key is shown by fingerprint (`--mask` is now always on).
+    const auth = resolveDevspecMcpAuth(args.cwd || process.cwd(), {
+      hostToken: hostTokenFromEnv(process.env),
+    })
+    process.stdout.write(JSON.stringify(printableAuth(auth), null, 2) + '\n')
     process.exit(auth.ok ? 0 : 1)
   }
 
@@ -924,7 +1672,7 @@ if (isMain) {
     try {
       if (fs.existsSync(CONNECTIONS_DIR)) {
         for (const f of fs.readdirSync(CONNECTIONS_DIR)) {
-          if (!f.endsWith('.json')) continue
+          if (!isConnectionStateFilename(f)) continue
           const s = readJson(path.join(CONNECTIONS_DIR, f))
           if (s) {
             out.push({
@@ -1067,12 +1815,13 @@ if (isMain) {
     const result = resolveLocalAction({
       agent: agentName,
       localId,
+      ownerPid: resolveOwnerPid(args['owner-pid'], null),
       forceNew: !!args.forceNew,
       maxAgeMinutes,
     })
 
     result.cwd = args.cwd ? path.resolve(args.cwd) : process.cwd()
-    result.local_id_source = detected.source
+    result.local_id_source = detected.source || (result.local_id ? 'owner_pid_bond' : null)
     result.candidates =
       result.action === 'reconnect' || result.action === 'already_live'
         ? [
@@ -1105,6 +1854,57 @@ if (isMain) {
     process.exit(0)
   }
 
+  if (cmd === 'status') {
+    const connectionId = args['connection-id'] || readJson(LEGACY_PATH)?.connection_id
+    if (!connectionId) {
+      process.stderr.write('Usage: remote-control-state.mjs status --connection-id <uuid>\n')
+      process.exit(2)
+    }
+    const s = readJson(connectionPath(connectionId))
+    if (!s) {
+      process.stdout.write(
+        JSON.stringify({
+          ok: false,
+          connection_id: connectionId,
+          found: false,
+          reconnect: {
+            action: 'reconnect',
+            instruction: 'State file not found; re-run devspec-remote-connect.mjs to establish the bond.',
+          },
+        }) + '\n',
+      )
+      process.exit(1)
+    }
+    const endedFromUi = s.ended_from_ui === true || s.end_reason === 'ui' || s.end_reason === 'ended_from_ui'
+    const localStop = s.end_reason === 'local_stop'
+    const ownerDead = Number.isInteger(s.owner_pid) && s.owner_pid > 1 && !ownerAlive(s.owner_pid)
+    const standDown = endedFromUi || localStop || ownerDead
+    process.stdout.write(
+      JSON.stringify(
+        {
+          ok: true,
+          connection_id: s.connection_id,
+          session_id: s.session_id || null,
+          enabled: s.enabled !== false,
+          ended_from_ui: endedFromUi,
+          end_reason: s.end_reason || null,
+          owner_alive: !ownerDead,
+          token_present: Boolean(s.token),
+          connection_capability_present: typeof s.connection_capability === 'string',
+          reconnect: {
+            action: standDown ? 'stand_down' : 'reconnect',
+            instruction: standDown
+              ? 'Connection was deliberately ended or owner process exited. Stand down and do not re-register.'
+              : 'Connection end was not attributed to a human stop. Re-run devspec-remote-connect.mjs once to resume.',
+          },
+        },
+        null,
+        2,
+      ) + '\n',
+    )
+    process.exit(0)
+  }
+
   if (cmd === 'read') {
     let s = null
     if (args['connection-id']) {
@@ -1116,28 +1916,20 @@ if (isMain) {
         s = null
       }
     }
+    // Secrets are reported by presence (and the key by fingerprint), never by value.
     const printable = s
       ? {
           ...s,
+          token: undefined,
+          token_fingerprint: tokenFingerprint(s.token),
+          csrf_token: undefined,
+          csrf_token_present: typeof s.csrf_token === 'string' && s.csrf_token.length > 0,
           connection_capability_present: typeof s.connection_capability === 'string',
           connection_capability: undefined,
         }
       : null
     process.stdout.write(JSON.stringify(printable, null, 2) + '\n')
     process.exit(s ? 0 : 1)
-  }
-
-  if (cmd === 'reap') {
-    // Connect-time / SessionStart backstop: SIGTERM provably-dead pollers only.
-    const agentName = args.agent || AGENT_NAME
-    const reaped = reapDeadPollers({
-      agent: agentName,
-      exceptConnectionId: args['except-connection'] || args['connection-id'] || null,
-    })
-    process.stdout.write(
-      JSON.stringify({ ok: true, agent: agentName, count: reaped.length, reaped }) + '\n',
-    )
-    process.exit(0)
   }
 
   if (cmd === 'ensure-poller' || cmd === 'start-poller') {
@@ -1176,17 +1968,73 @@ if (isMain) {
     process.exit(0)
   }
 
+  if (cmd === 'orient' || cmd === 'context') {
+    const agentName = args.agent || AGENT_NAME
+    let payload = null
+    if (cmd === 'context' && !process.stdin.isTTY) {
+      try {
+        payload = JSON.parse(fs.readFileSync(0, 'utf8') || '{}')
+      } catch {
+        payload = null
+      }
+    }
+    const stdinConvId = payload?.conversationId || payload?.session_id
+    const detected = detectLocalId(
+      stdinConvId ? { ...args, 'local-id': stdinConvId } : args,
+      process.env,
+    )
+    const bond = detected.local_id ? readLocalBond(agentName, detected.local_id) : null
+    const connectionId = args['connection-id'] || bond?.connection_id || null
+    const state = connectionId ? readJson(connectionPath(connectionId)) : null
+    if (!connectionId || !state) {
+      if (cmd === 'context') process.exit(0)
+      process.stdout.write(
+        'This conversation is not connected to DevSpec. Nothing to orient on.\n',
+      )
+      process.exit(1)
+    }
+    if (cmd === 'context') {
+      const additionalContext = [
+        `DevSpec connection active: connection_id=${connectionId}`,
+        state.session_codename ? `codename=${state.session_codename}` : '',
+        state.session_id ? `session_id=${state.session_id}` : 'sessionless',
+        detected.local_id ? `local_id=${detected.local_id}` : '',
+      ]
+        .filter(Boolean)
+        .join(' | ')
+      process.stdout.write(
+        JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: args.event === 'SessionStart' ? 'SessionStart' : 'PreInvocation',
+            additionalContext,
+          },
+        }) + '\n',
+      )
+      process.exit(0)
+    }
+    const lines = [
+      `connection_id: ${connectionId}`,
+      `codename: ${state.session_codename || '—'}`,
+      `session_id: ${state.session_id || 'none (sessionless — there is no room to answer in)'}`,
+      `local_id: ${state.local_id || detected.local_id || '—'}`,
+      `transcript_path: ${state.transcript_path || '—'}`,
+    ]
+    process.stdout.write(lines.join('\n') + '\n')
+    process.exit(0)
+  }
+
   if (cmd === 'disable-local') {
     // SessionEnd teardown: resolve THIS conversation's bound connection (no
     // --connection-id needed) and disable it.
     const agentName = args.agent || AGENT_NAME
     let localId = detectLocalId(args, process.env).local_id
-    // SessionEnd hook delivers the conversation id on stdin as { session_id }.
+    // Hook delivers the conversation id on stdin as { conversationId } or { session_id }.
     if (!localId && !process.stdin.isTTY) {
       try {
         const raw = fs.readFileSync(0, 'utf8')
         const j = JSON.parse(raw || '{}')
-        if (typeof j.session_id === 'string') localId = sanitizeLocalId(j.session_id)
+        const stdinId = j.conversationId || j.session_id
+        if (typeof stdinId === 'string') localId = sanitizeLocalId(stdinId)
       } catch {
         /* no stdin payload */
       }
@@ -1220,37 +2068,46 @@ if (isMain) {
     // Token symmetry (item 74b29c76): prefer the SAME bearer the host MCP client
     // used for register_connection so the poller heartbeats THIS connection under
     // the same identity — otherwise the server rejects with "connection belongs to
-    // a different token" and dispatch delivery spams. The host token comes from an
-    // explicit --host-token (the write "receives one") or the reachable plugin
-    // userConfig env Claude Code exports (an env "carries it"); it wins over the
-    // .mcp.json walk but not an explicit DEVSPEC_MCP_TOKEN. Absent on non-Claude
-    // plugins / dev-from-source setups → resolution is unchanged. See resolve-mcp-auth.mjs.
-    const hostToken =
-      (typeof args['host-token'] === 'string' && args['host-token'].trim()
-        ? args['host-token'].trim()
-        : null) || hostTokenFromEnv(process.env)
-    const auth = resolveDevspecMcpAuth(cwd, { hostToken })
+    // a different token" and dispatch delivery spams. That is the bearer in
+    // Antigravity's own MCP config (`hostTokenFromEnv`); it wins over the .mcp.json
+    // walk but not an explicit DEVSPEC_MCP_TOKEN. It is never taken from the command
+    // line (item b17cb7d7). See resolve-mcp-auth.mjs.
+    const auth = resolveDevspecMcpAuth(cwd, { hostToken: hostTokenFromEnv(process.env) })
     const prev = readJson(connectionPath(connectionId)) || {}
     const agentName = args.agent || prev.agent_name || AGENT_NAME
     // The conversation this write belongs to — stamped INTO the per-connection state
     // so the mirror hook can bind strictly to THIS conversation.
     const localId = detectLocalId(args, process.env).local_id
+    const explicitTranscriptPath =
+      typeof args['transcript-path'] === 'string' && args['transcript-path'].trim()
+        ? args['transcript-path'].trim()
+        : null
+    const transcriptPath =
+      explicitTranscriptPath ||
+      prev.transcript_path ||
+      inferAntigravityTranscriptPath(localId, process.env) ||
+      null
     // Optional attached session (present for --session / --new; absent = sessionless).
     const sessionId =
       typeof args.session === 'string' && args.session.length >= 8 ? args.session : prev.session_id ?? null
     // Owner-process anchor for self-termination (see devspec-remote-poll.mjs and
     // resolveOwnerPid / resolveOwnerPidAutoWindows above for the win32 self-resolve path).
     const ownerPid = resolveOwnerPid(args['owner-pid'], prev.owner_pid)
-    const projectId = args['project-id'] || prev.project_id || null
+    let projectId = args['project-id'] || prev.project_id || findProjectPin(cwd)?.project_id || null
+    const gitRemote = gitRemoteOrigin(cwd)
     const capability = auth.ok
       ? await negotiateConnectionCapability({
           mcpUrl: args.url || auth.mcp_url || prev.mcp_url,
           token: auth.token || prev.token,
           projectId,
+          gitRemote,
           localId,
           connectionId,
           agentName,
           cwd,
+          onProjectId: (resolvedId) => {
+            if (!projectId && resolvedId) projectId = resolvedId
+          },
         })
       : { ok: false, error: auth.error || 'MCP auth unavailable' }
     const state = {
@@ -1260,7 +2117,10 @@ if (isMain) {
       session_id: sessionId,
       agent_name: agentName,
       local_id: localId ?? prev.local_id ?? null,
+      transcript_path: transcriptPath,
       owner_pid: ownerPid,
+      owner_started:
+        (ownerPid ? processStartTime(ownerPid) : null) ?? prev.owner_started ?? null,
       project_id: projectId,
       mcp_url: args.url || auth.mcp_url || prev.mcp_url || 'https://api.devspec.ai/api/mcp',
       token: auth.token || prev.token || undefined,
@@ -1290,6 +2150,7 @@ if (isMain) {
         cwd,
         end_reason: null,
         cursor_after_message_id: prev.cursor_after_message_id || null,
+        transcript_path: transcriptPath,
       })
     }
 
@@ -1306,6 +2167,7 @@ if (isMain) {
       auth_source: state.auth_source,
       token_present: !!state.token,
       local_id: localId,
+      transcript_path: transcriptPath,
       bond_path: bond ? localBondPath(agentName, localId) : null,
       project_id: projectId,
       plan_capability: {
@@ -1329,12 +2191,6 @@ if (isMain) {
     // Default: start the continuous heartbeat poller after a successful write.
     const wantPoller = state.auth_ok && !args.noPoller
     if (wantPoller) {
-      try {
-        const reaped = reapDeadPollers({ agent: agentName, exceptConnectionId: connectionId })
-        if (reaped.length) result.reaped = reaped
-      } catch {
-        /* non-fatal */
-      }
       // Same token/url/owner → the live poller keeps serving this connection
       // (session attach/detach reaches it via the server heartbeat echo), so a
       // `write --session` never restarts it. Only a real identity change takes

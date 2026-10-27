@@ -1,0 +1,6 @@
+{
+  "command": "node",
+  "args": ["../../scripts/devspec-remote-listen.mjs"],
+  "restart_policy": "always",
+  "description": "Connects Antigravity to DevSpec and delivers remote wakes via agentapi or stdout."
+}

@@ -19,18 +19,25 @@ Multiple remotes may run on one machine (several Antigravity terminals).
 
 1. **Resolve connection id** from arguments, or this conversation's state via
    ```bash
-   node "<plugin>/hooks/scripts/remote-control-state.mjs" resolve-local \
+   PLUGIN_DIR="$HOME/.gemini/config/plugins/devspec"; [ -d "$PLUGIN_DIR" ] || PLUGIN_DIR="$HOME/.gemini/config/plugins/antigravity-devspec-autopilot-extension"
+   node "$PLUGIN_DIR/scripts/remote-control-state.mjs" resolve-local \
      --agent "Antigravity" --local-id "<local_id>"
    ```
-   (use its `connection_id`), or `~/.devspec/remote-control/connections/<uuid>.json`, or legacy `~/.devspec/remote-control.json`. If ambiguous, ask the user. Note its `session_id` (may be null = sessionless).
+   (use its `connection_id` and `session_id` from the helper's redacted output — never read the files under `~/.devspec/remote-control/` directly). If ambiguous, ask the user. Note its `session_id` (may be null = sessionless).
 
-2. **Mark the connection offline (this connection only):**
-   - `heartbeat_connection({ connection_id, status: "offline", end_reason: "local_stop" })` (one path, attached or sessionless), then optionally `detach_connection({ connection_id })`.
+2. **Mark the connection offline (this connection only)**, one path, attached or sessionless:
+   ```bash
+   PLUGIN_DIR="$HOME/.gemini/config/plugins/devspec"; [ -d "$PLUGIN_DIR" ] || PLUGIN_DIR="$HOME/.gemini/config/plugins/antigravity-devspec-autopilot-extension"
+   node "$PLUGIN_DIR/scripts/connection-call.mjs" heartbeat_connection \
+     --connection-id "<connection_id>" --status offline --end-reason local_stop
+   node "$PLUGIN_DIR/scripts/connection-call.mjs" detach_connection --connection-id "<connection_id>"
+   ```
    - **Do not** `post_session_message` disconnect chrome — presence updates via the offline heartbeat / Agents page.
 
 3. **Disable state + kill only this poller + mark bond stopped:**
    ```bash
-   node "<plugin>/hooks/scripts/remote-control-state.mjs" disable \
+   PLUGIN_DIR="$HOME/.gemini/config/plugins/devspec"; [ -d "$PLUGIN_DIR" ] || PLUGIN_DIR="$HOME/.gemini/config/plugins/antigravity-devspec-autopilot-extension"
+   node "$PLUGIN_DIR/scripts/remote-control-state.mjs" disable \
      --connection-id '<connection_id>' --agent "Antigravity" --local-id "<local_id>"
    ```
    Connection-scoped: writes that connection's state `enabled: false`, marks matching local bonds `stopped` (soft-reconnect only for this conversation within ~30m), and SIGTERMs pollers whose argv includes this connection UUID only.

@@ -8,11 +8,14 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { FIXTURE_ID, fixtureEnvelope, fixturePollResponse } from './remote-ingress-test-fixtures.mjs'
+import { normalizeRemoteIngressV1 } from './remote-ingress-v1.mjs'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import {
   isDeliverableCommand,
   hasValidCommandProjectScope,
   buildPollConnectionArguments,
-  normalizePollDelivery,
   REMOTE_INGRESS_VERSION,
   DELEGATED_SCOPE_VERSION,
   ACTIVE_PLAN_PROJECTION_VERSION,
@@ -21,13 +24,45 @@ import {
   installStopSignalHandlers,
   resolveServerAttachment,
   verbForTurnTransition,
-  trimAdvisoryCarry,
   pollTerminalReason,
   emptyTurnBackoffMs,
   errorBackoffMs,
   unansweredCommands,
   splitRoomWindow,
+  PUSH_HEALTHY_MS,
+  nextPushReconnectDelayMs,
+  pushChannelUrl,
+  parseSseFrame,
+  openPushChannel,
+  extractAntigravityTrailFromTranscript,
+  streamTurnTrailIfChanged,
+  remoteIngressNegotiationArguments,
+  knownInstructionTierArguments,
+  writeRoomState,
+  isTurnMarkerActive,
+  hasPostReplyToolActivity,
 } from './devspec-remote-poll.mjs'
+import { captureInstructionContext, storeTiers, takeTiersFor } from './instruction-tiers.mjs'
+import { storeRepositoryContext, takeRepositoryContext } from './repository-context.mjs'
+import {
+  applyIngressToStore,
+  loadTranscriptStore,
+  persistTranscriptStore,
+  roomStatePath,
+  transcriptPaths,
+} from './room-transcript.mjs'
+import { materialiseBatchAttachments } from './attachment-store.mjs'
+import { commandOfferArguments, parseCommandOfferResponse } from './command-offer.mjs'
+import { connectAtStartupEnabled, runSessionStart } from './session-start.mjs'
+import { buildWakeDeliveryMessage, deliverWakeViaAgentApi } from './devspec-remote-listen.mjs'
+import { resolveLocalAction } from './remote-control-state.mjs'
+import { runPostToolDispatch } from './post-tool-dispatch.mjs'
+import {
+  clearTurnMarker,
+  explicitReplyMarkerPath,
+  readTurnMarker,
+  writeTurnMarker,
+} from './mirror-turn.mjs'
 
 const ME = 'conn-mine-1111'
 const OTHER_CONN = 'conn-theirs-2222'
@@ -190,25 +225,26 @@ describe('buildPollConnectionArguments (delegated scope negotiation)', () => {
   })
 })
 
-describe('normalizePollDelivery (strict 1.3 active-plan delivery)', () => {
+// The poller hands each poll's ingress to normalizeRemoteIngressV1 (consumeCanonicalIngress).
+describe('poll ingress normalisation (strict 1.3 active-plan delivery)', () => {
   it('accepts the current revision and exposes all-room plans as advisory only', () => {
-    const accepted = normalizePollDelivery(fixturePollResponse(), FIXTURE_ID.connection)
+    const accepted = normalizeRemoteIngressV1(fixturePollResponse().ingress, FIXTURE_ID.connection)
     assert.equal(accepted.ok, true)
     assert.equal(accepted.commands.length, 1)
-    assert.equal(accepted.activeSessionPlans.advisory, true)
-    assert.equal(accepted.activeSessionPlans.plans[0].revision, 7)
+    assert.equal(accepted.envelope.active_session_plans.advisory, true)
+    assert.equal(accepted.envelope.active_session_plans.plans[0].revision, 7)
   })
 
   it('keeps replay/read awareness inert', () => {
     const envelope = fixtureEnvelope({ wakeKind: 'history_reseed', deliveryState: 'reseed' })
-    const accepted = normalizePollDelivery(fixturePollResponse({ envelope }), FIXTURE_ID.connection)
+    const accepted = normalizeRemoteIngressV1(fixturePollResponse({ envelope }).ingress, FIXTURE_ID.connection)
     assert.equal(accepted.ok, true)
     assert.deepEqual(accepted.commands, [])
-    assert.ok(accepted.activeSessionPlans)
+    assert.ok(accepted.envelope.active_session_plans)
   })
 
   it('fails closed instead of consulting top-level legacy command arrays', () => {
-    const accepted = normalizePollDelivery({ changed: true, commands: [command()] }, FIXTURE_ID.connection)
+    const accepted = normalizeRemoteIngressV1({ changed: true, commands: [command()] }, FIXTURE_ID.connection)
     assert.equal(accepted.ok, false)
   })
 })
@@ -257,55 +293,6 @@ describe('cadenceFor (hold length, not interval)', () => {
       ].map(([attached, turnActive]) => cadenceFor({ attached, turnActive }).tier),
     )
     assert.deepEqual([...tiers].sort(), ['attended', 'idle'])
-  })
-})
-
-/**
- * The advisory carry buffer. A long-poll answers the instant anything lands, so the
- * room and the command that needs it arrive in SEPARATE responses — this buffer is
- * what makes "the room arrives with the command" true rather than nominally true.
- */
-describe('trimAdvisoryCarry', () => {
-  const msg = (id, len = 10) => ({ id, content: 'x'.repeat(len) })
-
-  it('keeps everything inside budget, oldest-first order preserved', () => {
-    const { kept, dropped } = trimAdvisoryCarry([msg('a'), msg('b'), msg('c')])
-    assert.deepEqual(kept.map((m) => m.id), ['a', 'b', 'c'])
-    assert.equal(dropped, 0)
-  })
-
-  it('drops the OLDEST when over the count budget — nearest context survives', () => {
-    const { kept, dropped } = trimAdvisoryCarry([msg('a'), msg('b'), msg('c')], { maxCount: 2 })
-    assert.deepEqual(kept.map((m) => m.id), ['b', 'c'])
-    assert.equal(dropped, 1)
-  })
-
-  it('drops the oldest when over the character budget', () => {
-    const { kept, dropped } = trimAdvisoryCarry([msg('a', 100), msg('b', 100), msg('c', 100)], {
-      maxChars: 250,
-    })
-    assert.deepEqual(kept.map((m) => m.id), ['b', 'c'])
-    assert.equal(dropped, 1)
-  })
-
-  it('keeps a single over-budget message rather than delivering nothing', () => {
-    const { kept } = trimAdvisoryCarry([msg('huge', 50_000)], { maxChars: 100 })
-    assert.deepEqual(kept.map((m) => m.id), ['huge'])
-  })
-
-  it('handles empty and malformed input without throwing', () => {
-    assert.deepEqual(trimAdvisoryCarry([]), { kept: [], dropped: 0 })
-    assert.deepEqual(trimAdvisoryCarry(null), { kept: [], dropped: 0 })
-    assert.equal(trimAdvisoryCarry([{ id: 'no-content' }]).kept.length, 1)
-  })
-
-  it('THE 1-2-3 CASE: three separate arrivals still reach the command together', () => {
-    // Each untargeted message came back in its own long-poll response.
-    let carry = []
-    for (const n of ['1', '2', '3']) {
-      carry = trimAdvisoryCarry([...carry, { id: n, content: n }]).kept
-    }
-    assert.deepEqual(carry.map((m) => m.content), ['1', '2', '3'])
   })
 })
 
@@ -633,5 +620,658 @@ describe('installStopSignalHandlers (item b9e02835)', () => {
     installStopSignalHandlers(proc)
     assert.equal(typeof proc.handlers.SIGTERM, 'function')
     assert.equal(typeof proc.handlers.SIGINT, 'function')
+  })
+})
+
+describe('SSE push channel (parseSseFrame, pushChannelUrl, nextPushReconnectDelayMs, openPushChannel)', () => {
+  it('builds /connection-stream URL with version query parameters', () => {
+    const url = pushChannelUrl('https://api.devspec.ai/api/mcp/', ME)
+    assert.equal(
+      url,
+      'https://api.devspec.ai/api/mcp/connection-stream?connection_id=conn-mine-1111&system_notice_version=2&interaction_event_version=1&question_dismissal_event_version=1',
+    )
+  })
+
+  it('parses comment, hello, wake, ended, and system_notice frames', () => {
+    assert.deepEqual(parseSseFrame(': keepalive'), { kind: 'comment' })
+    assert.deepEqual(parseSseFrame('event: hello\ndata: {}'), { kind: 'hello' })
+    assert.deepEqual(parseSseFrame('event: wake\ndata: {"reason":"message"}'), { kind: 'wake' })
+    assert.deepEqual(parseSseFrame('event: ended\ndata: {"end_reason":"ui"}'), {
+      kind: 'ended',
+      endReason: 'ui',
+    })
+    assert.deepEqual(
+      parseSseFrame('event: system_notice\ndata: {"notice_id":"n1","text":"hi"}'),
+      { kind: 'system_notice', notice: { notice_id: 'n1', text: 'hi' } },
+    )
+  })
+
+  it('backs off reconnect attempts and resets after a healthy stream', () => {
+    assert.deepEqual(nextPushReconnectDelayMs({ attempt: 0, openedAtMs: null }), {
+      delayMs: 1_000,
+      nextAttempt: 1,
+    })
+    assert.deepEqual(nextPushReconnectDelayMs({ attempt: 3, openedAtMs: null }), {
+      delayMs: null,
+      nextAttempt: 4,
+    })
+    // Healthy stream resets attempt to 0 -> 1_000ms
+    assert.deepEqual(
+      nextPushReconnectDelayMs({
+        attempt: 3,
+        openedAtMs: 1_000,
+        nowMs: 1_000 + PUSH_HEALTHY_MS + 50,
+      }),
+      { delayMs: 1_000, nextAttempt: 1 },
+    )
+  })
+
+  it('falls back cleanly to poll_connection when SSE endpoint returns non-200', async () => {
+    let fallbackReason = null
+    const handle = openPushChannel({
+      mcpUrl: 'https://api.devspec.ai/api/mcp',
+      token: 'tok',
+      connectionId: ME,
+      fetchImpl: async () => ({
+        ok: false,
+        status: 404,
+        headers: new Map([['content-type', 'application/json']]),
+      }),
+      onFallback: (reason) => {
+        fallbackReason = reason
+      },
+    })
+    await new Promise((r) => setTimeout(r, 20))
+    handle.close()
+    assert.equal(fallbackReason, 'push_http_404')
+  })
+})
+
+describe('extractAntigravityTrailFromTranscript & streamTurnTrailIfChanged', () => {
+  const sampleTranscript = [
+    JSON.stringify({
+      step_index: 1,
+      type: 'USER_INPUT',
+      created_at: '2026-10-13T22:00:00.000Z',
+      content: 'Investigate the remote poller',
+    }),
+    JSON.stringify({
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-10-13T22:00:05.000Z',
+      thinking: 'Let us inspect the remote poller script and check SSE push handling.\n\nSecond paragraph ignored.',
+      tool_calls: [
+        {
+          tool_name: 'view_file',
+          args: {
+            AbsolutePath: '/tmp/foo.mjs',
+            toolAction: 'Viewing devspec-remote-poll.mjs',
+            toolSummary: 'View devspec-remote-poll.mjs',
+          },
+        },
+        {
+          tool_name: 'invoke_subagent',
+          args: {
+            toolAction: 'Spawning codebase researcher',
+            Subagents: [
+              {
+                TypeName: 'research',
+                Role: 'Plugin Architecture Researcher',
+                Prompt: 'Explore the plugin',
+              },
+            ],
+          },
+        },
+      ],
+    }),
+  ].join('\n')
+
+  it('extracts thinking summaries, toolAction/toolSummary, and subagent invocations', () => {
+    const { events, markdown } = extractAntigravityTrailFromTranscript(sampleTranscript, {
+      sinceIso: '2026-10-13T22:00:01.000Z',
+    })
+    assert.equal(events.length, 3)
+    assert.equal(events[0].kind, 'thinking')
+    assert.match(events[0].label, /inspect the remote poller script/)
+    assert.equal(events[1].kind, 'tool')
+    assert.equal(events[1].action, 'Viewing devspec-remote-poll.mjs')
+    assert.equal(events[2].kind, 'subagent')
+    assert.equal(events[2].role, 'Plugin Architecture Researcher')
+    assert.match(markdown, /> 💭 Let us inspect the remote poller script/)
+    assert.match(markdown, /✓ `read` — `\/tmp\/foo\.mjs` → Viewing devspec-remote-poll\.mjs/)
+    assert.match(markdown, /✓ `invoke_subagent` — `Plugin Architecture Researcher`/)
+  })
+
+  it('posts debounced phase: trail updates via post_session_message only when changed', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-trail-test-'))
+    const transcriptPath = path.join(tmpDir, 'transcript.jsonl')
+    fs.writeFileSync(transcriptPath, sampleTranscript, 'utf8')
+    const calls = []
+    const first = await streamTurnTrailIfChanged({
+      transcriptPath,
+      sinceMs: Date.parse('2026-10-13T22:00:01.000Z'),
+      sessionId: 'sess-12345678',
+      connectionId: ME,
+      mcpUrl: 'https://api.devspec.ai/api/mcp',
+      token: 'tok',
+      prevSignature: '',
+      callMcp: async (req) => {
+        calls.push(req)
+        return {}
+      },
+    })
+    assert.equal(first.posted, true)
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].name, 'post_session_message')
+    assert.equal(calls[0].arguments.phase, 'trail')
+    assert.equal(calls[0].arguments.connection_id, ME)
+    assert.equal(calls[0].arguments.trail_events.length, 3)
+
+    // Calling again with the same signature does not re-post
+    const second = await streamTurnTrailIfChanged({
+      transcriptPath,
+      sinceMs: Date.parse('2026-10-13T22:00:01.000Z'),
+      sessionId: 'sess-12345678',
+      connectionId: ME,
+      mcpUrl: 'https://api.devspec.ai/api/mcp',
+      token: 'tok',
+      prevSignature: first.signature,
+      callMcp: async (req) => {
+        calls.push(req)
+        return {}
+      },
+    })
+    assert.equal(second.posted, false)
+    assert.equal(calls.length, 1)
+
+    // Once post_session_message and devspec-remote-wait.mjs run at the end of the turn,
+    // streamTurnTrailIfChanged must skip posting a trailing phase:'trail' update (which
+    // would otherwise create an empty "No response" bubble on the server).
+    const postReplyLines = [
+      ...sampleTranscript.trim().split('\n'),
+      JSON.stringify({
+        step_index: 5,
+        type: 'PLANNER_RESPONSE',
+        created_at: '2026-10-13T22:00:08.000Z',
+        tool_calls: [
+          {
+            id: 'tc-4',
+            name: 'run_command',
+            args: {
+              CommandLine: 'node -e "mcpToolsCall({ name: \'post_session_message\', arguments: { content: \'Done\' } })"',
+            },
+          },
+        ],
+      }),
+      JSON.stringify({
+        step_index: 6,
+        type: 'PLANNER_RESPONSE',
+        created_at: '2026-10-13T22:00:09.000Z',
+        thinking: 'Now re-arm the remote wait listener.',
+        tool_calls: [
+          {
+            id: 'tc-5',
+            name: 'run_command',
+            args: {
+              CommandLine: 'node scripts/devspec-remote-wait.mjs --connection-id ' + ME + ' --pending',
+            },
+          },
+        ],
+      }),
+    ]
+    fs.writeFileSync(transcriptPath, postReplyLines.join('\n') + '\n', 'utf8')
+    const afterReply = await streamTurnTrailIfChanged({
+      transcriptPath,
+      sinceMs: Date.parse('2026-10-13T22:00:01.000Z'),
+      sessionId: 'sess-12345678',
+      connectionId: ME,
+      mcpUrl: 'https://api.devspec.ai/api/mcp',
+      token: 'tok',
+      prevSignature: first.signature,
+      callMcp: async (req) => {
+        calls.push(req)
+        return {}
+      },
+    })
+    assert.equal(afterReply.posted, false)
+    assert.equal(afterReply.skipped, 'reply_already_posted')
+    assert.equal(calls.length, 1)
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  })
+})
+
+describe('session-start auto-connect, cached instruction tiers, and sidecar wake delivery', () => {
+  it('stores and consumes cached instruction tiers once for startup orientation', () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-tiers-'))
+    assert.equal(
+      storeTiers('conn-tier-test', { tier_0: 'Tier0 rules', tier_1: 'Tier1 project' }, { home: tmpHome }),
+      true,
+    )
+    const taken = takeTiersFor('conn-tier-test', { home: tmpHome, consume: true })
+    assert.deepEqual(taken, { tier_0: 'Tier0 rules', tier_1: 'Tier1 project', tier_2: '' })
+    assert.equal(takeTiersFor('conn-tier-test', { home: tmpHome }), null)
+    fs.rmSync(tmpHome, { recursive: true, force: true })
+  })
+
+  // Hermetic: a key in this machine's own Antigravity config must not decide the
+  // answer, so every case names its home, folder and key (item 1df99dd4).
+  it('detects connectAtStartupEnabled from env or .devspec/project.json, and only with a key to connect with', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-startup-'))
+    const at = { cwd: tmp, home: tmp }
+    try {
+      assert.equal(
+        connectAtStartupEnabled({ HOME: tmp, DEVSPEC_CONNECT_AT_STARTUP: '1', DEVSPEC_MCP_TOKEN: 'dvs_startup_key' }, at),
+        true,
+      )
+      assert.equal(connectAtStartupEnabled({ HOME: tmp, DEVSPEC_CONNECT_AT_STARTUP: '1' }, at), false, 'no key: nothing to connect with')
+      assert.equal(
+        connectAtStartupEnabled({ HOME: tmp, DEVSPEC_CONNECT_AT_STARTUP: '0', DEVSPEC_MCP_TOKEN: 'dvs_startup_key' }, at),
+        false,
+      )
+      fs.mkdirSync(path.join(tmp, '.devspec'))
+      fs.writeFileSync(path.join(tmp, '.devspec', 'project.json'), JSON.stringify({ connect_at_startup: true }))
+      assert.equal(connectAtStartupEnabled({ HOME: tmp, DEVSPEC_MCP_TOKEN: 'dvs_startup_key' }, at), true)
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
+  })
+
+  it('auto-connects on SessionStart when DEVSPEC_CONNECT_AT_STARTUP=1 and injects cached tiers', async () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-sess-start-'))
+    const writtenStates = new Map()
+    const writtenBonds = new Map()
+    const ensuredPollers = []
+    try {
+      const out = await runSessionStart(
+        JSON.stringify({
+          conversationId: 'conv-auto-12345678',
+          workspacePaths: ['/workspace/devspecv2'],
+          transcript_path: '/tmp/transcript.jsonl',
+        }),
+        {
+          env: {
+            HOME: tmpHome,
+            DEVSPEC_CONNECT_AT_STARTUP: '1',
+            DEVSPEC_MCP_TOKEN: 'tok-auto-123',
+          },
+          cwd: tmpHome,
+          home: tmpHome,
+          loadStateFn: () => null,
+          writeStateFn: (id, payload) => writtenStates.set(id, payload),
+          writeBondFn: (agent, localId, bond) => writtenBonds.set(`${agent}:${localId}`, bond),
+          ensurePollerFn: (id, opts) => ensuredPollers.push({ id, opts }),
+          reapPollersFn: () => {},
+          callMcp: async ({ name }) => {
+            assert.equal(name, 'register_connection')
+            return {
+              connection_id: 'conn-auto-99999999',
+              codename: 'Swift Falcon',
+              project_id: 'proj-resolved-by-git-remote',
+              instructions: { tier_0: 'Always ground with DevSpec first.' },
+            }
+          },
+        },
+      )
+      assert.ok(out?.hookSpecificOutput?.additionalContext)
+      assert.ok(Array.isArray(out?.injectSteps))
+      assert.match(out.hookSpecificOutput.additionalContext, /Swift Falcon/)
+      assert.match(out.hookSpecificOutput.additionalContext, /Always ground with DevSpec first\./)
+      assert.ok(writtenStates.has('conn-auto-99999999'))
+      assert.equal(writtenStates.get('conn-auto-99999999').cwd, '/workspace/devspecv2')
+      assert.equal(writtenStates.get('conn-auto-99999999').project_id, 'proj-resolved-by-git-remote')
+      assert.ok(writtenBonds.has('Antigravity:conv-auto-12345678'))
+      assert.ok(ensuredPollers.length >= 1)
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
+    }
+  })
+
+  it('formats wake delivery messages and invokes agentapi send-message', async () => {
+    const msg = buildWakeDeliveryMessage({
+      type: 'owner_messages',
+      session_id: 'sess-abc',
+      messages: [
+        {
+          author: { display_name: 'N3O' },
+          content: 'Please run the test suite and report back.',
+        },
+      ],
+    })
+    assert.match(msg, /\[DevSpec Remote Wake\]/)
+    assert.match(msg, /N3O: Please run the test suite and report back\./)
+
+    const seen = []
+    const res = await deliverWakeViaAgentApi({
+      conversationId: 'conv-123',
+      message: msg,
+      execFileImpl: (cmd, args, _opts, cb) => {
+        seen.push({ cmd, args })
+        cb(null, 'sent', '')
+      },
+    })
+    assert.equal(res.ok, true)
+    assert.equal(seen.length, 1)
+    assert.equal(seen[0].cmd, 'agentapi')
+    assert.deepEqual(seen[0].args, ['send-message', 'conv-123', msg])
+  })
+})
+
+describe('Parity 3: room transcript, 4-tier instruction files, repository context, attachments, and command offers', () => {
+  it('negotiates ingress 1.6.0 versions and known_instruction_tiers_hash and writes 4-tier instruction & repository files', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-parity3-tiers-'))
+    try {
+      assert.deepEqual(remoteIngressNegotiationArguments(), {
+        ingress_version: 1,
+        delegated_scope_version: 1,
+        active_plan_projection_version: 1,
+        system_notice_version: 2,
+        sender_style_version: 1,
+        room_context_version: 1,
+        session_polls_projection_version: 2,
+      })
+
+      const tiersPayload = {
+        instruction_tiers_version: 1,
+        instruction_tiers_hash: `sha256:${'a'.repeat(64)}`,
+        owner_custom_instructions: 'Concise markdown',
+        owner_agent_rules: 'Tier 0 rules',
+        project_custom_instructions: 'Tier 1 project principles',
+        project_agent_rules: 'Tier 3 execution mechanics',
+      }
+      const contextFile = captureInstructionContext(ME, tiersPayload, { dir: tmpDir })
+      assert.ok(contextFile && fs.existsSync(contextFile))
+      assert.deepEqual(
+        knownInstructionTierArguments({
+          instruction_tiers_version: 1,
+          instruction_tiers_hash: `sha256:${'a'.repeat(64)}`,
+        }),
+        {
+          known_instruction_tiers_version: 1,
+          known_instruction_tiers_hash: `sha256:${'a'.repeat(64)}`,
+        },
+      )
+
+      const repoRegistration = {
+        project_id: PROJECT_ID,
+        repository_context: {
+          version: 1,
+          project_id: PROJECT_ID,
+          status: 'available',
+          repositories: [
+            {
+              id: '11111111-2222-4333-8444-555555555555',
+              full_name: 'DevSpecAI/DevSpecV2',
+              provider: 'github',
+              git_url: 'git@github.com:DevSpecAI/DevSpecV2.git',
+              target_branch: 'staging',
+              default_branch: 'staging',
+            },
+          ],
+        },
+      }
+      assert.equal(storeRepositoryContext(ME, repoRegistration, { dir: tmpDir }), true)
+      const formattedRepo = takeRepositoryContext(ME, 'conv-1', { dir: tmpDir })
+      assert.match(formattedRepo, /DevSpecAI\/DevSpecV2/)
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('persists local room transcript (.transcript.jsonl, .transcript-state.json) and .room.json and materialises attachments & command offers', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-parity3-room-'))
+    try {
+      const sessId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+      const store = loadTranscriptStore(FIXTURE_ID.connection, sessId, {
+        dir: tmpDir,
+        selfLabel: 'Antigravity · Calm Fox',
+      })
+      const baseEnv = fixtureEnvelope()
+      const env = {
+        ...baseEnv,
+        contract_version: '1.6.0',
+        policy_version: '2026-09-24.1',
+        system_notices: [],
+        window: {
+          ...baseEnv.window,
+          policy_version: '2026-09-24.1',
+        },
+        room_context: {
+          version: 1,
+          messages: [],
+          coverage: {
+            complete_from_start: true,
+            through: baseEnv.commands[0].order,
+          },
+          open_check: null,
+          deletions: {
+            supported: true,
+            complete: true,
+            total: 0,
+            through: null,
+            message_ids: [],
+          },
+        },
+      }
+      const applied = applyIngressToStore(store, env, {
+        sessionId: sessId,
+      })
+      assert.equal(applied.applied, true)
+      assert.equal(persistTranscriptStore(store, { dir: tmpDir }), true)
+
+      const tPaths = transcriptPaths(FIXTURE_ID.connection, sessId, tmpDir)
+      assert.equal(fs.existsSync(tPaths.transcript), true)
+      assert.equal(fs.existsSync(tPaths.state), true)
+
+      writeRoomState(
+        FIXTURE_ID.connection,
+        { session_id: sessId, ingress: env },
+        {},
+        { dir: tmpDir },
+      )
+      assert.equal(fs.existsSync(roomStatePath(FIXTURE_ID.connection, tmpDir)), true)
+
+      assert.deepEqual(commandOfferArguments({ negotiable: true }), { command_offer_version: 1 })
+      assert.deepEqual(
+        parseCommandOfferResponse({
+          command_offer_version: 1,
+          command_handoff_stale: false,
+          command_offer: null,
+        }),
+        { supported: true, offer: null, stale: false },
+      )
+
+      const batch = [
+        {
+          message_id: FIXTURE_ID.message,
+          attachments: [
+            {
+              filename: 'notes.bin',
+              mime_type: 'application/octet-stream',
+              content: Buffer.from('hello').toString('base64'),
+            },
+          ],
+        },
+      ]
+      const materialised = materialiseBatchAttachments(batch, {
+        dir: path.join(tmpDir, 'attachments'),
+      })
+      assert.ok(materialised[0].attachments[0].path)
+      assert.equal(fs.readFileSync(materialised[0].attachments[0].path, 'utf8'), 'hello')
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('reuses the window owner_pid connection in resolveLocalAction when invoked from a shell without localId', () => {
+    const connState = {
+      connection_id: ME,
+      agent_name: 'Antigravity',
+      local_id: 'c01518ab-467e-42e9-b1c9-bdb3557683c3',
+      session_id: '7069bedd-878d-4c5a-b52c-b5cfc1bcd544',
+      session_codename: 'Sturdy Marten',
+      owner_pid: 4166454,
+      enabled: true,
+      ended_from_ui: false,
+      updated_at: new Date().toISOString(),
+    }
+    const res = resolveLocalAction({
+      agent: 'Antigravity',
+      localId: null,
+      ownerPid: 4166454,
+      listStates: () => [connState],
+      readBond: () => ({
+        status: 'live',
+        connection_id: ME,
+        agent_name: 'Antigravity',
+        local_id: connState.local_id,
+        session_id: connState.session_id,
+        session_codename: connState.session_codename,
+        updated_at: connState.updated_at,
+      }),
+      readConnection: () => connState,
+    })
+    assert.equal(res.action, 'already_live')
+    assert.equal(res.connection_id, ME)
+    assert.equal(res.local_id, 'c01518ab-467e-42e9-b1c9-bdb3557683c3')
+    assert.equal(res.session_id, '7069bedd-878d-4c5a-b52c-b5cfc1bcd544')
+  })
+
+  it('keeps >10m turns active via lastToolAt and re-asserts .turn after an opening post_session_message acknowledgment', async () => {
+    const now = 1_700_000_000_000
+    const thirtyMinsAgo = now - 30 * 60 * 1000
+    const fiveSecsAgo = now - 5_000
+
+    // Without lastToolAt, a 30-minute-old turn marker expires at MAX_TURN_MS (10m)
+    assert.equal(isTurnMarkerActive({ startedAt: thirtyMinsAgo }, now), false)
+    // With recent lastToolAt, the turn remains active even 30 minutes into the turn
+    assert.equal(
+      isTurnMarkerActive({ startedAt: thirtyMinsAgo, lastToolAt: fiveSecsAgo }, now),
+      true,
+    )
+
+    // hasPostReplyToolActivity detects when a tool ran after post_session_message
+    assert.equal(
+      hasPostReplyToolActivity({ startedAt: thirtyMinsAgo, lastReplyAt: now - 4_000, lastToolAt: now - 1_000 }, now),
+      true,
+    )
+    assert.equal(
+      hasPostReplyToolActivity({ startedAt: thirtyMinsAgo, lastReplyAt: now - 1_000, lastToolAt: now - 4_000 }, now),
+      false,
+    )
+
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-post-tool-turn-'))
+    try {
+      const connDir = path.join(tmpHome, '.devspec', 'remote-control', 'connections')
+      const bondsDir = path.join(tmpHome, '.devspec', 'remote-control', 'bonds')
+      fs.mkdirSync(connDir, { recursive: true })
+      fs.mkdirSync(bondsDir, { recursive: true })
+      const connId = '2c6fc5a6-550e-4d60-8a9b-94714872079a'
+      const convId = '4f23be98-50fb-431f-9960-3930725805d6'
+      fs.writeFileSync(
+        path.join(connDir, `${connId}.json`),
+        JSON.stringify({
+          connection_id: connId,
+          agent_name: 'Antigravity',
+          local_id: convId,
+          session_id: 'ac485d38-a2de-4363-8515-0a0db598b706',
+          enabled: true,
+        }),
+      )
+      fs.writeFileSync(
+        path.join(bondsDir, `Antigravity.${convId}.json`),
+        JSON.stringify({
+          status: 'live',
+          connection_id: connId,
+          agent_name: 'Antigravity',
+          local_id: convId,
+        }),
+      )
+      writeTurnMarker(connId, { remoteTurn: true }, connDir)
+
+      // 1. Agent calls post_session_message ("On it...") via lazy call_mcp_tool
+      await runPostToolDispatch(
+        JSON.stringify({
+          conversationId: convId,
+          tool_name: 'default_api:call_mcp_tool',
+          tool_input: {
+            ServerName: 'devspec',
+            ToolName: 'post_session_message',
+            Arguments: {
+              connection_id: connId,
+              message: 'On it — building the server and plugin pieces now.',
+            },
+          },
+        }),
+        { home: tmpHome, env: { HOME: tmpHome } },
+      )
+      assert.equal(fs.existsSync(explicitReplyMarkerPath(connId, connDir)), true)
+      const afterReplyMarker = readTurnMarker(connId, connDir)
+      assert.equal(typeof afterReplyMarker?.lastReplyAt, 'number')
+
+      // 2. Poller clears .turn when server says no working attempt after post_session_message
+      clearTurnMarker(connId, connDir)
+      assert.equal(readTurnMarker(connId, connDir), null)
+
+      // 3. Agent continues working in the same turn (calls view_file): .turn is re-asserted
+      //    while .explicit-reply is preserved so Stop won't double-post a fallback reply
+      await runPostToolDispatch(
+        JSON.stringify({
+          conversationId: convId,
+          tool_name: 'default_api:view_file',
+          tool_input: { AbsolutePath: '/tmp/example.ts' },
+        }),
+        { home: tmpHome, env: { HOME: tmpHome } },
+      )
+      const resumedMarker = readTurnMarker(connId, connDir)
+      assert.ok(resumedMarker)
+      assert.equal(typeof resumedMarker.lastToolAt, 'number')
+      assert.equal(fs.existsSync(explicitReplyMarkerPath(connId, connDir)), true)
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
+    }
+  })
+
+  it('formats canonical_system_notices (server_notice) in buildWakeDeliveryMessage for sessionless agentapi delivery', () => {
+    const msg = buildWakeDeliveryMessage({
+      type: 'canonical_system_notices',
+      session_id: null,
+      execute_notice_ids: ['66666666-6666-4666-8666-666666666666'],
+      ingress: {
+        system_notices: [
+          {
+            kind: 'server_notice',
+            notice_id: '66666666-6666-4666-8666-666666666666',
+            topic: 'duplicate_detection',
+            notice_type: 'potential_duplicate',
+            summary: 'Task "Add retry backoff" may duplicate "Retry backoff on poll".',
+            prompt: 'Inspect both items and call resolve_duplicate or record_duplicate_nonmatch.',
+            records: [
+              {
+                label: 'New item',
+                record_type: 'task',
+                record_id: '77777777-7777-4777-8777-777777777777',
+                title: 'Add retry backoff',
+                text: 'Add retry backoff to poll loop.',
+              },
+            ],
+            allowed_outcomes: ['resolve_duplicate', 'record_duplicate_nonmatch'],
+            allowed_tools: ['resolve_duplicate', 'record_duplicate_nonmatch'],
+          },
+        ],
+      },
+    })
+    assert.match(msg, /\[DevSpec Remote Wake\]/)
+    assert.match(msg, /\[DevSpec System Notice: duplicate_detection \/ potential_duplicate\]/)
+    assert.match(msg, /resolve_duplicate, record_duplicate_nonmatch/)
+    assert.equal(
+      msg.split('Add retry backoff to poll loop.').length - 1,
+      1,
+      'notice record text must appear once in buildWakeDeliveryMessage instead of 4 times',
+    )
+    assert.equal(
+      msg.split('Inspect both items and call resolve_duplicate or record_duplicate_nonmatch.').length - 1,
+      1,
+      'notice prompt must appear once in buildWakeDeliveryMessage',
+    )
   })
 })

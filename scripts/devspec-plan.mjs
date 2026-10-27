@@ -8,8 +8,8 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 const REMOTE_CONTROL_DIR = path.join(os.homedir(), '.devspec', 'remote-control')
 const CONNECTIONS_DIR = path.join(REMOTE_CONTROL_DIR, 'connections')
@@ -224,7 +224,7 @@ function parseCli(argv) {
   return { connectionId, schema, rest }
 }
 
-const isMain = Boolean(process.argv[1]) && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
+const isMain = isEntryPoint(import.meta.url)
 if (isMain) {
   const cli = parseCli(process.argv.slice(2))
   if (cli.schema) {
