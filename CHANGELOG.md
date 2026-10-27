@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.4
+
+- Canonical production MCP endpoint fallback (`https://api.devspec.ai/api/mcp`) is now used consistently across `resolve-mcp-auth.mjs`, `remote-control-state.mjs`, `mirror-turn.mjs`, and `devspec-project.mjs` whenever an MCP config entry omits `serverUrl`.
+
 ## 0.21.3
 
 ### Commits are tagged and checked only in the project's repositories

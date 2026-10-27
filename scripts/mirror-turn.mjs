@@ -1370,7 +1370,7 @@ export async function streamTurnTrailIfChanged(
     mcpUrl = mcpUrl || auth.mcp_url
   }
   if (!token) return { streamed: false, reason: 'no_auth_token' }
-  mcpUrl = mcpUrl || 'https://devspec.ai/api/mcp'
+  mcpUrl = mcpUrl || 'https://api.devspec.ai/api/mcp'
 
   const isLocalMirroredTurn = Boolean(
     !marker.remoteTurn &&
@@ -1611,7 +1611,7 @@ export async function handleMirrorTurn(
   }
   if (!token) return { ok: true, skipped: 'no_auth_token' }
 
-  mcpUrl = mcpUrl || 'https://devspec.ai/api/mcp'
+  mcpUrl = mcpUrl || 'https://api.devspec.ai/api/mcp'
   const agentName = AGENT_NAME
   const connectionId = state.connection_id
   const sessionId = state.session_id || null

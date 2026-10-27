@@ -1488,7 +1488,7 @@ export async function writeConnectionState({
       (ownerPid ? processStartTime(ownerPid) : null) ?? prev.owner_started ?? null,
     project_id: projectId,
     ...(projectName ? { project_name: projectName } : {}),
-    mcp_url: auth.mcp_url || prev.mcp_url || 'https://devspec.ai/api/mcp',
+    mcp_url: auth.mcp_url || prev.mcp_url || 'https://api.devspec.ai/api/mcp',
     token: auth.token || prev.token || undefined,
     auth_source: auth.source || auth.error || prev.auth_source || null,
     auth_ok: !!auth.ok || !!prev.auth_ok,
