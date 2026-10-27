@@ -28,7 +28,23 @@ const AGY = process.env.AGY_BIN || (process.env.AGY_E2E === '1' ? await fetchAgy
 const skip = AGY ? false : 'set AGY_E2E=1 (downloads the pinned agy) or AGY_BIN=<agy> to run'
 const windows = process.platform === 'win32'
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-agy-e2e-'))
-after(() => fs.rmSync(scratch, { recursive: true, force: true, maxRetries: 5 }))
+// The plugin's remote poller for a bound test connection can still be writing its
+// state for a moment after agy exits (seen on the Linux runner as ENOTEMPTY), so the
+// scratch folder is removed with patience; a leftover temp folder fails no check.
+after(async () => {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      fs.rmSync(scratch, { recursive: true, force: true })
+      return
+    } catch (error) {
+      if (attempt >= 20) {
+        console.warn(`could not remove ${scratch}: ${error.message}`)
+        return
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500))
+    }
+  }
+})
 const fresh = (name) => {
   const dir = path.join(scratch, name)
   fs.mkdirSync(dir, { recursive: true })
