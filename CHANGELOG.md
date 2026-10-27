@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.20.2
+
+### The agent is no longer asked to type task tags it does not need
+
+When exactly one task is claimed, the plugin already adds that task's `[devspec:<id>]` tag to a `git commit -m "…"` message itself. Two of its messages still told the agent to put the full tag in the message by hand.
+
+- **No task claimed:** the commit refusal now tells the agent to find the task the work belongs to, or create one, claim it, and retry the same commit. The tag is added for it. The refusal used to say "reuse" a task and add the tag itself.
+- **Editing with no task claimed:** the one-time reminder now says the same.
+- **One task claimed, message not in quotes:** the plugin cannot extend a message written as `-m wip`. The refusal says to put the message in quotes and retry, where it used to give the no-task advice.
+- **Several tasks claimed:** this is still the one case where the agent writes a tag itself, because the plugin never guesses between tasks.
+- **Rules:** `rules/AGENTS.md` says the same, and points at the commit section of DevSpec's served contract rather than restating it.
+- **Self-checks:** the plugin now checks that every part of the contract it names exists in the contract DevSpec serves. Only names are checked, so a clause DevSpec adds does not break it.
+
 ## 0.20.1
 
 ### A commit the plugin tags is allowed again without a prompt

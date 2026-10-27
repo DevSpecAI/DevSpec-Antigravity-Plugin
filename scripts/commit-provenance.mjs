@@ -831,6 +831,14 @@ function nudge(message) {
   }
 }
 
+/**
+ * What a refused commit asks of the model: only what it cannot leave to the plugin
+ * (item 9d945fcc). With exactly one task claimed, PreToolUse adds that task's tag to
+ * a `git commit -m "…"` message itself, so the model never types a UUID it does not
+ * need; it writes a tag only when several tasks are claimed, because the plugin must
+ * never guess between them. When the stamp applies is the served contract's
+ * commit_provenance_contract, pointed at rather than restated.
+ */
 function recoveryText(claims) {
   if (claims.length > 1) {
     return [
@@ -839,14 +847,21 @@ function recoveryText(claims) {
       'Then retry the commit. Nothing else is blocked.',
     ].join(' ')
   }
+  if (claims.length === 1) {
+    return [
+      'DevSpec: this commit has no [devspec:<id>] reference, and its message cannot be stamped as written.',
+      'Retry it with the message in quotes after -m (git commit -m "…") and the tag of the task you claimed is added for you.',
+      `Authority: ${CONTRACT_URI} (commit_provenance_contract). Nothing else is blocked.`,
+    ].join(' ')
+  }
   // Since item ab6a3960 the write gate refuses a thin task: create_task needs a real
   // description and the reason behind it, so this must never suggest a one-liner.
   return [
-    'DevSpec: this commit has no [devspec:<id>] reference, so it would land unlinked.',
-    'Recover without leaving this turn: search_tasks for the task this work belongs to and reuse it;',
+    'DevSpec: no task is claimed for this commit, so it would land unlinked.',
+    'Recover without leaving this turn: search_tasks for the task this work belongs to and claim it (claim_work_item);',
     'if none covers it, create_task for the smallest adequate task, with a real description of the change',
-    'and the reason it is needed (the server refuses a thin one). When to create one is the',
-    "contract's work_entry_contract. Then add [devspec:<full-uuid>] to the commit message and retry.",
+    'and the reason it is needed (the server refuses a thin one), and claim that. When to create one is the',
+    "contract's work_entry_contract. Then retry the same commit: its [devspec:<id>] tag is added for you.",
     `Authority: ${CONTRACT_URI}. Nothing else is blocked, and no other command is affected.`,
   ].join(' ')
 }
@@ -1785,9 +1800,9 @@ function maybeNudge(scope, { env, now, platform }) {
   }
   const message =
     'DevSpec: no task is claimed in this repository, so work done here has nothing to trace it to. ' +
-    'Before you commit, search_tasks for the task this work belongs to and claim it; if none covers it, ' +
+    'Before you commit, search_tasks for the task this work belongs to and claim it (claim_work_item); if none covers it, ' +
     "create the smallest adequate one with a real description and reason (the contract's work_entry_contract " +
-    'says when), and put [devspec:<full-uuid>] in the commit message. Editing is never blocked. ' +
+    'says when) and claim that. Then commit as usual: the [devspec:<id>] tag is added for you. Editing is never blocked. ' +
     `Shown once per session. Authority: ${CONTRACT_URI}`
   stagePendingNudge(scope.sessionId, message, { env, now, platform })
   return nudge(message)
