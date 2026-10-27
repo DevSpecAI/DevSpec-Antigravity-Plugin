@@ -16,6 +16,21 @@
  * full commit id, branch, working tree, previous head and whether it was an amend to
  * `observations.jsonl` beside it, for the plugin's hooks to report.
  *
+ * Tagging and the commit check (item 31ef3d3c). For a `git commit` in one of the
+ * connected project's repositories (its origin is one of the project's repositories,
+ * or a DevSpec pin names the project), PreToolUse leaves a stamp file with the tasks
+ * claimed in the conversation. Before git runs, this script reads the message from
+ * git's own arguments, whatever the shell did to produce them (a heredoc, `$(cat …)`,
+ * a file), and:
+ * - one task claimed, no reference in the message: adds ` [devspec:<id>]` to the end
+ *   of the subject line (`-m` in place; `-F <file>` through a private copy, never the
+ *   person's file; `-F -` by reading the message from standard input) and says so;
+ * - no task claimed, or several, and no reference: stops the commit before git runs
+ *   and says how to recover; the repository is left as it was;
+ * - anything else (another repository, amend, fixup, squash, a reused or reedited
+ *   message, `--no-edit`, an existing reference, a message it cannot read): git runs
+ *   exactly as asked, standard input included.
+ *
  * Self-contained (Node built-ins only), so it keeps working from its copy whatever
  * happens to the plugin folder. Every observation step fails open: if anything about
  * noting the commit goes wrong, git has still run exactly as asked.
@@ -194,11 +209,264 @@ function readTrace(file) {
   }
 }
 
-function delegate(realGit, args, env) {
+// ---- Tagging and the commit check (item 31ef3d3c) ----------------------------
+
+/** Any reference, even a malformed one: a message that has one is never touched. */
+const ANY_REFERENCE = /\[devspec:[^\]\s]*\]/i
+/** Forms that reuse or rework an existing message: never tagged, never stopped. */
+const REUSING_LONG = new Set(['--amend', '--no-edit', '--fixup', '--squash', '--reuse-message', '--reedit-message'])
+const VALUE_LONG = new Set([
+  '--message', '--file', '--fixup', '--squash', '--reuse-message', '--reedit-message', '--template',
+  '--author', '--date', '--cleanup', '--trailer', '--pathspec-from-file',
+])
+const FLAG_LONG = new Set([
+  '--quiet', '--verbose', '--all', '--include', '--only', '--interactive', '--patch', '--allow-empty',
+  '--allow-empty-message', '--no-verify', '--verify', '--edit', '--no-post-rewrite', '--signoff',
+  '--no-signoff', '--reset-author', '--short', '--branch', '--porcelain', '--long', '--null', '--dry-run',
+  '--status', '--no-status', '--gpg-sign', '--no-gpg-sign', '--untracked-files', '--pathspec-file-nul',
+  '--ahead-behind', '--no-ahead-behind', '--no-verbose', '--no-quiet',
+])
+const SHORT_FLAGS = new Set(['a', 'q', 'v', 's', 'n', 'e', 'i', 'o', 'p', 'z'])
+
+/**
+ * Read `git commit`'s own arguments: where the message comes from, and whether this
+ * is a form that reuses a message. Null when an argument is not one it knows, which
+ * leaves the commit exactly as asked.
+ */
+export function parseCommitArgs(rest) {
+  const out = { reusing: false, dryRun: false, messages: [], files: [] }
+  const take = (list, i, prefix, inline) => {
+    if (inline !== null) {
+      list.push({ index: i, prefix, value: inline })
+      return i
+    }
+    if (i + 1 >= rest.length) return -1
+    list.push({ index: i + 1, prefix: '', value: rest[i + 1] })
+    return i + 1
+  }
+  for (let i = 0; i < rest.length; i += 1) {
+    const arg = rest[i]
+    if (arg === '--') break
+    if (arg.startsWith('--')) {
+      const eq = arg.indexOf('=')
+      const name = eq < 0 ? arg : arg.slice(0, eq)
+      const inline = eq < 0 ? null : arg.slice(eq + 1)
+      if (name === '--dry-run') out.dryRun = true
+      if (REUSING_LONG.has(name)) out.reusing = true
+      if (name === '--message') i = take(out.messages, i, `${name}=`, inline)
+      else if (name === '--file') i = take(out.files, i, `${name}=`, inline)
+      else if (VALUE_LONG.has(name)) i = inline === null ? i + 1 : i
+      else if (!FLAG_LONG.has(name) && !REUSING_LONG.has(name)) return null
+      if (i < 0 || i >= rest.length + 1) return null
+      continue
+    }
+    if (arg.startsWith('-') && arg.length > 1) {
+      for (let j = 1; j < arg.length; j += 1) {
+        const c = arg[j]
+        if ('mFcCt'.includes(c)) {
+          const inline = j + 1 < arg.length ? arg.slice(j + 1) : null
+          const prefix = arg.slice(0, j + 1)
+          if (c === 'm') i = take(out.messages, i, prefix, inline)
+          else if (c === 'F') i = take(out.files, i, prefix, inline)
+          else {
+            if (c === 'c' || c === 'C') out.reusing = true
+            if (inline === null) i += 1
+          }
+          if (i < 0 || i >= rest.length + 1) return null
+          break
+        }
+        if (c === 'S' || c === 'u') break
+        if (!SHORT_FLAGS.has(c)) return null
+      }
+      continue
+    }
+    // A pathspec: git takes options after it too.
+  }
+  return out
+}
+
+/** `host/owner/repo`, lower-cased, from any remote URL form; null when it is not one. */
+export function normalizeRemoteKey(raw) {
+  if (typeof raw !== 'string') return null
+  const value = raw.trim()
+  if (!value) return null
+  let host
+  let pathname
+  const scp = /^(?:[^@/:]+@)?([^/:]+):(.+)$/.exec(value)
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
+    try {
+      const url = new URL(value)
+      host = url.hostname
+      pathname = url.pathname
+    } catch {
+      return null
+    }
+  } else if (scp && !value.startsWith('/')) {
+    host = scp[1]
+    pathname = scp[2]
+  } else {
+    return null
+  }
+  let decoded = pathname
+  try {
+    decoded = decodeURIComponent(pathname)
+  } catch {
+    /* keep it as written */
+  }
+  const clean = decoded.replace(/^\/+/, '').replace(/\/+$/, '').replace(/\.git$/i, '')
+  return host && clean ? `${host.toLowerCase()}/${clean.toLowerCase()}` : null
+}
+
+function readStampFile(here, observation) {
+  try {
+    const value = JSON.parse(fs.readFileSync(path.join(here, 'stamps', `${observation}.json`), 'utf8'))
+    if (value?.v !== 1 || !Array.isArray(value.claims) || !Array.isArray(value.repositories)) return null
+    return value
+  } catch {
+    return null
+  }
+}
+
+function readPin(dir) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(dir, '.devspec', 'project.json'), 'utf8'))?.project_id ?? null
+  } catch {
+    return null
+  }
+}
+
+/** Whether the repository this commit lands in is one of the project's. */
+function inProjectScope(realGit, globals, stamp) {
+  const top = quiet(realGit, [...globals, 'rev-parse', '--show-toplevel'])
+  if (!top) return false
+  const remote = normalizeRemoteKey(quiet(realGit, [...globals, 'config', '--get', 'remote.origin.url']) ?? '')
+  if (remote && stamp.repositories.includes(remote)) return true
+  const common = quiet(realGit, [...globals, 'rev-parse', '--path-format=absolute', '--git-common-dir'])
+  let commonReal = null
+  try {
+    commonReal = common ? fs.realpathSync(common) : null
+  } catch {
+    commonReal = null
+  }
+  if (commonReal && Array.isArray(stamp.marked_repos) && stamp.marked_repos.includes(commonReal)) return true
+  if (typeof stamp.project_id !== 'string' || !stamp.project_id) return false
+  // A pin in the working tree (from where git runs up to its top), or in the main
+  // working tree for a linked worktree: the repository, not the folder, decides.
+  const prefix = quiet(realGit, [...globals, 'rev-parse', '--show-prefix']) ?? ''
+  let dir = path.join(top, prefix)
+  for (;;) {
+    if (readPin(dir) === stamp.project_id) return true
+    if (path.resolve(dir) === path.resolve(top)) break
+    dir = path.dirname(dir)
+  }
+  if (commonReal && path.basename(commonReal) === '.git' && readPin(path.dirname(commonReal)) === stamp.project_id) return true
+  return false
+}
+
+/** The message with ` [devspec:<id>]` at the end of its subject line, or null when it has none. */
+export function tagSubject(message, id) {
+  const lines = message.split('\n')
+  const at = lines.findIndex((line) => line.trim().length > 0)
+  if (at < 0) return null
+  lines[at] = `${lines[at].replace(/\s+$/, '')} [devspec:${id}]`
+  return lines.join('\n')
+}
+
+function readAllStdin() {
+  const chunks = []
+  const buffer = Buffer.alloc(64 * 1024)
+  for (;;) {
+    let read = 0
+    try {
+      read = fs.readSync(0, buffer, 0, buffer.length, null)
+    } catch (error) {
+      if (error.code === 'EAGAIN') continue
+      if (error.code === 'EOF') break
+      throw error
+    }
+    if (read === 0) break
+    chunks.push(Buffer.from(buffer.subarray(0, read)))
+  }
+  return Buffer.concat(chunks)
+}
+
+/**
+ * Decide what happens to a commit before git runs:
+ * `{ args, stdin, notice }` to run (possibly tagged), or `{ stop }` with the text to
+ * show instead of running it. Everything it cannot be sure of runs as asked.
+ */
+export function prepareCommit({ realGit, args, split, here, env, cwd = process.cwd(), readStdin = readAllStdin }) {
+  const unchanged = { args, stdin: 'inherit', notice: null, cleanup: null }
+  const stamp = readStampFile(here, env.DEVSPEC_AGY_GIT_OBSERVATION)
+  if (!stamp || split.command !== 'commit') return unchanged
+  const rest = args.slice(split.globals.length + 1)
+  const parsed = parseCommitArgs(rest)
+  if (!parsed || parsed.reusing || parsed.dryRun) return unchanged
+  if (parsed.messages.length > 0 && parsed.files.length > 0) return unchanged
+  if (parsed.files.length > 1 || (parsed.messages.length === 0 && parsed.files.length === 0)) return unchanged
+  if (!inProjectScope(realGit, split.globals, stamp)) return unchanged
+
+  const offset = split.globals.length + 1
+  let message
+  let stdinBytes = null
+  let fileSource = null
+  if (parsed.files.length === 1) {
+    fileSource = parsed.files[0]
+    if (fileSource.value === '-') {
+      stdinBytes = readStdin()
+      message = stdinBytes.toString('utf8')
+    } else {
+      // git reads a relative file from where it runs, after any -C.
+      let base = cwd
+      for (let i = 0; i < split.globals.length; i += 1) {
+        if (split.globals[i] === '-C') base = path.resolve(base, split.globals[i + 1])
+        else if (split.globals[i].startsWith('-C') && split.globals[i].length > 2) base = path.resolve(base, split.globals[i].slice(2))
+      }
+      try {
+        message = fs.readFileSync(path.resolve(base, fileSource.value), 'utf8')
+      } catch {
+        return unchanged
+      }
+    }
+  } else {
+    message = parsed.messages.map((m) => m.value).join('\n\n')
+  }
+  const asked = stdinBytes ? { ...unchanged, stdin: stdinBytes } : unchanged
+  if (ANY_REFERENCE.test(message)) return asked
+
+  const claims = stamp.claims.filter((id) => UUID.test(id))
+  if (claims.length === 0) return { stop: stamp.messages?.unclaimed ?? 'DevSpec: no task is claimed for this commit.' }
+  if (claims.length > 1) return { stop: stamp.messages?.several ?? 'DevSpec: several tasks are claimed; put the right [devspec:<id>] in the message.' }
+  const id = claims[0].toLowerCase()
+  const notice = `DevSpec: added [devspec:${id}] to this commit's subject line (the one task claimed in this conversation).`
+
+  const next = [...args]
+  if (fileSource) {
+    const tagged = tagSubject(message, id)
+    if (tagged === null) return asked
+    const copies = path.join(here, 'messages')
+    fs.mkdirSync(copies, { recursive: true, mode: 0o700 })
+    const copy = path.join(copies, `${randomUUID()}.txt`)
+    fs.writeFileSync(copy, tagged, { mode: 0o600 })
+    next[offset + fileSource.index] = `${fileSource.prefix}${copy}`
+    return { args: next, stdin: stdinBytes ? 'ignore' : 'inherit', notice, cleanup: copy }
+  }
+  const first = parsed.messages.find((m) => m.value.trim().length > 0)
+  if (!first) return asked
+  next[offset + first.index] = `${first.prefix}${tagSubject(first.value, id)}`
+  return { args: next, stdin: 'inherit', notice, cleanup: null }
+}
+
+function delegate(realGit, args, env, stdin = 'inherit') {
   return new Promise((resolve) => {
     let child
     try {
-      child = spawn(realGit, args, { stdio: 'inherit', env, windowsHide: true })
+      const input = Buffer.isBuffer(stdin) ? 'pipe' : stdin
+      child = spawn(realGit, args, { stdio: [input, 'inherit', 'inherit'], env, windowsHide: true })
+      if (Buffer.isBuffer(stdin)) {
+        child.stdin.on('error', () => { /* git may close its input early */ })
+        child.stdin.end(stdin)
+      }
     } catch (error) {
       resolve({ code: 126, signal: null, error })
       return
@@ -242,6 +510,29 @@ export async function runShim(argv = process.argv.slice(2), env = process.env, h
       !env.GIT_TRACE2_EVENT && !env.GIT_TRACE2,
   )
 
+  // Tag the commit, or stop it, before git runs (item 31ef3d3c). A failure here runs
+  // git exactly as asked; standard input that was already read is passed on whole.
+  let run = { args, stdin: 'inherit', notice: null, cleanup: null }
+  if (split?.command === 'commit' && UUID.test(observation ?? '')) {
+    let readBytes = null
+    try {
+      run = prepareCommit({
+        realGit, args, split, here, env,
+        readStdin: () => {
+          readBytes = readAllStdin()
+          return readBytes
+        },
+      })
+    } catch {
+      run = { args, stdin: readBytes ?? 'inherit', notice: null, cleanup: null }
+    }
+    if (run.stop) {
+      process.stderr.write(`${run.stop}\n`)
+      return { code: 1, signal: null, error: null }
+    }
+    if (run.notice) process.stderr.write(`${run.notice}\n`)
+  }
+
   let before = null
   let traceFile = null
   let childEnv = env
@@ -261,7 +552,10 @@ export async function runShim(argv = process.argv.slice(2), env = process.env, h
     }
   }
 
-  const result = await delegate(realGit, args, childEnv)
+  const result = await delegate(realGit, run.args, childEnv, run.stdin)
+  if (run.cleanup) {
+    try { fs.rmSync(run.cleanup, { force: true }) } catch { /* a private copy left behind */ }
+  }
 
   if (traceFile) {
     try {

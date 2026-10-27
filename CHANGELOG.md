@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.21.0
+
+### Commits in the project's repositories are tagged for the agent, whatever their shape
+
+Until now the plugin added a commit's task tag, and stopped an untagged commit, only in a folder carrying a DevSpec marker, and only for a commit command it could read from the command text. Your repositories have no marker, and a commit written with a multi-line message (a heredoc, `$(cat …)`, a message file) was never read. In a 14-day sample every untagged commit had a multi-line message.
+
+- **By repository, not folder.** A commit is in scope when its repository's `origin` is one of the connected project's repositories, or a DevSpec pin names the project. Any other repository is left completely alone, including test fixtures and the throwaway repositories scripts make.
+- **Tagged inside the git stand-in.** The stand-in from 0.20.0 sees git's own arguments after the shell has produced them. With exactly one task claimed in the conversation and no reference in the message, it adds ` [devspec:<id>]` to the end of the subject line before git runs:
+  - `-m` messages, including `-m "$(cat <<'EOF' …)"`, are tagged in place.
+  - `-F <file>` gets a private copy; your own file is never edited.
+  - `-F -` (a heredoc) is read from standard input. When it cannot be tagged, the exact original bytes go to git.
+  - The command output says when the tag was added.
+- **Stopped before git runs.** With no task claimed, an untagged commit is stopped with text telling the agent to claim the right task and retry the same commit, so nothing has to be typed. With several claimed, it is stopped and the agent is asked to write the right tag. The repository is left as it was.
+- **Left as they are:** amend, fixup and squash commits, reused or reedited messages, `--no-edit`, and messages that already carry a reference, which is never replaced.
+- **Permissions unchanged.** Every command gets exactly the permission decision it had before.
+- **Windows and disconnected sessions** keep the older behaviour: only a plain `git commit -m` in a folder marked for DevSpec is tagged or checked, from the command text.
+- `rules/AGENTS.md` says the same and points at the commit section of DevSpec's served contract.
+
 ## 0.20.2
 
 ### The agent is no longer asked to type task tags it does not need

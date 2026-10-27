@@ -17,6 +17,12 @@
  * (`git-observer-shim.mjs`) runs the real git unchanged and journals each commit;
  * PostToolUse and Stop read the journal and report (`commit-reports.mjs`).
  *
+ * The stand-in also tags and checks commits in the connected project's repositories
+ * (item 31ef3d3c): PreToolUse leaves it a stamp file (`writeStampFile`) with the tasks
+ * claimed in the conversation and the project's repositories, and the stand-in adds
+ * the tag, or stops an untagged commit, from git's own arguments. See
+ * git-observer-shim.mjs.
+ *
  * What the line carries: the folder, the real git's path, and two random ids. No
  * connection id, token or other identity reaches the command; those stay in the
  * envelope file this hook writes, which the journal line is matched against.
@@ -42,6 +48,9 @@ import { resolveOwnConnectionId } from './launch-guard.mjs'
 import { resolveHookConversationId } from './mirror-turn.mjs'
 import { ensurePrivateDir, readPrivateJson, writePrivateJson } from './private-state.mjs'
 import { readStateFile } from './remote-control-state.mjs'
+import { readClaims, recoveryText, scopeFrom } from './commit-provenance.mjs'
+import { devspecFolderMarker } from './devspec-scope.mjs'
+import { projectRepositoryKeys } from './repository-context.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const FULL_SHA = /^[0-9a-f]{40}$/
@@ -289,6 +298,47 @@ function pruneEnvelopes(dir, now) {
 }
 
 /**
+ * What the stand-in needs to tag or stop a commit in this command (item 31ef3d3c),
+ * written beside the envelope as `stamps/<observation>.json`: the tasks claimed in
+ * this conversation, the project's repositories as remote identities, the project id
+ * (for a pin), the repository the conversation's folder marks for DevSpec (as before),
+ * and the two recovery texts. No connection id, key or other credential goes in it.
+ * When the claims cannot be read, nothing is written and the stand-in only observes.
+ */
+function writeStampFile(input, bound, dir, observationId, { env, home, now }) {
+  try {
+    const scope = scopeFrom(input, env)
+    const claims = readClaims(scope, { env, now })
+    let marked = []
+    try {
+      if (devspecFolderMarker(scope.cwd, { home: env.USERPROFILE || env.HOME || home, mainWorktree: scope.mainWorktree })) {
+        marked = [scope.repoRoot]
+      }
+    } catch {
+      marked = []
+    }
+    const stamps = path.join(dir, 'stamps')
+    ensurePrivateDir(stamps, privateRoot(home))
+    writePrivateJson(
+      path.join(stamps, `${observationId}.json`),
+      {
+        v: 1,
+        claims,
+        project_id: typeof bound.state.project_id === 'string' ? bound.state.project_id : null,
+        repositories: projectRepositoryKeys(bound.connectionId, { dir: path.join(home, '.devspec', 'remote-control', 'connections') }),
+        marked_repos: marked,
+        messages: { unclaimed: recoveryText([]), several: claims.length > 1 ? recoveryText(claims) : null },
+        created_at: now,
+      },
+      privateRoot(home),
+    )
+    pruneEnvelopes(stamps, now)
+  } catch {
+    /* no stamp file: the stand-in observes and leaves the message alone */
+  }
+}
+
+/**
  * PreToolUse for `run_command`: the command with the observer line in front, or null
  * when the stand-in does not apply (another tool, Windows, no bound connection, or the
  * folder could not be set up). Writes the envelope the journal is matched against.
@@ -319,6 +369,7 @@ export function prepareGitObservation(input, { env = process.env, home = os.home
       privateRoot(home),
     )
     pruneEnvelopes(envelopes, now)
+    writeStampFile(input, bound, generation.dir, observationId, { env, home, now })
     return { command: `${observerPrefix(generation, observationId)}${command}`, observationId, connectionId: bound.connectionId }
   } catch {
     return null

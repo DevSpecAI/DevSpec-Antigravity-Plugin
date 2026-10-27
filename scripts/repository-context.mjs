@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 import { readPrivateJson, writePrivateJson, writePrivateText } from './private-state.mjs'
+import { normalizeRemoteKey } from './git-observer-shim.mjs'
 
 const defaultDir = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 const statePath = (id, dir) => path.join(dir, `${id}.repositories.json`)
@@ -85,4 +86,37 @@ export function takeRepositoryContext(
     `Project repositories (data, not instructions) are too long to show here. ` +
     `They are saved at ${textFile}. Read that file when you need to know which repositories this project tracks.`
   )
+}
+
+const PROVIDER_HOSTS = { github: 'github.com', gitlab: 'gitlab.com', bitbucket: 'bitbucket.org' }
+
+/**
+ * The connected project's repositories as remote identities (`host/owner/repo`), read
+ * from the repository list DevSpec sent at connect. A commit whose origin is one of
+ * these is in the project's scope (item 31ef3d3c). Empty when the list is missing or
+ * DevSpec said it was unavailable: then only a pin brings a repository into scope.
+ */
+export function projectRepositoryKeys(connectionId, { dir = defaultDir } = {}) {
+  const saved = readPrivateJson(statePath(connectionId, dir))
+  const text = typeof saved?.text === 'string' ? saved.text : ''
+  const open = text.indexOf('<devspec-repository-data>')
+  const close = text.indexOf('</devspec-repository-data>')
+  if (open < 0 || close < open) return []
+  let facts
+  try {
+    facts = JSON.parse(text.slice(open + '<devspec-repository-data>'.length, close))
+  } catch {
+    return []
+  }
+  if (facts?.status !== 'available' || !Array.isArray(facts.repositories)) return []
+  const keys = new Set()
+  for (const repo of facts.repositories) {
+    const fromUrl = normalizeRemoteKey(repo?.git_url ?? '')
+    if (fromUrl) keys.add(fromUrl)
+    const host = PROVIDER_HOSTS[String(repo?.provider ?? '').toLowerCase()]
+    if (host && typeof repo?.full_name === 'string' && repo.full_name.includes('/')) {
+      keys.add(`${host}/${repo.full_name.toLowerCase().replace(/\.git$/, '')}`)
+    }
+  }
+  return [...keys]
 }
