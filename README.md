@@ -60,6 +60,15 @@ chmod 700 ~/.gemini/config && chmod 600 ~/.gemini/config/mcp_config.json
 
 **Installing the plugin is required alongside the MCP server.** It supplies `rules/AGENTS.md`, the `/devspec-remote`, `/devspec-remote-stop`, and `/devspec-project` skills, the status bar (`DevSpec: local (/devspec-remote to connect) · <Project>`), and the connection hooks that let you steer `agy` from DevSpec.
 
+In your terminal (macOS, Linux, or Windows), run:
+
+```bash
+agy plugin install https://github.com/DevSpecAI/DevSpec-Antigravity-Plugin
+```
+
+<details>
+<summary>Prefer cloning straight with Git?</summary>
+
 **macOS / Linux:**
 
 ```bash
@@ -74,6 +83,8 @@ git clone https://github.com/DevSpecAI/DevSpec-Antigravity-Plugin.git \
 New-Item -ItemType Directory -Force "$HOME\.gemini\config\plugins" | Out-Null
 git clone https://github.com/DevSpecAI/DevSpec-Antigravity-Plugin.git "$HOME\.gemini\config\plugins\devspec"
 ```
+
+</details>
 
 ### 4. Optional — recommended for phone and voice control: skip permission prompts
 
@@ -115,11 +126,13 @@ When a repository belongs to more than one DevSpec project, or you open `agy` in
 
 ## Updating
 
-To update the plugin to the latest version, pull in the plugin directory and start a new `agy` session:
+To update the plugin to the latest version, re-run the install command (or pull in the plugin directory) and start a new `agy` session:
 
 ```bash
-git -C ~/.gemini/config/plugins/devspec pull
+agy plugin install https://github.com/DevSpecAI/DevSpec-Antigravity-Plugin
 ```
+
+(Or run `git -C ~/.gemini/config/plugins/devspec pull`.)
 
 Release notes are in [CHANGELOG.md](./CHANGELOG.md).
 
