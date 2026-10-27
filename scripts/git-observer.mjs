@@ -143,7 +143,7 @@ function isStandIn(file, home) {
 export function findRealGit(env = process.env, home = os.homedir()) {
   for (const dir of String(env.PATH || '').split(path.delimiter)) {
     if (!dir) continue
-    const candidate = path.join(dir, process.platform === 'win32' ? 'git.exe' : 'git') // DELIBERATELY BROKEN: finds git on Windows
+    const candidate = path.join(dir, 'git')
     if (isExecutable(candidate) && !isStandIn(candidate, home)) {
       try {
         return fs.realpathSync(candidate)
@@ -352,7 +352,7 @@ function writeStampFile(input, bound, dir, observationId, { env, home, now }) {
  */
 export function prepareGitObservation(input, { env = process.env, home = os.homedir(), platform = process.platform, now = Date.now(), args = null } = {}) {
   try {
-    if (toolName(input) !== 'run_command') return null // DELIBERATELY BROKEN: stand-in on for Windows
+    if (platform === 'win32' || toolName(input) !== 'run_command') return null
     const toolInput = args ?? toolArgs(input)
     const command = toolInput?.CommandLine
     if (typeof command !== 'string' || !command.trim() || stripObserverPrefix(command).observed) return null
