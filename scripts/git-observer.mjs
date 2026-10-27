@@ -352,7 +352,7 @@ function writeStampFile(input, bound, dir, observationId, { env, home, now }) {
  */
 export function prepareGitObservation(input, { env = process.env, home = os.homedir(), platform = process.platform, now = Date.now(), args = null } = {}) {
   try {
-    if (platform === 'win32' || toolName(input) !== 'run_command') return null
+    if (toolName(input) !== 'run_command') return null // DELIBERATELY BROKEN: stand-in on for Windows
     const toolInput = args ?? toolArgs(input)
     const command = toolInput?.CommandLine
     if (typeof command !== 'string' || !command.trim() || stripObserverPrefix(command).observed) return null
