@@ -93,7 +93,7 @@ beforeEach(() => {
     JSON.stringify({ connection_id: CONN, enabled: true, agent_name: 'Antigravity', local_id: CONV, token: 'dvs_test', mcp_url: serverUrl, connection_capability: 'cap-test' }),
     { mode: 0o600 },
   )
-  env = { PATH: process.env.PATH, HOME: home, GIT_CONFIG_NOSYSTEM: '1' }
+  env = { PATH: process.env.PATH, HOME: home, GIT_CONFIG_NOSYSTEM: '1', DEVSPEC_ANTIGRAVITY_STATE_DIR: path.join(home, 'provenance') }
 })
 
 /** PreToolUse → the command as bash runs it → PostToolUse. Returns the bash result. */
@@ -260,7 +260,16 @@ describe('every commit the agent makes is reported once, with the full id from g
     const wt = path.join(work, 'pinned-wt')
     git(['worktree', 'add', '-q', '-b', 'feature', wt], main)
     fs.writeFileSync(path.join(wt, 'commit.sh'), '#!/bin/sh\ngit commit -q --allow-empty -m "in a worktree"\n', { mode: 0o755 })
+    // The pinned repository is in scope, so its commit needs a claimed task; the commit
+    // inside the script is tagged by the stand-in, which no command-text reader sees.
+    const ITEM = '9e385793-cc59-4c06-b7c7-0ff8792b9762'
+    handlePost(
+      { conversationId: CONV, cwd: fs.realpathSync(wt), tool_name: 'mcp_devspec_claim_work_item', tool_input: { task_id: ITEM },
+        tool_response: { content: [{ type: 'text', text: JSON.stringify({ id: ITEM }) }] } },
+      { env },
+    )
     await agentRuns('./commit.sh', fs.realpathSync(wt))
+    assert.equal(git(['log', '-1', '--format=%s'], wt), `in a worktree [devspec:${ITEM}]`)
     assert.equal(received.length, 1)
     assert.equal(received[0].arguments.commit_sha, git(['rev-parse', 'HEAD'], wt))
     assert.equal(received[0].arguments.branch, 'feature')
@@ -268,7 +277,7 @@ describe('every commit the agent makes is reported once, with the full id from g
     assert.equal(received[0].arguments.git_remote, undefined)
   })
 
-  it('in a DevSpec-pinned repository with one claim, the commit-tag stamp and the stand-in line combine', async () => {
+  it('in a DevSpec-pinned repository with one claim, the commit is auto-allowed as before and the stand-in tags it', async () => {
     const ITEM = '9e385793-cc59-4c06-b7c7-0ff8792b9762'
     const dir = repo('claimed', { remote: REMOTE })
     fs.mkdirSync(path.join(dir, '.devspec'))
@@ -284,7 +293,8 @@ describe('every commit the agent makes is reported once, with the full id from g
     // not stop at a permission prompt when it commits.
     assert.equal(pre.decision, 'allow')
     assert.equal(toProtoPreToolResult(pre).decision, 'allow')
-    assert.equal(stripObserverPrefix(sent).command, `git commit -q --allow-empty -m "feat: claimed work [devspec:${ITEM}]"`)
+    // The agent's own command goes out unchanged; the stand-in adds the tag before git runs.
+    assert.equal(stripObserverPrefix(sent).command, 'git commit -q --allow-empty -m "feat: claimed work"')
     assert.equal(git(['log', '-1', '--format=%s'], dir), `feat: claimed work [devspec:${ITEM}]`)
     assert.deepEqual(shas(), [git(['rev-parse', 'HEAD'], dir)])
     assert.equal(received[0].arguments.git_remote, REMOTE, 'the remote, not the pin, names a repository that has one')

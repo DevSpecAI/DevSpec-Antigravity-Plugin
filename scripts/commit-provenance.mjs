@@ -839,7 +839,7 @@ function nudge(message) {
  * never guess between them. When the stamp applies is the served contract's
  * commit_provenance_contract, pointed at rather than restated.
  */
-function recoveryText(claims) {
+export function recoveryText(claims) {
   if (claims.length > 1) {
     return [
       `DevSpec: this commit has no [devspec:<id>] reference and ${claims.length} claims are active, so nothing was added automatically.`,

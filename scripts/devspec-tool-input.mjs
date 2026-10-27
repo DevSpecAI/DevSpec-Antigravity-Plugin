@@ -517,9 +517,14 @@ export async function runDevspecToolInput(raw = '', options = {}) {
   // with the task tag. Both branches below test exactly this, so the stand-in never
   // changes which commands are allowed (item 9e385793).
   const stampedCommit = Boolean(prov?.hookSpecificOutput?.updatedInput)
-  const observed = effectiveArgs ? prepareGitObservation(parsed, { ...options, args: effectiveArgs }) : null
+  // With the stand-in on the command, the stand-in tags the commit (item 31ef3d3c), so
+  // the agent's own command goes out unchanged behind the observer line; the text
+  // reader above only keeps each command's decision exactly as it was. Without the
+  // stand-in (Windows, no connection), the text reader's stamp is used as before.
+  const ownArgs = rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs) ? rawArgs : null
+  const observed = ownArgs ? prepareGitObservation(parsed, { ...options, args: ownArgs }) : null
   if (observed) {
-    const overwrite = { ...effectiveArgs, CommandLine: observed.command }
+    const overwrite = { ...ownArgs, CommandLine: observed.command }
     // Antigravity applies `overwrite` only with a decision, and refuses the call when
     // there is none, so the stand-in line must carry one; it keeps the decision the
     // command had without it. A stamped commit stays `allow`: the line only routes
