@@ -19,11 +19,11 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { pathToFileURL } from 'node:url'
 import { devspecFolderMarker, gitRemoteOrigin } from './devspec-scope.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveHookConversationId } from './mirror-turn.mjs'
 import { hostTokenFromEnv, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 export const CONTRACT_URI = 'devspec://product/implementation-contract'
 export const CLAIM_MAX_AGE_MS = 24 * 60 * 60 * 1000
@@ -1813,7 +1813,7 @@ async function main() {
   throw new Error('usage: commit-provenance.mjs session-start|pre|post')
 }
 
-const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
+const isMain = isEntryPoint(import.meta.url)
 if (isMain) {
   main().catch((error) => {
     if (process.argv[2] === 'pre' || process.argv[2] === 'post') {

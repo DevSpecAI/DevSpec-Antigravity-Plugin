@@ -19,7 +19,6 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { AGENT_NAME } from './agent-identity.mjs'
 import {
   attachmentDirFor,
@@ -116,6 +115,7 @@ import {
 } from './room-transcript.mjs'
 import { readSessionTitle, sessionTitleReadDue } from './session-title.mjs'
 import { readConnectionTelemetry } from './statusline.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 export const REMOTE_INGRESS_VERSION = 1
 export const DELEGATED_SCOPE_VERSION = 1
@@ -2515,9 +2515,7 @@ async function main() {
   }
 }
 
-const isMain =
-  Boolean(process.argv[1]) &&
-  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
+const isMain = isEntryPoint(import.meta.url)
 
 if (isMain) {
   main().catch((e) => {

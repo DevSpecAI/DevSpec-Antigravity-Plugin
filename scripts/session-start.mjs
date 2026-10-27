@@ -14,11 +14,12 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { fileURLToPath } from 'node:url'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { LOADED_PLUGIN_VERSION } from './connection-version.mjs'
 import { ensureHostPluginHeader } from './host-mcp-header.mjs'
 import { privateStateRoot, tightenPrivateTree } from './private-state.mjs'
+import { pruneObserverFolders } from './git-observer.mjs'
 import { readGithubIdentity, renderGithubIdentity, storeGithubIdentity } from './github-identity.mjs'
 import { findProjectPin, gitRemoteOrigin } from './devspec-scope.mjs'
 import {
@@ -52,6 +53,7 @@ import {
   resolveHookConversationId,
   syncStateTranscriptPath,
 } from './mirror-turn.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -524,6 +526,12 @@ export async function runSessionStart(
   } catch {
     /* non-fatal: every write still lands owner-only */
   }
+  try {
+    // Git stand-in folders of connections that are gone (git-observer.mjs).
+    pruneObserverFolders({ home: effectiveHome })
+  } catch {
+    /* non-fatal: housekeeping */
+  }
 
   const conversationId = resolveHookConversationId(raw, env)
   const transcriptPath = parseTranscriptPath(raw)
@@ -741,5 +749,5 @@ async function main() {
   process.exit(0)
 }
 
-const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
+const isMain = isEntryPoint(import.meta.url)
 if (isMain) main()

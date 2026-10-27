@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.20.0
+
+### DevSpec learns of every commit the agent makes
+
+DevSpec credits a commit to the agent that made it from the plugin's own report. Antigravity sent none: its commit observation ran only for a plain `git commit -m` in a repository with a DevSpec folder pin, and its script could not even start from a folder with a space in its name. On 27 October, staging held more than 900 commits reported by Pi agents and none from any Antigravity connection.
+
+- **Git reports the commit, not the command.** While the agent is connected to DevSpec, every shell command it runs finds a private stand-in for `git` first on its PATH. The stand-in runs the real git unchanged and asks git itself whether a commit was made. If one was, the plugin reports it with the full commit id, branch and the repository's remote address. This covers commits after `cd` or `&&`, with `git -C` in another repository, in a linked worktree, from a script the agent runs, through a git alias, and amends.
+- **Pin only as a fallback.** A commit is reported with the repository's `origin` address, and DevSpec decides which project it belongs to. A DevSpec folder pin is used only for a repository with no remote, found through the main working tree from a linked worktree.
+- **Your setup is left alone.** Nothing is installed in your repositories and no git configuration or hook is touched. The stand-in is on the PATH only for the agent's own commands, through one line Antigravity shows as "a pre-tool hook changed the arguments". No connection id, key or other identity reaches those commands. Your permission prompts and allow-rules work as before.
+- **Git is never held up.** Output, exit codes and signals are git's own. A report that cannot be sent waits and is retried at the agent's next steps, up to six times within a day. Every outcome (sent, refused with DevSpec's reason, skipped, dropped) is a line in `~/.devspec/remote-control/connections/<connection>.commits.log`.
+- **Only the agent's commits.** Commits you make yourself, in your own terminal or editor, are never reported as the agent's.
+- **Not covered.** Windows runs commands in a shell the stand-in's line does not fit, so the older, narrower observation still applies there. A git started by absolute path (`/usr/bin/git`) or with a cleared PATH bypasses the stand-in. Commits git makes for merge, cherry-pick, revert or rebase are not reported, as in Pi; DevSpec follows a rewritten commit through the `[devspec:<id>]` tag in its message.
+- **Every script starts from any folder.** Each script now checks that it is the one being run by comparing real paths. A space in a folder name or a symlinked plugin folder can no longer silently switch a script off.
+
 ## 0.19.0
 
 ### Replies to DevSpec notices reach the room as replies to the notice

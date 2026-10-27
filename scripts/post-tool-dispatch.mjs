@@ -14,9 +14,10 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { pathToFileURL } from 'node:url'
 import { handleBashPost } from './commit-observation.mjs'
 import { handlePost, stagePendingNudge } from './commit-provenance.mjs'
+import { reportObservedCommits } from './commit-reports.mjs'
+import { withoutObserverPrefix } from './git-observer.mjs'
 import { resolveOwnConnectionId } from './launch-guard.mjs'
 import {
   currentTurnNoticeIds,
@@ -42,6 +43,7 @@ import {
   requestForLaunch,
 } from './requests.mjs'
 import { postToolNotice } from './room-unread.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 function readStdin() {
   try {
@@ -57,6 +59,14 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
     payload = typeof raw === 'string' ? JSON.parse(raw || '{}') : raw || {}
   } catch {
     return null
+  }
+  // The git stand-in's line in front of a command is the plugin's, not the agent's:
+  // every handler below reads the command the agent wrote (git-observer.mjs).
+  const unprefixed = withoutObserverPrefix(payload)
+  const gitObserved = unprefixed.observed
+  if (gitObserved) {
+    payload = unprefixed.payload
+    raw = JSON.stringify(payload)
   }
 
   const toolName = String(
@@ -156,10 +166,13 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
   // 2. Record background subagent / command / schedule launches & git commit observations
   const bareToolName = toolName.replace(/^default_api:/, '')
   if (bareToolName === 'run_command' || bareToolName === 'Bash') {
-    try {
-      await handleBashPost(payload, { env, ...(call ? { call } : {}) })
-    } catch {
-      /* non-fatal */
+    // The older command-text observation only where the stand-in did not run.
+    if (!gitObserved) {
+      try {
+        await handleBashPost(payload, { env, home, ...(call ? { call } : {}) })
+      } catch {
+        /* non-fatal */
+      }
     }
     try {
       const repoNudge = await checkRepoLinkAfterTool(payload, { env, ...(call ? { call } : {}) })
@@ -223,6 +236,17 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
     }
   }
 
+  // 2b. Report the commits the git stand-in saw. Every PostToolUse reads the journal,
+  //     not only run_command's: a command left running in the background can commit
+  //     after its own call has returned.
+  if (connectionId) {
+    try {
+      await reportObservedCommits({ connectionId, home, budgetMs: 6_000, ...(call ? { call } : {}) })
+    } catch {
+      /* reporting never fails the hook */
+    }
+  }
+
   // 3. Room unread post-tool notice
   const unreadRaw = postToolNotice({ input: payload, env, home })
   if (unreadRaw) {
@@ -267,5 +291,5 @@ async function main() {
   process.exit(0)
 }
 
-const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
+const isMain = isEntryPoint(import.meta.url)
 if (isMain) main()

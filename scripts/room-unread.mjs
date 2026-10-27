@@ -21,6 +21,7 @@ import { fileURLToPath } from 'node:url'
 import { resolveHookConversationId } from './mirror-turn.mjs'
 import { ensurePrivateDir } from './private-state.mjs'
 import { readLocalBond, readStateFile } from './remote-control-state.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 export const READ_STATE_VERSION = 1
 // One page of unread messages per run. Antigravity's run_command drops the START of
@@ -719,6 +720,6 @@ function main(argv) {
   return 2
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === SCRIPT_PATH) {
+if (isEntryPoint(import.meta.url)) {
   process.exitCode = main(process.argv.slice(2))
 }

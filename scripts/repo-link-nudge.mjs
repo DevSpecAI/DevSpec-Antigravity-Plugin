@@ -24,12 +24,12 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { commitRepoDir } from './commit-observation.mjs'
 import { stateDir } from './commit-provenance.mjs'
 import { findProjectPin, gitRemoteOrigin } from './devspec-scope.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 const LOOKUP_TIMEOUT_MS = 8_000
 
@@ -178,8 +178,7 @@ async function main() {
   if (out) process.stdout.write(JSON.stringify(out) + '\n')
 }
 
-const isMain =
-  Boolean(process.argv[1]) && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
+const isMain = isEntryPoint(import.meta.url)
 
 if (isMain) {
   main().catch(() => {})

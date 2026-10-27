@@ -1,21 +1,23 @@
 #!/usr/bin/env node
 /**
  * Best-effort direct-commit observations, never a Git gate (P4 / 3d1f5f9d).
- * Snapshots git state before `run_command` / `Bash` direct commit invocations and
- * reports newly created commit SHAs via `report_commit_provenance` along with
- * active `task_id` and `provenance_ref` context when available.
+ *
+ * The FALLBACK path (item 9e385793). Commits are observed by the git stand-in on the
+ * agent's PATH (`git-observer.mjs`), which reads what git did. This older path reads
+ * the command text instead, so it sees only a plain `git commit -m …` (optionally
+ * after `cd … &&` or with `-C`), and it runs only where the stand-in cannot: on
+ * Windows, or when the stand-in's folder could not be set up. It snapshots the head
+ * before the command, confirms the new commit from the repository afterwards, and
+ * queues the report through `commit-reports.mjs` (retried, and logged either way).
  */
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { mcpToolsCall } from './mcp-call.mjs'
+import { enqueueCommitReports, flushCommitReports, sanitizeRemote } from './commit-reports.mjs'
 import {
-  canonicalRepo,
   heredocGitCommit,
-  readClaimDetails,
-  referenceIn,
   resolveProvenanceCwd,
   resolveProvenanceSessionId,
   simpleGitCommit,
@@ -23,10 +25,9 @@ import {
 } from './commit-provenance.mjs'
 import { devspecFolderMarker, findProjectPin, gitRemoteOrigin, mainWorkTreeFrom } from './devspec-scope.mjs'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
-import { readRequestState } from './requests.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
-const REPORT_TIMEOUT_MS = 2_500
 const OBSERVATION_TTL_MS = 10 * 60_000
 const MAX_PENDING = 100
 const FULL_SHA = /^[0-9a-f]{40}$/i
@@ -92,21 +93,11 @@ export function looksCommitProducing(command) {
   return Boolean(simpleGitCommit(command) ?? heredocGitCommit(command))
 }
 
-function safeRemote(raw) {
-  if (!raw) return null
-  if (/^git@[A-Za-z0-9.-]+:[A-Za-z0-9_./-]+$/.test(raw)) return raw
-  try {
-    const url = new URL(raw)
-    if (!['https:', 'http:', 'ssh:'].includes(url.protocol) || url.password || url.search || url.hash) return null
-    if (url.username && !(url.protocol === 'ssh:' && url.username === 'git')) return null
-    return url.toString()
-  } catch { return null }
-}
-
-function repositoryBinding(repoDir, env = process.env) {
-  if (!inJurisdiction(repoDir, env)) return null
+function repositoryBinding(repoDir) {
+  // DevSpec decides the project from the remote and refuses an untracked one; the
+  // pin is only for a repository with no remote (as in Pi), never a precondition.
   const rawRemote = gitRemoteOrigin(repoDir)
-  const remote = safeRemote(rawRemote)
+  const remote = sanitizeRemote(rawRemote)
   if (rawRemote && !remote) return null
   const pin = findProjectPin(repoDir)?.project_id
   if (pin && !UUID.test(pin)) return null
@@ -185,30 +176,6 @@ function reflog(repoDir, count) {
   return git(['reflog', 'show', `-${count}`, '--date=raw', '--format=%H%x09%gD%x09%gs', 'HEAD'], repoDir)
 }
 
-function resolveActiveClaimContext(sessionId, repoDir, state, commitMessage, env = process.env) {
-  const scope = { sessionId, cwd: repoDir, repoRoot: canonicalRepo(repoDir) }
-  const claim = readClaimDetails(scope, { env })
-  const msgRef = referenceIn(commitMessage)
-  const taskId = claim?.task_id ?? msgRef ?? null
-  let provenanceRef = claim?.provenance_ref ?? null
-  if (!provenanceRef && state?.connection_id) {
-    try {
-      const reqState = readRequestState(state.connection_id)
-      if (reqState?.serving && typeof reqState.serving === 'string') {
-        provenanceRef = reqState.serving
-      } else if (reqState?.turn?.size === 1) {
-        provenanceRef = [...reqState.turn][0]
-      }
-    } catch {
-      /* ignore */
-    }
-  }
-  if (!provenanceRef && typeof state?.last_command_delivery_id === 'string' && state.last_command_delivery_id) {
-    provenanceRef = state.last_command_delivery_id
-  }
-  return { task_id: taskId, provenance_ref: provenanceRef }
-}
-
 export function handleBashPre(input, options = {}) {
   try {
     const env = options.env ?? process.env
@@ -221,7 +188,7 @@ export function handleBashPre(input, options = {}) {
     const file = markerPath(sessionId, input, repoDir, env)
     fs.rmSync(file, { force: true })
     const binding = connectionBinding((options.boundConnection ?? boundConnection)(sessionId))
-    const repository = repositoryBinding(repoDir, env)
+    const repository = repositoryBinding(repoDir)
     if (!binding || !repository) return null
     const now = options.now ?? Date.now()
     const sha = readHead(repoDir)
@@ -286,7 +253,7 @@ export async function handleBashPost(input, options = {}) {
     const cwd = resolveProvenanceCwd(input)
     const invocation = directInvocation(extractCommand(input), cwd)
     if (!invocation) return null
-    const { repoDir, message } = invocation
+    const { repoDir } = invocation
     const before = consumeMarker(markerPath(sessionId, input, repoDir, env))
     const now = options.now ?? Date.now()
     if (!before || before.version !== 1 || !Number.isFinite(before.at) || now < before.at || now - before.at > OBSERVATION_TTL_MS) {
@@ -305,35 +272,29 @@ export async function handleBashPost(input, options = {}) {
     }
     const state = (options.boundConnection ?? boundConnection)(sessionId)
     if (connectionBinding(state) !== before.binding) return null
-    const repository = repositoryBinding(repoDir, env)
+    const repository = repositoryBinding(repoDir)
     if (!repository || digest(repository) !== digest(before.repository)) return null
     const sha = createdSha(repoDir, before, now)
     if (!sha) return null
-    const activeClaim = resolveActiveClaimContext(sessionId, repoDir, state, message, env)
-    await (options.call ?? mcpToolsCall)({
-      mcpUrl: state.mcp_url,
-      token: state.token,
-      connectionCapability: state.connection_capability ?? null,
-      name: 'report_commit_provenance',
-      arguments: {
-        connection_id: state.connection_id,
-        commit_sha: sha,
-        observation_id: before.observationId,
+    enqueueCommitReports(
+      [{
+        connectionId: state.connection_id,
+        sha,
         branch: before.branch.replace(/^refs\/heads\//, ''),
-        ...(repository.remote ? { git_remote: repository.remote } : { pinned_project_id: repository.pin }),
-        ...(options.includeClaimArguments && activeClaim.task_id
-          ? { task_id: activeClaim.task_id }
-          : {}),
-        ...(options.includeClaimArguments && activeClaim.provenance_ref
-          ? { provenance_ref: activeClaim.provenance_ref }
-          : {}),
-      },
-      ...(activeClaim.task_id ? { task_id: activeClaim.task_id } : {}),
-      ...(activeClaim.provenance_ref ? { provenance_ref: activeClaim.provenance_ref } : {}),
-      timeoutMs: options.timeoutMs ?? REPORT_TIMEOUT_MS,
+        observationId: before.observationId,
+        worktree: repoDir,
+        ...(repository.remote ? { remote: repository.remote } : { pin: repository.pin }),
+      }],
+      { now, home: options.home ?? os.homedir() },
+    )
+    await flushCommitReports({
+      now,
+      home: options.home ?? os.homedir(),
+      budgetMs: options.budgetMs ?? 6_000,
+      ...(options.call ? { call: options.call } : {}),
     })
   } catch {
-    /* no retry under a later bond; server ingestion remains the backstop */
+    /* observation never affects git; a report that failed waits in the queue */
   }
   return null
 }
@@ -347,4 +308,4 @@ async function main() {
     /* malformed envelopes and every observation failure fail open */
   }
 }
-if (import.meta.url === `file://${process.argv[1]}`) main().catch(() => {})
+if (isEntryPoint(import.meta.url)) main().catch(() => {})

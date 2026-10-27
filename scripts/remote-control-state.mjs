@@ -84,6 +84,7 @@ import { AGENT_NAME } from './agent-identity.mjs'
 import { processStartTime } from './close-on-end.mjs'
 import { saveConversationProject } from './conversation-project.mjs'
 import { findProjectPin, gitRemoteOrigin } from './devspec-scope.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 const DEVSPEC_DIR = path.join(os.homedir(), '.devspec')
 const LEGACY_PATH = path.join(DEVSPEC_DIR, 'remote-control.json')
@@ -1617,9 +1618,7 @@ export async function writeConnectionState({
 }
 
 // --- CLI entry (skipped when imported for tests) ---
-const isMain =
-  Boolean(process.argv[1]) &&
-  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
+const isMain = isEntryPoint(import.meta.url)
 
 if (isMain) {
   const args = parseArgs(process.argv.slice(2))

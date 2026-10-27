@@ -408,7 +408,7 @@ describe('commit-observation.mjs — pre/post git commit observation', () => {
     local_id: CONVERSATION,
   }
 
-  it('snapshots git state before run_command git mutations and reports new commit SHAs via report_commit_provenance with active task_id and provenance_ref', async () => {
+  it('snapshots git state before run_command git mutations and reports new commit SHAs via report_commit_provenance', async () => {
     // Active claim in this conversation+repo
     handlePost(
       {
@@ -443,6 +443,10 @@ describe('commit-observation.mjs — pre/post git commit observation', () => {
     handleBashPre(event, { env, boundConnection: () => connState })
     const res = spawnSync('sh', ['-c', command], { cwd: repo, encoding: 'utf8' })
     assert.equal(res.status, 0, res.stderr)
+    // The report is sent from the queue with the key the connection's state holds.
+    const connDir = path.join(sandbox, '.devspec', 'remote-control', 'connections')
+    fs.mkdirSync(connDir, { recursive: true, mode: 0o700 })
+    fs.writeFileSync(path.join(connDir, `${connState.connection_id}.json`), JSON.stringify(connState), { mode: 0o600 })
 
     const calls = []
     await handleBashPost(
@@ -452,8 +456,8 @@ describe('commit-observation.mjs — pre/post git commit observation', () => {
       },
       {
         env,
+        home: sandbox,
         boundConnection: () => connState,
-        includeClaimArguments: true,
         call: async (val) => {
           calls.push(val)
         },
@@ -465,11 +469,11 @@ describe('commit-observation.mjs — pre/post git commit observation', () => {
     assert.equal(calls[0].arguments.connection_id, connState.connection_id)
     assert.equal(calls[0].arguments.commit_sha, git(['rev-parse', 'HEAD'], repo))
     assert.equal(calls[0].arguments.pinned_project_id, PROJECT)
-    assert.equal(calls[0].task_id, ITEM)
-    assert.equal(calls[0].provenance_ref, PROV_REF)
-    assert.equal(calls[0].arguments.task_id, ITEM)
-    assert.equal(calls[0].arguments.provenance_ref, PROV_REF)
     assert.match(calls[0].arguments.observation_id, /^[0-9a-f-]{36}$/)
+    // Only what report_commit_provenance takes: the server refuses any other argument.
+    for (const key of Object.keys(calls[0].arguments)) {
+      assert.ok(['connection_id', 'commit_sha', 'branch', 'observation_id', 'git_remote', 'pinned_project_id'].includes(key), key)
+    }
   })
 
   it('works end-to-end through runDevspecToolInput and runPostToolDispatch when auto-stamping a commit', async () => {
@@ -527,14 +531,13 @@ describe('commit-observation.mjs — pre/post git commit observation', () => {
       },
       {
         env,
+        home: sandbox,
         boundConnection: () => connState,
         call: async (val) => calls.push(val),
       },
     )
     assert.equal(calls.length, 1)
     assert.equal(calls[0].arguments.commit_sha, git(['rev-parse', 'HEAD'], repo))
-    assert.equal(calls[0].task_id, ITEM)
-    assert.equal(calls[0].provenance_ref, PROV_REF)
   })
 
   it('ignores failed commits, non-commit commands, and unmarked repos', async () => {
@@ -555,7 +558,7 @@ describe('commit-observation.mjs — pre/post git commit observation', () => {
     const calls = []
     await handleBashPost(
       { ...failedEvent, tool_response: { exit_code: 1 } },
-      { env, boundConnection: () => connState, call: async (v) => calls.push(v) },
+      { env, home: sandbox, boundConnection: () => connState, call: async (v) => calls.push(v) },
     )
     assert.equal(calls.length, 0)
   })

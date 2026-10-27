@@ -6,6 +6,7 @@ When working in a DevSpec-connected project or remote-controlled session in Anti
    - Work entry, task tracking, claiming (`reserve_work_items`, `claim_work_item`), commit provenance (`[devspec:<id>]`), and completion reporting (`record_implementation`, `record_criterion_verdicts`) are governed by [`devspec://product/implementation-contract`](devspec://product/implementation-contract).
    - Connecting MCP or receiving advisory room context is not a request to mutate DevSpec. Start tracked work only from an explicit local user request or a server-authorized remote command (`type: "owner_message"` or `type: "automation_run"`).
    - `PreToolUse` (`scripts/devspec-tool-input.mjs`) stamps `connection_id`, `project_id`, `local_session_id`, `agent_name` and who asked (`provenance_ref` / `request_ref`) onto DevSpec MCP calls; never pass them yourself.
+   - While connected, it also puts one `export PATH=… # devspec-git-observer v1` line in front of each `run_command`, so a stand-in for `git` reports every commit you make to DevSpec (that is the "pre-tool hook changed the arguments" notice). Git runs unchanged: write and run commands as usual.
    - Who may change what is the contract's `authority_contract`, decided by the server on every write. When a result and these rules seem to disagree, the result and the served contract win.
 
 2. **Protecting intent: work that waits, experiments, findings, records.**

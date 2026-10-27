@@ -18,7 +18,6 @@ import { execFile } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { pathToFileURL } from 'node:url'
 import { AGENT_NAME } from './agent-identity.mjs'
 import {
   closeAntigravityOnEnd,
@@ -43,6 +42,7 @@ import {
 import { ensurePrivateDir, writePrivateText } from './private-state.mjs'
 import { recordDeliveredBatchRequests } from './requests.mjs'
 import { autoConnectAtStartup, connectAtStartupEnabled } from './session-start.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 
@@ -1046,7 +1046,7 @@ async function main() {
   }
 }
 
-const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
+const isMain = isEntryPoint(import.meta.url)
 if (isMain) {
   main().catch((e) => {
     process.stderr.write(`devspec-remote-listen: ${e.message}\n`)
