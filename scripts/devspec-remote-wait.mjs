@@ -15,7 +15,6 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import {
   attachmentDirFor,
   describeAttachment,
@@ -53,6 +52,7 @@ import {
 } from './remote-ingress-v1.mjs'
 import { recordDeliveredBatchRequests } from './requests.mjs'
 import { wakeNotice } from './room-unread.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 export { describeAttachment, materialiseAttachments, MAX_INLINE_ATTACHMENT_CHARS }
 
@@ -1194,8 +1194,7 @@ async function main() {
   process.exit(EXIT_REARM)
 }
 
-const isMain =
-  Boolean(process.argv[1]) && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
+const isMain = isEntryPoint(import.meta.url)
 
 if (isMain) {
   main().catch((e) => {

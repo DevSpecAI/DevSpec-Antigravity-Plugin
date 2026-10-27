@@ -10,8 +10,8 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { gitRoot } from './devspec-scope.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 const PIN_RELATIVE = path.join('.devspec', 'project.json')
 const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
@@ -115,8 +115,7 @@ async function main() {
   if (out) process.stdout.write(JSON.stringify(out) + '\n')
 }
 
-const isMain =
-  Boolean(process.argv[1]) && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
+const isMain = isEntryPoint(import.meta.url)
 
 if (isMain) {
   main().catch(() => {})

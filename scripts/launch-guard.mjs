@@ -11,7 +11,6 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import {
   readRequestState,
   servableCarried,
@@ -21,6 +20,7 @@ import {
 } from './requests.mjs'
 import { resolveHookConversationId } from './mirror-turn.mjs'
 import { readLocalBond, readStateFile, resolveOwnerPid } from './remote-control-state.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 export function resolveOwnConnectionId(
   conversationId,
@@ -91,12 +91,7 @@ export function launchGuard(input, { home = os.homedir(), env = process.env } = 
   }
 }
 
-let isMain = false
-try {
-  isMain = Boolean(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))
-} catch {
-  /* imported */
-}
+const isMain = isEntryPoint(import.meta.url)
 if (isMain) {
   try {
     const out = launchGuard(JSON.parse(fs.readFileSync(0, 'utf8') || '{}'))

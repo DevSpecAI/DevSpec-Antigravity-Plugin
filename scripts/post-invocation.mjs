@@ -10,7 +10,6 @@
 
 import fs from 'node:fs'
 import os from 'node:os'
-import { pathToFileURL } from 'node:url'
 import { pendingNudgeNotice } from './commit-provenance.mjs'
 import {
   loadState,
@@ -19,6 +18,7 @@ import {
   syncStateTranscriptPath,
 } from './mirror-turn.mjs'
 import { invocationNotice } from './room-unread.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 function readStdin() {
   try {
@@ -79,5 +79,5 @@ async function main() {
   process.exit(0)
 }
 
-const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
+const isMain = isEntryPoint(import.meta.url)
 if (isMain) main()

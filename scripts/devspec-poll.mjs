@@ -21,9 +21,9 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { mcpToolsCall, mcpToolsList } from './mcp-call.mjs'
 import { readPrivateJson } from './private-state.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -206,9 +206,7 @@ async function main() {
   process.stdout.write(JSON.stringify(result, null, 2) + '\n')
 }
 
-const isMain =
-  Boolean(process.argv[1]) &&
-  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
+const isMain = isEntryPoint(import.meta.url)
 if (isMain) {
   main().catch((error) => {
     process.stderr.write(`devspec-poll: ${error?.message || String(error)}\n`)

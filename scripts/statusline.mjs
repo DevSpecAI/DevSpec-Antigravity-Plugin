@@ -37,6 +37,7 @@ import { ensurePrivateDir } from './private-state.mjs'
 import { ownerAlive, resolveOwnerPid } from './remote-control-state.mjs'
 import { DEFAULT_PROD_URL, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { connectAtStartupEnabled } from './session-start.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 const REMOTE_DIR = '.devspec/remote-control'
 const AGENT_DIR = AGENT_NAME.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
@@ -876,8 +877,7 @@ async function main() {
   if (line) process.stdout.write(line + '\n')
 }
 
-const isMain =
-  Boolean(process.argv[1]) && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
+const isMain = isEntryPoint(import.meta.url)
 
 if (isMain) {
   main().catch(() => process.exit(0))

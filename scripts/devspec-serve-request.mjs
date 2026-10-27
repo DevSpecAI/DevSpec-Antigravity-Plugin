@@ -9,7 +9,6 @@
  */
 
 import fs from 'node:fs'
-import { fileURLToPath } from 'node:url'
 import {
   appendRequestEvent,
   describeCarried,
@@ -20,6 +19,7 @@ import {
   turnAmbiguity,
   undecidedTurnMessage,
 } from './requests.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 export {
   appendRequestEvent,
@@ -32,12 +32,7 @@ export {
   undecidedTurnMessage,
 }
 
-let isMain = false
-try {
-  isMain = Boolean(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))
-} catch {
-  /* imported */
-}
+const isMain = isEntryPoint(import.meta.url)
 if (isMain) {
   const result = serveMain(process.argv.slice(2))
   process.stdout.write(`${JSON.stringify(result)}\n`)

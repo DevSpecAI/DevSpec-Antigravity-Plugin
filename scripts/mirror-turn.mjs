@@ -17,7 +17,6 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { pathToFileURL } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { ensurePrivateDir, writePrivateJson } from './private-state.mjs'
@@ -53,6 +52,7 @@ import {
 } from './notice-reply.mjs'
 import { recordMirroredLocalPrompt } from './room-unread.mjs'
 import { readConnectionTelemetry } from './statusline.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 const MODES = new Set(['user_prompt', 'stop', 'background_launch', 'subagent_stop'])
 const mode = MODES.has(process.argv[2]) ? process.argv[2] : 'stop'
@@ -1947,6 +1947,18 @@ export async function handleMirrorTurn(
         }
       }
 
+      // Report what the git stand-in saw this turn, and retry what is waiting
+      // (commit-reports.mjs). Only for the real state folder, whose home it lives in.
+      const stateHome = path.dirname(path.dirname(path.dirname(path.resolve(connectionsDir))))
+      if (connectionId && path.join(stateHome, '.devspec', 'remote-control', 'connections') === path.resolve(connectionsDir)) {
+        try {
+          const { reportObservedCommits } = await import('./commit-reports.mjs')
+          await reportObservedCommits({ connectionId, home: stateHome, call, budgetMs: 6_000 })
+        } catch {
+          /* reporting never fails the hook */
+        }
+      }
+
       if (connectionId) {
         await call({
           mcpUrl,
@@ -2041,5 +2053,5 @@ async function main() {
   process.exit(0)
 }
 
-const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
+const isMain = isEntryPoint(import.meta.url)
 if (isMain) main()

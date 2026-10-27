@@ -64,6 +64,7 @@ import {
 } from './repository-context.mjs'
 import { formatMissingAuthMessage, hostTokenFromEnv, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { transcriptPaths } from './room-unread.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 const CONNECT_ATTEMPTS = 3
 const CONNECT_BACKOFF_MS = [300, 1_200]
@@ -764,9 +765,7 @@ async function main() {
   process.exit(0)
 }
 
-const isMain =
-  Boolean(process.argv[1]) &&
-  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
+const isMain = isEntryPoint(import.meta.url)
 
 if (isMain) {
   main().catch((e) => {

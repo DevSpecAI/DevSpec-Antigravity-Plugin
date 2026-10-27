@@ -21,10 +21,10 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { handleBashPre } from './commit-observation.mjs'
 import { handlePre } from './commit-provenance.mjs'
+import { prepareGitObservation } from './git-observer.mjs'
 import { versionedConnectionArguments } from './connection-version.mjs'
 import { launchGuard, resolveOwnConnectionId } from './launch-guard.mjs'
 import {
@@ -42,6 +42,7 @@ import { PROVENANCE_REF_TOOLS, REQUEST_REF_TOOLS, stampRequest } from './request
 import { readRequestState } from './requests.mjs'
 import { prePostHoldObject } from './room-unread.mjs'
 import { readConnectionTelemetry } from './statusline.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 const CONNECTION_SUBJECT = /(?:^|_)connection(?:_|$)|^report_(?:pickup|keepalive|complete|request)$/
 
@@ -504,6 +505,33 @@ export async function runDevspecToolInput(raw = '', options = {}) {
   const effectiveInput = prov?.hookSpecificOutput?.updatedInput
     ? { ...parsed, tool_input: prov.hookSpecificOutput.updatedInput }
     : parsed
+
+  // The agent's commits are noted by the git stand-in on its shell PATH, whatever the
+  // command looks like (git-observer.mjs). The older observation, which reads the
+  // command text, runs only where the stand-in cannot: Windows, or a folder that
+  // could not be set up.
+  const rawArgs = parsed.tool_input ?? parsed.toolInput ?? parsed.toolCall?.args
+  const effectiveArgs = prov?.hookSpecificOutput?.updatedInput ??
+    (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs) ? rawArgs : null)
+  const observed = effectiveArgs ? prepareGitObservation(parsed, { ...options, args: effectiveArgs }) : null
+  if (observed) {
+    const overwrite = { ...effectiveArgs, CommandLine: observed.command }
+    // Antigravity applies `overwrite` only with a decision, and refuses the call when
+    // there is none. `ask` leaves the decision where it was (measured with agy 1.4.8):
+    // a command the person's allow-rules or --dangerously-skip-permissions already
+    // allow still runs at once, and any other still asks. `allow` would skip that.
+    const result = {
+      ...(prov ?? {}),
+      decision: 'ask',
+      overwrite,
+      hookSpecificOutput: { ...(prov?.hookSpecificOutput ?? {}), hookEventName: 'PreToolUse', updatedInput: overwrite },
+    }
+    // Antigravity drops a hook's whole answer past its line limit, and with it any
+    // commit-message stamp above; then the command goes out as it was, unobserved.
+    if (Buffer.byteLength(`${JSON.stringify(toProtoPreToolResult(result))}\n`, 'utf8') < HOOK_STDOUT_LIMIT_BYTES) {
+      return result
+    }
+  }
   handleBashPre(effectiveInput, options)
 
   if (prov?.hookSpecificOutput?.updatedInput) {
@@ -549,12 +577,7 @@ export function toProtoPreToolResult(out) {
   return proto
 }
 
-let isMain = false
-try {
-  isMain = Boolean(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))
-} catch {
-  /* imported */
-}
+const isMain = isEntryPoint(import.meta.url)
 if (isMain) {
   ;(async () => {
     try {

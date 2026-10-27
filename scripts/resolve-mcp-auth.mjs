@@ -35,6 +35,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { pluginHeaders } from './connection-version.mjs'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 export const DEFAULT_PROD_URL = 'https://devspec.ai/api/mcp'
 
@@ -464,7 +465,7 @@ export async function verifyAndPinDevspecAuth(
 }
 
 // CLI
-if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith('resolve-mcp-auth.mjs')) {
+if (isEntryPoint(import.meta.url)) {
   // Reflect the same host-token preference the write path uses, for diagnostics.
   // The key is reported by its fingerprint only.
   const result = resolveDevspecMcpAuth(process.cwd(), { hostToken: hostTokenFromEnv(process.env) })

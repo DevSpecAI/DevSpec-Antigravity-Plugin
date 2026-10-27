@@ -13,7 +13,6 @@ import { createHash, randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { AGENT_NAME } from './agent-identity.mjs'
 import {
   matchingProjects,
@@ -29,6 +28,7 @@ import {
   scanConnectionStates,
 } from './remote-control-state.mjs'
 import { hostTokenFromEnv, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 function fingerprint(file) {
   try {
@@ -277,7 +277,7 @@ async function main() {
   process.stdout.write(JSON.stringify(manageProjectDefault(action, { ...options, state })) + '\n')
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isEntryPoint(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`${error.message}\n`)
     process.exitCode = 1

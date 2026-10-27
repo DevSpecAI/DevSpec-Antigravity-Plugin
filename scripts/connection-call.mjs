@@ -3,13 +3,12 @@
 // this narrow mechanical lifecycle caller instead of asking the model to report a
 // version, so its model calls no connection plumbing itself: DevSpec lists only model
 // tools to a host that declares none.
-import { realpathSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
 import { hostname } from 'node:os'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { versionedConnectionArguments } from './connection-version.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 const LIFECYCLE_CALLS = ['register_connection', 'attach_connection', 'heartbeat_connection', 'detach_connection']
 const fields = new Map([['--project-id', 'project_id'], ['--local-id', 'local_id'], ['--connection-id', 'connection_id'], ['--session', 'session_id'], ['--cwd', 'cwd'], ['--name', 'name'], ['--git-remote', 'git_remote'], ['--pinned-project-id', 'pinned_project_id'], ['--status', 'status'], ['--end-reason', 'end_reason']])
@@ -51,8 +50,7 @@ export async function runConnectionCall(name, args, { resolveAuth = resolveDevsp
   } catch (error) { throw new Error(publicConnectionResult(error instanceof Error ? error.message : String(error), auth.token)) }
 }
 
-let main = false
-try { main = !!process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)) } catch {}
+const main = isEntryPoint(import.meta.url)
 if (main) {
   try {
     const { name, args } = parseConnectionCall(process.argv.slice(2))

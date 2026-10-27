@@ -16,6 +16,7 @@ import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { ensurePrivateDir } from './private-state.mjs'
+import { isEntryPoint } from './entry-point.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const KEY = /^[A-Za-z0-9_.:-]{1,128}$/
@@ -709,12 +710,7 @@ export function serveMain(
   }
 }
 
-let isMain = false
-try {
-  isMain = Boolean(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))
-} catch {
-  /* imported */
-}
+const isMain = isEntryPoint(import.meta.url)
 if (isMain && (process.argv[2] === 'serve' || process.argv.includes('--connection-id'))) {
   const result = serveMain(process.argv.slice(2))
   process.stdout.write(`${JSON.stringify(result)}\n`)
