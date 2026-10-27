@@ -10,7 +10,7 @@ Connect [Google Antigravity CLI](https://antigravity.google/product/antigravity-
 - **Node.js 18 or later** (`node --version` — install from [nodejs.org](https://nodejs.org/en/download) if needed) and **`git`** on your `PATH`
 - A **[DevSpec](https://devspec.ai)** access token (`dvs_…`) with **Read & write** access from your [Agent setup](https://app.devspec.ai/settings/agents) page
 
-Full commit tracking — every commit reported to DevSpec and tagged with its task automatically — needs macOS, Linux, or Windows through WSL. On native Windows, Antigravity falls back to the simpler check that reads the command, which catches single-line commits only.
+Full commit tracking — every commit reported to DevSpec and tagged with its task automatically — needs macOS, Linux, or Windows through WSL. On native Windows, Antigravity falls back to the simpler check that reads the command, which catches single-line commits only, in a folder with a `.devspec/project.json` pin.
 
 ## Setup
 

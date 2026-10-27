@@ -92,7 +92,7 @@ describe('MCP-served implementation contract', () => {
     assert.deepEqual(hooks['devspec-remote-control-mirror'].PreInvocation, [
       {
         type: 'command',
-        command: 'node "./scripts/pre-invocation.mjs"',
+        command: 'node ./scripts/pre-invocation.mjs',
         timeout: 10,
       },
     ])

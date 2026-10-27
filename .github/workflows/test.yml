@@ -1,0 +1,43 @@
+# The git stand-in and the hooks around it, on Linux and on native Windows, including
+# a real agy (the release pinned in e2e/agy-release.mjs) driven by a scripted model.
+# Scoped on purpose: the rest of the suite runs locally (see README).
+name: test
+
+on:
+  pull_request:
+    branches: [staging, main]
+  push:
+    branches: [staging]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stand-in:
+    name: stand-in (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Unit tests (git stand-in, commit tagging, hooks)
+        if: runner.os == 'Linux'
+        run: node --test scripts/git-observer.test.mjs scripts/shim-stamping.test.mjs scripts/commit-provenance.test.mjs scripts/entry-point.test.mjs scripts/hooks-json.test.mjs
+      - name: Unit tests (hooks)
+        if: runner.os == 'Windows'
+        run: node --test scripts/hooks-json.test.mjs
+      - name: End to end with the real agy
+        env:
+          AGY_E2E: '1'
+        run: node --test e2e/agy.e2e.test.mjs

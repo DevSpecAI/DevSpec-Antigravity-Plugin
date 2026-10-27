@@ -28,8 +28,15 @@
  * envelope file this hook writes, which the journal line is matched against.
  *
  * Not covered, and why:
- * - Windows: Antigravity runs commands there in a shell this POSIX line does not fit,
- *   so no prefix is added and the older `commit-observation.mjs` path applies.
+ * - Native Windows. agy runs each command there with PowerShell (`pwsh -Command`, or
+ *   `powershell -Command` without PowerShell 7), and a PowerShell line in front would
+ *   reach git (measured with agy 1.4.8). But on Windows agy checks the person's
+ *   permission rules against the rewritten command and matches a PowerShell command
+ *   whole, so any added line stops their allow rules from matching (every command
+ *   would ask) and can take the command past their deny rules. The hook cannot see the
+ *   grants made during a conversation, so it cannot tell when that would happen. No
+ *   prefix is added there; the older `commit-observation.mjs` path applies.
+ *   e2e/agy.e2e.test.mjs holds both platforms to this with the real agy.
  * - A git found by absolute path (`/usr/bin/git commit`), or a command that resets PATH
  *   (`env -i`), bypasses the stand-in.
  * - Commits git makes for commands other than `commit` (merge, cherry-pick, revert,
