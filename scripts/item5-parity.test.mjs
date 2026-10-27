@@ -708,7 +708,7 @@ describe('Item 5 Parity: statusline.mjs rendering and telemetry', () => {
         assert.equal(req.arguments.limit, 1)
         return { id: SESS_ID, title: 'Fix login redirect' }
       },
-      mcpUrl: 'https://devspec.ai/api/mcp',
+      mcpUrl: 'https://api.devspec.ai/api/mcp',
       token: 'dvs_test',
       sessionId: SESS_ID,
     })

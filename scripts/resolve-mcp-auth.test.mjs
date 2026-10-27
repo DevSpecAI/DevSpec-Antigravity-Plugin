@@ -148,7 +148,7 @@ describe('resolveDevspecMcpAuth (Antigravity)', { concurrency: false }, () => {
     process.env.DEVSPEC_MCP_TOKEN = 'dvs_env_only'
     const auth = resolveDevspecMcpAuth(d)
     assert.equal(auth.ok, true)
-    assert.equal(auth.mcp_url, 'https://devspec.ai/api/mcp')
+    assert.equal(auth.mcp_url, 'https://api.devspec.ai/api/mcp')
   })
 
   it('defaults to the production API host when the config entry has a token but no URL', () => {
@@ -161,7 +161,7 @@ describe('resolveDevspecMcpAuth (Antigravity)', { concurrency: false }, () => {
     )
     const auth = resolveDevspecMcpAuth(d)
     assert.equal(auth.token, 'dvs_no_url')
-    assert.equal(auth.mcp_url, 'https://devspec.ai/api/mcp')
+    assert.equal(auth.mcp_url, 'https://api.devspec.ai/api/mcp')
   })
 
   it('honours a staging serverUrl override rather than falling back to production', () => {

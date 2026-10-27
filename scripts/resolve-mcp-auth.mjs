@@ -37,7 +37,7 @@ import { pluginHeaders } from './connection-version.mjs'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
-export const DEFAULT_PROD_URL = 'https://devspec.ai/api/mcp'
+export const DEFAULT_PROD_URL = 'https://api.devspec.ai/api/mcp'
 
 export function formatMissingAuthMessage(platform = process.platform) {
   const configPath =

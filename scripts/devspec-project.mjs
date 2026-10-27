@@ -215,7 +215,7 @@ export function resolveActiveConversationProject(
       version: 1,
       status: 'selected',
       local_id: effectiveLocalId || matchingConn.local_id || null,
-      endpoint: matchingConn.mcp_url || endpoint || 'https://devspec.ai/api/mcp',
+      endpoint: matchingConn.mcp_url || endpoint || 'https://api.devspec.ai/api/mcp',
       project: {
         id: matchingConn.project_id,
         name: matchingConn.project_name || matchingConn.project_id,
