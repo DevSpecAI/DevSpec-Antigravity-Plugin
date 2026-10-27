@@ -143,7 +143,7 @@ function isStandIn(file, home) {
 export function findRealGit(env = process.env, home = os.homedir()) {
   for (const dir of String(env.PATH || '').split(path.delimiter)) {
     if (!dir) continue
-    const candidate = path.join(dir, 'git')
+    const candidate = path.join(dir, process.platform === 'win32' ? 'git.exe' : 'git') // DELIBERATELY BROKEN: finds git on Windows
     if (isExecutable(candidate) && !isStandIn(candidate, home)) {
       try {
         return fs.realpathSync(candidate)
