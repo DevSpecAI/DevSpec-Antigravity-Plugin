@@ -513,16 +513,24 @@ export async function runDevspecToolInput(raw = '', options = {}) {
   const rawArgs = parsed.tool_input ?? parsed.toolInput ?? parsed.toolCall?.args
   const effectiveArgs = prov?.hookSpecificOutput?.updatedInput ??
     (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs) ? rawArgs : null)
+  // The one command shape this hook allows itself: a commit whose message it stamped
+  // with the task tag. Both branches below test exactly this, so the stand-in never
+  // changes which commands are allowed (item 9e385793).
+  const stampedCommit = Boolean(prov?.hookSpecificOutput?.updatedInput)
   const observed = effectiveArgs ? prepareGitObservation(parsed, { ...options, args: effectiveArgs }) : null
   if (observed) {
     const overwrite = { ...effectiveArgs, CommandLine: observed.command }
     // Antigravity applies `overwrite` only with a decision, and refuses the call when
-    // there is none. `ask` leaves the decision where it was (measured with agy 1.4.8):
-    // a command the person's allow-rules or --dangerously-skip-permissions already
-    // allow still runs at once, and any other still asks. `allow` would skip that.
+    // there is none, so the stand-in line must carry one; it keeps the decision the
+    // command had without it. A stamped commit stays `allow`: the line only routes
+    // git through the stand-in, which runs the real git unchanged, so it adds no
+    // capability, and an agent driven from DevSpec must not stall on a prompt at
+    // commit time. Every other command had no decision, and `ask` is that: measured
+    // with agy 1.4.8, the person's allow-rules and --dangerously-skip-permissions
+    // still let a command run at once, and anything else still asks.
     const result = {
       ...(prov ?? {}),
-      decision: 'ask',
+      decision: stampedCommit ? 'allow' : 'ask',
       overwrite,
       hookSpecificOutput: { ...(prov?.hookSpecificOutput ?? {}), hookEventName: 'PreToolUse', updatedInput: overwrite },
     }
@@ -534,7 +542,7 @@ export async function runDevspecToolInput(raw = '', options = {}) {
   }
   handleBashPre(effectiveInput, options)
 
-  if (prov?.hookSpecificOutput?.updatedInput) {
+  if (stampedCommit) {
     return {
       decision: 'allow',
       overwrite: prov.hookSpecificOutput.updatedInput,

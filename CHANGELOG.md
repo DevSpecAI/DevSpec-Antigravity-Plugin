@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.20.1
+
+### A commit the plugin tags is allowed again without a prompt
+
+- In 0.20.0, a commit whose message the plugin stamps with its task tag (`[devspec:<id>]`, when exactly one task is claimed) asked for permission. Before 0.20.0 the plugin allowed it outright. An agent driven from DevSpec, with nobody at the terminal, would have stopped at that prompt when it committed.
+- Every command now gets exactly the decision it had before 0.20.0. A stamped commit is allowed. Every other command defers to your own permission settings and allow-rules, as before. The line that puts the git stand-in on the command adds no permission: it only routes git through the stand-in, which runs the real git unchanged.
+- A self-check now fails if a stamped commit stops being allowed, or if any other command becomes allowed by the plugin.
+
 ## 0.20.0
 
 ### DevSpec learns of every commit the agent makes
