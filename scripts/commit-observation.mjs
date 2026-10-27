@@ -23,7 +23,7 @@ import {
   simpleGitCommit,
   stateDir,
 } from './commit-provenance.mjs'
-import { devspecFolderMarker, findProjectPin, gitRemoteOrigin, mainWorkTreeFrom } from './devspec-scope.mjs'
+import { findProjectPin, gitRemoteOrigin } from './devspec-scope.mjs'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
@@ -127,20 +127,6 @@ export function boundConnection(sessionId, dir = CONNECTIONS_DIR) {
     return candidates.length === 1 ? candidates[0] : null
   } catch {
     return null
-  }
-}
-
-export function inJurisdiction(dir, env = process.env) {
-  try {
-    return Boolean(
-      dir &&
-        devspecFolderMarker(dir, {
-          home: env.USERPROFILE || env.HOME || os.homedir(),
-          mainWorktree: mainWorkTreeFrom(dir),
-        }),
-    )
-  } catch {
-    return false
   }
 }
 

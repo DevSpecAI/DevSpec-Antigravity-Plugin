@@ -17,7 +17,6 @@ import {
   commitRepoDir,
   handleBashPost,
   handleBashPre,
-  inJurisdiction,
 } from './commit-observation.mjs'
 import {
   CONTRACT_URI,
@@ -591,7 +590,6 @@ describe('commit-observation.mjs — pre/post git commit observation', () => {
 
   it('ignores failed commits, non-commit commands, and unmarked repos', async () => {
     assert.equal(commitRepoDir('cd "/tmp/a b" && git commit -m "x"', '/fallback'), '/tmp/a b')
-    assert.equal(inJurisdiction(repo, env), true)
     const connDir = path.join(sandbox, 'conns')
     fs.mkdirSync(connDir, { recursive: true, mode: 0o700 })
     fs.writeFileSync(path.join(connDir, 'c.json'), JSON.stringify(connState), { mode: 0o600 })

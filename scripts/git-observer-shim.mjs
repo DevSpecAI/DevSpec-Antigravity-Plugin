@@ -335,7 +335,12 @@ function readPin(dir) {
   }
 }
 
-/** Whether the repository this commit lands in is one of the project's. */
+/**
+ * Whether the repository this commit lands in is one of the project's: its origin is
+ * one of the project's repositories, or a pin names the project (commit-scope.mjs,
+ * item cdd7f0f3). A folder that merely declares DevSpec in an MCP configuration is
+ * not the project's.
+ */
 function inProjectScope(realGit, globals, stamp) {
   const top = quiet(realGit, [...globals, 'rev-parse', '--show-toplevel'])
   if (!top) return false
@@ -348,7 +353,6 @@ function inProjectScope(realGit, globals, stamp) {
   } catch {
     commonReal = null
   }
-  if (commonReal && Array.isArray(stamp.marked_repos) && stamp.marked_repos.includes(commonReal)) return true
   if (typeof stamp.project_id !== 'string' || !stamp.project_id) return false
   // A pin in the working tree (from where git runs up to its top), or in the main
   // working tree for a linked worktree: the repository, not the folder, decides.

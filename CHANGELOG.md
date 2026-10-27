@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.21.3
+
+### Commits are tagged and checked only in the project's repositories
+
+- **One definition of "the project's repositories", the contract's.** A repository is the project's when its `origin` is one of the connected project's repositories, or when it carries a `.devspec/project.json` pin naming the project, found in the working tree or in the main working tree of a linked worktree. A folder whose MCP configuration only declares DevSpec no longer counts: that says DevSpec is used there, not that the repository belongs to this project, so the plugin could tag or stop commits in a repository the project does not track.
+- **Native Windows matches by origin too.** The simpler check that reads the command, which native Windows uses, now tags a single-line `git commit -m` with your one claimed task, or stops it when none is claimed, in any repository the connected project tracks, with no pin needed. Without a connection, a pin still brings a repository into scope.
+- **Permissions unchanged.** A commit the plugin tags in a pinned repository is still allowed outright. A commit it tags in a repository matched by its origin is not allowed outright: it goes through your own permission rules, as it did before, so no command is allowed that was not allowed before. Where the git stand-in runs, the simpler check still acts only in pinned repositories, so every command keeps its decision. The stand-in no longer receives a list of "marked" folders from the hook.
+- The README and the agent's rules now say native Windows covers the project's repositories, not only pinned folders.
+
 ## 0.21.2
 
 ### The plugin works on native Windows again, and CI checks it there

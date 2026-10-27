@@ -13,7 +13,7 @@
  *   task and reported to DevSpec. On Linux and macOS the git stand-in does this for any
  *   commit; on native Windows agy runs commands in PowerShell, the stand-in is off (it
  *   would change permission decisions there), and the simpler check that reads the
- *   command tags a single-line `git commit -m` in a pinned folder.
+ *   command tags a single-line `git commit -m` in a repository the project tracks.
  */
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -81,8 +81,8 @@ describe(`agy ${windows ? 'on native Windows' : `on ${process.platform}`} with t
     try {
       const root = fresh('commit')
       const { home, pluginDir } = makeHome(root)
-      // The simpler check on Windows acts only in a folder pinned to the project.
-      const { repo, git } = makeRepo(root, { pin: windows })
+      // No pin: on both platforms the repository is the project's by its origin.
+      const { repo, git } = makeRepo(root)
       bindConversation(repo, pluginDir, devspec.url)
       const commands = ['git commit -q --allow-empty -m "e2e single line"']
       if (!windows) commands.push("git commit -q --allow-empty -F - <<'MSG'\ne2e multi-line\n\nBody line.\nMSG")

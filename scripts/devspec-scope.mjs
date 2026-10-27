@@ -6,31 +6,17 @@
  * network, no server round trip — because the callers are a PreToolUse hook that
  * runs before every mutation and a connect script that must work offline:
  *
- *  - WHICH project does this folder belong to?        → `findProjectPin`
- *  - Is this folder part of a DevSpec project AT ALL? → `devspecFolderMarker`
+ *  - WHICH project does this folder belong to?           → `findProjectPin`
+ *  - Which pin covers this repository, from stat calls? → `projectPin`
+ *
+ * Whether a repository is in the connected project's scope for commits is
+ * `commit-scope.mjs`: its origin, or a pin.
  */
 
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-
-/** Names that identify DevSpec in an MCP server / plugin registration. */
-const DEVSPEC_NAME = /devspec/i
-
-/**
- * Per-directory config files that can declare a project-scoped DevSpec
- * registration across Antigravity, Gemini CLI, and Claude Code.
- */
-const MCP_CONFIG_FILES = [
-  ['.mcp.json'],
-  ['.gemini', 'settings.json'],
-  ['.gemini', 'mcp.json'],
-  ['.gemini', 'antigravity-cli', 'mcp_config.json'],
-  ['.claude', 'settings.json'],
-  ['.claude', 'settings.local.json'],
-  ['.claude', 'mcp.json'],
-]
 
 /** `git remote get-url origin`, or null when there is no repo / no origin. */
 export function gitRemoteOrigin(cwd) {
@@ -113,36 +99,6 @@ function readPin(dir) {
     if (id) return { kind: 'pin', project_id: id, path: candidate }
   } catch {
     /* an unreadable or malformed pin is simply not a pin */
-  }
-  return null
-}
-
-function keysOf(value) {
-  return value && typeof value === 'object' && !Array.isArray(value) ? Object.keys(value) : []
-}
-
-function namesDevSpec(values) {
-  return values.some((value) => typeof value === 'string' && DEVSPEC_NAME.test(value))
-}
-
-function declaresDevSpec(parsed) {
-  if (namesDevSpec(keysOf(parsed?.mcpServers))) return true
-  if (Array.isArray(parsed?.enabledMcpjsonServers) && namesDevSpec(parsed.enabledMcpjsonServers)) return true
-  if (namesDevSpec(keysOf(parsed?.enabledPlugins))) return true
-  return false
-}
-
-function readMcpDeclaration(dir) {
-  for (const relative of MCP_CONFIG_FILES) {
-    const candidate = path.join(dir, ...relative)
-    try {
-      if (!fs.existsSync(candidate)) continue
-      if (declaresDevSpec(JSON.parse(fs.readFileSync(candidate, 'utf8')))) {
-        return { kind: 'mcp-config', path: candidate }
-      }
-    } catch {
-      /* an unreadable or malformed config declares nothing */
-    }
   }
   return null
 }
@@ -230,17 +186,23 @@ export function findProjectPin(cwd, { home = os.homedir(), root = undefined, mai
   return fromMain ? { project_id: fromMain.project_id, path: fromMain.path } : null
 }
 
-export function devspecFolderMarker(cwd, {
+/**
+ * The pin covering the repository at `cwd`: one in the working tree from `cwd` up to
+ * its top, else one at the main working tree of a linked worktree (a pin is untracked,
+ * so a linked worktree has none of its own; convention 182fc97f). Stat calls only.
+ * `{ kind: 'pin', project_id, path }` or null.
+ */
+export function projectPin(cwd, {
   home = os.homedir(),
   root = undefined,
   mainWorktree = undefined,
 } = {}) {
   const stopAt = root === undefined ? workTreeRootFrom(cwd, { home }) : root
-  const inChain = walkUp(cwd, { home, root: stopAt }, (dir) => readPin(dir) ?? readMcpDeclaration(dir))
+  const inChain = walkUp(cwd, { home, root: stopAt }, readPin)
   if (inChain) return inChain
 
   if (!mainWorktree) return null
   const main = path.resolve(mainWorktree)
   if (atOrAboveHome(main, path.resolve(home))) return null
-  return readPin(main) ?? readMcpDeclaration(main)
+  return readPin(main)
 }

@@ -493,7 +493,16 @@ export async function runDevspecToolInput(raw = '', options = {}) {
   const out = prepareDevspecToolInput(parsed, options)
   if (out && Object.keys(out).length > 0) return out
 
-  const prov = await handlePre(parsed, options)
+  // The agent's commits are noted by the git stand-in on its shell PATH, whatever the
+  // command looks like (git-observer.mjs), and it tags and checks them in the project's
+  // repositories. Where it runs, the text reader below acts only in pinned repositories,
+  // as it always has, so the command keeps its decision; where it cannot (Windows, no
+  // connection) the text reader is the fallback and also matches by origin (item
+  // cdd7f0f3).
+  const rawArgs = parsed.tool_input ?? parsed.toolInput ?? parsed.toolCall?.args
+  const ownArgs = rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs) ? rawArgs : null
+  const observed = ownArgs ? prepareGitObservation(parsed, { ...options, args: ownArgs }) : null
+  const prov = await handlePre(parsed, { ...options, matchRemote: !observed })
   if (prov?.hookSpecificOutput?.permissionDecision === 'deny') {
     return {
       decision: 'deny',
@@ -506,23 +515,20 @@ export async function runDevspecToolInput(raw = '', options = {}) {
     ? { ...parsed, tool_input: prov.hookSpecificOutput.updatedInput }
     : parsed
 
-  // The agent's commits are noted by the git stand-in on its shell PATH, whatever the
-  // command looks like (git-observer.mjs). The older observation, which reads the
-  // command text, runs only where the stand-in cannot: Windows, or a folder that
-  // could not be set up.
-  const rawArgs = parsed.tool_input ?? parsed.toolInput ?? parsed.toolCall?.args
+  // The older observation, which reads the command text, runs only where the stand-in
+  // cannot: Windows, or a folder that could not be set up.
   const effectiveArgs = prov?.hookSpecificOutput?.updatedInput ??
     (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs) ? rawArgs : null)
   // The one command shape this hook allows itself: a commit whose message it stamped
-  // with the task tag. Both branches below test exactly this, so the stand-in never
-  // changes which commands are allowed (item 9e385793).
+  // with the task tag in a pinned repository. A stamp in a repository in scope by its
+  // origin asks (item cdd7f0f3). Both branches below use exactly this, so the stand-in
+  // never changes which commands are allowed (item 9e385793).
   const stampedCommit = Boolean(prov?.hookSpecificOutput?.updatedInput)
+  const stampDecision = stampedCommit && prov.hookSpecificOutput.permissionDecision === 'allow' ? 'allow' : 'ask'
   // With the stand-in on the command, the stand-in tags the commit (item 31ef3d3c), so
   // the agent's own command goes out unchanged behind the observer line; the text
   // reader above only keeps each command's decision exactly as it was. Without the
   // stand-in (Windows, no connection), the text reader's stamp is used as before.
-  const ownArgs = rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs) ? rawArgs : null
-  const observed = ownArgs ? prepareGitObservation(parsed, { ...options, args: ownArgs }) : null
   if (observed) {
     const overwrite = { ...ownArgs, CommandLine: observed.command }
     // Antigravity applies `overwrite` only with a decision, and refuses the call when
@@ -535,7 +541,7 @@ export async function runDevspecToolInput(raw = '', options = {}) {
     // still let a command run at once, and anything else still asks.
     const result = {
       ...(prov ?? {}),
-      decision: stampedCommit ? 'allow' : 'ask',
+      decision: stampDecision,
       overwrite,
       hookSpecificOutput: { ...(prov?.hookSpecificOutput ?? {}), hookEventName: 'PreToolUse', updatedInput: overwrite },
     }
@@ -549,7 +555,7 @@ export async function runDevspecToolInput(raw = '', options = {}) {
 
   if (stampedCommit) {
     return {
-      decision: 'allow',
+      decision: stampDecision,
       overwrite: prov.hookSpecificOutput.updatedInput,
       ...prov,
     }

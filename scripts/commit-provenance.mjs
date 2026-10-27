@@ -19,7 +19,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { devspecFolderMarker, gitRemoteOrigin } from './devspec-scope.mjs'
+import { commitScope, connectedProject } from './commit-scope.mjs'
+import { gitRemoteOrigin } from './devspec-scope.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveHookConversationId } from './mirror-turn.mjs'
 import { hostTokenFromEnv, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
@@ -804,7 +805,13 @@ function deny(reason) {
   }
 }
 
-function stamp(updatedCommand, toolInput, itemId) {
+/**
+ * The stamped command, with the permission decision it carries: `allow` only for a
+ * commit in a pinned repository, the one stamp the plugin has always allowed; `ask`
+ * for one in scope by its origin (item cdd7f0f3), so matching by remote stamps more
+ * commits without allowing any command the plugin did not allow before.
+ */
+function stamp(updatedCommand, toolInput, itemId, { decision }) {
   const nextInput = { ...toolInput }
   if (typeof toolInput?.CommandLine === 'string') {
     nextInput.CommandLine = updatedCommand
@@ -816,6 +823,7 @@ function stamp(updatedCommand, toolInput, itemId) {
     systemMessage: `DevSpec stamped [devspec:${itemId}] onto this commit message (one active claim).`,
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
+      permissionDecision: decision,
       updatedInput: nextInput,
     },
   }
@@ -920,10 +928,7 @@ export function handlePost(input, options = {}) {
     try { scope = scopeFrom(input, env) } catch { return null }
     let marker = null
     try {
-      marker = devspecFolderMarker(scope.cwd, {
-        home: env.USERPROFILE || env.HOME || os.homedir(),
-        mainWorktree: scope.mainWorktree,
-      })
+      marker = repositoryInScope(input, scope, env, options)
     } catch { return null }
     if (!marker) return null
     const claims = readClaims(scope, { env, now, platform })
@@ -1727,6 +1732,22 @@ function parseAutomationRecordResponse(
   return null
 }
 
+/**
+ * The repository this hook's command or edit works in, when it is the connected
+ * project's: an origin the project tracks, or a pin (commit-scope.mjs, item cdd7f0f3).
+ * Without a connection only a pin can say so. Null leaves the command alone.
+ *
+ * `options.matchRemote: false` is for a command the git stand-in also runs under: the
+ * stand-in tags and checks commits in repositories matched by origin, inside git, and
+ * this reader then acts only where it always has, a pinned repository, so the command
+ * keeps the permission decision it had (devspec-tool-input.mjs).
+ */
+function repositoryInScope(input, scope, env, options = {}) {
+  const home = options.home ?? (env.USERPROFILE || env.HOME || os.homedir())
+  const project = connectedProject(input, { env, home })
+  return commitScope(scope.cwd, { home, mainWorktree: scope.mainWorktree, project, matchRemote: options.matchRemote !== false })
+}
+
 export async function handlePre(input, options = {}) {
   const { env = process.env, now = Date.now(), platform = process.platform } = options
   const tool = bareToolName(input?.tool_name ?? input?.toolName ?? input?.toolCall?.name)
@@ -1737,10 +1758,7 @@ export async function handlePre(input, options = {}) {
 
   let marker = null
   try {
-    marker = devspecFolderMarker(scope.cwd, {
-      home: env.USERPROFILE || env.HOME || os.homedir(),
-      mainWorktree: scope.mainWorktree,
-    })
+    marker = repositoryInScope(input, scope, env, options)
   } catch { return null }
   if (!marker) return null
 
@@ -1784,7 +1802,7 @@ export async function handlePre(input, options = {}) {
   if (claims.length === 1 && commit.appendable) {
     const id = claims[0]
     const updated = `${command.slice(0, commit.insertOffset)} [devspec:${id}]${command.slice(commit.insertOffset)}`
-    return stamp(updated, toolInput, id)
+    return stamp(updated, toolInput, id, { decision: marker.kind === 'pin' ? 'allow' : 'ask' })
   }
 
   return deny(recoveryText(claims))
