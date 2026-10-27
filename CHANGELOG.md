@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.21.1
+
+### Which setups get full commit tracking
+
+- The README and the agent's rules now state which setups get full commit tracking, in the same words as DevSpec's other plugins and its help page: "Full commit tracking — every commit reported to DevSpec and tagged with its task automatically — needs macOS, Linux, or Windows through WSL."
+- They also say what native Windows gets today: on native Windows, Antigravity falls back to the simpler check that reads the command, which catches single-line commits only.
+
 ## 0.21.0
 
 ### Commits in the project's repositories are tagged for the agent, whatever their shape

@@ -9,6 +9,8 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 // on line boundaries — its own customization guide, under "Size Limits and Context
 // Budget". A rules file over it would lose its last sections without any error.
 const ANTIGRAVITY_RULE_FILE_MAX_BYTES = 24_000
+const FULL_TRACKING =
+  'Full commit tracking — every commit reported to DevSpec and tagged with its task automatically — needs macOS, Linux, or Windows through WSL.'
 
 describe('Item 5 parity: rules/AGENTS.md, package version 0.15.0, and documentation accuracy', () => {
   it("bundles rules/AGENTS.md within Antigravity's per-file rule limit, with core DevSpec contracts and scripts", () => {
@@ -34,6 +36,12 @@ describe('Item 5 parity: rules/AGENTS.md, package version 0.15.0, and documentat
     // A reply about a DevSpec notice is a notice reply, never a command answer (fdc96b30).
     assert.match(content, /system_notice_ids/)
     assert.match(content, /semantics\.notice_reply/)
+    // Which setups get full commit tracking: the same sentence in every DevSpec plugin
+    // and the help page, and native Windows stated plainly until it is tested (6da10a3a).
+    for (const text of [content, fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8')]) {
+      assert.ok(text.includes(FULL_TRACKING), 'the shared full-commit-tracking sentence')
+      assert.match(text, /native Windows[^.]*single-line commits only/)
+    }
     assert.match(content, /never pass `provenance_ref`/)
     assert.match(content, /wake: ALREADY ARMED/)
     assert.match(content, /rearm:\s*"already_armed"/)
