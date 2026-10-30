@@ -2,7 +2,7 @@
   "name": "devspec",
   "displayName": "DevSpec",
   "description": "Connect Antigravity CLI to DevSpec: work from project tasks, shared memory, and documents, link commits automatically, and steer your terminal from the web or your phone.",
-  "version": "0.21.6",
+  "version": "0.21.7",
   "author": {
     "name": "DevSpec",
     "url": "https://devspec.ai"
