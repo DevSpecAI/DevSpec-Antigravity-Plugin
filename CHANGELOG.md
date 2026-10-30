@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.6
+
+- Fixed a loop that could use up all of your computer's memory. DevSpec's plugins for Antigravity, Claude Code and Pi each put a stand-in for `git` in front of the real one, so they can tag and report commits. When two of them were on the same PATH, for example an Antigravity agent started from a Claude Code terminal, each could take the other for git and pass every git command back and forth, starting a new process each time. The stand-in now recognises any DevSpec plugin's stand-in and always runs the real git, including when it had already noted another plugin's stand-in as git. If an older version of another plugin still sends a command round in a loop, the command stops at once with a message saying so, instead of exhausting memory.
+
 ## 0.21.5
 
 - Documented the one-line `agy plugin install https://github.com/DevSpecAI/DevSpec-Antigravity-Plugin` install and update command in `README.md` (retaining manual `git clone` / `git pull` as an optional fallback) and added `displayName`, `description`, `version`, `author`, `homepage`, and `repository` metadata to `plugin.json`.

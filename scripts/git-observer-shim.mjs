@@ -44,6 +44,64 @@ import { fileURLToPath } from 'node:url'
 
 const FULL_SHA = /^[0-9a-f]{40}$/
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/*
+ * What every DevSpec git stand-in agrees on, so that two of them on one PATH never take
+ * each other for git (item 65658d3b). The Antigravity, Claude Code and Pi plugins each
+ * put a `git` stand-in first on their agent's PATH, and each used to recognise only its
+ * own when looking for the real git. On 2026-10-30 Pi's and Claude Code's, on one PATH,
+ * each picked the other and handed every call back and forth, a new Node process per
+ * hop: about 10 GB in 30 seconds, until the machine's low-memory guard killed two
+ * Antigravity agents among others. The plugins share this as a contract, not a file:
+ * Claude Code (item 30978c06) and Pi (item 80bceb2c) implement the same three rules.
+ *
+ * 1. Every stand-in's `git` file carries STAND_IN_MARKER in its first bytes.
+ * 2. Looking for the real git, skip any candidate that carries it.
+ * 3. Everything a stand-in starts runs one level deeper (STAND_IN_DEPTH_ENV). A stand-in
+ *    started inside another's work runs git straight through, and one started
+ *    MAX_STAND_IN_DEPTH deep starts nothing: that bounds a loop with an older or foreign
+ *    stand-in that does not follow rules 1 and 2.
+ *
+ * They live here, not in a module of their own, because this file is copied alone.
+ */
+export const STAND_IN_MARKER = '# devspec-git-stand-in'
+export const STAND_IN_DEPTH_ENV = 'DEVSPEC_GIT_STAND_IN_DEPTH'
+/** How far into its file a stand-in's marker must be; the other plugins read this much. */
+export const MARKER_WINDOW_BYTES = 256
+/**
+ * How deep stand-ins may nest before one refuses. Real nesting is a stand-in, then git,
+ * then a git hook that runs git under a stand-in again: two or three levels. Eight bounds
+ * a loop to a few short-lived processes that fail in well under a second.
+ */
+export const MAX_STAND_IN_DEPTH = 8
+
+/** Whether `file` is a DevSpec git stand-in, whichever plugin wrote it. */
+export function isMarkedStandIn(file) {
+  let fd = null
+  try {
+    fd = fs.openSync(fs.realpathSync(file), 'r')
+    const head = Buffer.alloc(MARKER_WINDOW_BYTES)
+    const read = fs.readSync(fd, head, 0, head.length, 0)
+    return head.subarray(0, read).toString('latin1').includes(STAND_IN_MARKER)
+  } catch {
+    return false
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd) } catch { /* already closed */ }
+    }
+  }
+}
+
+/** How many stand-ins this process is already nested inside: 0 unless one started it. */
+export function standInDepth(env = process.env) {
+  const value = String(env[STAND_IN_DEPTH_ENV] ?? '').trim()
+  return /^\d{1,6}$/.test(value) ? Number(value) : 0
+}
+
+/** What git prints when a stand-in refuses to go deeper. Read by the person and the agent. */
+export function loopStoppedText() {
+  return 'git: DevSpec stopped this command because two DevSpec plugins were passing it back and forth instead of running git. Nothing was changed. Update the DevSpec plugin for each coding agent you use, then start a new session.'
+}
 // Trace2 output of one git command, hooks included, is a few kilobytes; a trace past
 // this is not read (and that one commit goes unobserved) rather than held in memory.
 const MAX_TRACE_BYTES = 4 * 1024 * 1024
@@ -492,9 +550,13 @@ function delegate(realGit, args, env, stdin = 'inherit') {
   })
 }
 
-export async function runShim(argv = process.argv.slice(2), env = process.env, here = path.dirname(fileURLToPath(import.meta.url))) {
+export async function runShim(argv = process.argv.slice(2), env = process.env, here = path.dirname(fileURLToPath(import.meta.url)), depth = standInDepth(env)) {
   const [realGit, ...args] = argv
   if (!realGit) return { code: 126, signal: null, error: new Error('devspec git observer: no git to run') }
+  // Started inside another stand-in's work: go no deeper than the plugins agree.
+  if (depth >= MAX_STAND_IN_DEPTH) return { code: 126, signal: null, error: new Error(loopStoppedText()) }
+  // ...and git, with everything else this starts, runs one level deeper.
+  const passOn = { ...env, [STAND_IN_DEPTH_ENV]: String(depth + 1) }
 
   // Never run another copy of this stand-in as "the real git": that recursion has no end.
   try {
@@ -504,11 +566,18 @@ export async function runShim(argv = process.argv.slice(2), env = process.env, h
   } catch {
     /* an unresolvable path is reported by spawn itself */
   }
+  // ...nor another DevSpec plugin's: that is how two of them looped (65658d3b).
+  if (isMarkedStandIn(realGit)) {
+    return { code: 126, signal: null, error: new Error('devspec git observer: the real git is another DevSpec plugin\'s stand-in') }
+  }
 
   const observation = env.DEVSPEC_AGY_GIT_OBSERVATION
   const generation = env.DEVSPEC_AGY_GIT_GENERATION
   const split = splitGlobalOptions(args)
+  // Inside another stand-in's work (another plugin's, or a git hook under one), the
+  // commit is that one's to tag, check and record: git runs straight through.
   const eligible = Boolean(
+    depth === 0 &&
     UUID.test(observation ?? '') && UUID.test(generation ?? '') && split &&
       (split.command === 'commit' || !NOT_COMMIT.has(split.command)) &&
       !env.GIT_TRACE2_EVENT && !env.GIT_TRACE2,
@@ -517,7 +586,7 @@ export async function runShim(argv = process.argv.slice(2), env = process.env, h
   // Tag the commit, or stop it, before git runs (item 31ef3d3c). A failure here runs
   // git exactly as asked; standard input that was already read is passed on whole.
   let run = { args, stdin: 'inherit', notice: null, cleanup: null }
-  if (split?.command === 'commit' && UUID.test(observation ?? '')) {
+  if (depth === 0 && split?.command === 'commit' && UUID.test(observation ?? '')) {
     let readBytes = null
     try {
       run = prepareCommit({
@@ -539,7 +608,7 @@ export async function runShim(argv = process.argv.slice(2), env = process.env, h
 
   let before = null
   let traceFile = null
-  let childEnv = env
+  let childEnv = passOn
   if (eligible) {
     try {
       before = preflight(realGit, split.globals)
@@ -547,12 +616,12 @@ export async function runShim(argv = process.argv.slice(2), env = process.env, h
         const traces = path.join(here, 'traces')
         fs.mkdirSync(traces, { recursive: true, mode: 0o700 })
         traceFile = path.join(traces, `${randomUUID()}.trace`)
-        childEnv = { ...env, GIT_TRACE2_EVENT: traceFile }
+        childEnv = { ...passOn, GIT_TRACE2_EVENT: traceFile }
       }
     } catch {
       before = null
       traceFile = null
-      childEnv = env
+      childEnv = passOn
     }
   }
 
@@ -599,7 +668,11 @@ try {
   entry = false
 }
 if (entry) {
-  const result = await runShim()
+  // Its own checks before git (quiet() inherits this process's environment) run one
+  // level deeper too.
+  const depth = standInDepth(process.env)
+  process.env[STAND_IN_DEPTH_ENV] = String(depth + 1)
+  const result = await runShim(process.argv.slice(2), process.env, path.dirname(fileURLToPath(import.meta.url)), depth)
   if (result.error) process.stderr.write(`${result.error.message}\n`)
   if (result.signal) {
     try { process.kill(process.pid, result.signal) } catch { process.exit(1) }
