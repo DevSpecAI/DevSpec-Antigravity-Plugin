@@ -35,6 +35,7 @@ export const REQUEST_REF_TOOLS = new Set([
   'fail_work_item',
   'import_instruction_rules',
   'link_tasks',
+  'manage_goals',
   'manage_knowledge_links',
   'manage_protected_intent',
   'record_completed_work',

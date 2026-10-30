@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.21.7
+
+- Goal and outcome changes made with `manage_goals` now carry who asked for them (`request_ref` and `provenance_ref`), matching every other judged DevSpec write.
+- Added the direct call shapes for `get_project_goals`, `get_goals`, and `manage_goals` (including `merged_chapter_summary` when merging goals) to `rules/AGENTS.md` so Antigravity can read and manage goals and outcomes without extra schema-read steps.
+
 ## 0.21.6
 
 - Fixed a loop that could use up all of your computer's memory. DevSpec's plugins for Antigravity, Claude Code and Pi each put a stand-in for `git` in front of the real one, so they can tag and report commits. When two of them were on the same PATH, for example an Antigravity agent started from a Claude Code terminal, each could take the other for git and pass every git command back and forth, starting a new process each time. The stand-in now recognises any DevSpec plugin's stand-in and always runs the real git, including when it had already noted another plugin's stand-in as git. If an older version of another plugin still sends a command round in a loop, the command stops at once with a message saying so, instead of exhausting memory.
