@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.8
+
+- Updated `rules/AGENTS.md` quick-reference call shapes for `get_tasks` (`dismissal_category?`), `create_task` (`human_only?`, `no_code?`), and `update_task` (`dismissal_category?`, `target_task_id?`, `note?`, `human_only?`, `no_code?`), documenting the four required task dismissal categories (`duplicate`, `replaced`, `outdated`, and `not_wanted`).
+
 ## 0.21.7
 
 - Goal and outcome changes made with `manage_goals` now carry who asked for them (`request_ref` and `provenance_ref`), matching every other judged DevSpec write.
