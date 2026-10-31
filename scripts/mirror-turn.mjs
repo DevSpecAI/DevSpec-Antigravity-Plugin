@@ -8,7 +8,8 @@
  *                     + busy/heartbeat + turn marker
  * background_launch → records background subagent/task launches against the open turn
  * stop              → busy/heartbeat + turn marker clear (or hold when background work
- *                     launched by this turn is still in flight)
+ *                     launched by this turn is still in flight); a remote turn that
+ *                     ended on an error tells the room so (turn-failure.mjs)
  *
  * Answers are agent-canonical: skills call post_session_message({ connection_id }).
  * ADR b98a39a9 — no dual writers.
@@ -52,6 +53,7 @@ import {
 } from './notice-reply.mjs'
 import { recordMirroredLocalPrompt } from './room-unread.mjs'
 import { readConnectionTelemetry } from './statusline.mjs'
+import { parseTurnFailure, turnFailureMessage } from './turn-failure.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
 const MODES = new Set(['user_prompt', 'stop', 'background_launch', 'subagent_stop'])
@@ -1850,6 +1852,7 @@ export async function handleMirrorTurn(
         !isRemoteTurn &&
           (marker?.localPromptMirrored || marker?.localTurn || state?.local_turn),
       )
+      const turnFailure = parseTurnFailure(parsedHookInput)
       if (turnNotices) {
         // The model's last words on the notices, as a reply to them: bound to no
         // command turn, so no trail, no complete_turn and no local-turn flags, which
@@ -1887,6 +1890,39 @@ export async function handleMirrorTurn(
           } catch {
             /* non-fatal fallback */
           }
+        }
+      } else if (turnFailure && isRemoteTurn && sessionId) {
+        // The turn died on an error before the model could answer (item 408ad47b):
+        // tell the room in Antigravity's own words instead of mirroring nothing. Posted
+        // even after an explicit progress post, because the command still failed. An
+        // ordinary answer, not phase error: the server drops an error post when no
+        // working bubble is open, which is the silent case this exists for. A turn
+        // typed in the terminal falls through: the error is already in front of them.
+        const telemetry = connectionId ? readConnectionTelemetry(connectionId) : null
+        try {
+          await call({
+            mcpUrl,
+            token,
+            name: 'post_session_message',
+            arguments: {
+              connection_id: connectionId,
+              session_id: sessionId,
+              agent_name: agentName,
+              message: fitPostMessage(turnFailureMessage(turnFailure, agentName)),
+              complete_turn: true,
+              ...(telemetry ? { agent_stats: telemetry } : {}),
+              ...(telemetry?.model?.id
+                ? {
+                    model: {
+                      providerID: telemetry.model.provider || 'google',
+                      modelID: telemetry.model.id,
+                    },
+                  }
+                : {}),
+            },
+          })
+        } catch {
+          /* non-fatal: report_complete below still ends the turn */
         }
       } else if (!hadExplicitReply && sessionId && (isRemoteTurn || isLocalMirroredTurn || hadStreamedTrail)) {
         let trail = { markdown: '', events: [] }

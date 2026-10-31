@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.9
+
+- When Antigravity can't finish a message sent from a DevSpec session (for example its sign-in has expired, it has run out of quota, or the model service is down), it now says so in the session straight away, quoting Antigravity's own error, and stops showing as working. Before, the session showed nothing while the error sat in the terminal. A message typed in Antigravity's own terminal gets no session reply, because the error is already shown there.
+
 ## 0.21.8
 
 - Updated `rules/AGENTS.md` quick-reference call shapes for `get_tasks` (`dismissal_category?`), `create_task` (`human_only?`, `no_code?`), and `update_task` (`dismissal_category?`, `target_task_id?`, `note?`, `human_only?`, `no_code?`), documenting the four required task dismissal categories (`duplicate`, `replaced`, `outdated`, and `not_wanted`).
