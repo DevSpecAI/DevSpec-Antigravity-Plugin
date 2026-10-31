@@ -48,6 +48,7 @@ export const REQUEST_REF_TOOLS = new Set([
   'resolve_duplicate',
   'resolve_memory_flag',
   'resolve_resource_flag',
+  'resolve_task_flag',
   'retract_memory',
   'spin_off_task',
   'supersede_task',
