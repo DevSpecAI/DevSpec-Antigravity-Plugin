@@ -1398,6 +1398,16 @@ export async function streamTurnTrailIfChanged(
       : {}),
   }
 
+  const res = await call({
+    mcpUrl,
+    token,
+    name: 'post_session_message',
+    arguments: postArgs,
+  })
+  if (res?.isError === true || res?.result?.isError === true) {
+    return { streamed: false, reason: 'server_refused' }
+  }
+
   try {
     ensurePrivateDir(connectionsDir)
     fs.writeFileSync(
@@ -1414,12 +1424,6 @@ export async function streamTurnTrailIfChanged(
     /* non-fatal */
   }
 
-  await call({
-    mcpUrl,
-    token,
-    name: 'post_session_message',
-    arguments: postArgs,
-  })
   return { streamed: true, eventCount: trail.events.length, signature: trail.signature }
 }
 

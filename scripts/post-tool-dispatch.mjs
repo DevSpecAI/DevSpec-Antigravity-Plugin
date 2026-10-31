@@ -110,7 +110,8 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
 
   // 1. Explicit reply marker when the agent calls post_session_message (non-trail),
   //    or refresh/re-assert .turn on non-plumbing work tools and stream live mid-turn
-  //    progress trail (`phase: 'trail'`) when attached to a session.
+  //    progress trail (`phase: 'trail'`) when attached to a session or running a
+  //    sessionless remote automation turn.
   const now = Date.now()
   // A reply to DevSpec notices is not the turn's reply (notice-reply.mjs): marking it
   // as one would stop a command being worked from getting its own answer at Stop.
@@ -149,7 +150,7 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
     } catch {
       /* ignore */
     }
-    if (state?.session_id) {
+    if (state) {
       try {
         await streamTurnTrailIfChanged(state, {
           connectionsDir,
