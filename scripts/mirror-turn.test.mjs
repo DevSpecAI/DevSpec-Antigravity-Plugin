@@ -33,6 +33,7 @@ import {
   extractAntigravityTrailFromTranscript,
   streamTurnTrailIfChanged,
 } from './mirror-turn.mjs'
+import { runPostToolDispatch } from './post-tool-dispatch.mjs'
 
 describe('resolveHookConversationId', () => {
   it('prefers CLAUDE_CODE_SESSION_ID env (the value write stamps)', () => {
@@ -921,6 +922,102 @@ describe('Antigravity native hook payload & transcript handling', () => {
       assert.equal(sessionlessLocalStream.reason, 'not_attached')
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('runPostToolDispatch streams sessionless remote automation trails, retries after pre-claim refusal, and stays silent on unattached local turns', async () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-post-tool-sessionless-'))
+    try {
+      const connectionsDir = path.join(tmpHome, '.devspec', 'remote-control', 'connections')
+      fs.mkdirSync(connectionsDir, { recursive: true })
+      const connId = '99999999-aaaa-4bbb-8ccc-dddddddddddd'
+      const convId = '77777777-8888-4999-8aaa-bbbbbbbbbbbb'
+      const transcriptPath = path.join(tmpHome, 'transcript.jsonl')
+      const startedAt = Date.parse('2026-10-31T21:00:00.000Z')
+
+      fs.writeFileSync(
+        transcriptPath,
+        [
+          JSON.stringify({
+            step_index: 0,
+            type: 'USER_INPUT',
+            created_at: '2026-10-31T21:00:00.000Z',
+            content: '[DevSpec Remote Wake] automation_run',
+          }),
+          JSON.stringify({
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            created_at: '2026-10-31T21:00:01.000Z',
+            thinking: 'Checking clean plugin checkouts before fast-forwarding.',
+            tool_calls: [
+              {
+                name: 'default_api:run_command',
+                arguments: { CommandLine: 'git status --porcelain' },
+              },
+            ],
+          }),
+        ].join('\n') + '\n',
+      )
+
+      fs.writeFileSync(
+        path.join(connectionsDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          session_id: null,
+          local_id: convId,
+          transcript_path: transcriptPath,
+          token: 'dvs_test_tok_fake1234',
+          mcp_url: 'https://api.devspec.ai/api/mcp',
+        }),
+      )
+
+      // 1. Sessionless remote automation turn: first call before claim_automation_run is refused by server
+      writeTurnMarker(connId, { startedAt, remoteTurn: true, held: false }, connectionsDir)
+      const calls = []
+      let failPreClaim = true
+      const mockCall = async (req) => {
+        if (req.name === 'post_session_message' && failPreClaim) {
+          const err = new Error('session_id is required when the connection has no running automation run')
+          err.code = 'MCP_TOOL_REFUSAL'
+          throw err
+        }
+        calls.push(req)
+        return { ok: true }
+      }
+
+      const hookPayload = JSON.stringify({
+        conversationId: convId,
+        transcriptPath,
+        tool_name: 'default_api:run_command',
+        tool_input: { CommandLine: 'git status --porcelain' },
+      })
+
+      await runPostToolDispatch(hookPayload, { env: {}, home: tmpHome, call: mockCall })
+      assert.equal(calls.length, 0, 'pre-claim refusal fails non-fatally without recording post')
+      assert.equal(
+        fs.existsSync(path.join(connectionsDir, `${connId}.trail-state.json`)),
+        false,
+        'pre-claim refusal must not latch trail-state.json signature',
+      )
+
+      // 2. Once claim_automation_run transitions run to running, the exact same/next post-tool call streams cleanly
+      failPreClaim = false
+      await runPostToolDispatch(hookPayload, { env: {}, home: tmpHome, call: mockCall })
+      const trailPosts = calls.filter((c) => c.name === 'post_session_message')
+      assert.equal(trailPosts.length, 1)
+      assert.equal(trailPosts[0].arguments.connection_id, connId)
+      assert.equal(trailPosts[0].arguments.session_id, undefined)
+      assert.equal(trailPosts[0].arguments.phase, 'trail')
+      assert.match(trailPosts[0].arguments.work_trail, /git status --porcelain/)
+
+      // 3. Unattached local turn (remoteTurn: false, session_id: null) never streams trail
+      calls.length = 0
+      writeTurnMarker(connId, { startedAt: startedAt + 50, remoteTurn: false, held: false }, connectionsDir)
+      await runPostToolDispatch(hookPayload, { env: {}, home: tmpHome, call: mockCall })
+      assert.equal(calls.filter((c) => c.name === 'post_session_message').length, 0)
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
     }
   })
 })

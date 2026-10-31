@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.10
+
+- Stream live work-trail progress during sessionless remote automation runs so viewers watching a running automation see real-time tool and reasoning output without needing an attached room session, and retry cleanly if an early tool call fires before the automation run is claimed.
+
 ## 0.21.9
 
 - When Antigravity can't finish a message sent from a DevSpec session (for example its sign-in has expired, it has run out of quota, or the model service is down), it now says so in the session straight away, quoting Antigravity's own error, and stops showing as working. Before, the session showed nothing while the error sat in the terminal. A message typed in Antigravity's own terminal gets no session reply, because the error is already shown there.
