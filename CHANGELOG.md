@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.12
+
+- When DevSpec's check finds that a task your Antigravity agent just wrote duplicates one that already exists, the agent now sorts it out there and then instead of leaving a flag for later. If the existing task is yours, or one you're allowed to change, it adds anything new to it, closes the new one as its duplicate and tells you. If it's someone else's, it asks you whether to add to it, which waits for that person's OK, or to keep yours separate, recorded as not a duplicate with your reason.
+
 ## 0.21.11
 
 - Antigravity now takes part in ruling DevSpec's checks. It tells DevSpec it understands check jobs (`check_job_version: 1` on every poll and on the connection stream), so DevSpec can send it every check on a change, its own changes included, beside automation runs. A check job is accepted only in its exact shape and addressed to this connection, kept once in the inbox, and wakes the agent with one line saying a check is waiting on that record; automation runs arrive exactly as before, and anything else is still refused. The agent takes the job with `claim_check_job`, rules every entry with `record_check_rulings`, then carries on, and `rules/AGENTS.md` and the remote skill say so. Busy is already reported truthfully (working while a turn runs, not working when it ends), which DevSpec needs to hand an untaken job to the next in line.
