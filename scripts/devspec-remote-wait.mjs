@@ -4,7 +4,7 @@
  *
  * Preserves the byte-offset cursor, armed-listener pidfile, one-shot fallback, and
  * session-scoped `--stream` monitor architecture. Runtime wake inputs are revalidated
- * `canonical_commands`, typed `canonical_control`, explicit `automation_run`,
+ * `canonical_commands`, typed `canonical_control`, explicit `automation_run`, `check_job`,
  * `interaction_answer`, or `question_dismissal` records written by `devspec-remote-poll.mjs`
  * (plus backward-compatible `owner_messages` records).
  *
@@ -21,6 +21,7 @@ import {
   materialiseAttachments,
   MAX_INLINE_ATTACHMENT_CHARS,
 } from './attachment-store.mjs'
+import { CHECK_JOB_RECORD_TYPE, checkJobWakeText, validateCheckJobInboxRecord } from './check-job.mjs'
 import { closeAntigravityOnEnd, ownedByAntigravityProcess } from './close-on-end.mjs'
 import { questionHandoffEvent, validQuestionHandoff } from './command-offer.mjs'
 import {
@@ -468,6 +469,8 @@ export function parseInboxBatches(lines, connectionId) {
         batches.push(record)
       } else if (connectionId && validateAutomationInboxRecord(record, connectionId)) {
         batches.push(record)
+      } else if (connectionId && validateCheckJobInboxRecord(record, connectionId)) {
+        batches.push(record)
       } else if (
         record.type === 'owner_messages' &&
         Array.isArray(record.messages) &&
@@ -778,6 +781,34 @@ export function buildAutomationRunEvents(batch, { inboxFile } = {}) {
   ]
 }
 
+/**
+ * A check job wakes the agent with the contract's one line; the dispatch beside it
+ * carries `check_job_id` for `claim_check_job`. It is inbox metadata, not a command:
+ * it brings no requester, so it leaves the turn's request chain as it is.
+ */
+export function buildCheckJobEvents(batch, { inboxFile } = {}) {
+  return [
+    {
+      type: 'check_job',
+      session_id: batch.session_id ?? null,
+      authoritative: true,
+      executable: true,
+      channel: 'explicit_check_job_dispatch',
+      check_job_id: batch.dispatch.check_job_id,
+      dispatch: batch.dispatch,
+      content: checkJobWakeText(batch.dispatch),
+    },
+    {
+      type: 'wake',
+      reason: 'check_job',
+      check_job_id: batch.dispatch.check_job_id,
+      inbox: inboxFile ?? null,
+      authoritative: false,
+      executable: false,
+    },
+  ]
+}
+
 function stdoutLine(line) {
   return new Promise((resolve, reject) => {
     process.stdout.write(line, (error) => (error ? reject(error) : resolve()))
@@ -867,7 +898,7 @@ export function buildOwnerMessageEvents(
 
 /**
  * Format any inbox entry (`canonical_commands`, `canonical_system_notices`, `automation_run`,
- * `interaction_answer`, `question_dismissal`, or legacy `owner_messages`) into canonical
+ * `check_job`, `interaction_answer`, `question_dismissal`, or legacy `owner_messages`) into canonical
  * wake JSON lines. Used by both `devspec-remote-wait.mjs` and `devspec-remote-listen.mjs`.
  */
 export function formatInboxEntryForStream(
@@ -925,6 +956,8 @@ export function formatInboxEntryForStream(
         : buildInteractionAnswerEvents(batch, { inboxFile, rearm })
   } else if (batch.type === 'automation_run' && batch.dispatch) {
     events = buildAutomationRunEvents(batch, { inboxFile })
+  } else if (batch.type === CHECK_JOB_RECORD_TYPE && batch.dispatch) {
+    events = buildCheckJobEvents(batch, { inboxFile })
   } else if (batch.type === 'owner_messages') {
     events = buildOwnerMessageEvents(batch, {
       inboxFile,
@@ -1114,10 +1147,12 @@ async function main() {
                       : buildInteractionAnswerEvents(batch, { inboxFile: file })
                     : batch.type === 'automation_run'
                       ? buildAutomationRunEvents(batch, { inboxFile: file })
-                      : buildOwnerMessageEvents(batch, {
-                          inboxFile: file,
-                          attachmentDir: attachmentDirFor(connectionId),
-                        })
+                      : batch.type === CHECK_JOB_RECORD_TYPE
+                        ? buildCheckJobEvents(batch, { inboxFile: file })
+                        : buildOwnerMessageEvents(batch, {
+                            inboxFile: file,
+                            attachmentDir: attachmentDirFor(connectionId),
+                          })
 
           if (batch.type === DISMISSAL_RECORD_TYPE) {
             let emitted = false
