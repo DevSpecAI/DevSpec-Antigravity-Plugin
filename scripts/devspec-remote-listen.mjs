@@ -19,6 +19,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { AGENT_NAME } from './agent-identity.mjs'
+import { CHECK_JOB_RECORD_TYPE, checkJobWakeText, validateCheckJobInboxRecord } from './check-job.mjs'
 import {
   closeAntigravityOnEnd,
   ownedByAnotherAntigravityProcess,
@@ -354,7 +355,7 @@ function finalizeWakeWithOptionalFileHandoff({
 
 /**
  * Format an inbox entry (`owner_messages`, `canonical_commands`, `canonical_system_notices`,
- * `automation_run`, `interaction_answer`, or `question_dismissal`) into a wake prompt
+ * `automation_run`, `check_job`, `interaction_answer`, or `question_dismissal`) into a wake prompt
  * suitable for `agentapi send-message` / `agentapi new-conversation`.
  * Includes both the `[DevSpec Remote Wake]` summary header and the full canonical
  * JSON lines from `formatInboxEntryForStream` (`rearm: "already_armed"`).
@@ -463,6 +464,16 @@ export function buildWakeDeliveryMessage(entry, opts = {}) {
       '[DevSpec Remote Wake]',
       `Automation run dispatched: "${d.automation_name}" (run_id=${d.run_id}, connection_id=${d.delivery_connection_id})`,
     ]
+    const streamJson = formatInboxEntryForStream(entry, streamOpts)
+    if (streamJson) lines.push(streamJson)
+    return lines.join('\n\n')
+  }
+
+  if (entry.type === CHECK_JOB_RECORD_TYPE) {
+    // Revalidated here too: the listener reads inbox lines raw, and a check job
+    // wakes the agent only in its exact shape, addressed to this connection.
+    if (!validateCheckJobInboxRecord(entry, effectiveConnId)) return null
+    const lines = ['[DevSpec Remote Wake]', checkJobWakeText(entry.dispatch)]
     const streamJson = formatInboxEntryForStream(entry, streamOpts)
     if (streamJson) lines.push(streamJson)
     return lines.join('\n\n')
