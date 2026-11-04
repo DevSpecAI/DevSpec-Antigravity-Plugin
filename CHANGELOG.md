@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.21.13
+
+- Check jobs and DevSpec system notices on your agent's own work now queue behind an active turn in arrival order instead of interrupting mid-turn or clobbering active turn tracking, while urgent room commands and controls continue through immediately.
+- Dedicated check-job follow-up turns now rule checks silently without streaming a spurious work trail or posting a fallback command reply into the session room, and start with a clean request attribution state so earlier finished commands never ride on check or notice follow-up writes.
+- Background task completions carrying Antigravity `<conversationId>/task-<n>` sender IDs now reconcile cleanly during active multi-step turns as well as held turns so completed background tasks never leave `.turn` or finished requests stuck open.
+
 ## 0.21.12
 
 - When DevSpec's check finds that a task your Antigravity agent just wrote duplicates one that already exists, the agent now sorts it out there and then instead of leaving a flag for later. If the existing task is yours, or one you're allowed to change, it adds anything new to it, closes the new one as its duplicate and tells you. If it's someone else's, it asks you whether to add to it, which waits for that person's OK, or to keep yours separate, recorded as not a duplicate with your reason.

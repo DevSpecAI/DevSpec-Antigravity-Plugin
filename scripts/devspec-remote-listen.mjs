@@ -28,7 +28,7 @@ import {
 import { LOADED_PLUGIN_VERSION } from './connection-version.mjs'
 import { formatInboxEntryForStream, formatSystemNoticeContent } from './devspec-remote-wait.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
-import { loadState, recordTurnWake } from './mirror-turn.mjs'
+import { isTurnMarkerActive, loadState, readTurnMarker, recordTurnWake } from './mirror-turn.mjs'
 import { noticeReplyInstruction } from './notice-reply.mjs'
 import {
   ensurePollerForConnection,
@@ -41,7 +41,7 @@ import {
   writeStateFile,
 } from './remote-control-state.mjs'
 import { ensurePrivateDir, writePrivateText } from './private-state.mjs'
-import { recordDeliveredBatchRequests } from './requests.mjs'
+import { recordDeliveredBatchRequests, setCurrentRequest, UNSTATED } from './requests.mjs'
 import { autoConnectAtStartup, connectAtStartupEnabled } from './session-start.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
@@ -696,28 +696,241 @@ export function deliverWakeViaAgentApi({
  */
 export function readNewInboxEntries(inboxPath, offsetBytes = 0) {
   if (!inboxPath || !fs.existsSync(inboxPath)) {
-    return { entries: [], nextOffset: 0 }
+    return { entries: [], records: [], nextOffset: 0 }
   }
   try {
     const buf = fs.readFileSync(inboxPath)
     const start = offsetBytes >= 0 && offsetBytes <= buf.length ? offsetBytes : 0
     const slice = buf.subarray(start)
     const lastNl = slice.lastIndexOf(0x0a)
-    if (lastNl === -1) return { entries: [], nextOffset: start }
-    const completeText = slice.subarray(0, lastNl + 1).toString('utf8')
+    if (lastNl === -1) return { entries: [], records: [], nextOffset: start }
     const entries = []
-    for (const line of completeText.split('\n')) {
-      const trimmed = line.trim()
+    const records = []
+    let cursor = start
+    while (cursor <= start + lastNl) {
+      const nl = buf.indexOf(0x0a, cursor)
+      if (nl === -1 || nl > start + lastNl) break
+      const lineStart = cursor
+      const lineEnd = nl + 1
+      cursor = lineEnd
+      const trimmed = buf.subarray(lineStart, nl).toString('utf8').trim()
       if (!trimmed) continue
       try {
-        entries.push(JSON.parse(trimmed))
+        const entry = JSON.parse(trimmed)
+        entries.push(entry)
+        records.push({ entry, startOffset: lineStart, endOffset: lineEnd })
       } catch {
         /* ignore malformed line */
       }
     }
-    return { entries, nextOffset: start + lastNl + 1 }
+    return { entries, records, nextOffset: start + lastNl + 1 }
   } catch {
-    return { entries: [], nextOffset: offsetBytes }
+    return { entries: [], records: [], nextOffset: offsetBytes }
+  }
+}
+
+export function isQueuedBehindActiveTurnEntry(entry) {
+  return Boolean(
+    entry && (entry.type === CHECK_JOB_RECORD_TYPE || entry.type === 'canonical_system_notices'),
+  )
+}
+
+export function createListenerQueueState(initialOffset = 0) {
+  return {
+    scanOffset: typeof initialOffset === 'number' && initialOffset >= 0 ? initialOffset : 0,
+    committedOffset: typeof initialOffset === 'number' && initialOffset >= 0 ? initialOffset : 0,
+    heldRecords: [],
+    lastDeliveryError: null,
+  }
+}
+
+/**
+ * Run one inbox tick for `devspec-remote-listen.mjs`:
+ * - Holds `check_job` and `canonical_system_notices` in strict FIFO arrival order while
+ *   a turn is active (`isTurnMarkerActive`), without blocking urgent commands or controls,
+ *   without clobbering the active turn's `.turn` marker or `.requests.jsonl`, and without
+ *   advancing persisted `inbox_byte_offset` past held records so crash recovery loses nothing.
+ * - Once the active turn finishes, drains queued `check_job` / `canonical_system_notices`
+ *   one follow-up turn at a time in arrival order, resetting `current` request to `null`
+ *   and skipping `report_pickup` (check jobs and system notices are not server commands).
+ */
+export async function processListenerInboxTick(
+  queueState,
+  {
+    connectionId,
+    conversationId = null,
+    inboxPath,
+    live = null,
+    useAgentApi = true,
+    once = false,
+    connectionsDir = CONNECTIONS_DIR,
+    deliver = deliverWakeViaAgentApi,
+    callMcp = mcpToolsCall,
+    writeState = writeStateFile,
+    writeStdout = (line) => process.stdout.write(line),
+    env = process.env,
+    nowFn = () => Date.now(),
+  } = {},
+) {
+  if (typeof live?.inbox_byte_offset === 'number' && live.inbox_byte_offset > queueState.scanOffset) {
+    queueState.scanOffset = live.inbox_byte_offset
+    queueState.committedOffset = live.inbox_byte_offset
+    queueState.heldRecords = queueState.heldRecords.filter(
+      (rec) => rec.endOffset > live.inbox_byte_offset,
+    )
+  }
+
+  const isTurnBusy = () =>
+    isTurnMarkerActive(readTurnMarker(connectionId, connectionsDir), nowFn())
+
+  const deliverSingleRecord = async (rec, { queuedEntry }) => {
+    const message = buildWakeDeliveryMessage(rec.entry, {
+      connectionId,
+      inboxFile: inboxPath,
+    })
+    if (!message) return { ok: true, skipped: true }
+
+    let deliveredVia = 'stdout'
+    if (useAgentApi) {
+      const res = await deliver({
+        conversationId,
+        message,
+        env,
+        state: live,
+      })
+      if (!res?.ok) {
+        const error = String(res?.error || 'agentapi_failed')
+        if (error !== queueState.lastDeliveryError) {
+          writeStdout(
+            JSON.stringify({
+              type: 'wake_delivery_failed',
+              connection_id: connectionId,
+              conversation_id: conversationId,
+              error,
+              retrying: !once,
+              at: new Date(nowFn()).toISOString(),
+            }) + '\n',
+          )
+          queueState.lastDeliveryError = error
+        }
+        return { ok: false, error }
+      }
+      deliveredVia = 'agentapi'
+      if (queueState.lastDeliveryError !== null) {
+        writeStdout(
+          JSON.stringify({
+            type: 'wake_delivery_recovered',
+            connection_id: connectionId,
+            at: new Date(nowFn()).toISOString(),
+          }) + '\n',
+        )
+        queueState.lastDeliveryError = null
+      }
+      if (!queuedEntry && live?.token && live?.mcp_url) {
+        callMcp({
+          mcpUrl: live.mcp_url,
+          token: live.token,
+          ...(live.connection_capability
+            ? { connectionCapability: live.connection_capability }
+            : {}),
+          name: 'report_pickup',
+          arguments: { connection_id: connectionId },
+          timeoutMs: 5_000,
+        }).catch(() => {})
+      }
+    }
+
+    recordTurnWake(connectionId, rec.entry, connectionsDir)
+    try {
+      recordDeliveredBatchRequests(connectionId, rec.entry, { dir: connectionsDir })
+    } catch {
+      /* non-fatal */
+    }
+    if (queuedEntry) {
+      try {
+        setCurrentRequest(connectionId, UNSTATED, { dir: connectionsDir })
+      } catch {
+        /* non-fatal */
+      }
+    }
+
+    writeStdout(
+      JSON.stringify({
+        type: 'wake_delivery',
+        connection_id: connectionId,
+        conversation_id: conversationId,
+        delivered_via: deliveredVia,
+        message,
+      }) + '\n',
+    )
+    return { ok: true, skipped: false }
+  }
+
+  let deliveryFailed = false
+
+  while (queueState.heldRecords.length > 0 && !isTurnBusy()) {
+    const rec = queueState.heldRecords[0]
+    const outcome = await deliverSingleRecord(rec, { queuedEntry: true })
+    if (!outcome.ok) {
+      deliveryFailed = true
+      break
+    }
+    queueState.heldRecords.shift()
+  }
+
+  const { records, nextOffset } = readNewInboxEntries(inboxPath, queueState.scanOffset)
+  let abortedAtOffset = null
+
+  if (!deliveryFailed && records.length > 0) {
+    for (const rec of records) {
+      const queuedEntry = isQueuedBehindActiveTurnEntry(rec.entry)
+      if (queuedEntry) {
+        const validMessage = buildWakeDeliveryMessage(rec.entry, {
+          connectionId,
+          inboxFile: inboxPath,
+        })
+        if (!validMessage) continue
+        if (isTurnBusy() || queueState.heldRecords.length > 0) {
+          queueState.heldRecords.push(rec)
+          continue
+        }
+      }
+      const outcome = await deliverSingleRecord(rec, { queuedEntry })
+      if (!outcome.ok && !once) {
+        abortedAtOffset = rec.startOffset
+        break
+      }
+    }
+  } else if (deliveryFailed) {
+    abortedAtOffset = queueState.scanOffset
+  }
+
+  const newScanOffset = abortedAtOffset !== null ? abortedAtOffset : nextOffset
+  queueState.scanOffset = newScanOffset
+  const nextCommitted =
+    queueState.heldRecords.length > 0
+      ? Math.min(queueState.heldRecords[0].startOffset, newScanOffset)
+      : newScanOffset
+
+  if (nextCommitted !== queueState.committedOffset) {
+    queueState.committedOffset = nextCommitted
+    if (live) {
+      writeState(
+        connectionId,
+        {
+          ...live,
+          inbox_byte_offset: nextCommitted,
+          updated_at: new Date(nowFn()).toISOString(),
+        },
+        connectionsDir,
+      )
+    }
+  }
+
+  return {
+    committedOffset: queueState.committedOffset,
+    scanOffset: queueState.scanOffset,
+    heldCount: queueState.heldRecords.length,
   }
 }
 
@@ -833,17 +1046,17 @@ async function main() {
   }
 
   const inboxPath = inboxPathForConnection(connectionId)
-  let offset =
+  const initialOffset =
     typeof state?.inbox_byte_offset === 'number'
       ? state.inbox_byte_offset
       : fs.existsSync(inboxPath)
         ? fs.statSync(inboxPath).size
         : 0
+  const queueState = createListenerQueueState(initialOffset)
 
   // A wake that cannot be delivered stays in the inbox and is retried every tick; say
   // so once per distinct reason (and again when it recovers), so a stuck listener is
   // visible in its log instead of silently holding every room message (479607e6).
-  let lastDeliveryError = null
   let pollerMisses = 0
   let pollerRepairs = 0
   let repairNotBefore = 0
@@ -946,9 +1159,6 @@ async function main() {
       conversationId = live.local_id
       writeListenerMarker()
     }
-    if (typeof live?.inbox_byte_offset === 'number' && live.inbox_byte_offset > offset) {
-      offset = live.inbox_byte_offset
-    }
 
     // If an in-conversation devspec-remote-wait.mjs is armed, let it consume the inbox
     // so we never race or double-deliver wakes.
@@ -957,100 +1167,15 @@ async function main() {
       continue
     }
 
-    const { entries, nextOffset } = readNewInboxEntries(inboxPath, offset)
-    if (entries.length > 0) {
-      let allDeliveredOrNonCommand = true
-      for (const entry of entries) {
-        const message = buildWakeDeliveryMessage(entry, {
-          connectionId,
-          inboxFile: inboxPath,
-        })
-        if (!message) continue
-        let deliveredVia = 'stdout'
-        if (args.useAgentApi) {
-          const res = await deliverWakeViaAgentApi({
-            conversationId,
-            message,
-            env: process.env,
-            state: live,
-          })
-          if (res.ok) {
-            deliveredVia = 'agentapi'
-            if (lastDeliveryError !== null) {
-              process.stdout.write(
-                JSON.stringify({ type: 'wake_delivery_recovered', connection_id: connectionId, at: new Date().toISOString() }) + '\n',
-              )
-              lastDeliveryError = null
-            }
-            recordTurnWake(connectionId, entry)
-            if (live?.token && live?.mcp_url) {
-              mcpToolsCall({
-                mcpUrl: live.mcp_url,
-                token: live.token,
-                ...(live.connection_capability
-                  ? { connectionCapability: live.connection_capability }
-                  : {}),
-                name: 'report_pickup',
-                arguments: { connection_id: connectionId },
-                timeoutMs: 5_000,
-              }).catch(() => {})
-            }
-            try {
-              recordDeliveredBatchRequests(connectionId, entry, { dir: CONNECTIONS_DIR })
-            } catch {
-              /* non-fatal */
-            }
-          } else {
-            const error = String(res.error || 'agentapi_failed')
-            if (error !== lastDeliveryError) {
-              process.stdout.write(
-                JSON.stringify({
-                  type: 'wake_delivery_failed',
-                  connection_id: connectionId,
-                  conversation_id: conversationId,
-                  error,
-                  retrying: !args.once,
-                  at: new Date().toISOString(),
-                }) + '\n',
-              )
-              lastDeliveryError = error
-            }
-            if (!args.once) {
-              // Do not advance offset if agentapi delivery failed in daemon mode,
-              // so devspec-remote-wait.mjs or a later tick can deliver it.
-              allDeliveredOrNonCommand = false
-              break
-            }
-          }
-        } else {
-          recordTurnWake(connectionId, entry)
-          try {
-            recordDeliveredBatchRequests(connectionId, entry, { dir: CONNECTIONS_DIR })
-          } catch {
-            /* non-fatal */
-          }
-        }
-        process.stdout.write(
-          JSON.stringify({
-            type: 'wake_delivery',
-            connection_id: connectionId,
-            conversation_id: conversationId,
-            delivered_via: deliveredVia,
-            message,
-          }) + '\n',
-        )
-      }
-      if (allDeliveredOrNonCommand) {
-        offset = nextOffset
-        if (live) {
-          writeStateFile(connectionId, {
-            ...live,
-            inbox_byte_offset: offset,
-            updated_at: new Date().toISOString(),
-          })
-        }
-      }
-    }
+    await processListenerInboxTick(queueState, {
+      connectionId,
+      conversationId,
+      inboxPath,
+      live,
+      useAgentApi: args.useAgentApi,
+      once: args.once,
+      connectionsDir: CONNECTIONS_DIR,
+    })
 
     if (args.once) break
     await sleep(500)

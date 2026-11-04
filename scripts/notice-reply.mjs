@@ -138,13 +138,39 @@ export function turnNoticeIds({ marker, requestState = null, connectionState = n
 }
 
 /**
- * What one delivered inbox entry adds to the turn marker: its notice ids, or
- * `otherWake` for anything that is not a notice. A control entry (abort, model switch)
+ * Whether the current turn was woken solely by one or more DevSpec check jobs, with no
+ * command, terminal prompt, automation run, or system notice open on the turn.
+ *
+ * A check-job-only turn rules checks silently (`claim_check_job` / `record_check_rulings`)
+ * and must neither stream a work trail into the room nor auto-post a fallback session
+ * reply on Stop.
+ */
+export function isCheckJobOnlyTurn({ marker, requestState = null, connectionState = null } = {}) {
+  if (!marker?.checkJobWake) return false
+  if (marker.otherWake || marker.localPromptMirrored || marker.localTurn || connectionState?.local_turn) {
+    return false
+  }
+  const ids = Array.isArray(marker.noticeIds)
+    ? marker.noticeIds.filter((id) => typeof id === 'string' && UUID.test(id))
+    : []
+  if (ids.length > 0) return false
+  if (requestState) {
+    if (requestState.current === NO_REQUEST) return false
+    if (requestState.current && requestState.open?.has?.(requestState.current)) return false
+    if (requestState.joined?.size > 0) return false
+  }
+  return true
+}
+
+/**
+ * What one delivered inbox entry adds to the turn marker: its notice ids, `checkJobWake`
+ * for a check job, or `otherWake` for anything else. A control entry (abort, model switch)
  * is no input to the turn and adds nothing.
  */
 export function turnWakeFromEntry(entry) {
   if (!entry || typeof entry !== 'object') return null
   if (entry.type === 'canonical_control') return null
+  if (entry.type === 'check_job') return { checkJobWake: true }
   if (entry.type === 'canonical_system_notices') {
     const ids = Array.isArray(entry.execute_notice_ids)
       ? entry.execute_notice_ids
@@ -163,6 +189,7 @@ export function turnWakeFromEntry(entry) {
  */
 export function turnWakeFromText(text) {
   const noticeIds = []
+  let checkJobWake = false
   let otherWake = false
   for (const line of String(text || '').split('\n')) {
     const start = line.indexOf('{')
@@ -176,9 +203,13 @@ export function turnWakeFromText(text) {
     if (!event || typeof event !== 'object') continue
     if (event.type === 'system_notice' && typeof event.notice_id === 'string') {
       noticeIds.push(event.notice_id)
+    } else if (event.type === 'check_job') {
+      checkJobWake = true
     } else if (event.type === 'wake') {
       if (event.reason === 'exact_connection_system_notice') {
         if (Array.isArray(event.system_notice_ids)) noticeIds.push(...event.system_notice_ids)
+      } else if (event.reason === 'check_job') {
+        checkJobWake = true
       } else {
         otherWake = true
       }
@@ -188,13 +219,23 @@ export function turnWakeFromText(text) {
   }
   const ids = noticeIds.filter((id) => typeof id === 'string' && UUID.test(id))
   if (otherWake) return { otherWake: true }
-  return ids.length > 0 ? { noticeIds: ids } : null
+  if (ids.length > 0 || checkJobWake) {
+    return {
+      ...(ids.length > 0 ? { noticeIds: ids } : {}),
+      ...(checkJobWake ? { checkJobWake: true } : {}),
+    }
+  }
+  return null
 }
 
-/** Fold a wake into the marker's record: notice ids accumulate, `otherWake` sticks. */
+/** Fold a wake into the marker's record: notice ids and `checkJobWake` accumulate, `otherWake` sticks. */
 export function mergeTurnWake(marker, wake) {
   if (!wake) return {}
   if (wake.otherWake) return { otherWake: true }
   const held = Array.isArray(marker?.noticeIds) ? marker.noticeIds : []
-  return { noticeIds: [...new Set([...held, ...(wake.noticeIds ?? [])])] }
+  const checkJobWake = Boolean(marker?.checkJobWake || wake.checkJobWake)
+  return {
+    noticeIds: [...new Set([...held, ...(wake.noticeIds ?? [])])],
+    ...(checkJobWake ? { checkJobWake: true } : {}),
+  }
 }

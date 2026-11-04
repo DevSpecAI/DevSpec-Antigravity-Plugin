@@ -19,7 +19,7 @@ import { ensurePrivateDir } from './private-state.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-const KEY = /^[A-Za-z0-9_.:-]{1,128}$/
+const KEY = /^[A-Za-z0-9_.:/-]{1,128}$/
 const ENDED_STATUSES = new Set(['completed', 'failed', 'killed', 'stopped', 'cancelled', 'canceled', 'error'])
 const CRON_PROMPT_CLIP = 1000
 const ROTATE_BYTES = 64 * 1024
@@ -285,10 +285,18 @@ function carriedBy(entry, state) {
   }
 }
 
+function senderKeys(text) {
+  const out = []
+  for (const match of String(text || '').matchAll(/\bsender=([A-Za-z0-9_.:/-]{1,128})/g)) {
+    if (KEY.test(match[1]) && !out.includes(match[1])) out.push(match[1])
+  }
+  return out
+}
+
 export function requestForWake({ origin, text, state }) {
   const kind = typeof origin === 'string' ? origin : origin?.kind
   if (kind === 'task-notification') {
-    for (const key of [tag(text, 'task-id'), tag(text, 'tool-use-id')]) {
+    for (const key of [tag(text, 'task-id'), tag(text, 'tool-use-id'), ...senderKeys(text)]) {
       const launch = key ? state.launches.get(key) : null
       if (launch) return carriedBy(launch, state)
     }
@@ -296,6 +304,9 @@ export function requestForWake({ origin, text, state }) {
     if (commands.length > 0) return { ref: commands.at(-1), also: commands.slice(0, -1) }
     if (ownerMessageIds(text).length > 0) return { ref: UNSTATED, also: [] }
     if (/"type"\s*:\s*"automation_run"/.test(String(text || ''))) return { ref: NO_REQUEST, also: [] }
+    if (/"type"\s*:\s*"(?:check_job|system_notice)"/.test(String(text || ''))) {
+      return { ref: UNSTATED, also: [], carries: false }
+    }
     return { ref: UNSTATED, also: [] }
   }
   if (kind === 'scheduled-trigger') {
@@ -316,7 +327,7 @@ export function requestForWake({ origin, text, state }) {
 }
 
 export function notifiedKeys(text) {
-  return [tag(text, 'task-id'), tag(text, 'tool-use-id')].filter((key) => key && KEY.test(key))
+  return [...new Set([tag(text, 'task-id'), tag(text, 'tool-use-id'), ...senderKeys(text)].filter((key) => key && KEY.test(key)))]
 }
 
 export function promptArrival({ fromAPerson, origin, text, midTurn = false, state, newId = randomUUID }) {
@@ -326,9 +337,11 @@ export function promptArrival({ fromAPerson, origin, text, midTurn = false, stat
     events.push(midTurn ? { op: 'joined', id } : { op: 'current', ref: id })
     return { events, typedId: id }
   }
-  const { ref, also } = requestForWake({ origin, text, state })
+  const { ref, also, carries = true } = requestForWake({ origin, text, state })
   if (midTurn) {
-    for (const id of [ref, ...also]) events.push({ op: 'joined', id })
+    if (carries) {
+      for (const id of [ref, ...also]) events.push({ op: 'joined', id })
+    }
   } else {
     events.push({ op: 'current', ref: ref === UNSTATED ? null : ref })
     for (const id of also) events.push({ op: 'joined', id })
@@ -592,7 +605,11 @@ export function launchForRequest(toolName, toolInput, toolResponse, toolUseId = 
     }
     case 'run_command': {
       if (isDevSpecListener(input)) return null
-      const key = id(res.taskId ?? res.task_id ?? res.backgroundTaskId)
+      const outText = typeof res.output === 'string' ? res.output : typeof res.raw === 'string' ? res.raw : ''
+      const textMatch =
+        outText.match(/(?:background task ID|with task id)[:\s]+([A-Za-z0-9_.:/-]+)/i) ||
+        outText.match(/TaskId[:\s"]+([A-Za-z0-9_.:/-]+)/i)
+      const key = id(res.taskId ?? res.task_id ?? res.backgroundTaskId ?? textMatch?.[1])
       return key ? { key, alias, kind: 'shell', notifies: true } : null
     }
     case 'schedule': {

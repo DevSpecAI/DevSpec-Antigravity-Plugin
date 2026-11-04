@@ -32,7 +32,12 @@ import {
   QUEUED,
   validateInteractionAnswerRecord,
 } from './interaction-events.mjs'
-import { recordTurnWake, writeTurnMarker } from './mirror-turn.mjs'
+import {
+  isTurnMarkerActive,
+  readTurnMarker,
+  recordTurnWake,
+  writeTurnMarker,
+} from './mirror-turn.mjs'
 import { noticeReplyInstruction } from './notice-reply.mjs'
 import {
   STATE_ABSENT,
@@ -51,7 +56,7 @@ import {
   normalizeRemoteIngressV1,
   REMOTE_INGRESS_RESOURCE_URI,
 } from './remote-ingress-v1.mjs'
-import { recordDeliveredBatchRequests } from './requests.mjs'
+import { recordDeliveredBatchRequests, setCurrentRequest, UNSTATED } from './requests.mjs'
 import { wakeNotice } from './room-unread.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
@@ -1111,6 +1116,12 @@ async function main() {
       for (const record of records) {
         const [batch] = parseInboxBatches([record.line], connectionId)
         if (batch) {
+          const isQueuedTurnBatch =
+            batch.type === CHECK_JOB_RECORD_TYPE || batch.type === 'canonical_system_notices'
+          if (isQueuedTurnBatch && isTurnMarkerActive(readTurnMarker(connectionId, CONNECTIONS_DIR))) {
+            deferred = true
+            break
+          }
           if (batch.type === DISMISSAL_RECORD_TYPE) {
             const decision = dismissalDeliveryDecision(batch, readDismissalState(connectionId), connectionId)
             if (decision === 'defer') {
@@ -1178,8 +1189,15 @@ async function main() {
           } catch {
             /* non-fatal */
           }
-          // What this wake brings into the turn: notice ids, or another kind of wake.
+          // What this wake brings into the turn: notice ids, checkJobWake, or another kind of wake.
           recordTurnWake(connectionId, batch, CONNECTIONS_DIR)
+          if (isQueuedTurnBatch) {
+            try {
+              setCurrentRequest(connectionId, UNSTATED, { dir: CONNECTIONS_DIR })
+            } catch {
+              /* non-fatal */
+            }
+          }
           delivered +=
             batch.type === 'canonical_commands'
               ? batch.execute_message_ids.length
@@ -1188,6 +1206,10 @@ async function main() {
                 : batch.type === 'owner_messages' && Array.isArray(batch.messages)
                   ? batch.messages.length
                   : 1
+          if (isQueuedTurnBatch) {
+            offset = record.endOffset
+            break
+          }
         }
         offset = record.endOffset
       }
