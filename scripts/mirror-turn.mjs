@@ -169,7 +169,21 @@ export function writeTurnMarker(connectionId, extra = {}, dir = CONNECTIONS_DIR)
 export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR) {
   if (!connectionId) return null
   const wake = turnWakeFromEntry(entry)
-  const existing = readTurnMarker(connectionId, dir)
+  let existing = readTurnMarker(connectionId, dir)
+  // A stale marker (isTurnMarkerActive) is a turn that ended without its Stop, and
+  // every reader already treats it as no turn. The wake delivered now starts a new
+  // one, so it must not inherit that turn's startedAt or what woke it: the marker would
+  // stay stale and every queued check job and notice behind this one would be released
+  // at once instead of one per turn (item b68df72d). Only the marker goes; writing the
+  // fresh one below clears the old turn's reply and trail state as any new turn does.
+  if (existing && !isTurnMarkerActive(existing)) {
+    try {
+      fs.rmSync(turnMarkerPath(connectionId, dir), { force: true })
+    } catch {
+      /* non-fatal, as every marker write here is */
+    }
+    existing = null
+  }
   // A notice or check job is not a command: one that arrives during a turn typed at
   // the terminal leaves it a local turn, so that turn's answer keeps its local-turn flags.
   const nonCommandWake = Boolean(wake?.noticeIds || wake?.checkJobWake)

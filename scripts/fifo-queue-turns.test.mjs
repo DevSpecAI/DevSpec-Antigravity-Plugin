@@ -2,19 +2,29 @@
 /**
  * FIFO queueing of check jobs and system notices behind active turns, silent check-job
  * follow-up turns, and mid-turn `<conversationId>/task-<n>` completion reconciliation
- * (DevSpec item d36ac887).
+ * (DevSpec item d36ac887); commands past held records on the fallback wait path, held
+ * records that survive a restart or a hand-off, and one per turn after a stale turn
+ * marker (item b68df72d).
  */
 
 import assert from 'node:assert/strict'
+import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { describe, it } from 'node:test'
 import {
   buildWakeDeliveryMessage,
   createListenerQueueState,
   processListenerInboxTick,
+  restoreListenerQueueState,
 } from './devspec-remote-listen.mjs'
+import {
+  appendCanonicalInbox,
+  dispatchesStartTurn,
+  scanPersistedInboxRecords,
+} from './devspec-remote-poll.mjs'
 import { prepareDevspecToolInput } from './devspec-tool-input.mjs'
 import {
   clearTurnMarker,
@@ -28,7 +38,12 @@ import {
   streamTurnTrailIfChanged,
   writeTurnMarker,
 } from './mirror-turn.mjs'
-import { writeLocalBond, writeStateFile } from './remote-control-state.mjs'
+import { readStateFile, writeLocalBond, writeStateFile } from './remote-control-state.mjs'
+import {
+  FIXTURE_ID,
+  fixtureControl,
+  fixtureEnvelope,
+} from './remote-ingress-test-fixtures.mjs'
 import {
   appendRequestEvent,
   launchForRequest,
@@ -50,11 +65,13 @@ const REQ_ID = 'f1111111-1111-4111-8111-111111111111'
 const URGENT_REQ_ID = 'f2222222-2222-4222-8222-222222222222'
 const PROV_ID = 'c1111111-1111-4111-8111-111111111111'
 const USER_ID = 'a1111111-1111-4111-8111-111111111111'
+const SECOND_CHECK_JOB_ID = '13131313-1313-4313-8313-131313131313'
+const WAIT_SCRIPT = fileURLToPath(new URL('./devspec-remote-wait.mjs', import.meta.url))
 
-function makeCheckJobRecord(id = CHECK_JOB_ID) {
+function makeCheckJobRecord(id = CHECK_JOB_ID, connectionId = CONN_ID) {
   return {
     type: 'check_job',
-    connection_id: CONN_ID,
+    connection_id: connectionId,
     session_id: SESS_ID,
     dispatch: {
       id,
@@ -66,7 +83,7 @@ function makeCheckJobRecord(id = CHECK_JOB_ID) {
       high_risk: 1,
       yours: true,
       offered_at: '2026-11-04T18:00:00.000Z',
-      delivery_connection_id: CONN_ID,
+      delivery_connection_id: connectionId,
     },
   }
 }
@@ -119,15 +136,15 @@ function makeCommandRecord(messageId = URGENT_MSG_ID) {
   }
 }
 
-function makeFixture() {
+function makeFixture(connectionId = CONN_ID) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-fifo-queue-'))
   const rcDir = path.join(home, '.devspec', 'remote-control')
   const connDir = path.join(rcDir, 'connections')
   fs.mkdirSync(connDir, { recursive: true })
   const transcriptPath = path.join(home, 'transcript.jsonl')
-  const inboxPath = path.join(connDir, `${CONN_ID}.inbox.jsonl`)
+  const inboxPath = path.join(connDir, `${connectionId}.inbox.jsonl`)
   const live = {
-    connection_id: CONN_ID,
+    connection_id: connectionId,
     session_id: SESS_ID,
     project_id: PROJ_ID,
     local_id: CONV_ID,
@@ -140,8 +157,9 @@ function makeFixture() {
     inbox_byte_offset: 0,
   }
   writeStateFile(live, connDir)
-  writeLocalBond(CONV_ID, { connection_id: CONN_ID }, rcDir)
+  writeLocalBond(CONV_ID, { connection_id: connectionId }, rcDir)
   return {
+    connectionId,
     home,
     connDir,
     transcriptPath,
@@ -176,8 +194,13 @@ describe('active-turn FIFO queueing in devspec-remote-listen.mjs', () => {
 
       const deliveredMessages = []
       const mcpCalls = []
-      const persistedOffsets = []
       const queueState = createListenerQueueState(0)
+      const checkBytes = Buffer.byteLength(checkLine, 'utf8')
+      const noticeBytes = Buffer.byteLength(noticeLine, 'utf8')
+      const heldBoth = [
+        { start: 0, end: checkBytes },
+        { start: checkBytes, end: checkBytes + noticeBytes },
+      ]
 
       const tick = () =>
         processListenerInboxTick(queueState, {
@@ -198,18 +221,20 @@ describe('active-turn FIFO queueing in devspec-remote-listen.mjs', () => {
           },
           writeState: (_id, next) => {
             fx.live.inbox_byte_offset = next.inbox_byte_offset
-            persistedOffsets.push(next.inbox_byte_offset)
+            fx.live.inbox_held_records = next.inbox_held_records
           },
           writeStdout: () => {},
           env: {},
         })
 
       // 1. Active turn running: check_job + system_notice are both held, nothing delivered,
-      // active turn marker (`otherWake: true`) and `current: REQ_ID` stay intact, and disk offset stays at 0.
+      // active turn marker (`otherWake: true`) and `current: REQ_ID` stay intact. The
+      // cursor moves past them and their byte ranges are persisted beside it.
       const firstTick = await tick()
       assert.equal(deliveredMessages.length, 0)
       assert.equal(firstTick.heldCount, 2)
-      assert.equal(firstTick.committedOffset, 0)
+      assert.equal(fx.live.inbox_byte_offset, checkBytes + noticeBytes)
+      assert.deepEqual(fx.live.inbox_held_records, heldBoth)
       assert.equal(readTurnMarker(CONN_ID, fx.connDir).otherWake, true)
       assert.equal(readRequestState(CONN_ID, { dir: fx.connDir }).current, REQ_ID)
       assert.equal(mcpCalls.length, 0)
@@ -221,7 +246,12 @@ describe('active-turn FIFO queueing in devspec-remote-listen.mjs', () => {
       assert.equal(deliveredMessages.length, 1)
       assert.match(deliveredMessages[0], /Please pause and check staging first\./)
       assert.equal(secondTick.heldCount, 2, 'check_job and notice remain held behind the active turn')
-      assert.equal(secondTick.committedOffset, 0, 'disk offset stays before earliest held record for crash safety')
+      assert.equal(
+        fx.live.inbox_byte_offset,
+        checkBytes + noticeBytes + Buffer.byteLength(commandLine, 'utf8'),
+        'the cursor moves past the delivered command, so a restart never replays it',
+      )
+      assert.deepEqual(fx.live.inbox_held_records, heldBoth, 'the held records are persisted beside it')
       assert.equal(mcpCalls.filter((c) => c.name === 'report_pickup').length, 1, 'commands report pickup')
 
       // 3. Active command turn finishes (Stop clears turn marker and closes finished requests).
@@ -235,7 +265,7 @@ describe('active-turn FIFO queueing in devspec-remote-listen.mjs', () => {
       assert.equal(deliveredMessages.length, 2)
       assert.match(deliveredMessages[1], /take it with claim_check_job/)
       assert.equal(thirdTick.heldCount, 1, 'system_notice waits for the check-job turn to finish')
-      assert.equal(thirdTick.committedOffset, Buffer.byteLength(checkLine, 'utf8'))
+      assert.deepEqual(fx.live.inbox_held_records, [heldBoth[1]])
       assert.equal(isCurrentTurnCheckJobOnly(CONN_ID, { dir: fx.connDir }), true)
       assert.equal(readRequestState(CONN_ID, { dir: fx.connDir }).current, null)
       assert.equal(mcpCalls.length, 0, 'check_job delivery never calls report_pickup')
@@ -246,10 +276,8 @@ describe('active-turn FIFO queueing in devspec-remote-listen.mjs', () => {
       assert.equal(deliveredMessages.length, 3)
       assert.match(deliveredMessages[2], new RegExp(`system_notice_ids: \\["${NOTICE_ID}"\\]`))
       assert.equal(fourthTick.heldCount, 0)
-      assert.equal(
-        fourthTick.committedOffset,
-        Buffer.byteLength(checkLine + noticeLine + commandLine, 'utf8'),
-      )
+      assert.deepEqual(fx.live.inbox_held_records, [])
+      assert.equal(fx.live.inbox_byte_offset, Buffer.byteLength(checkLine + noticeLine + commandLine, 'utf8'))
       assert.deepEqual(readTurnMarker(CONN_ID, fx.connDir).noticeIds, [NOTICE_ID])
       assert.equal(readRequestState(CONN_ID, { dir: fx.connDir }).current, null)
       assert.equal(mcpCalls.length, 0, 'system_notice delivery never calls report_pickup')
@@ -336,7 +364,7 @@ describe('dedicated check-job follow-up turns in mirror-turn.mjs and devspec-too
             type: 'PLANNER_RESPONSE',
             created_at: new Date(Date.now() + 1000).toISOString(),
             thinking: 'Claiming and ruling the check job.',
-            tool_calls: [{ name: 'call_mcp_tool', arguments: { ServerName: 'devspec', ToolName: 'claim_check_job' } }],
+            tool_calls: [{ name: 'default_api:call_mcp_tool', args: { ServerName: 'devspec', ToolName: 'claim_check_job' } }],
           }),
           JSON.stringify({
             step_index: 12,
@@ -468,5 +496,479 @@ describe('Antigravity <conversationId>/task-<n> background launch & mid-turn rec
     } finally {
       fx.cleanup()
     }
+  })
+})
+
+// ---------------------------------------------------------------------------------
+// Item b68df72d: commands past held records on the fallback wait path, held records
+// that survive a restart or a hand-off, and one per turn after a stale turn marker.
+// ---------------------------------------------------------------------------------
+
+/** A turn marker no reader counts as a running turn: no sign of life for 11 minutes. */
+function writeStaleTurnMarker(connectionId, dir) {
+  const longAgo = Date.now() - 11 * 60 * 1000
+  fs.writeFileSync(
+    path.join(dir, `${connectionId}.turn`),
+    JSON.stringify({ startedAt: longAgo, lastToolAt: longAgo, remoteTurn: true, otherWake: true }),
+  )
+}
+
+/** One inbox line exactly as the poller writes it (appendCanonicalInbox). */
+function canonicalLine(connectionId, envelope, channel) {
+  let line = null
+  const result = appendCanonicalInbox(connectionId, envelope, scanPersistedInboxRecords(''), {
+    channel,
+    writeRecord: (_id, record) => {
+      line = `${JSON.stringify(record)}\n`
+      return true
+    },
+  })
+  assert.equal(result.appended, true, `fixture ${channel} record was not written`)
+  return line
+}
+
+const W_CONN = FIXTURE_ID.connection
+
+function waitCommandLine(body = 'Please pause and check staging first.') {
+  return canonicalLine(
+    W_CONN,
+    fixtureEnvelope({ body, envelopeId: '22222222-2222-4222-8222-000000000001' }),
+    'command',
+  )
+}
+
+function waitControlLine() {
+  return canonicalLine(
+    W_CONN,
+    fixtureEnvelope({
+      wakeKind: 'control',
+      control: fixtureControl('compact'),
+      envelopeId: '22222222-2222-4222-8222-000000000002',
+    }),
+    'control',
+  )
+}
+
+function waitNoticeLine() {
+  return canonicalLine(
+    W_CONN,
+    {
+      kind: 'devspec.remote_ingress',
+      schema_version: 1,
+      contract_version: '1.6.0',
+      policy_version: '2026-09-24.1',
+      envelope_id: '22222222-2222-4222-8222-000000000003',
+      connection: { connection_id: W_CONN, agent_name: 'Antigravity', codename: 'Calm Fox', label: 'Antigravity / Calm Fox' },
+      wake: { kind: 'system_notice', active: true, reason_id: 'exact_connection_system_notice' },
+      delivery_state: 'live',
+      command_message_ids: [],
+      commands: [],
+      system_notices: [
+        {
+          version: 1,
+          kind: 'server_notice',
+          notice_id: NOTICE_ID,
+          topic: 'coherence_finding',
+          notice_type: 'reversal',
+          summary: 'Protected decision reversed by new record',
+          prompt: 'Review the protected record.',
+          contract_uri: 'devspec://product/remote-ingress-contract',
+          records: [
+            {
+              label: 'Protected record',
+              record_type: 'memory',
+              record_id: '81000000-0000-4000-8000-000000000001',
+              title: 'All deliveries use canonical ingress',
+              text: 'All remote deliveries use the canonical ingress envelope.',
+              url: null,
+            },
+          ],
+          allowed_outcomes: ['keep_protected', 'propose_override', 'retract_new_record'],
+          allowed_tools: ['retract_memory', 'supersede_memory', 'manage_protected_intent'],
+        },
+      ],
+      room_context: { version: 1, messages: [], coverage: null },
+      control: null,
+      context: { human_context: [], agent_context: [], ai_context: [], system_context: [] },
+      window: {
+        policy_version: '2026-09-24.1',
+        returned: 0,
+        total_known: 0,
+        source_window: { start: null, end: null },
+        truncated: false,
+        has_more: false,
+        next_cursor: null,
+        fetch_id: null,
+        omission_reason: null,
+      },
+    },
+    'system_notice',
+  )
+}
+
+const waitCheckLine = (id = CHECK_JOB_ID) => `${JSON.stringify(makeCheckJobRecord(id, W_CONN))}\n`
+
+function parseEventLines(text) {
+  const events = []
+  for (const line of String(text || '').split('\n')) {
+    if (!line.trim()) continue
+    try {
+      events.push(JSON.parse(line))
+    } catch {
+      /* not an event line */
+    }
+  }
+  return events
+}
+
+const checkJobIds = (events) => events.filter((e) => e.type === 'check_job').map((e) => e.check_job_id)
+const noticeIds = (events) => events.filter((e) => e.type === 'system_notice').map((e) => e.notice_id)
+const ownerMessages = (events) => events.filter((e) => e.type === 'owner_message')
+
+/** Arm the fallback wait the way the connect script prints it on re-arm: one-shot `--pending`. */
+function runWaitOnce(fx, { timeoutMs = 15_000 } = {}) {
+  const res = spawnSync(
+    process.execPath,
+    [WAIT_SCRIPT, '--connection-id', fx.connectionId, '--pending', '--poll-ms', '5'],
+    { env: { ...process.env, HOME: fx.home, USERPROFILE: fx.home }, encoding: 'utf8', timeout: timeoutMs },
+  )
+  return { status: res.status, signal: res.signal, stderr: res.stderr, events: parseEventLines(res.stdout) }
+}
+
+function startWaitStream(fx) {
+  const child = spawn(
+    process.execPath,
+    [WAIT_SCRIPT, '--connection-id', fx.connectionId, '--stream', '--pending', '--poll-ms', '5'],
+    { env: { ...process.env, HOME: fx.home, USERPROFILE: fx.home }, stdio: ['ignore', 'pipe', 'pipe'] },
+  )
+  const events = []
+  let pending = ''
+  let stderr = ''
+  child.stdout.setEncoding('utf8')
+  child.stdout.on('data', (chunk) => {
+    pending += chunk
+    for (let nl = pending.indexOf('\n'); nl !== -1; nl = pending.indexOf('\n')) {
+      events.push(...parseEventLines(pending.slice(0, nl)))
+      pending = pending.slice(nl + 1)
+    }
+  })
+  child.stderr.setEncoding('utf8')
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk
+  })
+  const until = async (predicate, label, timeoutMs = 10_000) => {
+    const startedAt = Date.now()
+    while (!predicate()) {
+      if (child.exitCode !== null) throw new Error(`wait stream exited (${child.exitCode}) before ${label}: ${stderr}`)
+      if (Date.now() - startedAt > timeoutMs) throw new Error(`timed out waiting for ${label}: ${stderr}`)
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
+  const stop = () =>
+    new Promise((resolve) => {
+      if (child.exitCode !== null) return resolve()
+      child.once('exit', resolve)
+      child.kill('SIGTERM')
+    })
+  return { events, until, stop }
+}
+
+/** Listener deliveries the way main() makes them: state re-read from disk every tick. */
+function listenerTicker(fx, { deliveredMessages, queueState }) {
+  return (state = queueState) =>
+    processListenerInboxTick(state, {
+      connectionId: fx.connectionId,
+      conversationId: CONV_ID,
+      inboxPath: fx.inboxPath,
+      live: readStateFile(fx.connectionId, fx.connDir),
+      useAgentApi: true,
+      connectionsDir: fx.connDir,
+      deliver: async ({ message }) => {
+        deliveredMessages.push(message)
+        return { ok: true }
+      },
+      callMcp: async () => ({ ok: true }),
+      writeStdout: () => {},
+      env: {},
+    })
+}
+
+describe('the fallback wait path (devspec-remote-wait.mjs) delivers past held work', () => {
+  it('wakes at once for a command and a control behind held check jobs and notices, then releases the held ones one per turn in arrival order across re-arms', () => {
+    const fx = makeFixture(W_CONN)
+    try {
+      // A command turn is running.
+      writeTurnMarker(W_CONN, { remoteTurn: true, otherWake: true }, fx.connDir)
+      const checkLine = waitCheckLine()
+      const noticeLine = waitNoticeLine()
+      const controlLine = waitControlLine()
+      const commandLine = waitCommandLine()
+      fs.writeFileSync(fx.inboxPath, checkLine + noticeLine + controlLine + commandLine)
+      const c = Buffer.byteLength(checkLine)
+      const n = Buffer.byteLength(noticeLine)
+      const end = fs.statSync(fx.inboxPath).size
+
+      // The arm wakes on the control and the command; the check job and notice wait.
+      const first = runWaitOnce(fx)
+      assert.equal(first.status, 0, first.stderr)
+      assert.match(first.stderr, /wake \(2 msg\)/, 'the control and the command both woke it')
+      assert.equal(ownerMessages(first.events).length, 1)
+      assert.match(ownerMessages(first.events)[0].body, /Please pause and check staging first\./)
+      assert.deepEqual(checkJobIds(first.events), [])
+      assert.deepEqual(noticeIds(first.events), [])
+      let state = readStateFile(W_CONN, fx.connDir)
+      assert.equal(state.inbox_byte_offset, end, 'the cursor is past everything it delivered')
+      assert.deepEqual(state.inbox_held_records, [
+        { start: 0, end: c },
+        { start: c, end: c + n },
+      ])
+
+      // Re-armed while that turn still runs: nothing is replayed and nothing released.
+      const still = runWaitOnce(fx, { timeoutMs: 1_000 })
+      assert.notEqual(still.status, 0, 'no wake while the turn runs')
+      assert.deepEqual(still.events, [], 'the delivered command is not replayed')
+
+      // The turn ends: the next arm brings the check job alone, and starts its turn.
+      clearTurnMarker(W_CONN, fx.connDir)
+      const second = runWaitOnce(fx)
+      assert.equal(second.status, 0, second.stderr)
+      assert.deepEqual(checkJobIds(second.events), [CHECK_JOB_ID])
+      assert.deepEqual(noticeIds(second.events), [], 'the notice waits for the check job turn')
+      assert.equal(ownerMessages(second.events).length, 0)
+      state = readStateFile(W_CONN, fx.connDir)
+      assert.deepEqual(state.inbox_held_records, [{ start: c, end: c + n }])
+      assert.equal(readTurnMarker(W_CONN, fx.connDir).checkJobWake, true)
+
+      // That turn ends: the notice comes next, and nothing is left owed.
+      clearTurnMarker(W_CONN, fx.connDir)
+      const third = runWaitOnce(fx)
+      assert.equal(third.status, 0, third.stderr)
+      assert.deepEqual(noticeIds(third.events), [NOTICE_ID])
+      assert.deepEqual(checkJobIds(third.events), [])
+      assert.deepEqual(readStateFile(W_CONN, fx.connDir).inbox_held_records, [])
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('in --stream mode keeps delivering commands past a held check job and releases held work one turn at a time', async () => {
+    const fx = makeFixture(W_CONN)
+    const stream = startWaitStream(fx)
+    try {
+      writeTurnMarker(W_CONN, { remoteTurn: true, otherWake: true }, fx.connDir)
+      fs.writeFileSync(fx.inboxPath, waitCheckLine())
+      const stateHeld = () => readStateFile(W_CONN, fx.connDir)?.inbox_held_records ?? []
+      await stream.until(() => stateHeld().length === 1, 'the check job to be held')
+
+      fs.appendFileSync(fx.inboxPath, waitCommandLine())
+      await stream.until(() => ownerMessages(stream.events).length === 1, 'the command')
+      assert.deepEqual(checkJobIds(stream.events), [], 'the check job still waits for the turn')
+
+      clearTurnMarker(W_CONN, fx.connDir)
+      await stream.until(() => checkJobIds(stream.events).length === 1, 'the check job after the turn ends')
+
+      // The check job's own turn is running now, so a notice arriving waits for it.
+      fs.appendFileSync(fx.inboxPath, waitNoticeLine())
+      await stream.until(() => stateHeld().length === 1, 'the notice to be held')
+      assert.deepEqual(noticeIds(stream.events), [])
+
+      clearTurnMarker(W_CONN, fx.connDir)
+      await stream.until(() => noticeIds(stream.events).length === 1, 'the notice after the check job turn')
+      const order = stream.events
+        .filter((e) => ['owner_message', 'check_job', 'system_notice'].includes(e.type))
+        .map((e) => e.type)
+      assert.deepEqual(order, ['owner_message', 'check_job', 'system_notice'])
+    } finally {
+      await stream.stop()
+      fx.cleanup()
+    }
+  })
+
+  it('releases one held check job per turn after a stale turn marker, never a burst', () => {
+    const fx = makeFixture(W_CONN)
+    try {
+      writeStaleTurnMarker(W_CONN, fx.connDir)
+      const first = waitCheckLine(CHECK_JOB_ID)
+      fs.writeFileSync(fx.inboxPath, first + waitCheckLine(SECOND_CHECK_JOB_ID))
+      const c = Buffer.byteLength(first)
+
+      const wake = runWaitOnce(fx)
+      assert.equal(wake.status, 0, wake.stderr)
+      assert.deepEqual(checkJobIds(wake.events), [CHECK_JOB_ID])
+      assert.deepEqual(readStateFile(W_CONN, fx.connDir).inbox_held_records, [
+        { start: c, end: fs.statSync(fx.inboxPath).size },
+      ])
+
+      clearTurnMarker(W_CONN, fx.connDir)
+      const next = runWaitOnce(fx)
+      assert.equal(next.status, 0, next.stderr)
+      assert.deepEqual(checkJobIds(next.events), [SECOND_CHECK_JOB_ID])
+    } finally {
+      fx.cleanup()
+    }
+  })
+})
+
+describe('held records survive a listener restart and a hand-off to the wait script', () => {
+  it('a restarted listener neither replays the command delivered past a held check job nor loses the check job', async () => {
+    const fx = makeFixture()
+    try {
+      recordTurnWake(CONN_ID, { type: 'canonical_commands', execute_message_ids: [CMD_MSG_ID] }, fx.connDir)
+      fs.writeFileSync(fx.inboxPath, `${JSON.stringify(makeCheckJobRecord())}\n`)
+      const deliveredMessages = []
+      const tick = listenerTicker(fx, { deliveredMessages, queueState: createListenerQueueState(0) })
+
+      await tick()
+      fs.appendFileSync(fx.inboxPath, `${JSON.stringify(makeCommandRecord())}\n`)
+      await tick()
+      assert.equal(deliveredMessages.length, 1)
+      assert.match(deliveredMessages[0], /Please pause and check staging first\./)
+
+      // Restart: a new listener builds its queue from the state file alone.
+      const restarted = restoreListenerQueueState(readStateFile(CONN_ID, fx.connDir), {
+        inboxPath: fx.inboxPath,
+        connectionId: CONN_ID,
+      })
+      assert.equal(restarted.heldRecords.length, 1)
+      assert.equal(restarted.scanOffset, fs.statSync(fx.inboxPath).size)
+
+      await tick(restarted)
+      assert.equal(deliveredMessages.length, 1, 'the delivered command is not replayed')
+
+      clearTurnMarker(CONN_ID, fx.connDir)
+      await tick(restarted)
+      assert.equal(deliveredMessages.length, 2)
+      assert.match(deliveredMessages[1], /take it with claim_check_job/)
+      clearTurnMarker(CONN_ID, fx.connDir)
+      await tick(restarted)
+      assert.equal(deliveredMessages.length, 2, 'the check job is delivered exactly once')
+      assert.deepEqual(readStateFile(CONN_ID, fx.connDir).inbox_held_records, [])
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('the wait script armed with --pending after the listener delivers the held check job and does not replay the command', async () => {
+    const fx = makeFixture(W_CONN)
+    try {
+      writeTurnMarker(W_CONN, { remoteTurn: true, otherWake: true }, fx.connDir)
+      fs.writeFileSync(fx.inboxPath, waitCheckLine())
+      const deliveredMessages = []
+      const tick = listenerTicker(fx, { deliveredMessages, queueState: createListenerQueueState(0) })
+      await tick()
+      fs.appendFileSync(fx.inboxPath, waitCommandLine())
+      await tick()
+      assert.equal(deliveredMessages.length, 1, 'the listener delivered the command')
+
+      clearTurnMarker(W_CONN, fx.connDir)
+      const wake = runWaitOnce(fx)
+      assert.equal(wake.status, 0, wake.stderr)
+      assert.deepEqual(checkJobIds(wake.events), [CHECK_JOB_ID])
+      assert.equal(ownerMessages(wake.events).length, 0, 'the command is not replayed')
+      assert.deepEqual(readStateFile(W_CONN, fx.connDir).inbox_held_records, [])
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('a listener resuming after the wait script released its held check job does not deliver it again', async () => {
+    const fx = makeFixture(W_CONN)
+    try {
+      writeTurnMarker(W_CONN, { remoteTurn: true, otherWake: true }, fx.connDir)
+      fs.writeFileSync(fx.inboxPath, waitCheckLine())
+      const deliveredMessages = []
+      const queueState = createListenerQueueState(0)
+      const tick = listenerTicker(fx, { deliveredMessages, queueState })
+      await tick()
+      assert.equal(queueState.heldRecords.length, 1)
+
+      // The listener stands aside while the wait script is armed; that script delivers it.
+      clearTurnMarker(W_CONN, fx.connDir)
+      const wake = runWaitOnce(fx)
+      assert.deepEqual(checkJobIds(wake.events), [CHECK_JOB_ID])
+
+      clearTurnMarker(W_CONN, fx.connDir)
+      await tick()
+      assert.equal(deliveredMessages.length, 0, 'already delivered by the wait script')
+      assert.equal(queueState.heldRecords.length, 0)
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('drops persisted held ranges that no longer point at one queued record before the cursor', () => {
+    const fx = makeFixture()
+    try {
+      const checkLine = `${JSON.stringify(makeCheckJobRecord())}\n`
+      const commandLine = `${JSON.stringify(makeCommandRecord())}\n`
+      fs.writeFileSync(fx.inboxPath, checkLine + commandLine)
+      const c = Buffer.byteLength(checkLine)
+      const end = fs.statSync(fx.inboxPath).size
+      const restored = restoreListenerQueueState(
+        {
+          inbox_byte_offset: end,
+          inbox_held_records: [
+            { start: 0, end: c },
+            { start: c, end }, // a command, never queued work
+            { start: 1, end: c }, // part of a line
+            { start: 0, end: c }, // the same record twice
+          ],
+        },
+        { inboxPath: fx.inboxPath, connectionId: CONN_ID },
+      )
+      assert.deepEqual(
+        restored.heldRecords.map((rec) => [rec.startOffset, rec.endOffset, rec.entry.type]),
+        [[0, c, 'check_job']],
+      )
+      const pastCursor = restoreListenerQueueState(
+        { inbox_byte_offset: 0, inbox_held_records: [{ start: 0, end: c }] },
+        { inboxPath: fx.inboxPath, connectionId: CONN_ID },
+      )
+      assert.deepEqual(pastCursor.heldRecords, [], 'a range past the cursor was never held')
+    } finally {
+      fx.cleanup()
+    }
+  })
+})
+
+describe('a stale turn marker on the main listener', () => {
+  it('releases held check jobs one per turn rather than all at once', async () => {
+    const fx = makeFixture()
+    try {
+      writeStaleTurnMarker(CONN_ID, fx.connDir)
+      fs.writeFileSync(
+        fx.inboxPath,
+        `${JSON.stringify(makeCheckJobRecord(CHECK_JOB_ID))}\n${JSON.stringify(makeCheckJobRecord(SECOND_CHECK_JOB_ID))}\n`,
+      )
+      const deliveredMessages = []
+      const tick = listenerTicker(fx, { deliveredMessages, queueState: createListenerQueueState(0) })
+
+      const first = await tick()
+      assert.equal(deliveredMessages.length, 1)
+      assert.match(deliveredMessages[0], new RegExp(CHECK_JOB_ID))
+      assert.equal(first.heldCount, 1)
+      // The delivered check job started a fresh turn, not the dead one's continuation.
+      const marker = readTurnMarker(CONN_ID, fx.connDir)
+      assert.equal(marker.checkJobWake, true)
+      assert.equal(marker.otherWake, undefined)
+
+      await tick()
+      assert.equal(deliveredMessages.length, 1, 'the second waits for the first one’s turn')
+
+      clearTurnMarker(CONN_ID, fx.connDir)
+      await tick()
+      assert.equal(deliveredMessages.length, 2)
+      assert.match(deliveredMessages[1], new RegExp(SECOND_CHECK_JOB_ID))
+    } finally {
+      fx.cleanup()
+    }
+  })
+})
+
+describe('the poller asserting a turn ahead of the armed wait script', () => {
+  it('does so for an automation run but never for a check job, which may have to wait', () => {
+    assert.equal(dispatchesStartTurn({ automation_run: 1, check_job: 0 }), true)
+    assert.equal(dispatchesStartTurn({ automation_run: 1, check_job: 1 }), true)
+    assert.equal(dispatchesStartTurn({ automation_run: 0, check_job: 1 }), false)
   })
 })

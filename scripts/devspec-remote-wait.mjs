@@ -8,6 +8,12 @@
  * `interaction_answer`, or `question_dismissal` records written by `devspec-remote-poll.mjs`
  * (plus backward-compatible `owner_messages` records).
  *
+ * Check jobs and system notices wait behind a running turn and go one per turn in
+ * arrival order; everything else is delivered as it arrives, past any held record. The
+ * held records' byte ranges are persisted beside the cursor (`inbox_held_records`), so
+ * the next arm or a restarted listener picks them up without replaying what was
+ * delivered past them (isQueuedBehindTurn, readHeldInboxRecords).
+ *
  * Usage:
  *   node devspec-remote-wait.mjs --connection-id <uuid> [--stream] [--from-end|--pending] [--owner-pid <pid>]
  */
@@ -280,10 +286,14 @@ export function writeStatePatch(
   }
 }
 
+/**
+ * Persist the scan cursor and the held records' byte ranges in one write: they are one
+ * fact (item b68df72d), so a reader that comes next never sees one without the other.
+ */
 function commitDeliveredOffset(
   connectionId,
   offset,
-  { dir = CONNECTIONS_DIR, legacyPath = LEGACY_STATE_PATH } = {},
+  { held = [], dir = CONNECTIONS_DIR, legacyPath = LEGACY_STATE_PATH } = {},
 ) {
   const current = readStateResult(connectionId, { dir, legacyPath })
   if (current.status === STATE_UNREADABLE) {
@@ -295,6 +305,7 @@ function commitDeliveredOffset(
   const next = {
     ...current.value,
     inbox_byte_offset: offset,
+    inbox_held_records: held,
     connection_id: connectionId,
     updated_at: new Date().toISOString(),
   }
@@ -309,6 +320,7 @@ function commitDeliveredOffset(
     writePrivateJson(legacyPath, {
       ...leg.value,
       inbox_byte_offset: offset,
+      inbox_held_records: held,
       connection_id: connectionId,
       updated_at: next.updated_at,
     })
@@ -341,13 +353,102 @@ export function readInboxRecords(file, offset) {
     const records = []
     let start = 0
     for (let newline = bytes.indexOf(0x0a, start); newline !== -1; newline = bytes.indexOf(0x0a, start)) {
-      records.push({ line: bytes.subarray(start, newline).toString('utf8'), endOffset: offset + newline + 1 })
+      records.push({
+        line: bytes.subarray(start, newline).toString('utf8'),
+        startOffset: offset + start,
+        endOffset: offset + newline + 1,
+      })
       start = newline + 1
     }
     return records
   } finally {
     fs.closeSync(fd)
   }
+}
+
+/**
+ * Check jobs and system notices about the agent's own work wait for its running turn:
+ * they queue in arrival order behind it and are delivered one per turn (item d36ac887,
+ * decision ff1bcabe). Nothing else queues. Commands, controls and question answers are
+ * delivered as they arrive, past any held record (item b68df72d).
+ */
+export function isQueuedBehindTurn(record) {
+  return record?.type === CHECK_JOB_RECORD_TYPE || record?.type === 'canonical_system_notices'
+}
+
+/** What the state file keeps of the held records: their byte ranges, in arrival order. */
+export function heldRecordRanges(held) {
+  return held.map(({ startOffset, endOffset }) => ({ start: startOffset, end: endOffset }))
+}
+
+/**
+ * The queued records a previous reader of this inbox was holding, read back from it
+ * (item b68df72d). Shared by this script and `devspec-remote-listen.mjs`, which hand
+ * the inbox to each other.
+ *
+ * The cursor moves past a held record so the scan can carry on to what follows it, so
+ * the cursor alone no longer says what is still owed. The state file keeps the held
+ * records' byte ranges beside the cursor, written in the same write, so the next reader
+ * (a restarted listener, or this script on `--pending`) delivers each one exactly once
+ * and never replays the commands delivered past it.
+ *
+ * The ranges come from a file, so each is revalidated: it must sit wholly before the
+ * cursor, start after the one before it ended, cover exactly one complete line, and
+ * `parse` (the reader's own revalidation) must accept that line as queued work.
+ * Anything else is dropped and said so; the inbox is append-only, so a range that no
+ * longer checks out points at nothing the plugin wrote.
+ *
+ * @param {string} file the inbox
+ * @param {unknown} ranges `inbox_held_records` from the state file
+ * @param {number} cursor `inbox_byte_offset` from the same state file
+ * @param {(line: string) => object | null} parse the reader's revalidation of one line
+ * @returns {Array<{ startOffset: number, endOffset: number, entry: object }>} in arrival order
+ */
+export function readHeldInboxRecords(
+  file,
+  ranges,
+  cursor,
+  parse,
+  { log = (line) => process.stderr.write(line), label = 'devspec-remote-wait' } = {},
+) {
+  if (!Array.isArray(ranges) || ranges.length === 0) return []
+  const sorted = ranges
+    .filter((range) => range && Number.isInteger(range.start) && Number.isInteger(range.end))
+    .sort((a, b) => a.start - b.start)
+  let fd = null
+  try {
+    fd = fs.openSync(file, 'r')
+  } catch {
+    log(`${label}: held records dropped — inbox unreadable\n`)
+    return []
+  }
+  const held = []
+  try {
+    for (const { start, end } of sorted) {
+      const previous = held.at(-1)
+      const inBounds =
+        start >= 0 &&
+        end > start &&
+        end <= cursor &&
+        (previous === undefined || start >= previous.endOffset)
+      let entry = null
+      if (inBounds) {
+        const bytes = Buffer.alloc(end - start)
+        const read = fs.readSync(fd, bytes, 0, bytes.length, start)
+        const oneLine =
+          read === bytes.length && bytes.at(-1) === 0x0a && !bytes.subarray(0, -1).includes(0x0a)
+        if (oneLine) entry = parse(bytes.subarray(0, -1).toString('utf8'))
+      }
+      if (!entry || !isQueuedBehindTurn(entry)) {
+        log(`${label}: held record at ${start}-${end} no longer checks out — dropped\n`)
+        continue
+      }
+      held.push({ startOffset: start, endOffset: end, entry })
+    }
+  } finally {
+    fs.closeSync(fd)
+  }
+  return held
 }
 
 const ROOM_STATE_SECTIONS = new Set([
@@ -1010,6 +1111,61 @@ export async function emitOwnerMessageBatches(
   return delivered
 }
 
+/** The stdout events one inbox batch becomes. */
+function eventsForBatch(batch, { inboxFile, connectionId }) {
+  if (batch.type === 'canonical_commands') {
+    return buildCanonicalCommandEvents(batch, {
+      inboxFile,
+      unread: wakeNotice({
+        connectionId,
+        sessionId: batch.session_id,
+        deliveredCommandIds: batch.execute_message_ids,
+        deliveredCommands: Array.isArray(batch.ingress?.commands)
+          ? batch.ingress.commands.filter((c) => batch.execute_message_ids.includes(c.message_id))
+          : [],
+      }),
+    })
+  }
+  if (batch.type === 'canonical_control') return buildCanonicalControlEvents(batch, { inboxFile })
+  if (batch.type === 'canonical_system_notices') return buildCanonicalSystemNoticeEvents(batch, { inboxFile })
+  if (batch.type === INTERACTION_ANSWER_RECORD_TYPE || batch.type === DISMISSAL_RECORD_TYPE) {
+    return batch.disposition === QUEUED
+      ? buildQueuedAnswerEvents(batch, { inboxFile })
+      : buildInteractionAnswerEvents(batch, { inboxFile })
+  }
+  if (batch.type === 'automation_run') return buildAutomationRunEvents(batch, { inboxFile })
+  if (batch.type === CHECK_JOB_RECORD_TYPE) return buildCheckJobEvents(batch, { inboxFile })
+  return buildOwnerMessageEvents(batch, { inboxFile, attachmentDir: attachmentDirFor(connectionId) })
+}
+
+/** How many deliveries one inbox batch counts as in the wake summary. */
+function deliveryCount(batch) {
+  if (batch.type === 'canonical_commands') return batch.execute_message_ids.length
+  if (batch.type === 'canonical_system_notices') return batch.execute_notice_ids.length
+  if (batch.type === 'owner_messages' && Array.isArray(batch.messages)) return batch.messages.length
+  return 1
+}
+
+/** What delivering one batch records: its requests, and what it brings into the turn. */
+function recordBatchDelivered(connectionId, batch) {
+  try {
+    recordDeliveredBatchRequests(connectionId, batch, { dir: CONNECTIONS_DIR })
+  } catch {
+    /* non-fatal */
+  }
+  // What this wake brings into the turn: notice ids, checkJobWake, or another kind of
+  // wake. It also starts the turn when none is running, which is what holds the next
+  // queued record back until this one's turn ends.
+  recordTurnWake(connectionId, batch, CONNECTIONS_DIR)
+  if (isQueuedBehindTurn(batch)) {
+    try {
+      setCurrentRequest(connectionId, UNSTATED, { dir: CONNECTIONS_DIR })
+    } catch {
+      /* non-fatal */
+    }
+  }
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2))
   const connectionId = args.connectionId
@@ -1041,14 +1197,26 @@ async function main() {
     fs.writeFileSync(file, '', { mode: 0o600 })
   }
 
+  // `offset` is the scan cursor: every record before it was delivered, set aside as
+  // obsolete, or is in `held`, the queued work still waiting for its turn (item b68df72d).
+  const parseHeld = (line) => {
+    const [batch] = parseInboxBatches([line], connectionId)
+    return batch ?? null
+  }
   let offset = 0
+  let held = []
   if (args.pending) {
     offset = typeof state?.inbox_byte_offset === 'number' ? state.inbox_byte_offset : 0
+    held = readHeldInboxRecords(file, state?.inbox_held_records, offset, parseHeld)
   } else if (args.fromEnd) {
     offset = fileSize(file)
-    if (readDismissalState(connectionId)) writeStatePatch(connectionId, { inbox_byte_offset: offset })
+    // A first arm discards the backlog, and queued work is part of it.
+    if (readDismissalState(connectionId)) {
+      writeStatePatch(connectionId, { inbox_byte_offset: offset, inbox_held_records: [] })
+    }
   } else if (typeof state?.inbox_byte_offset === 'number') {
     offset = state.inbox_byte_offset
+    held = readHeldInboxRecords(file, state?.inbox_held_records, offset, parseHeld)
   } else {
     offset = fileSize(file)
   }
@@ -1068,6 +1236,10 @@ async function main() {
       `mode=${args.stream ? 'stream (session-scoped, wake=stdout line)' : 'one-shot (wake=exit 0)'} ` +
       `deadline=${deadline === null ? `none (anchored to owner pid ${ownerAnchor})` : new Date(deadline).toISOString()}\n`,
   )
+
+  // Queued work waits while a turn is running, in both modes. A one-shot arm exits on
+  // its first wake and leaves what it held in the state file for the next arm.
+  const turnRunning = () => isTurnMarkerActive(readTurnMarker(connectionId, CONNECTIONS_DIR))
 
   let delivered = 0
   let sawLive = Boolean(
@@ -1110,17 +1282,32 @@ async function main() {
       sawLive = true
     }
 
+    // Held work first, oldest first: it arrived before anything the scan below finds.
+    // Delivering one starts its turn (recordBatchDelivered), so the next one waits for
+    // that turn to end: one per turn, in arrival order.
+    let released = false
+    while (held.length > 0 && !turnRunning()) {
+      const [next] = held
+      await writeEventSequence(eventsForBatch(next.entry, { inboxFile: file, connectionId }))
+      recordBatchDelivered(connectionId, next.entry)
+      held.shift()
+      released = true
+      delivered += deliveryCount(next.entry)
+    }
+
     const records = readInboxRecords(file, offset)
-    if (records.length > 0) {
+    if (records.length > 0 || released) {
       let deferred = false
       for (const record of records) {
         const [batch] = parseInboxBatches([record.line], connectionId)
         if (batch) {
-          const isQueuedTurnBatch =
-            batch.type === CHECK_JOB_RECORD_TYPE || batch.type === 'canonical_system_notices'
-          if (isQueuedTurnBatch && isTurnMarkerActive(readTurnMarker(connectionId, CONNECTIONS_DIR))) {
-            deferred = true
-            break
+          // Queued work that must wait is set aside and the scan carries on past it
+          // (item b68df72d): a command, control or answer behind it is never held up.
+          // Anything already held keeps its place ahead of a newer arrival.
+          if (isQueuedBehindTurn(batch) && (held.length > 0 || turnRunning())) {
+            held.push({ startOffset: record.startOffset, endOffset: record.endOffset, entry: batch })
+            offset = record.endOffset
+            continue
           }
           if (batch.type === DISMISSAL_RECORD_TYPE) {
             const decision = dismissalDeliveryDecision(batch, readDismissalState(connectionId), connectionId)
@@ -1133,37 +1320,7 @@ async function main() {
               continue
             }
           }
-          const events =
-            batch.type === 'canonical_commands'
-              ? buildCanonicalCommandEvents(batch, {
-                  inboxFile: file,
-                  unread: wakeNotice({
-                    connectionId,
-                    sessionId: batch.session_id,
-                    deliveredCommandIds: batch.execute_message_ids,
-                    deliveredCommands: Array.isArray(batch.ingress?.commands)
-                      ? batch.ingress.commands.filter((c) =>
-                          batch.execute_message_ids.includes(c.message_id),
-                        )
-                      : [],
-                  }),
-                })
-              : batch.type === 'canonical_control'
-                ? buildCanonicalControlEvents(batch, { inboxFile: file })
-                : batch.type === 'canonical_system_notices'
-                  ? buildCanonicalSystemNoticeEvents(batch, { inboxFile: file })
-                  : batch.type === INTERACTION_ANSWER_RECORD_TYPE || batch.type === DISMISSAL_RECORD_TYPE
-                    ? batch.disposition === QUEUED
-                      ? buildQueuedAnswerEvents(batch, { inboxFile: file })
-                      : buildInteractionAnswerEvents(batch, { inboxFile: file })
-                    : batch.type === 'automation_run'
-                      ? buildAutomationRunEvents(batch, { inboxFile: file })
-                      : batch.type === CHECK_JOB_RECORD_TYPE
-                        ? buildCheckJobEvents(batch, { inboxFile: file })
-                        : buildOwnerMessageEvents(batch, {
-                            inboxFile: file,
-                            attachmentDir: attachmentDirFor(connectionId),
-                          })
+          const events = eventsForBatch(batch, { inboxFile: file, connectionId })
 
           if (batch.type === DISMISSAL_RECORD_TYPE) {
             let emitted = false
@@ -1184,37 +1341,14 @@ async function main() {
           } else {
             await writeEventSequence(events)
           }
-          try {
-            recordDeliveredBatchRequests(connectionId, batch, { dir: CONNECTIONS_DIR })
-          } catch {
-            /* non-fatal */
-          }
-          // What this wake brings into the turn: notice ids, checkJobWake, or another kind of wake.
-          recordTurnWake(connectionId, batch, CONNECTIONS_DIR)
-          if (isQueuedTurnBatch) {
-            try {
-              setCurrentRequest(connectionId, UNSTATED, { dir: CONNECTIONS_DIR })
-            } catch {
-              /* non-fatal */
-            }
-          }
-          delivered +=
-            batch.type === 'canonical_commands'
-              ? batch.execute_message_ids.length
-              : batch.type === 'canonical_system_notices'
-                ? batch.execute_notice_ids.length
-                : batch.type === 'owner_messages' && Array.isArray(batch.messages)
-                  ? batch.messages.length
-                  : 1
-          if (isQueuedTurnBatch) {
-            offset = record.endOffset
-            break
-          }
+          recordBatchDelivered(connectionId, batch)
+          delivered += deliveryCount(batch)
         }
         offset = record.endOffset
       }
 
-      commitDeliveredOffset(connectionId, offset)
+      // The cursor and the held records are one fact, so they are written together.
+      commitDeliveredOffset(connectionId, offset, { held: heldRecordRanges(held) })
       if (deferred) {
         await sleep(pollMs)
         continue

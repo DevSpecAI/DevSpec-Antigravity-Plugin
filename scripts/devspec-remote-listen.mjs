@@ -26,7 +26,13 @@ import {
   ownedByAntigravityProcess,
 } from './close-on-end.mjs'
 import { LOADED_PLUGIN_VERSION } from './connection-version.mjs'
-import { formatInboxEntryForStream, formatSystemNoticeContent } from './devspec-remote-wait.mjs'
+import {
+  formatInboxEntryForStream,
+  formatSystemNoticeContent,
+  heldRecordRanges,
+  isQueuedBehindTurn,
+  readHeldInboxRecords,
+} from './devspec-remote-wait.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { isTurnMarkerActive, loadState, readTurnMarker, recordTurnWake } from './mirror-turn.mjs'
 import { noticeReplyInstruction } from './notice-reply.mjs'
@@ -729,18 +735,93 @@ export function readNewInboxEntries(inboxPath, offsetBytes = 0) {
   }
 }
 
-export function isQueuedBehindActiveTurnEntry(entry) {
+/**
+ * Whether a queued entry (check job or system notice) can be delivered at all. Built
+ * with no inline-size limit so judging it never writes a wake payload file.
+ */
+function isDeliverableQueuedEntry(entry, { connectionId, inboxPath }) {
+  if (!isQueuedBehindTurn(entry)) return false
   return Boolean(
-    entry && (entry.type === CHECK_JOB_RECORD_TYPE || entry.type === 'canonical_system_notices'),
+    buildWakeDeliveryMessage(entry, { connectionId, inboxFile: inboxPath, maxInlineBytes: Infinity }),
   )
 }
 
-export function createListenerQueueState(initialOffset = 0) {
+/** Read back the held records persisted beside the cursor (readHeldInboxRecords). */
+function readListenerHeldRecords(inboxPath, ranges, cursor, connectionId) {
+  return readHeldInboxRecords(
+    inboxPath,
+    ranges,
+    cursor,
+    (line) => {
+      try {
+        const entry = JSON.parse(line)
+        return isDeliverableQueuedEntry(entry, { connectionId, inboxPath }) ? entry : null
+      } catch {
+        return null
+      }
+    },
+    { label: 'devspec-remote-listen' },
+  )
+}
+
+export function createListenerQueueState(initialOffset = 0, heldRecords = []) {
   return {
     scanOffset: typeof initialOffset === 'number' && initialOffset >= 0 ? initialOffset : 0,
-    committedOffset: typeof initialOffset === 'number' && initialOffset >= 0 ? initialOffset : 0,
-    heldRecords: [],
+    heldRecords: Array.isArray(heldRecords) ? [...heldRecords] : [],
     lastDeliveryError: null,
+  }
+}
+
+/**
+ * The queue a listener starts with: the persisted cursor and the held records persisted
+ * beside it (item b68df72d). A restart therefore neither replays the commands that were
+ * delivered past a held record nor loses the held record itself. With no cursor yet,
+ * the listener starts at the end of the inbox, as it always has.
+ */
+export function restoreListenerQueueState(state, { inboxPath, connectionId } = {}) {
+  if (typeof state?.inbox_byte_offset === 'number') {
+    return createListenerQueueState(
+      state.inbox_byte_offset,
+      readListenerHeldRecords(inboxPath, state.inbox_held_records, state.inbox_byte_offset, connectionId),
+    )
+  }
+  return createListenerQueueState(inboxPath && fs.existsSync(inboxPath) ? fs.statSync(inboxPath).size : 0)
+}
+
+const rangeKey = (start, end) => `${start}-${end}`
+
+function sameHeldRanges(persisted, ranges) {
+  if (!Array.isArray(persisted) || persisted.length !== ranges.length) return false
+  return persisted.every((range, i) => range?.start === ranges[i].start && range?.end === ranges[i].end)
+}
+
+/**
+ * Take in what another reader of this inbox did while this listener stood aside (item
+ * b68df72d). While an in-conversation `devspec-remote-wait.mjs` is armed the listener
+ * does not read the inbox: that script moves the cursor, delivers or holds queued
+ * records itself, and writes both to the state file. Whatever it wrote is the truth
+ * when the listener resumes:
+ * - a cursor ahead of ours: everything before it was handled there, and its held list
+ *   (read back and revalidated) replaces ours;
+ * - our own cursor with a held list: any of ours missing from it was delivered there.
+ * A cursor behind ours is an older write; the commit at the end of the tick replaces it.
+ */
+function adoptPersistedQueue(queueState, live, { inboxPath, connectionId }) {
+  const persisted = live?.inbox_byte_offset
+  if (typeof persisted !== 'number') return
+  if (persisted > queueState.scanOffset) {
+    queueState.scanOffset = persisted
+    queueState.heldRecords = readListenerHeldRecords(
+      inboxPath,
+      live.inbox_held_records,
+      persisted,
+      connectionId,
+    )
+  } else if (persisted === queueState.scanOffset && Array.isArray(live.inbox_held_records)) {
+    const listed = new Set(live.inbox_held_records.map((range) => rangeKey(range?.start, range?.end)))
+    queueState.heldRecords = queueState.heldRecords.filter((rec) =>
+      listed.has(rangeKey(rec.startOffset, rec.endOffset)),
+    )
   }
 }
 
@@ -748,8 +829,11 @@ export function createListenerQueueState(initialOffset = 0) {
  * Run one inbox tick for `devspec-remote-listen.mjs`:
  * - Holds `check_job` and `canonical_system_notices` in strict FIFO arrival order while
  *   a turn is active (`isTurnMarkerActive`), without blocking urgent commands or controls,
- *   without clobbering the active turn's `.turn` marker or `.requests.jsonl`, and without
- *   advancing persisted `inbox_byte_offset` past held records so crash recovery loses nothing.
+ *   and without clobbering the active turn's `.turn` marker or `.requests.jsonl`.
+ * - Moves the persisted `inbox_byte_offset` past held records and persists their byte
+ *   ranges beside it (`inbox_held_records`) in the same write, so a restart or a hand-off
+ *   to `devspec-remote-wait.mjs --pending` delivers each held record exactly once and
+ *   never replays the commands delivered past it (item b68df72d).
  * - Once the active turn finishes, drains queued `check_job` / `canonical_system_notices`
  *   one follow-up turn at a time in arrival order, resetting `current` request to `null`
  *   and skipping `report_pickup` (check jobs and system notices are not server commands).
@@ -772,13 +856,7 @@ export async function processListenerInboxTick(
     nowFn = () => Date.now(),
   } = {},
 ) {
-  if (typeof live?.inbox_byte_offset === 'number' && live.inbox_byte_offset > queueState.scanOffset) {
-    queueState.scanOffset = live.inbox_byte_offset
-    queueState.committedOffset = live.inbox_byte_offset
-    queueState.heldRecords = queueState.heldRecords.filter(
-      (rec) => rec.endOffset > live.inbox_byte_offset,
-    )
-  }
+  adoptPersistedQueue(queueState, live, { inboxPath, connectionId })
 
   const isTurnBusy = () =>
     isTurnMarkerActive(readTurnMarker(connectionId, connectionsDir), nowFn())
@@ -840,6 +918,8 @@ export async function processListenerInboxTick(
       }
     }
 
+    // Starts the turn when none is running, which is what holds the next queued
+    // record back until this one's turn ends.
     recordTurnWake(connectionId, rec.entry, connectionsDir)
     try {
       recordDeliveredBatchRequests(connectionId, rec.entry, { dir: connectionsDir })
@@ -866,8 +946,8 @@ export async function processListenerInboxTick(
     return { ok: true, skipped: false }
   }
 
+  // Held work first, oldest first: it arrived before anything the scan below finds.
   let deliveryFailed = false
-
   while (queueState.heldRecords.length > 0 && !isTurnBusy()) {
     const rec = queueState.heldRecords[0]
     const outcome = await deliverSingleRecord(rec, { queuedEntry: true })
@@ -878,58 +958,54 @@ export async function processListenerInboxTick(
     queueState.heldRecords.shift()
   }
 
-  const { records, nextOffset } = readNewInboxEntries(inboxPath, queueState.scanOffset)
-  let abortedAtOffset = null
-
-  if (!deliveryFailed && records.length > 0) {
+  // A held record that cannot be delivered stops the tick; the scan waits for it.
+  if (!deliveryFailed) {
+    const { records, nextOffset } = readNewInboxEntries(inboxPath, queueState.scanOffset)
+    let scanOffset = nextOffset
     for (const rec of records) {
-      const queuedEntry = isQueuedBehindActiveTurnEntry(rec.entry)
+      const queuedEntry = isQueuedBehindTurn(rec.entry)
       if (queuedEntry) {
-        const validMessage = buildWakeDeliveryMessage(rec.entry, {
-          connectionId,
-          inboxFile: inboxPath,
-        })
-        if (!validMessage) continue
-        if (isTurnBusy() || queueState.heldRecords.length > 0) {
+        if (!isDeliverableQueuedEntry(rec.entry, { connectionId, inboxPath })) continue
+        // Set aside, and the scan carries on past it: a command, control or answer
+        // behind it is never held up. Anything already held keeps its place ahead.
+        if (queueState.heldRecords.length > 0 || isTurnBusy()) {
           queueState.heldRecords.push(rec)
           continue
         }
       }
       const outcome = await deliverSingleRecord(rec, { queuedEntry })
       if (!outcome.ok && !once) {
-        abortedAtOffset = rec.startOffset
+        // Retried from here next tick; what was held before it keeps its place.
+        scanOffset = rec.startOffset
         break
       }
     }
-  } else if (deliveryFailed) {
-    abortedAtOffset = queueState.scanOffset
+    queueState.scanOffset = scanOffset
   }
 
-  const newScanOffset = abortedAtOffset !== null ? abortedAtOffset : nextOffset
-  queueState.scanOffset = newScanOffset
-  const nextCommitted =
-    queueState.heldRecords.length > 0
-      ? Math.min(queueState.heldRecords[0].startOffset, newScanOffset)
-      : newScanOffset
-
-  if (nextCommitted !== queueState.committedOffset) {
-    queueState.committedOffset = nextCommitted
-    if (live) {
-      writeState(
-        connectionId,
-        {
-          ...live,
-          inbox_byte_offset: nextCommitted,
-          updated_at: new Date(nowFn()).toISOString(),
-        },
-        connectionsDir,
-      )
-    }
+  // The cursor and the held records are one fact, so they are written together, and
+  // whenever the state file disagrees with them (another writer, or a first tick).
+  const heldRanges = heldRecordRanges(queueState.heldRecords)
+  if (
+    live &&
+    (live.inbox_byte_offset !== queueState.scanOffset ||
+      !sameHeldRanges(live.inbox_held_records, heldRanges))
+  ) {
+    writeState(
+      connectionId,
+      {
+        ...live,
+        inbox_byte_offset: queueState.scanOffset,
+        inbox_held_records: heldRanges,
+        updated_at: new Date(nowFn()).toISOString(),
+      },
+      connectionsDir,
+    )
   }
 
   return {
-    committedOffset: queueState.committedOffset,
     scanOffset: queueState.scanOffset,
+    heldRanges,
     heldCount: queueState.heldRecords.length,
   }
 }
@@ -1046,13 +1122,7 @@ async function main() {
   }
 
   const inboxPath = inboxPathForConnection(connectionId)
-  const initialOffset =
-    typeof state?.inbox_byte_offset === 'number'
-      ? state.inbox_byte_offset
-      : fs.existsSync(inboxPath)
-        ? fs.statSync(inboxPath).size
-        : 0
-  const queueState = createListenerQueueState(initialOffset)
+  const queueState = restoreListenerQueueState(state, { inboxPath, connectionId })
 
   // A wake that cannot be delivered stays in the inbox and is retried every tick; say
   // so once per distinct reason (and again when it recovers), so a stuck listener is
