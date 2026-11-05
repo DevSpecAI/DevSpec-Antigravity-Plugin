@@ -38,13 +38,17 @@ import {
   absentLaunches,
   appendRequestEvent,
   closeRequest,
+  notifiedKeys,
   openRequest,
   promptArrival,
   readRequestState,
   requestsWithWorkPending,
   rotateRequestLog,
+  setCurrentRequest,
+  UNSTATED,
 } from './requests.mjs'
 import {
+  isCheckJobOnlyTurn,
   mergeTurnWake,
   postCanTakeTurnNotices,
   turnNoticeIds,
@@ -107,6 +111,8 @@ export function turnMarkerPath(connectionId, dir = CONNECTIONS_DIR) {
   return path.join(dir, `${connectionId}.turn`)
 }
 
+const DEFAULT_MAX_TURN_MS = 10 * 60 * 1000
+
 export function readTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
   if (!connectionId) return null
   try {
@@ -115,6 +121,15 @@ export function readTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
   } catch {
     return null
   }
+}
+
+export function isTurnMarkerActive(marker, now = Date.now(), maxTurnMs = DEFAULT_MAX_TURN_MS) {
+  if (!marker || typeof marker.startedAt !== 'number') return false
+  const lastActiveAt = Math.max(
+    marker.startedAt,
+    typeof marker.lastToolAt === 'number' ? marker.lastToolAt : 0,
+  )
+  return now - lastActiveAt < maxTurnMs
 }
 
 export function trailStatePath(connectionId, dir = CONNECTIONS_DIR) {
@@ -154,10 +169,25 @@ export function writeTurnMarker(connectionId, extra = {}, dir = CONNECTIONS_DIR)
 export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR) {
   if (!connectionId) return null
   const wake = turnWakeFromEntry(entry)
-  const existing = readTurnMarker(connectionId, dir)
-  // A notice is not a command: one that arrives during a turn typed at the terminal
-  // leaves it a local turn, so that turn's answer keeps its local-turn flags.
-  const remote = existing && wake?.noticeIds ? {} : { remoteTurn: true }
+  let existing = readTurnMarker(connectionId, dir)
+  // A stale marker (isTurnMarkerActive) is a turn that ended without its Stop, and
+  // every reader already treats it as no turn. The wake delivered now starts a new
+  // one, so it must not inherit that turn's startedAt or what woke it: the marker would
+  // stay stale and every queued check job and notice behind this one would be released
+  // at once instead of one per turn (item b68df72d). Only the marker goes; writing the
+  // fresh one below clears the old turn's reply and trail state as any new turn does.
+  if (existing && !isTurnMarkerActive(existing)) {
+    try {
+      fs.rmSync(turnMarkerPath(connectionId, dir), { force: true })
+    } catch {
+      /* non-fatal, as every marker write here is */
+    }
+    existing = null
+  }
+  // A notice or check job is not a command: one that arrives during a turn typed at
+  // the terminal leaves it a local turn, so that turn's answer keeps its local-turn flags.
+  const nonCommandWake = Boolean(wake?.noticeIds || wake?.checkJobWake)
+  const remote = existing && nonCommandWake ? {} : { remoteTurn: true }
   return writeTurnMarker(connectionId, { ...remote, ...mergeTurnWake(existing, wake) }, dir)
 }
 
@@ -171,6 +201,22 @@ export function currentTurnNoticeIds(
 ) {
   if (!connectionId) return null
   return turnNoticeIds({
+    marker: marker === undefined ? readTurnMarker(connectionId, dir) : marker,
+    requestState: readRequestState(connectionId, { dir }),
+    connectionState,
+  })
+}
+
+/**
+ * True when the current turn was woken solely by DevSpec check job(s), with no command,
+ * terminal prompt, automation run, or system notice open on the turn.
+ */
+export function isCurrentTurnCheckJobOnly(
+  connectionId,
+  { dir = CONNECTIONS_DIR, connectionState = null, marker = undefined } = {},
+) {
+  if (!connectionId) return false
+  return isCheckJobOnlyTurn({
     marker: marker === undefined ? readTurnMarker(connectionId, dir) : marker,
     requestState: readRequestState(connectionId, { dir }),
     connectionState,
@@ -270,18 +316,94 @@ export function readOwnedLines(connectionId, marker, dir = CONNECTIONS_DIR) {
   return lines
 }
 
-export function readOwnedIds(connectionId, marker, dir = CONNECTIONS_DIR) {
+export function readOwnedIds(
+  connectionId,
+  marker,
+  dir = CONNECTIONS_DIR,
+  { now = Date.now(), maxAgeMs = 60 * 60 * 1000 } = {},
+) {
   const lines = readOwnedLines(connectionId, marker, dir)
   const ended = new Set(
     lines.filter((e) => typeof e.ended === 'string').map((e) => e.id),
   )
   const ids = []
   for (const entry of lines) {
-    if (typeof entry.ended !== 'string' && !ended.has(entry.id) && !ids.includes(entry.id)) {
-      ids.push(entry.id)
+    if (typeof entry.ended === 'string' || ended.has(entry.id) || ids.includes(entry.id)) continue
+    if (typeof entry.at === 'string' && Number.isFinite(maxAgeMs) && maxAgeMs > 0) {
+      const launchedMs = Date.parse(entry.at)
+      if (Number.isFinite(launchedMs) && now - launchedMs > maxAgeMs) continue
     }
+    ids.push(entry.id)
   }
   return ids
+}
+
+/**
+ * Reconcile completed background tasks and subagents from `<SYSTEM_MESSAGE>` steps in
+ * `transcript.jsonl`, whether the completion arrived while the turn was still running
+ * (`existingMarker.held === false`) or while Stop was holding the turn open.
+ */
+export function reconcileCompletedOwnedWork(
+  connectionId,
+  marker,
+  transcriptPath,
+  dir = CONNECTIONS_DIR,
+) {
+  if (!connectionId || !transcriptPath) return
+  const ownedIds = marker ? readOwnedIds(connectionId, marker, dir) : []
+  const reqState = readRequestState(connectionId, { dir })
+  const unnotifiedKeys = [...new Set(reqState.launches.values())]
+    .filter((launch) => launch.notifies && !launch.notified)
+    .map((launch) => launch.key)
+  if (ownedIds.length === 0 && unnotifiedKeys.length === 0) return
+
+  let raw = ''
+  try {
+    const stat = fs.statSync(transcriptPath)
+    if (!stat.isFile() || stat.size === 0) return
+    const readSize = Math.min(stat.size, 262_144)
+    const fd = fs.openSync(transcriptPath, 'r')
+    try {
+      const buf = Buffer.alloc(readSize)
+      fs.readSync(fd, buf, 0, readSize, stat.size - readSize)
+      raw = buf.toString('utf8')
+    } finally {
+      fs.closeSync(fd)
+    }
+  } catch {
+    return
+  }
+
+  const endedOwned = new Set()
+  const newlyNotified = new Set()
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    let step
+    try {
+      step = JSON.parse(trimmed)
+    } catch {
+      continue
+    }
+    if (step?.type !== 'SYSTEM_MESSAGE' || typeof step.content !== 'string') continue
+    if (typeof marker?.startedAt === 'number' && step.created_at) {
+      const stepMs = Date.parse(step.created_at)
+      if (Number.isFinite(stepMs) && stepMs < marker.startedAt - 1000) continue
+    }
+    for (const id of ownedIds) {
+      if (!endedOwned.has(id) && step.content.includes(id)) {
+        recordOwnedEnd(connectionId, id, { dir })
+        endedOwned.add(id)
+      }
+    }
+    const keysInStep = notifiedKeys(step.content)
+    for (const key of unnotifiedKeys) {
+      if (!newlyNotified.has(key) && (keysInStep.includes(key) || step.content.includes(key))) {
+        appendRequestEvent(connectionId, { op: 'notified', key }, { dir })
+        newlyNotified.add(key)
+      }
+    }
+  }
 }
 
 /**
@@ -338,8 +460,8 @@ export function launchedAntigravityBackgroundWork(toolName, toolInput, toolRespo
           ? resp.raw
           : ''
     const bgMatch =
-      outText.match(/background task ID[:\s]+([A-Za-z0-9_-]+)/i) ||
-      outText.match(/TaskId[:\s"]+([A-Za-z0-9_-]+)/i)
+      outText.match(/(?:background task ID|with task id)[:\s]+([A-Za-z0-9_.:/-]+)/i) ||
+      outText.match(/TaskId[:\s"]+([A-Za-z0-9_.:/-]+)/i)
     if (bgMatch) {
       return {
         id: bgMatch[1],
@@ -1318,10 +1440,13 @@ export async function streamTurnTrailIfChanged(
   if (!state.session_id && !marker.remoteTurn) {
     return { streamed: false, reason: 'not_attached' }
   }
-  // A turn woken only by DevSpec notices has no command turn to carry a trail: the
-  // server would file it under the previous command (notice-reply.mjs).
+  // A turn woken only by DevSpec notices or check jobs has no command turn to carry a
+  // trail: the server would file it under the previous command (notice-reply.mjs).
   if (currentTurnNoticeIds(connectionId, { dir: connectionsDir, connectionState: state, marker })) {
     return { streamed: false, reason: 'notice_turn' }
+  }
+  if (isCurrentTurnCheckJobOnly(connectionId, { dir: connectionsDir, connectionState: state, marker })) {
+    return { streamed: false, reason: 'check_job_turn' }
   }
   const tPath =
     normalizeTranscriptPath(state.transcript_path) ||
@@ -1628,6 +1753,7 @@ export async function handleMirrorTurn(
   // USER_INPUT (or was already mirrored for this step_index), avoid duplicate
   // local_prompt posts and redundant heartbeats on every tool iteration.
   const existingMarker = readTurnMarker(connectionId, connectionsDir)
+  reconcileCompletedOwnedWork(connectionId, existingMarker, effectiveTranscriptPath, connectionsDir)
   const latestStep = extractLatestTranscriptStep(effectiveTranscriptPath)
   const isNewUserInputStep =
     latestStep?.type === 'USER_INPUT' &&
@@ -1650,18 +1776,6 @@ export async function handleMirrorTurn(
     }
   }
 
-  // If waking up from a held Stop via a SYSTEM_MESSAGE (e.g. subagent or background task
-  // completion), mark those owned background launches as completed so the subsequent Stop
-  // can finish the turn cleanly.
-  if (modeArg === 'user_prompt' && existingMarker?.held && latestStep?.type === 'SYSTEM_MESSAGE') {
-    const ownedIds = readOwnedIds(connectionId, existingMarker, connectionsDir)
-    for (const id of ownedIds) {
-      if (typeof latestStep.content === 'string' && latestStep.content.includes(id)) {
-        recordOwnedEnd(connectionId, id, { dir: connectionsDir })
-      }
-    }
-  }
-
   const text = extractLastText(raw, modeArg)
   const rawStepContent = typeof latestStep?.content === 'string' ? latestStep.content : ''
   const isExplicitUserInputStep =
@@ -1677,6 +1791,7 @@ export async function handleMirrorTurn(
       (latestStep?.type === 'SYSTEM_MESSAGE' &&
         (rawStepContent.includes('"event":"wake"') ||
           rawStepContent.includes('"type":"system_notice"') ||
+          rawStepContent.includes('"type":"check_job"') ||
           rawStepContent.includes('"event":"directives"') ||
           rawStepContent.includes('"event":"automation_run"') ||
           rawStepContent.includes('"event":"interaction_answer"') ||
@@ -1795,14 +1910,29 @@ export async function handleMirrorTurn(
 
     const turnActive = modeArg === 'user_prompt'
     if (turnActive) {
-      // What woke the turn (notice-reply.mjs): the wake's own notice ids, or that a
-      // person or a command did. The listener records the same as it delivers; both
-      // write, so neither ordering of the two loses it.
+      // What woke the turn (notice-reply.mjs): the wake's own notice ids, checkJobWake,
+      // or that a person or a command did. The listener records the same as it delivers;
+      // both write, so neither ordering of the two loses it.
       const wake = isRemoteWakeInput
         ? turnWakeFromText(rawStepContent || text)
         : fromAPerson
           ? { otherWake: true }
           : null
+      if (
+        connectionId &&
+        isRemoteWakeInput &&
+        (wake?.checkJobWake || wake?.noticeIds?.length) &&
+        !existingMarker?.otherWake &&
+        !existingMarker?.localPromptMirrored &&
+        !existingMarker?.localTurn &&
+        !state?.local_turn
+      ) {
+        try {
+          setCurrentRequest(connectionId, UNSTATED, { dir: connectionsDir })
+        } catch {
+          /* non-fatal */
+        }
+      }
       const markerExtra = {
         held: false,
         remoteTurn: Boolean(isRemoteWakeInput),
@@ -1818,6 +1948,7 @@ export async function handleMirrorTurn(
       // On Stop: check if this turn launched background work (e.g. subagent or async command)
       // that has not yet reported back. If so, hold the turn open instead of closing it.
       const marker = readTurnMarker(connectionId, connectionsDir)
+      reconcileCompletedOwnedWork(connectionId, marker, effectiveTranscriptPath, connectionsDir)
       const outstandingIds = marker ? readOwnedIds(connectionId, marker, connectionsDir) : []
       if (outstandingIds.length > 0 && !marker?.held) {
         writeTurnMarker(connectionId, { held: true }, connectionsDir)
@@ -1838,8 +1969,14 @@ export async function handleMirrorTurn(
 
       const hadExplicitReply = consumeExplicitReplyMarker(connectionId, connectionsDir)
       // Read before the marker goes: a turn woken only by DevSpec notices ends with a
-      // reply to those notices, never with an answer filed under an earlier command.
+      // reply to those notices, and a turn woken only by check jobs ends silently,
+      // never with an answer filed under an earlier command.
       const turnNotices = currentTurnNoticeIds(connectionId, {
+        dir: connectionsDir,
+        connectionState: state,
+        marker,
+      })
+      const checkJobOnlyTurn = isCurrentTurnCheckJobOnly(connectionId, {
         dir: connectionsDir,
         connectionState: state,
         marker,
@@ -1928,7 +2065,12 @@ export async function handleMirrorTurn(
         } catch {
           /* non-fatal: report_complete below still ends the turn */
         }
-      } else if (!hadExplicitReply && sessionId && (isRemoteTurn || isLocalMirroredTurn || hadStreamedTrail)) {
+      } else if (
+        !checkJobOnlyTurn &&
+        !hadExplicitReply &&
+        sessionId &&
+        (isRemoteTurn || isLocalMirroredTurn || hadStreamedTrail)
+      ) {
         let trail = { markdown: '', events: [] }
         if (effectiveTranscriptPath && fs.existsSync(effectiveTranscriptPath)) {
           try {

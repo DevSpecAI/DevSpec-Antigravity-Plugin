@@ -218,6 +218,19 @@ export function readListenerArmed(connectionId, state, dir = CONNECTIONS_DIR) {
 }
 
 /**
+ * Whether a batch of dispatches just written to the inbox starts a turn the poller may
+ * assert ahead of delivery (shouldAssertTurnOnPollerInboxWrite). An automation run does:
+ * the armed wait delivers it as soon as it reads it. A check job may have to wait for
+ * the running turn (item d36ac887), so writing one says nothing about a turn starting.
+ * Asserting one anyway made the check job wait behind a turn that was only its own
+ * arrival, until the marker went stale ten minutes later; the reader that delivers it
+ * starts the turn then (recordTurnWake, item b68df72d).
+ */
+export function dispatchesStartTurn(appendedByType) {
+  return (appendedByType?.automation_run ?? 0) > 0
+}
+
+/**
  * Should `devspec-remote-poll.mjs` immediately write `.turn` when persisting an
  * inbound command/event to `.inbox.jsonl`?
  *
@@ -2245,7 +2258,10 @@ async function main() {
           }) + '\n',
         )
       }
-      if (shouldAssertTurnOnPollerInboxWrite(connectionId, readState(connectionId))) {
+      if (
+        dispatchesStartTurn(persisted.appendedByType) &&
+        shouldAssertTurnOnPollerInboxWrite(connectionId, readState(connectionId))
+      ) {
         writeTurnMarker(connectionId, { remoteTurn: true, otherWake: true })
       }
     }
