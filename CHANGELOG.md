@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.15
+
+- Updated `README.md` with an overview of shared team memory and staleness screening, sessionless **Agents** page availability versus session room attachment, `/devspec-remote --name "<codename>"`, check-ruling and automation wake behavior, single-claim commit tagging across linked repositories (including Git worktrees) and `.devspec/project.json`-pinned folders, observed criterion verification, Protected intent holds, and GitHub pull-request checks.
+
 ## 0.21.14
 
 - When your agent is waiting for room messages without the background listener, a room command, control or question answer that arrives behind a queued check job or notice now reaches the agent straight away instead of waiting for the current turn to end. Queued check jobs and notices still follow, one per turn, in the order they arrived.

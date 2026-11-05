@@ -1,8 +1,17 @@
 # DevSpec for Antigravity CLI
 
-Connect [Google Antigravity CLI](https://antigravity.google/product/antigravity-cli) (`agy`) to [DevSpec](https://devspec.ai). Once configured, `agy` connects to your DevSpec project so you can work from your project's tasks, decisions, and documents, coordinate in shared session rooms, and steer your local `agy` terminal from your phone or the web.
+**Build on your team's best thinking.** [DevSpec](https://devspec.ai) is where your team, your shared knowledge, and your coding agents build software together.
+
+Connect [Google Antigravity CLI](https://antigravity.google/product/antigravity-cli) (`agy`) to DevSpec to give your terminal durable project memory, structured task execution, automatic commit provenance, and live remote steering from your phone or browser.
 
 > **Note:** DevSpec connects to **Antigravity CLI** (`agy` in your terminal), not the Antigravity IDE.
+
+## Why DevSpec + Antigravity CLI?
+
+- **Shared team memory with automatic staleness screening** — Antigravity recalls the architectural decisions, conventions, risks, and reference docs that apply to the code it's touching. When you record a new decision or land changes, DevSpec screens your project's records for conflicts, duplicates, and **Possibly outdated** guidance so your team's shared memory stays accurate.
+- **Steer `agy` live from your phone or the web** — Run `/devspec-remote` to register your terminal on your project's **Agents** page outside any session room, or pass `--new` or `--session <id>` (or attach from [devspec.ai](https://devspec.ai)) to collaborate in a shared session room, answer structured agent questions and polls, and track multi-phase execution plans in real time. Sitting idle on the **Agents** page uses no tokens — `agy` runs only when you or an authorized teammate asks it to do something, when your project routes a check on a change for it to rule, or when an automation you opted into runs.
+- **Tasks, observed verification, and automatic commit provenance** — Claim tasks with full project context. When a single task is claimed in a linked project repository (including Git worktrees) or a `.devspec/project.json`-pinned folder, the plugin tags your commits (`[devspec:<id>]`) automatically, links pull requests, and records observed verification evidence from checks `agy` actually ran against each acceptance criterion.
+- **Protected intent and GitHub pull-request holds** — DevSpec screens changes against your team's recorded decisions, requirements, and open tasks, holds reversals of someone else's decision and unagreed experiments on their own branch until approved, and publishes its pull-request check on GitHub to reflect pending checks and holds.
 
 ## Requirements
 
@@ -100,7 +109,7 @@ You can also run plain `agy` when working at your desk.
 
 - **Inside a linked repository:** Start `agy` (or `agy --dangerously-skip-permissions`) in the folder where you cloned the Git repository linked to your DevSpec project. It matches that project automatically.
 - **In any other folder, or when switching projects:** Start `agy` and run `/devspec-project` to choose which project this conversation belongs to.
-- **Remote control from phone or web:** Run `/devspec-remote` inside `agy` to put this terminal on your project's **Agents** page or attach it to a session room (and run `/devspec-remote-stop` when you're done).
+- **Remote control from phone or web:** Run `/devspec-remote` inside `agy` to put this terminal on your project's **Agents** page outside any session room, or pass `--new` or `--session <id>` (or attach from [devspec.ai](https://devspec.ai)) to join a session room (and run `/devspec-remote-stop` when you're done).
 
 ## Commands
 
@@ -108,10 +117,11 @@ Everything in DevSpec can be asked in plain words ("Work on DevSpec task 4f2a", 
 
 | Command | What it does |
 |---|---|
-| `/devspec-remote` | Registers this `agy` conversation on the **Agents** page so you can steer it from the web or your phone. |
+| `/devspec-remote` | Registers this `agy` conversation on the **Agents** page outside any session room so you can steer it from the web or your phone. |
 | `/devspec-remote --project "Client Website"` | Connects and selects a project for this conversation without changing the folder default. |
-| `/devspec-remote --session <id>` | Connects and joins an existing DevSpec session. |
-| `/devspec-remote --new` | Creates a new shared DevSpec session and joins it (`--new --private` creates a private session). |
+| `/devspec-remote --session <id>` | Connects and joins an existing DevSpec session room. |
+| `/devspec-remote --new` | Creates a new shared DevSpec session room and joins it (`--new --private` creates a private session). |
+| `/devspec-remote --name "Night Owl"` | Connects using a custom agent codename. |
 | `/devspec-remote-stop` | Disconnects this conversation from DevSpec while leaving other `agy` terminals running. |
 | `/devspec-project` | Shows the current project and folder default, or lets you `choose`, `remember`, or `forget` a project. |
 
