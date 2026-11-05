@@ -9,7 +9,8 @@
  * Negotiates remote-ingress 1.6.0 (`ingress_version: 1`, `delegated_scope_version: 1`,
  * `active_plan_projection_version: 1`, `system_notice_version: 2`, `sender_style_version: 1`,
  * `room_context_version: 1`, `session_polls_projection_version: 2`), `known_instruction_tiers_hash`,
- * `interaction_event_version: 1`, `question_dismissal_event_version: 1`, and `command_offer_version: 1`.
+ * `interaction_event_version: 1`, `question_dismissal_event_version: 1`, `command_offer_version: 1`,
+ * and `check_job_version: 1` (check jobs beside automation runs in `dispatches[]`; check-job.mjs).
  * Authority: devspec://product/implementation-contract
  *
  * Usage:
@@ -32,6 +33,7 @@ import {
   commandOfferNegotiable,
   parseCommandOfferResponse,
 } from './command-offer.mjs'
+import { CHECK_JOB_RECORD_TYPE, CHECK_JOB_VERSION, validateCheckJobDispatch } from './check-job.mjs'
 import { closeAntigravityOnEnd } from './close-on-end.mjs'
 import { stripConnectionCapability as stripConnectionCapabilityFields } from './connection-capability-state.mjs'
 import { pluginHeaders } from './connection-version.mjs'
@@ -152,6 +154,11 @@ export function remoteIngressNegotiationArguments() {
     sender_style_version: SENDER_STYLE_VERSION,
     room_context_version: ROOM_CONTEXT_VERSION,
     session_polls_projection_version: SESSION_POLL_PROJECTION_VERSION_2,
+    // Sent on every poll: a poll without it clears the connection's check-job
+    // negotiation, and DevSpec then rules its checks itself. Busy is reported
+    // truthfully (the `.turn` marker: true while a turn runs, false when it ends),
+    // which the contract requires of a host that asks for check jobs.
+    check_job_version: CHECK_JOB_VERSION,
   }
 }
 
@@ -208,6 +215,19 @@ export function readListenerArmed(connectionId, state, dir = CONNECTIONS_DIR) {
     /* fall through */
   }
   return state && state.wait_armed_at ? false : null
+}
+
+/**
+ * Whether a batch of dispatches just written to the inbox starts a turn the poller may
+ * assert ahead of delivery (shouldAssertTurnOnPollerInboxWrite). An automation run does:
+ * the armed wait delivers it as soon as it reads it. A check job may have to wait for
+ * the running turn (item d36ac887), so writing one says nothing about a turn starting.
+ * Asserting one anyway made the check job wait behind a turn that was only its own
+ * arrival, until the marker went stale ten minutes later; the reader that delivers it
+ * starts the turn then (recordTurnWake, item b68df72d).
+ */
+export function dispatchesStartTurn(appendedByType) {
+  return (appendedByType?.automation_run ?? 0) > 0
 }
 
 /**
@@ -308,7 +328,7 @@ function readTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
   }
 }
 
-// The poller marks a turn only for a command, an automation run or an answered
+// The poller marks a turn only for a command, an automation run, a check job or an answered
 // question, so each call also says `otherWake`: that turn was not woken by DevSpec
 // notices alone, and its posts are never stamped as notice replies (notice-reply.mjs).
 function writeTurnMarker(connectionId, extra = { remoteTurn: true }) {
@@ -490,6 +510,26 @@ export function validateAutomationRunDispatch(dispatch, connectionId) {
     : { ok: false, error: 'invalid or misaddressed automation_run dispatch' }
 }
 
+/**
+ * One `dispatches[]` item: an automation run in its exact existing shape, or a check
+ * job in its exact shape (`kind: 'check_job'`). Anything else is rejected exactly as
+ * before check jobs existed, by the automation-run validator.
+ */
+export function validateWakeDispatch(dispatch, connectionId) {
+  if (
+    dispatch && typeof dispatch === 'object' && !Array.isArray(dispatch) &&
+    dispatch.kind === 'check_job'
+  ) {
+    return validateCheckJobDispatch(dispatch, connectionId)
+  }
+  return validateAutomationRunDispatch(dispatch, connectionId)
+}
+
+/** The inbox record type each accepted dispatch is persisted under. */
+function dispatchRecordType(dispatch) {
+  return dispatch.kind === 'check_job' ? CHECK_JOB_RECORD_TYPE : 'automation_run'
+}
+
 /** Rebuild crash-safe delivery identity from newline-terminated durable records only. */
 export function scanPersistedInboxRecords(text, activeSessionId = undefined) {
   void activeSessionId
@@ -531,7 +571,10 @@ export function scanPersistedInboxRecords(text, activeSessionId = undefined) {
             : []
         for (const id of ids) if (typeof id === 'string') index.systemNoticeIds.add(id)
       }
-      if (record?.type === 'automation_run' && typeof record.dispatch?.id === 'string') {
+      if (
+        (record?.type === 'automation_run' || record?.type === CHECK_JOB_RECORD_TYPE) &&
+        typeof record.dispatch?.id === 'string'
+      ) {
         index.dispatchIds.add(record.dispatch.id)
       }
     } catch {
@@ -688,7 +731,12 @@ export function appendCanonicalInbox(
   }
 }
 
-export function appendAutomationDispatches(
+/**
+ * Persist `dispatches[]` (automation runs and check jobs) to the inbox, each once by id.
+ * One item that is neither exact shape rejects the whole batch, as before, so nothing
+ * is written and the dispatch cursor does not move.
+ */
+export function appendWakeDispatches(
   connectionId,
   dispatches,
   dispatchCursor,
@@ -698,15 +746,17 @@ export function appendAutomationDispatches(
 ) {
   const validated = []
   for (const offered of Array.isArray(dispatches) ? dispatches : []) {
-    const parsed = validateAutomationRunDispatch(offered, connectionId)
+    const parsed = validateWakeDispatch(offered, connectionId)
     if (!parsed.ok) return { ok: false, appended: 0, error: parsed.error }
     validated.push(parsed.dispatch)
   }
   let appended = 0
+  const appendedByType = { automation_run: 0, [CHECK_JOB_RECORD_TYPE]: 0 }
   for (const dispatch of validated) {
     if (index.dispatchIds.has(dispatch.id)) continue
+    const type = dispatchRecordType(dispatch)
     const record = {
-      type: 'automation_run',
+      type,
       connection_id: connectionId,
       session_id: sessionId,
       received_at: new Date().toISOString(),
@@ -714,12 +764,13 @@ export function appendAutomationDispatches(
       dispatch,
     }
     if (!writeRecord(connectionId, record)) {
-      return { ok: false, appended, error: 'automation inbox persistence failed' }
+      return { ok: false, appended, appendedByType, error: 'dispatch inbox persistence failed' }
     }
     index.dispatchIds.add(dispatch.id)
     appended++
+    appendedByType[type]++
   }
-  return { ok: true, appended }
+  return { ok: true, appended, appendedByType }
 }
 
 export function disabledStatePatch(reason) {
@@ -1118,6 +1169,7 @@ export function pushChannelUrl(mcpUrl, connectionId, options = {}) {
     system_notice_version: String(options.systemNoticeVersion ?? SYSTEM_NOTICE_CHANNEL_VERSION),
     interaction_event_version: String(options.interactionEventVersion ?? 1),
     question_dismissal_event_version: String(options.questionDismissalEventVersion ?? 1),
+    check_job_version: String(options.checkJobVersion ?? CHECK_JOB_VERSION),
   })
   return `${base}/connection-stream?${params.toString()}`
 }
@@ -2169,14 +2221,14 @@ async function main() {
     return { ok: true, delivered: true }
   }
 
-  function consumeAutomationDispatches(res) {
+  function consumeWakeDispatches(res) {
     if (!Array.isArray(res?.dispatches)) {
       process.stderr.write('devspec-remote-poll: rejected malformed dispatches channel\n')
       return { ok: false, delivered: false }
     }
     const nextDispatchCursor =
       typeof res.dispatch_cursor === 'string' ? res.dispatch_cursor : dispatchCursor
-    const persisted = appendAutomationDispatches(
+    const persisted = appendWakeDispatches(
       connectionId,
       res.dispatches,
       nextDispatchCursor,
@@ -2184,7 +2236,7 @@ async function main() {
       sessionId,
     )
     if (!persisted.ok) {
-      process.stderr.write(`devspec-remote-poll: rejected automation dispatch (${persisted.error})\n`)
+      process.stderr.write(`devspec-remote-poll: rejected dispatch batch (${persisted.error})\n`)
       return { ok: false, delivered: false }
     }
     dispatchCursor = nextDispatchCursor
@@ -2193,17 +2245,23 @@ async function main() {
       delivered_dispatch_ids: [...persistedInbox.dispatchIds].slice(-200),
     })
     if (persisted.appended > 0) {
-      process.stdout.write(
-        JSON.stringify({
-          type: 'wake',
-          reason: 'automation_run',
-          count: persisted.appended,
-          inbox: inboxPathForConnection(connectionId),
-          authoritative: false,
-          executable: false,
-        }) + '\n',
-      )
-      if (shouldAssertTurnOnPollerInboxWrite(connectionId, readState(connectionId))) {
+      for (const [reason, count] of Object.entries(persisted.appendedByType)) {
+        if (count === 0) continue
+        process.stdout.write(
+          JSON.stringify({
+            type: 'wake',
+            reason,
+            count,
+            inbox: inboxPathForConnection(connectionId),
+            authoritative: false,
+            executable: false,
+          }) + '\n',
+        )
+      }
+      if (
+        dispatchesStartTurn(persisted.appendedByType) &&
+        shouldAssertTurnOnPollerInboxWrite(connectionId, readState(connectionId))
+      ) {
         writeTurnMarker(connectionId, { remoteTurn: true, otherWake: true })
       }
     }
@@ -2474,14 +2532,14 @@ async function main() {
         await sleep(emptyTurnBackoffMs(consecutiveEmpty, tier.waitMs))
         continue
       }
-      const automations = consumeAutomationDispatches(res)
+      const dispatched = consumeWakeDispatches(res)
       const canonical = await consumeCanonicalIngress(res)
       if (canonical.ok) {
         needsSeed = redrainRequested
         redrainRequested = false
       }
       const handOverNow = considerCommandOffer(res)
-      if (automations.delivered || canonical.delivered) {
+      if (dispatched.delivered || canonical.delivered) {
         consecutiveEmpty = 0
         continue
       }

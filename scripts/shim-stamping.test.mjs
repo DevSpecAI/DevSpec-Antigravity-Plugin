@@ -182,6 +182,20 @@ describe('the commit check, before git runs', () => {
     assert.match(result.stderr, new RegExp(`\\[devspec:${OTHER_TASK}\\]`))
     assert.equal(head(dir), before)
   })
+
+  it('inside another git stand-in\'s work: not stopped, not tagged, not recorded, because that one owns the commit (65658d3b)', async () => {
+    const dir = repo('app', PROJECT_REMOTE)
+    // What another DevSpec plugin's stand-in, or a git hook under one, hands this one.
+    const unclaimed = await agentRuns('DEVSPEC_GIT_STAND_IN_DEPTH=1 git commit -q --allow-empty -m "feat: nested, unclaimed"', dir)
+    assert.equal(unclaimed.result.status, 0, unclaimed.result.stderr)
+    assert.equal(lastMessage(dir), 'feat: nested, unclaimed')
+    claim(dir, TASK)
+    const claimed = await agentRuns('DEVSPEC_GIT_STAND_IN_DEPTH=1 git commit -q --allow-empty -m "feat: nested, claimed"', dir)
+    assert.equal(claimed.result.status, 0, claimed.result.stderr)
+    assert.equal(lastMessage(dir), 'feat: nested, claimed')
+    const observations = path.join(generationDir(CONN, home), 'observations.jsonl')
+    assert.equal(fs.existsSync(observations) ? fs.readFileSync(observations, 'utf8') : '', '')
+  })
 })
 
 describe('a repository outside the project', () => {

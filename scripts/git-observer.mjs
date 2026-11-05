@@ -55,6 +55,7 @@ import { ensurePrivateDir, readPrivateJson, writePrivateJson } from './private-s
 import { readStateFile } from './remote-control-state.mjs'
 import { readClaims, recoveryText, scopeFrom } from './commit-provenance.mjs'
 import { connectedProject } from './commit-scope.mjs'
+import { MARKER_WINDOW_BYTES, STAND_IN_MARKER } from './git-observer-shim.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const FULL_SHA = /^[0-9a-f]{40}$/
@@ -123,14 +124,17 @@ function isStandIn(file, home) {
     const real = fs.realpathSync(file)
     const root = fs.existsSync(observerRoot(home)) ? fs.realpathSync(observerRoot(home)) : observerRoot(home)
     if (real.startsWith(`${root}${path.sep}`)) return true
-    const head = Buffer.alloc(256)
+    const head = Buffer.alloc(MARKER_WINDOW_BYTES)
     const fd = fs.openSync(real, 'r')
     try {
       fs.readSync(fd, head, 0, head.length, 0)
     } finally {
       fs.closeSync(fd)
     }
-    return head.toString('utf8').includes(SHIM_MARKER)
+    // This plugin's own, or any DevSpec plugin's: two that each took the other for
+    // git looped until the machine ran out of memory (65658d3b).
+    const text = head.toString('latin1')
+    return text.includes(SHIM_MARKER) || text.includes(STAND_IN_MARKER)
   } catch {
     return false
   }
@@ -168,6 +172,8 @@ function shimScript({ dir, node, realGit }) {
   const module = path.join(dir, SHIM_MODULE)
   return [
     '#!/bin/sh',
+    // Every DevSpec stand-in, whichever plugin's, skips a git carrying this line.
+    `${STAND_IN_MARKER}: DevSpec for Antigravity notes the commits this agent makes, then runs the real git.`,
     `${SHIM_MARKER}. It runs the real git unchanged and notes each commit it makes;`,
     "# it is on PATH only for the agent's own shell commands and installs nothing anywhere.",
     `real=${shellQuote(realGit)}`,

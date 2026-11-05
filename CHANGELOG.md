@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.21.15
+
+- Updated `README.md` with an overview of shared team memory and staleness screening, sessionless **Agents** page availability versus session room attachment, `/devspec-remote --name "<codename>"`, check-ruling and automation wake behavior, single-claim commit tagging across linked repositories (including Git worktrees) and `.devspec/project.json`-pinned folders, observed criterion verification, Protected intent holds, and GitHub pull-request checks.
+
+## 0.21.14
+
+- When your agent is waiting for room messages without the background listener, a room command, control or question answer that arrives behind a queued check job or notice now reaches the agent straight away instead of waiting for the current turn to end. Queued check jobs and notices still follow, one per turn, in the order they arrived.
+- Restarting the listener, or switching to the in-conversation wait, no longer repeats commands the agent has already been given, and queued check jobs and notices are still delivered afterwards.
+- A check job that arrives while the agent is idle and waiting is now delivered at once, instead of after a ten-minute delay.
+- After a turn that ended without finishing cleanly, queued check jobs and notices still arrive one per turn rather than all at once.
+
+## 0.21.13
+
+- Check jobs and DevSpec system notices on your agent's own work now queue behind an active turn in arrival order instead of interrupting mid-turn or clobbering active turn tracking, while urgent room commands and controls continue through immediately.
+- Dedicated check-job follow-up turns now rule checks silently without streaming a spurious work trail or posting a fallback command reply into the session room, and start with a clean request attribution state so earlier finished commands never ride on check or notice follow-up writes.
+- Background task completions carrying Antigravity `<conversationId>/task-<n>` sender IDs now reconcile cleanly during active multi-step turns as well as held turns so completed background tasks never leave `.turn` or finished requests stuck open.
+
+## 0.21.12
+
+- When DevSpec's check finds that a task your Antigravity agent just wrote duplicates one that already exists, the agent now sorts it out there and then instead of leaving a flag for later. If the existing task is yours, or one you're allowed to change, it adds anything new to it, closes the new one as its duplicate and tells you. If it's someone else's, it asks you whether to add to it, which waits for that person's OK, or to keep yours separate, recorded as not a duplicate with your reason.
+
+## 0.21.11
+
+- Antigravity now takes part in ruling DevSpec's checks. It tells DevSpec it understands check jobs (`check_job_version: 1` on every poll and on the connection stream), so DevSpec can send it every check on a change, its own changes included, beside automation runs. A check job is accepted only in its exact shape and addressed to this connection, kept once in the inbox, and wakes the agent with one line saying a check is waiting on that record; automation runs arrive exactly as before, and anything else is still refused. The agent takes the job with `claim_check_job`, rules every entry with `record_check_rulings`, then carries on, and `rules/AGENTS.md` and the remote skill say so. Busy is already reported truthfully (working while a turn runs, not working when it ends), which DevSpec needs to hand an untaken job to the next in line.
+
+## 0.21.10
+
+- Stream live work-trail progress during sessionless remote automation runs so viewers watching a running automation see real-time tool and reasoning output without needing an attached room session, and retry cleanly if an early tool call fires before the automation run is claimed.
+
+## 0.21.9
+
+- When Antigravity can't finish a message sent from a DevSpec session (for example its sign-in has expired, it has run out of quota, or the model service is down), it now says so in the session straight away, quoting Antigravity's own error, and stops showing as working. Before, the session showed nothing while the error sat in the terminal. A message typed in Antigravity's own terminal gets no session reply, because the error is already shown there.
+
+## 0.21.8
+
+- Updated `rules/AGENTS.md` quick-reference call shapes for `get_tasks` (`dismissal_category?`), `create_task` (`human_only?`, `no_code?`), and `update_task` (`dismissal_category?`, `target_task_id?`, `note?`, `human_only?`, `no_code?`), documenting the four required task dismissal categories (`duplicate`, `replaced`, `outdated`, and `not_wanted`).
+
+## 0.21.7
+
+- Goal and outcome changes made with `manage_goals` now carry who asked for them (`request_ref` and `provenance_ref`), matching every other judged DevSpec write.
+- Added the direct call shapes for `get_project_goals`, `get_goals`, and `manage_goals` (including `merged_chapter_summary` when merging goals) to `rules/AGENTS.md` so Antigravity can read and manage goals and outcomes without extra schema-read steps.
+
+## 0.21.6
+
+- Fixed a loop that could use up all of your computer's memory. DevSpec's plugins for Antigravity, Claude Code and Pi each put a stand-in for `git` in front of the real one, so they can tag and report commits. When two of them were on the same PATH, for example an Antigravity agent started from a Claude Code terminal, each could take the other for git and pass every git command back and forth, starting a new process each time. The stand-in now recognises any DevSpec plugin's stand-in and always runs the real git, including when it had already noted another plugin's stand-in as git. If an older version of another plugin still sends a command round in a loop, the command stops at once with a message saying so, instead of exhausting memory.
+
 ## 0.21.5
 
 - Documented the one-line `agy plugin install https://github.com/DevSpecAI/DevSpec-Antigravity-Plugin` install and update command in `README.md` (retaining manual `git clone` / `git pull` as an optional fallback) and added `displayName`, `description`, `version`, `author`, `homepage`, and `repository` metadata to `plugin.json`.
