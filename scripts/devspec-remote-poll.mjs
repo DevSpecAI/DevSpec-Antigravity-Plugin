@@ -10,7 +10,7 @@
  * `active_plan_projection_version: 1`, `system_notice_version: 2`, `sender_style_version: 1`,
  * `room_context_version: 1`, `session_polls_projection_version: 2`), `known_instruction_tiers_hash`,
  * `interaction_event_version: 1`, `question_dismissal_event_version: 1`, `command_offer_version: 1`,
- * and `check_job_version: 1` (check jobs beside automation runs in `dispatches[]`; check-job.mjs).
+ * and `check_job_version: 2` (check jobs beside automation runs in `dispatches[]`; check-job.mjs).
  * Authority: devspec://product/implementation-contract
  *
  * Usage:

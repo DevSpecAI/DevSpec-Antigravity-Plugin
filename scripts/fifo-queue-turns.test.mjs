@@ -80,7 +80,6 @@ function makeCheckJobRecord(id = CHECK_JOB_ID, connectionId = CONN_ID) {
       check_kind: 'conflict',
       record: { type: 'task', id: RECORD_ID, title: 'Queue checks behind active turns' },
       entries: 2,
-      high_risk: 1,
       yours: true,
       offered_at: '2026-11-04T18:00:00.000Z',
       delivery_connection_id: connectionId,

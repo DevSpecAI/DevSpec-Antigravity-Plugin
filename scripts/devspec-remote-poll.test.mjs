@@ -628,7 +628,7 @@ describe('SSE push channel (parseSseFrame, pushChannelUrl, nextPushReconnectDela
     const url = pushChannelUrl('https://api.devspec.ai/api/mcp/', ME)
     assert.equal(
       url,
-      'https://api.devspec.ai/api/mcp/connection-stream?connection_id=conn-mine-1111&system_notice_version=2&interaction_event_version=1&question_dismissal_event_version=1&check_job_version=1',
+      'https://api.devspec.ai/api/mcp/connection-stream?connection_id=conn-mine-1111&system_notice_version=2&interaction_event_version=1&question_dismissal_event_version=1&check_job_version=2',
     )
   })
 
@@ -968,7 +968,7 @@ describe('Parity 3: room transcript, 4-tier instruction files, repository contex
         sender_style_version: 1,
         room_context_version: 1,
         session_polls_projection_version: 2,
-        check_job_version: 1,
+        check_job_version: 2,
       })
 
       const tiersPayload = {

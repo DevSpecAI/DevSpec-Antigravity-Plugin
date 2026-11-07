@@ -42,7 +42,6 @@ function checkJob(over = {}) {
     check_kind: 'conflict',
     record: { type: 'task', id: RECORD, title: 'Sign in with a passkey' },
     entries: 3,
-    high_risk: 1,
     yours: true,
     offered_at: '2026-11-04T03:00:00.000Z',
     delivery_connection_id: CONNECTION,
@@ -66,19 +65,19 @@ function collect() {
 }
 
 describe('check job negotiation', () => {
-  it('asks for check jobs, version 1, on every poll', () => {
-    assert.equal(CHECK_JOB_VERSION, 1)
-    assert.equal(remoteIngressNegotiationArguments().check_job_version, 1)
+  it('asks for check jobs, version 2, on every poll (item 1d89fe56)', () => {
+    assert.equal(CHECK_JOB_VERSION, 2)
+    assert.equal(remoteIngressNegotiationArguments().check_job_version, 2)
   })
 
   it('asks for check jobs on the connection stream handshake, beside system_notice_version', () => {
     const url = new URL(pushChannelUrl('https://devspec.test/api/mcp', CONNECTION))
-    assert.equal(url.searchParams.get('check_job_version'), '1')
+    assert.equal(url.searchParams.get('check_job_version'), '2')
     assert.equal(url.searchParams.get('system_notice_version'), '2')
   })
 })
 
-describe('busy is reported truthfully across a turn (required with check_job_version 1)', () => {
+describe('busy is reported truthfully across a turn (required of a host that asks for check jobs)', () => {
   it('is busy from the turn start until its Stop, then not busy', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-check-job-busy-'))
     const conversationId = 'ca2d5a24-57ea-4252-90d0-82d4dd2504d1'
@@ -144,17 +143,27 @@ describe('dispatch validator union', () => {
     assert.deepEqual(validateWakeDispatch(run, CONNECTION), { ok: true, dispatch: run })
   })
 
-  it('accepts a check job in its exact shape, for every check kind and record type', () => {
+  it('accepts a version 2 check job in its exact shape, for every check kind and record type', () => {
     assert.deepEqual([...CHECK_JOB_WAKE_KEYS].sort(), Object.keys(checkJob()).sort())
+    assert.equal(CHECK_JOB_WAKE_KEYS.includes('high_risk'), false)
     for (const check_kind of ['conflict', 'conflict_decisions', 'duplicate', 'staleness']) {
-      for (const type of ['task', 'memory', 'artifact', 'proposal']) {
+      for (const type of ['task', 'memory', 'artifact', 'proposal', 'discussion_point', 'goal', 'backlog_scan']) {
         const job = checkJob({ check_kind, record: { type, id: RECORD, title: 'T' } })
         assert.equal(validateWakeDispatch(job, CONNECTION).ok, true, `${check_kind}/${type}`)
       }
     }
     // A record whose title is empty is still a record (the server sends '' for none).
     assert.equal(validateWakeDispatch(checkJob({ record: { type: 'memory', id: RECORD, title: '' } }), CONNECTION).ok, true)
-    assert.equal(validateWakeDispatch(checkJob({ yours: false, entries: 0, high_risk: 0 }), CONNECTION).ok, true)
+    assert.equal(validateWakeDispatch(checkJob({ yours: false, entries: 0 }), CONNECTION).ok, true)
+  })
+
+  it('refuses a version 1 envelope: version 2 never sends high_risk', () => {
+    for (const high_risk of [0, 1]) {
+      assert.deepEqual(validateWakeDispatch(checkJob({ high_risk }), CONNECTION), {
+        ok: false,
+        error: 'dispatch does not exactly match check_job',
+      })
+    }
   })
 
   it('rejects a check job with an extra key or a missing key', () => {
@@ -175,11 +184,12 @@ describe('dispatch validator union', () => {
       { id: 'not-a-uuid', check_job_id: 'not-a-uuid' },
       { check_kind: 'reversal' },
       { record: { type: 'action_item', id: RECORD, title: 'T' } },
+      { record: { type: 'open_task_staleness_scan', id: RECORD, title: 'T' } },
+      { record: { type: 'outcome', id: RECORD, title: 'T' } },
       { record: { type: 'task', id: 'short', title: 'T' } },
       { record: { type: 'task', id: RECORD, title: null } },
       { entries: -1 },
       { entries: 1.5 },
-      { high_risk: '1' },
       { yours: 'true' },
       { offered_at: 'yesterday' },
       { delivery_connection_id: other },
@@ -268,6 +278,34 @@ describe('waking the agent for a check job', () => {
       `A check is waiting on the memory ${RECORD}: take it with claim_check_job, rule every entry with record_check_rulings, then carry on.`,
     )
     assert.equal(WAKE_TEXT.includes('\n'), false)
+  })
+
+  it('says what a check on a settled discussion point, a Goal or the whole-backlog scan is about', () => {
+    const tail = ': take it with claim_check_job, rule every entry with record_check_rulings, then carry on.'
+    const stale = (type, title) => checkJob({ check_kind: 'staleness', record: { type, id: RECORD, title } })
+    assert.equal(
+      checkJobWakeText(stale('discussion_point', 'Do we keep magic links?')),
+      `An out-of-date check is waiting on the settled discussion point "Do we keep magic links?"${tail}`,
+    )
+    assert.equal(
+      checkJobWakeText(stale('goal', 'Self-serve onboarding')),
+      `An out-of-date check is waiting on the Goal "Self-serve onboarding"${tail}`,
+    )
+    assert.equal(
+      checkJobWakeText(stale('backlog_scan', 'Out-of-date scan of open tasks')),
+      `The whole-backlog out-of-date scan "Out-of-date scan of open tasks" is waiting${tail}`,
+    )
+    assert.equal(checkJobWakeText(stale('goal', '')), `An out-of-date check is waiting on the Goal ${RECORD}${tail}`)
+    assert.equal(checkJobWakeText(stale('backlog_scan', '')), `The whole-backlog out-of-date scan is waiting${tail}`)
+    // Each wakes the agent through the background listener like any other check job.
+    for (const type of ['discussion_point', 'goal', 'backlog_scan']) {
+      const job = stale(type, 'T')
+      const message = buildWakeDeliveryMessage(
+        { type: 'check_job', connection_id: CONNECTION, session_id: null, dispatch: job },
+        { connectionId: CONNECTION },
+      )
+      assert.equal(message.split('\n\n')[1], checkJobWakeText(job), type)
+    }
   })
 
   it('revalidates a persisted check job before it reaches the wake stream', () => {
