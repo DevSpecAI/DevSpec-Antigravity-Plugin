@@ -35,7 +35,7 @@ import {
 } from './devspec-remote-wait.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { isTurnMarkerActive, loadState, readTurnMarker, recordTurnWake } from './mirror-turn.mjs'
-import { noticeReplyInstruction } from './notice-reply.mjs'
+import { noticeAudience, noticeReplyInstruction } from './notice-reply.mjs'
 import {
   ensurePollerForConnection,
   listenerInfoPath,
@@ -445,8 +445,10 @@ export function buildWakeDeliveryMessage(entry, opts = {}) {
       const formatted = formatSystemNoticeContent(notice)
       if (formatted) bodyLines.push(formatted)
     }
-    // One reply can answer every notice this wake handed over.
-    if (notices.length > 1) bodyLines.push(noticeReplyInstruction(notices.map((n) => n.notice_id)))
+    // One reply can answer every notice this wake handed over that needs a person;
+    // one DevSpec labelled for the record is never replied to (notice-reply.mjs).
+    const replyIds = notices.filter((n) => noticeAudience(n) === 'needs_person').map((n) => n.notice_id)
+    if (replyIds.length > 1) bodyLines.push(noticeReplyInstruction(replyIds))
     const streamJson = formatInboxEntryForStream(entry, { ...streamOpts, includeContent: false })
     const topics = notices
       .map((n) => (n?.topic && n?.notice_type ? `${n.topic}/${n.notice_type}` : n?.kind || 'notice'))

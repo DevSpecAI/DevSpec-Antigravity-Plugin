@@ -339,3 +339,234 @@ describe('normalizeNoticeIds changes shape only', () => {
     assert.equal(normalizeNoticeIds(7), 7)
   })
 })
+
+// Item a868f41f: DevSpec labels every notice (system notice version 3), and the label,
+// never this plugin, decides whether anything reaches the room.
+function labelled(audience, ...ids) {
+  const entry = noticeEntry(...ids)
+  entry.ingress.system_notices = entry.ingress.system_notices.map((notice) => ({ ...notice, audience }))
+  return entry
+}
+
+function mixedEntry(needsId, recordId) {
+  const entry = noticeEntry(needsId, recordId)
+  const [needs, record] = entry.ingress.system_notices
+  entry.ingress.system_notices = [{ ...needs, audience: 'needs_person' }, { ...record, audience: 'for_the_record' }]
+  return entry
+}
+
+async function stopCalls(fx, hookInput = {}) {
+  const calls = []
+  await handleMirrorTurn('stop', JSON.stringify({ conversationId: CONV_ID, transcriptPath: fx.transcriptPath, ...hookInput }), {
+    env: {},
+    connectionsDir: fx.connDir,
+    legacyPath: path.join(fx.home, 'legacy.json'),
+    call: async (c) => {
+      calls.push(c)
+      return { ok: true }
+    },
+  })
+  return calls.filter((c) => c.name === 'post_session_message')
+}
+
+function lastWords(fx, content) {
+  fs.appendFileSync(
+    fx.transcriptPath,
+    `${JSON.stringify({ step_index: 4, type: 'PLANNER_RESPONSE', created_at: new Date(Date.now() + 2000).toISOString(), content })}\n`,
+  )
+}
+
+const TELL_PERSON_RESULT = {
+  content: [
+    { type: 'text', text: JSON.stringify({ outcome: 'committed', task: { id: NOTICE_B } }) },
+    {
+      type: 'text',
+      text: JSON.stringify({
+        tell_person: {
+          why: 'changed_someone_elses_record',
+          record: { type: 'task', id: NOTICE_B },
+          owner: 'someone_else',
+          instruction: 'This changed a record that is not the requester\'s own, so tell the person you are working for what you changed.',
+        },
+      }),
+    },
+  ],
+}
+
+async function postTool(fx, toolName, args, toolResponse) {
+  await runPostToolDispatch(
+    JSON.stringify({
+      conversationId: CONV_ID,
+      tool_name: 'call_mcp_tool',
+      tool_input: { ServerName: '"devspec"', ToolName: `"${toolName}"`, Arguments: JSON.stringify(args) },
+      tool_response: toolResponse,
+    }),
+    { env: {}, home: fx.home, call: async () => ({ ok: true }) },
+  )
+}
+
+describe('DevSpec labels each notice, and only one that needs a person is answered (item a868f41f)', () => {
+  it('hands the model the reply call only under a notice that needs a person', () => {
+    const record = buildWakeDeliveryMessage(labelled('for_the_record', NOTICE_A), { connectionId: CONN_ID })
+    assert.doesNotMatch(record, /post_session_message\(/)
+    assert.match(record, /labels this notice for the record \(semantics\.notice_audience in devspec:\/\/product\/remote-ingress-contract\)/)
+    assert.match(record, /This plugin posts no reply to it/)
+
+    const needs = buildWakeDeliveryMessage(labelled('needs_person', NOTICE_A), { connectionId: CONN_ID })
+    assert.ok(needs.includes(`system_notice_ids: ["${NOTICE_A}"]`))
+
+    // A batch's one reply names only the notices that need a person.
+    const mixed = buildWakeDeliveryMessage(mixedEntry(NOTICE_A, NOTICE_B), { connectionId: CONN_ID })
+    assert.doesNotMatch(mixed, new RegExp(`post_session_message\\(\\{ message, system_notice_ids: \\[[^\\]]*${NOTICE_B}`), 'no reply call names the for-the-record notice')
+    assert.ok(mixed.includes(`system_notice_ids: ["${NOTICE_A}"]`))
+
+    // The wait script carries the label on each notice event, which PreInvocation reads.
+    const [event] = buildCanonicalSystemNoticeEvents(labelled('for_the_record', NOTICE_A), { inboxFile: 'inbox' })
+    assert.equal(event.audience, 'for_the_record')
+    assert.doesNotMatch(event.content, /post_session_message\(/)
+  })
+
+  it('reads the label from the wake step itself at PreInvocation', async () => {
+    const fx = fixture()
+    try {
+      const wake = buildWakeDeliveryMessage(mixedEntry(NOTICE_A, NOTICE_B), { connectionId: CONN_ID })
+      fs.appendFileSync(
+        fx.transcriptPath,
+        `${JSON.stringify({ step_index: 3, type: 'SYSTEM_MESSAGE', created_at: new Date().toISOString(), content: `<SYSTEM_MESSAGE>\n${wake}\n</SYSTEM_MESSAGE>` })}\n`,
+      )
+      await handleMirrorTurn('user_prompt', JSON.stringify({ conversationId: CONV_ID, transcriptPath: fx.transcriptPath }), {
+        env: {},
+        connectionsDir: fx.connDir,
+        legacyPath: path.join(fx.home, 'legacy.json'),
+        call: async () => ({ ok: true }),
+      })
+      const marker = readTurnMarker(CONN_ID, fx.connDir)
+      assert.deepEqual(marker.noticeIds, [NOTICE_A])
+      assert.deepEqual(marker.recordNoticeIds, [NOTICE_B])
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('ends a turn woken only by for-the-record notices with nothing in the room, and no trail during it', async () => {
+    const fx = fixture()
+    try {
+      recordTurnWake(CONN_ID, labelled('for_the_record', NOTICE_A, NOTICE_B), fx.connDir)
+      assert.deepEqual(currentTurnNoticeIds(CONN_ID, { dir: fx.connDir }), [NOTICE_A, NOTICE_B])
+      const state = JSON.parse(fs.readFileSync(path.join(fx.connDir, `${CONN_ID}.json`), 'utf8'))
+      const trailCalls = []
+      const trail = await streamTurnTrailIfChanged(state, { connectionsDir: fx.connDir, home: fx.home, call: async (c) => trailCalls.push(c) })
+      assert.equal(trail.reason, 'notice_turn')
+      assert.equal(trailCalls.length, 0)
+
+      lastWords(fx, 'Linked the commit to the task.')
+      assert.deepEqual(await stopCalls(fx), [], 'no reply, no answer')
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('posts no error message for a routine turn that died on an error', async () => {
+    const fx = fixture()
+    try {
+      recordTurnWake(CONN_ID, labelled('for_the_record', NOTICE_A), fx.connDir)
+      assert.deepEqual(await stopCalls(fx, { terminationReason: 'ERROR', error: 'request failed: Forbidden' }), [])
+      recordTurnWake(CONN_ID, { type: 'check_job', connection_id: CONN_ID }, fx.connDir)
+      assert.deepEqual(await stopCalls(fx, { terminationReason: 'ERROR', error: 'request failed: Forbidden' }), [])
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('replies at Stop only to the notices that need a person', async () => {
+    const fx = fixture()
+    try {
+      recordTurnWake(CONN_ID, mixedEntry(NOTICE_A, NOTICE_B), fx.connDir)
+      lastWords(fx, 'Your change clashes with the retry decision: keep it or change the decision?')
+      const [post, ...rest] = await stopCalls(fx)
+      assert.equal(rest.length, 0)
+      assert.deepEqual(post.arguments.system_notice_ids, [NOTICE_A])
+      for (const key of [...TURN_ONLY, 'complete_turn', 'session_id']) assert.equal(post.arguments[key], undefined, key)
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('stamps a stray post in a for-the-record turn so DevSpec refuses it, and treats the refusal as quiet', async () => {
+    const fx = fixture()
+    try {
+      recordTurnWake(CONN_ID, labelled('for_the_record', NOTICE_A), fx.connDir)
+      const sent = prePost(fx, { message: 'Noted the commit review.' })
+      assert.deepEqual(sent.system_notice_ids, [NOTICE_A])
+      // DevSpec refuses it (delivery.reason for_the_record): not the turn's reply, not
+      // an error to surface, and nothing at Stop posts it another way.
+      await postTool(fx, 'post_session_message', sent, {
+        content: [{ type: 'text', text: JSON.stringify({ delivery: { status: 'rejected', reason: 'for_the_record', retryable: false }, error: 'Nothing was posted, and nothing needs to be.' }) }],
+        isError: true,
+      })
+      assert.equal(fs.existsSync(explicitReplyMarkerPath(CONN_ID, fx.connDir)), false)
+      lastWords(fx, 'Noted the commit review.')
+      assert.deepEqual(await stopCalls(fx), [])
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('tells the person when a write in a routine turn changed someone else\'s record (tell_person)', async () => {
+    const fx = fixture()
+    try {
+      recordTurnWake(CONN_ID, labelled('for_the_record', NOTICE_A), fx.connDir)
+      await postTool(fx, 'update_task', { task_id: NOTICE_B, lifecycle: 'dismissed' }, TELL_PERSON_RESULT)
+      assert.equal(readTurnMarker(CONN_ID, fx.connDir).tellPerson, true)
+      // The model did not post: Stop posts its last words, as an ordinary message.
+      lastWords(fx, 'I closed Brandon\'s duplicate task, which repeated mine.')
+      const [post, ...rest] = await stopCalls(fx)
+      assert.equal(rest.length, 0)
+      assert.equal(post.arguments.message, 'I closed Brandon\'s duplicate task, which repeated mine.')
+      assert.equal(post.arguments.connection_id, CONN_ID)
+      for (const key of [...TURN_ONLY, 'system_notice_ids', 'complete_turn']) assert.equal(post.arguments[key], undefined, key)
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('leaves the model\'s own post to the person unstamped after tell_person, and adds nothing at Stop', async () => {
+    const fx = fixture()
+    try {
+      recordTurnWake(CONN_ID, labelled('for_the_record', NOTICE_A), fx.connDir)
+      await postTool(fx, 'update_task', { task_id: NOTICE_B, lifecycle: 'dismissed' }, TELL_PERSON_RESULT)
+      const sent = prePost(fx, { message: 'I closed your duplicate task.' })
+      assert.equal(sent.system_notice_ids, undefined, 'the ordinary message DevSpec asks for')
+      await postTool(fx, 'post_session_message', sent, { content: [{ type: 'text', text: '{"delivery":{"status":"stored"}}' }] })
+      lastWords(fx, 'I closed your duplicate task.')
+      assert.deepEqual(await stopCalls(fx), [], 'told once, by the model')
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('does not take a mention of tell_person in record text for the mark', async () => {
+    const fx = fixture()
+    try {
+      recordTurnWake(CONN_ID, labelled('for_the_record', NOTICE_A), fx.connDir)
+      await postTool(fx, 'get_task', { task_id: NOTICE_B }, {
+        content: [{ type: 'text', text: JSON.stringify({ description: 'A write result may carry a "tell_person" block.' }) }],
+      })
+      assert.equal(readTurnMarker(CONN_ID, fx.connDir).tellPerson, undefined)
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('reads a notice persisted before labels as needing a person', async () => {
+    const fx = fixture()
+    try {
+      recordTurnWake(CONN_ID, noticeEntry(NOTICE_A), fx.connDir)
+      lastWords(fx, 'Merged.')
+      const [post] = await stopCalls(fx)
+      assert.deepEqual(post.arguments.system_notice_ids, [NOTICE_A])
+    } finally {
+      fx.cleanup()
+    }
+  })
+})

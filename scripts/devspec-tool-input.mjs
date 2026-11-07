@@ -14,8 +14,10 @@
  *    `overwrite` (and `hookSpecificOutput.updatedInput`) when unambiguous.
  * 5. Makes a `post_session_message` that replies to DevSpec notices a notice reply
  *    (`system_notice_ids`, notice-reply.mjs): the model's ids as an array, or the
- *    turn's own notices when every wake of the turn was a notice; no trail and no
- *    local-turn flags on it, and it never counts as the reply to a command.
+ *    turn's own notices when every wake of the turn was a notice (those that need a
+ *    person; if none do, the for-the-record ones, which DevSpec refuses to post, unless
+ *    a write in the turn carried `tell_person`); no trail and no local-turn flags on it,
+ *    and it never counts as the reply to a command.
  */
 
 import fs from 'node:fs'
@@ -28,7 +30,7 @@ import { prepareGitObservation } from './git-observer.mjs'
 import { versionedConnectionArguments } from './connection-version.mjs'
 import { launchGuard, resolveOwnConnectionId } from './launch-guard.mjs'
 import {
-  currentTurnNoticeIds,
+  currentTurnStampNoticeIds,
   extractAntigravityTrailFromTranscript,
   parseTranscriptPath,
   readTurnMarker,
@@ -203,7 +205,7 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
       next.system_notice_ids = normalizeNoticeIds(next.system_notice_ids)
       noticeReply = true
     } else if (connectionId && postCanTakeTurnNotices(next)) {
-      const turnNotices = currentTurnNoticeIds(connectionId, { dir: connDir, connectionState: connState })
+      const turnNotices = currentTurnStampNoticeIds(connectionId, { dir: connDir, connectionState: connState })
       if (turnNotices) {
         next.system_notice_ids = turnNotices
         noticeReply = true

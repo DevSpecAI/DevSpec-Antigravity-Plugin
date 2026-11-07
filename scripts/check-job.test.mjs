@@ -73,7 +73,7 @@ describe('check job negotiation', () => {
   it('asks for check jobs on the connection stream handshake, beside system_notice_version', () => {
     const url = new URL(pushChannelUrl('https://devspec.test/api/mcp', CONNECTION))
     assert.equal(url.searchParams.get('check_job_version'), '2')
-    assert.equal(url.searchParams.get('system_notice_version'), '2')
+    assert.equal(url.searchParams.get('system_notice_version'), '3')
   })
 })
 
