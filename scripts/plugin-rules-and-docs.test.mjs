@@ -64,16 +64,23 @@ describe('Item 5 parity: rules/AGENTS.md, package version 0.15.0, and documentat
     assert.equal(changelog.match(/^## (\S+)/m)?.[1], pkg.version)
   })
 
-  it('documents ~/.gemini/config/mcp_config.json and why the plugin is required in README.md and has no non-existent agy flags', () => {
+  it('sets up with the plugin and browser approvals: no settings file to edit, no token to paste, and no non-existent agy flags', () => {
     const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8')
-    assert.match(readme, /~\/\.gemini\/config\/mcp_config\.json/)
     assert.match(readme, /https:\/\/api\.devspec\.ai\/api\/mcp/)
     assert.match(readme, /rules\/AGENTS\.md/)
-    assert.match(readme, /Installing the plugin is required alongside the MCP server/)
     assert.match(readme, /local \(\/devspec-remote to connect\)/)
     assert.match(readme, /agy plugin install https:\/\/github\.com\/DevSpecAI\/DevSpec-Antigravity-Plugin/)
     assert.match(readme, /agy --dangerously-skip-permissions/)
     assert.match(readme, /\/devspec-project/)
+    assert.match(readme, /\/devspec-login/)
+    assert.match(readme, /agy mcp remove devspec/, 'upgraders are told how to drop the old hand-added entry')
+    for (const text of [
+      readme,
+      ...fs.readdirSync(path.join(ROOT, 'skills')).map((skill) => fs.readFileSync(path.join(ROOT, 'skills', skill, 'SKILL.md'), 'utf8')),
+    ]) {
+      assert.doesNotMatch(text, /Bearer|dvs_|YOUR_DEVSPEC|paste (?:your|the) (?:DevSpec )?token/i)
+      assert.doesNotMatch(text, /(?:open|edit|merge)[^.\n]*~\/\.gemini\/config\/mcp_config\.json/i)
+    }
     assert.doesNotMatch(readme, /--install-plugin|--update-plugins/)
   })
 })

@@ -9,6 +9,9 @@
  * 4. Ensures the bound connection's poller is running and syncs `transcript_path`.
  * 5. Injects compact connection orientation + cached instruction tiers (`storeTiers` / `takeTiersFor`)
  *    into `hookSpecificOutput.additionalContext`.
+ * 6. When the background features have no DevSpec sign-in for this install's server,
+ *    opens the one browser approval they need (as Antigravity) and tells the person,
+ *    or says plainly that an earlier sign-in has ended.
  */
 
 import fs from 'node:fs'
@@ -17,7 +20,6 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { LOADED_PLUGIN_VERSION } from './connection-version.mjs'
-import { ensureHostPluginHeader } from './host-mcp-header.mjs'
 import { privateStateRoot, tightenPrivateTree } from './private-state.mjs'
 import { pruneObserverFolders } from './git-observer.mjs'
 import { readGithubIdentity, renderGithubIdentity, storeGithubIdentity } from './github-identity.mjs'
@@ -29,13 +31,18 @@ import {
 } from './instruction-tiers.mjs'
 import { storeRepositoryContext } from './repository-context.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
+import { DEFAULT_PROD_URL, resolveDevspecMcpAuth, resolveLoginFor } from './resolve-mcp-auth.mjs'
+import { loginState } from './auth-store.mjs'
+import { lastSignIn, recordSignInOutcome, startBackgroundSignIn } from './devspec-login.mjs'
+import { browserCanReachThisMachine } from './oauth.mjs'
+import { configuredServer } from './devspec-server.mjs'
 import {
-  DEFAULT_PROD_URL,
-  formatMissingAuthMessage,
-  hostTokenFromEnv,
-  resolveDevspecMcpAuth,
-  verifyAndPinDevspecAuth,
-} from './resolve-mcp-auth.mjs'
+  envTokenNotice,
+  needsCodeMessage,
+  notSignedInMessage,
+  signInStartedMessage,
+  signInWaitingMessage,
+} from './sign-in-messages.mjs'
 import {
   discoverAntigravityLsAddress,
   ensureListenerForConnection,
@@ -89,26 +96,6 @@ export function parseHookCwd(hookInput, fallbackCwd = process.cwd()) {
     /* ignore */
   }
   return fallbackCwd
-}
-
-/**
- * Remove any leftover untracked placeholder `mcp_config.json` inside the plugin
- * directory so Antigravity does not hang trying to connect `devspec_devspec`.
- */
-export function cleanupLegacyPluginMcpConfig({ pluginRoot = PLUGIN_ROOT } = {}) {
-  if (!pluginRoot) return { removed: false, reason: 'no_plugin_root' }
-  const legacyMcpPath = path.join(pluginRoot, 'mcp_config.json')
-  try {
-    if (!fs.existsSync(legacyMcpPath)) return { removed: false, reason: 'not_present' }
-    const raw = fs.readFileSync(legacyMcpPath, 'utf8')
-    if (raw.includes('dvs_YOUR_DEVSPEC_MCP_TOKEN')) {
-      fs.rmSync(legacyMcpPath, { force: true })
-      return { removed: true, path: legacyMcpPath }
-    }
-    return { removed: false, reason: 'custom_config_kept' }
-  } catch {
-    return { removed: false, reason: 'error' }
-  }
 }
 
 /**
@@ -206,11 +193,7 @@ export function connectAtStartupEnabled(
   if (!explicitlyEnabled) return false
 
   const effectiveHome = home || env?.HOME || os.homedir()
-  const auth = resolveDevspecMcpAuth(cwd, {
-    env,
-    home: effectiveHome,
-    hostToken: hostTokenFromEnv(env, { cwd, home: effectiveHome }),
-  })
+  const auth = resolveDevspecMcpAuth(cwd, { env, home: effectiveHome, renew: false })
   return Boolean(auth?.ok && auth?.token)
 }
 
@@ -262,34 +245,12 @@ export async function autoConnectAtStartup({
   writeBondFn = writeLocalBond,
   ensurePollerFn = ensurePollerForConnection,
   ensureListenerFn = ensureListenerForConnection,
-  verifyAuthFn = verifyAndPinDevspecAuth,
   home = undefined,
 } = {}) {
   const effectiveHome = home || env?.HOME || os.homedir()
-  let auth = null
-  if (verifyAuthFn !== verifyAndPinDevspecAuth) {
-    try {
-      auth = await verifyAuthFn(cwd, { env, home: effectiveHome })
-    } catch {
-      auth = null
-    }
-  }
-  if (!auth?.token) {
-    auth = resolveDevspecMcpAuth(cwd, {
-      env,
-      home: effectiveHome,
-      hostToken: hostTokenFromEnv(env, { cwd, home: effectiveHome }),
-    })
-  }
-  if (!auth?.token && callMcp === defaultCallMcp) {
-    try {
-      auth = await verifyAuthFn(cwd, { env, home: effectiveHome })
-    } catch {
-      auth = null
-    }
-  }
-  if (!auth?.token) return null
-  let mcpUrl = auth.mcp_url || DEFAULT_PROD_URL
+  const auth = resolveDevspecMcpAuth(cwd, { env, home: effectiveHome })
+  if (!auth?.ok || !auth.token) return null
+  const mcpUrl = auth.mcp_url || DEFAULT_PROD_URL
   const ownerPid = resolveOwnerPid(explicitOwnerPid || 'auto', null)
   const checkOwnerAlive =
     explicitOwnerPid !== null && explicitOwnerPid !== undefined
@@ -346,33 +307,12 @@ export async function autoConnectAtStartup({
       supports_trail: true,
     },
   }
-  let reg = null
-  try {
-    reg = await callMcp({
-      mcpUrl,
-      token: auth.token,
-      name: 'register_connection',
-      arguments: registerArgs,
-    })
-  } catch (err) {
-    if (callMcp === defaultCallMcp && verifyAuthFn === verifyAndPinDevspecAuth) {
-      const fallbackAuth = await verifyAuthFn(cwd, { env, home: effectiveHome }).catch(() => null)
-      if (fallbackAuth?.token && fallbackAuth.token !== auth.token) {
-        auth = fallbackAuth
-        mcpUrl = auth.mcp_url || DEFAULT_PROD_URL
-        reg = await callMcp({
-          mcpUrl,
-          token: auth.token,
-          name: 'register_connection',
-          arguments: registerArgs,
-        })
-      } else {
-        throw err
-      }
-    } else {
-      throw err
-    }
-  }
+  const reg = await callMcp({
+    mcpUrl,
+    token: auth.token,
+    name: 'register_connection',
+    arguments: registerArgs,
+  })
   const connectionId = reg?.connection_id || reg?.connection?.id || null
   if (!connectionId) return null
 
@@ -428,6 +368,8 @@ export async function autoConnectAtStartup({
     token: auth.token,
     mcp_url: mcpUrl,
     auth_ok: true,
+    auth_source: auth.source,
+    ...(auth.principal ? { auth_principal: auth.principal } : {}),
     ...(typeof reg?.connection_capability === 'string' && reg.connection_capability
       ? {
           connection_capability: reg.connection_capability,
@@ -484,6 +426,86 @@ export async function autoConnectAtStartup({
   return statePayload
 }
 
+function sessionStartMessage(text) {
+  return {
+    injectSteps: [{ systemMessage: { systemMessage: text } }],
+    hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: text },
+  }
+}
+
+const NO_TOKEN_HUNTING = 'Never open the link or sign in for them, and never look for DevSpec tokens in files.'
+
+/** Something the person must hear: shown once, plainly, before the rest of the reply. */
+function tellPersonNow(message) {
+  return `DevSpec: ${message}\nTell the person this once, in plain words and with any link, at the start of your next reply. ${NO_TOKEN_HUNTING}`
+}
+
+/** Something the person may ask about: the status bar already shows it. */
+function tellPersonIfAsked(message) {
+  return `DevSpec: ${message}\nIf the person asks about DevSpec remote control or commit tracking, tell them this. ${NO_TOKEN_HUNTING}`
+}
+
+/**
+ * What SessionStart says about the background features' sign-in, when there is no
+ * connection yet. With no login for this install's server it opens the one browser
+ * approval (as Antigravity), unless an earlier one went unanswered or was canceled:
+ * then it waits for the person to ask (/devspec-login, /devspec-remote) rather than
+ * opening a tab at every window. A login that ended is said plainly and never
+ * reopened by itself: the person may have disconnected Antigravity on purpose.
+ */
+export function signInNotice(auth, { env = process.env, home = os.homedir(), startSignInFn = startBackgroundSignIn } = {}) {
+  if (auth?.ok) {
+    if (auth.source === 'env' && loginState(configuredServer(), { home }).kind !== 'none') {
+      return tellPersonIfAsked(envTokenNotice())
+    }
+    return null
+  }
+  const mcpUrl = auth?.mcp_url || configuredServer()
+  if (auth?.reason === 'sign_in_ended') return endedNotice(mcpUrl, auth.error, home)
+  if (auth?.reason !== 'not_signed_in') return auth?.error ? tellPersonIfAsked(auth.error) : null
+  const earlier = lastSignIn(mcpUrl, { home })
+  if (earlier && earlier.outcome !== 'signed_in') {
+    return tellPersonIfAsked(browserCanReachThisMachine(env) ? notSignedInMessage(mcpUrl) : needsCodeMessage())
+  }
+  const started = startSignInFn({ mcpUrl, home, env })
+  switch (started?.status) {
+    case 'started':
+      return tellPersonNow(signInStartedMessage(started.url))
+    case 'waiting':
+      return tellPersonNow(signInWaitingMessage(started.url))
+    case 'needs_code':
+      recordSignInOutcome(mcpUrl, home, 'needs_code')
+      return tellPersonNow(needsCodeMessage())
+    case 'signed_in':
+      return null
+    default:
+      return tellPersonIfAsked(started?.message ? `Sign-in could not start: ${started.message}` : notSignedInMessage(mcpUrl))
+  }
+}
+
+/**
+ * An ended sign-in is told to the person once, at the next session; after that the
+ * status bar keeps showing it and the agent mentions it when asked.
+ */
+function endedNotice(mcpUrl, message, home) {
+  const loginId = loginState(mcpUrl, { home }).login?.loginId ?? null
+  const earlier = lastSignIn(mcpUrl, { home })
+  if (earlier?.outcome === 'ended_told' && earlier.loginId === loginId) return tellPersonIfAsked(message)
+  recordSignInOutcome(mcpUrl, home, 'ended_told', null, { loginId })
+  return tellPersonNow(message)
+}
+
+/** The bound connection was made with a browser login that has since ended. */
+function connectionSignInEnded(state, home) {
+  if (state?.auth_source !== 'login' || typeof state.mcp_url !== 'string') return null
+  try {
+    const auth = resolveLoginFor(state.mcp_url, { home, renew: false })
+    return auth.ok ? null : endedNotice(auth.mcp_url, auth.error, home)
+  } catch {
+    return null
+  }
+}
+
 export async function runSessionStart(
   raw = '',
   {
@@ -494,30 +516,16 @@ export async function runSessionStart(
     writeStateFn = writeStateFile,
     writeBondFn = writeLocalBond,
     ensurePollerFn = ensurePollerForConnection,
-    verifyAuthFn = verifyAndPinDevspecAuth,
+    startSignInFn = startBackgroundSignIn,
     home = undefined,
   } = {},
 ) {
   const effectiveHome = home || env?.HOME || os.homedir()
   const effectiveCwd = parseHookCwd(raw, cwd)
   try {
-    cleanupLegacyPluginMcpConfig()
-  } catch {
-    /* non-fatal */
-  }
-  try {
     ensureStatusLineConfigured({ home: effectiveHome })
   } catch {
     /* non-fatal */
-  }
-  try {
-    // Antigravity's own MCP client names this plugin and its running version on
-    // every DevSpec call through the user's mcp_config.json (item 7a01644a). The
-    // same pass sets that file, which holds the person's key, back to 0600 in a 0700
-    // folder: agy rewrites it 0644 on every `agy mcp` command (item b17cb7d7).
-    ensureHostPluginHeader({ home: effectiveHome })
-  } catch {
-    /* non-fatal: the plugin's scripts send the header themselves */
   }
   try {
     // Repair what earlier versions left in ~/.devspec: key-holding state is already
@@ -537,11 +545,7 @@ export async function runSessionStart(
   const transcriptPath = parseTranscriptPath(raw)
   let state = loadStateFn(conversationId)
 
-  const auth = resolveDevspecMcpAuth(effectiveCwd, {
-    env,
-    home: effectiveHome,
-    hostToken: hostTokenFromEnv(env, { cwd: effectiveCwd, home: effectiveHome }),
-  })
+  const auth = resolveDevspecMcpAuth(effectiveCwd, { env, home: effectiveHome })
 
   if (!state?.connection_id && connectAtStartupEnabled(env, { cwd: effectiveCwd, home: effectiveHome })) {
     try {
@@ -554,7 +558,6 @@ export async function runSessionStart(
         writeStateFn,
         writeBondFn,
         ensurePollerFn,
-        verifyAuthFn,
         home: effectiveHome,
       })
     } catch {
@@ -563,23 +566,8 @@ export async function runSessionStart(
   }
 
   if (!state?.connection_id) {
-    if (!auth?.ok || !auth?.token) {
-      const missingAuthContext = `${auth?.error || formatMissingAuthMessage()}\nIf the user asks about DevSpec or remote control, report this message verbatim and do not guess or search for tokens across unrelated files.`
-      return {
-        injectSteps: [
-          {
-            systemMessage: {
-              systemMessage: missingAuthContext,
-            },
-          },
-        ],
-        hookSpecificOutput: {
-          hookEventName: 'SessionStart',
-          additionalContext: missingAuthContext,
-        },
-      }
-    }
-    return null
+    const notice = signInNotice(auth, { env, home: effectiveHome, startSignInFn })
+    return notice ? sessionStartMessage(notice) : null
   }
 
   // If the single live connection for this agent has a different or missing local_id,
@@ -690,7 +678,9 @@ export async function runSessionStart(
       dir: path.join(effectiveHome, '.devspec', 'remote-control', 'connections'),
     }),
   )
-  const head = githubLines.length > 0 ? `${parts.join(' | ')}\n${githubLines.join('\n')}` : parts.join(' | ')
+  const connectedHead = githubLines.length > 0 ? `${parts.join(' | ')}\n${githubLines.join('\n')}` : parts.join(' | ')
+  const ended = connectionSignInEnded(state, effectiveHome)
+  const head = ended ? `${ended}\n\n${connectedHead}` : connectedHead
   const additionalContext = tierContext ? `${head}\n\n${tierContext}` : head
 
   return {
@@ -731,7 +721,6 @@ async function main() {
       else if (argv[i] === '--conversation-id' && argv[i + 1]) convArg = argv[++i]
     }
     try {
-      cleanupLegacyPluginMcpConfig()
       ensureStatusLineConfigured()
       await autoConnectAtStartup({
         cwd: cwdArg,

@@ -35,7 +35,8 @@ import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveHookConversationId } from './mirror-turn.mjs'
 import { ensurePrivateDir } from './private-state.mjs'
 import { ownerAlive, resolveOwnerPid } from './remote-control-state.mjs'
-import { DEFAULT_PROD_URL, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { connectionCredential, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { pendingSignIn } from './devspec-login.mjs'
 import { connectAtStartupEnabled } from './session-start.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
@@ -346,17 +347,11 @@ export async function sendTelemetry({ connectionId, home = os.homedir(), call = 
       }
     })(),
   )
-  let token = state?.token
-  let mcpUrl = state?.mcp_url
-  if (!token) {
-    const auth = resolveDevspecMcpAuth(state?.cwd || process.cwd())
-    token = auth.token
-    mcpUrl = mcpUrl || auth.mcp_url
-  }
-  if (!token) return { ok: false, reason: 'no_token' }
+  const credential = connectionCredential(state, { home })
+  if (!credential) return { ok: false, reason: 'no_token' }
   await call({
-    mcpUrl: mcpUrl || DEFAULT_PROD_URL,
-    token,
+    mcpUrl: credential.mcpUrl,
+    token: credential.token,
     name: 'heartbeat_connection',
     arguments: {
       connection_id: connectionId,
@@ -829,18 +824,14 @@ export function renderStatusLine(rawInput = '', { home = os.homedir(), env = pro
     null
 
   const view = readConnectionView({ home, conversationId, cwd, env })
+  const signIn = signInStatus({ home, env })
   if (!view || view.state === 'local') {
     const hasInputContext = Boolean(
       cwd ||
         (typeof input.conversation_id === 'string' && input.conversation_id.trim()) ||
         (typeof input.session_id === 'string' && input.session_id.trim()),
     )
-    if (hasInputContext) {
-      const auth = resolveDevspecMcpAuth(cwd || process.cwd(), { home, env })
-      if (!auth.ok) {
-        return 'DevSpec: not configured — add dvs_ token to ~/.gemini/config/mcp_config.json'
-      }
-    }
+    if (hasInputContext && signIn) return `DevSpec: ${signIn.text}`
     if (!view) return ''
   }
   let telemetry = null
@@ -858,7 +849,34 @@ export function renderStatusLine(rawInput = '', { home = os.homedir(), env = pro
       ...(nowIso ? { nowIso } : {}),
     })
   }
-  return formatStatusLine(view, view?.work || [], telemetry)
+  const line = formatStatusLine(view, view?.work || [], telemetry)
+  // A connection whose sign-in has ended keeps showing, with what to do about it.
+  return signIn?.reason === 'sign_in_ended' && line && view.state === 'connected'
+    ? line.replace(/^DevSpec: /, `DevSpec: ${signIn.text} · `)
+    : line
+}
+
+/**
+ * The background features' sign-in, in the few words the status bar has room for,
+ * or null when it is fine. Never renews and never opens anything: the status bar
+ * renders often and only reports.
+ */
+export function signInStatus({ home = os.homedir(), env = process.env } = {}) {
+  let auth
+  try {
+    auth = resolveDevspecMcpAuth(process.cwd(), { home, env, renew: false })
+  } catch {
+    return null
+  }
+  if (auth.ok) return null
+  if (auth.reason === 'sign_in_ended') return { reason: auth.reason, text: 'sign-in ended (/devspec-login to sign in again)' }
+  if (auth.reason === 'not_signed_in') {
+    const text = pendingSignIn(auth.mcp_url, { home })
+      ? 'approve Antigravity in your browser to finish signing in'
+      : 'remote control not signed in (/devspec-login)'
+    return { reason: auth.reason, text }
+  }
+  return null
 }
 
 async function main() {

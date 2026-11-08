@@ -63,9 +63,10 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  resolveDevspecMcpAuth,
-  hostTokenFromEnv,
+  credentialIdentity,
   printableAuth,
+  resolveDevspecMcpAuth,
+  stateWithCurrentToken,
   tokenFingerprint,
 } from './resolve-mcp-auth.mjs'
 import {
@@ -294,9 +295,13 @@ function writeJson(filePath, state) {
   writePrivateJson(filePath, state)
 }
 
+/**
+ * A connection's state, carrying the current token of the browser login it was
+ * made with (that token changes about daily; see stateWithCurrentToken).
+ */
 export function readStateFile(connectionId, connDir = CONNECTIONS_DIR) {
   if (!connectionId) return null
-  return readJson(connectionPath(connectionId, connDir))
+  return stateWithCurrentToken(readJson(connectionPath(connectionId, connDir)))
 }
 
 export function writeStateFile(idOrState, stateOrDir = CONNECTIONS_DIR, maybeDir = CONNECTIONS_DIR) {
@@ -324,7 +329,6 @@ function parseArgs(argv) {
     } else if (a === '--agent' || a === '--agent_name') out.agent = argv[++i]
     else if (a === '--project-id' || a === '--project_id') out['project-id'] = argv[++i]
     else if (a === '--cwd') out.cwd = argv[++i]
-    else if (a === '--url') out.url = argv[++i]
     else if (a === '--codename' || a === '--session_codename') out.codename = argv[++i]
     else if (a === '--title') out.title = argv[++i]
     else if (a === '--local-id' || a === '--local_id' || a === '--conversation-id') {
@@ -1428,8 +1432,7 @@ export async function writeConnectionState({
       ? explicitSessionId
       : prev.session_id ?? null
   const ownerPid = resolveOwnerPid(explicitOwnerPid, prev.owner_pid)
-  const hostToken = hostTokenFromEnv(env, { cwd, home })
-  const auth = resolveDevspecMcpAuth(cwd, { hostToken, env, home })
+  const auth = resolveDevspecMcpAuth(cwd, { env, home })
   let projectId =
     explicitProjectId || prev.project_id || findProjectPin(cwd, { home })?.project_id || null
   const projectName = explicitProjectName || prev.project_name || null
@@ -1488,9 +1491,10 @@ export async function writeConnectionState({
       (ownerPid ? processStartTime(ownerPid) : null) ?? prev.owner_started ?? null,
     project_id: projectId,
     ...(projectName ? { project_name: projectName } : {}),
-    mcp_url: auth.mcp_url || prev.mcp_url || 'https://api.devspec.ai/api/mcp',
-    token: auth.token || prev.token || undefined,
-    auth_source: auth.source || auth.error || prev.auth_source || null,
+    // The server and its credential are written together, never one without the other.
+    ...(auth.ok
+      ? { mcp_url: auth.mcp_url, token: auth.token, auth_source: auth.source, auth_principal: auth.principal }
+      : { mcp_url: prev.mcp_url || auth.mcp_url || 'https://api.devspec.ai/api/mcp', token: prev.token || undefined }),
     auth_ok: !!auth.ok || !!prev.auth_ok,
     cwd,
     ...(gitRemote ? { git_remote: gitRemote } : {}),
@@ -1587,8 +1591,8 @@ export async function writeConnectionState({
   const wantPoller = state.auth_ok && !noPoller
   if (wantPoller) {
     const reuseRunning =
-      !!prev.token &&
-      prev.token === state.token &&
+      !!credentialIdentity(prev) &&
+      credentialIdentity(prev) === credentialIdentity(state) &&
       (prev.mcp_url || null) === (state.mcp_url || null) &&
       (Number(prev.owner_pid) || null) === (Number(state.owner_pid) || null) &&
       (prev.connection_capability || null) === (state.connection_capability || null)
@@ -1626,9 +1630,7 @@ if (isMain) {
 
   if (cmd === 'resolve-auth') {
     // Diagnostics only: the key is shown by fingerprint (`--mask` is now always on).
-    const auth = resolveDevspecMcpAuth(args.cwd || process.cwd(), {
-      hostToken: hostTokenFromEnv(process.env),
-    })
+    const auth = resolveDevspecMcpAuth(args.cwd || process.cwd())
     process.stdout.write(JSON.stringify(printableAuth(auth), null, 2) + '\n')
     process.exit(auth.ok ? 0 : 1)
   }
@@ -2065,14 +2067,11 @@ if (isMain) {
       process.exit(2)
     }
     const cwd = args.cwd || process.cwd()
-    // Token symmetry (item 74b29c76): prefer the SAME bearer the host MCP client
-    // used for register_connection so the poller heartbeats THIS connection under
-    // the same identity — otherwise the server rejects with "connection belongs to
-    // a different token" and dispatch delivery spams. That is the bearer in
-    // Antigravity's own MCP config (`hostTokenFromEnv`); it wins over the .mcp.json
-    // walk but not an explicit DEVSPEC_MCP_TOKEN. It is never taken from the command
-    // line (item b17cb7d7). See resolve-mcp-auth.mjs.
-    const auth = resolveDevspecMcpAuth(cwd, { hostToken: hostTokenFromEnv(process.env) })
+    // The background features' own credential (resolve-mcp-auth.mjs): the
+    // environment token on a machine with no browser, else this plugin's browser
+    // login for this install's server. It is never taken from the command line
+    // (item b17cb7d7), and the server always comes with it.
+    const auth = resolveDevspecMcpAuth(cwd)
     const prev = readJson(connectionPath(connectionId)) || {}
     const agentName = args.agent || prev.agent_name || AGENT_NAME
     // The conversation this write belongs to — stamped INTO the per-connection state
@@ -2097,8 +2096,8 @@ if (isMain) {
     const gitRemote = gitRemoteOrigin(cwd)
     const capability = auth.ok
       ? await negotiateConnectionCapability({
-          mcpUrl: args.url || auth.mcp_url || prev.mcp_url,
-          token: auth.token || prev.token,
+          mcpUrl: auth.mcp_url,
+          token: auth.token,
           projectId,
           gitRemote,
           localId,
@@ -2122,9 +2121,9 @@ if (isMain) {
       owner_started:
         (ownerPid ? processStartTime(ownerPid) : null) ?? prev.owner_started ?? null,
       project_id: projectId,
-      mcp_url: args.url || auth.mcp_url || prev.mcp_url || 'https://api.devspec.ai/api/mcp',
-      token: auth.token || prev.token || undefined,
-      auth_source: auth.source || auth.error || prev.auth_source || null,
+      ...(auth.ok
+        ? { mcp_url: auth.mcp_url, token: auth.token, auth_source: auth.source, auth_principal: auth.principal }
+        : { mcp_url: prev.mcp_url || auth.mcp_url || 'https://api.devspec.ai/api/mcp', token: prev.token || undefined }),
       auth_ok: !!auth.ok || !!prev.auth_ok,
       cwd,
       session_codename: args.codename || prev.session_codename || prev.codename || null,
@@ -2197,8 +2196,8 @@ if (isMain) {
       // the kill→respawn path — and even then the dying poller exits silently
       // (item b9e02835).
       const reuseRunning =
-        !!prev.token &&
-        prev.token === state.token &&
+        !!credentialIdentity(prev) &&
+        credentialIdentity(prev) === credentialIdentity(state) &&
         (prev.mcp_url || null) === (state.mcp_url || null) &&
         (Number(prev.owner_pid) || null) === (Number(state.owner_pid) || null)
       const poller = ensurePollerForConnection(connectionId, {

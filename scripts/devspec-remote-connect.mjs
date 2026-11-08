@@ -19,7 +19,6 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { LOADED_PLUGIN_VERSION } from './connection-version.mjs'
-import { ensureHostPluginHeader } from './host-mcp-header.mjs'
 import {
   blockConversationProject,
   matchingProjects,
@@ -62,7 +61,9 @@ import {
   storeRepositoryContext,
   takeRepositoryContext,
 } from './repository-context.mjs'
-import { formatMissingAuthMessage, hostTokenFromEnv, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { startBackgroundSignIn } from './devspec-login.mjs'
+import { needsCodeMessage, signInStartedMessage, signInWaitingMessage } from './sign-in-messages.mjs'
 import { transcriptPaths } from './room-unread.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
@@ -93,6 +94,51 @@ const WAIT_SCRIPT = path.join(THIS_DIR, 'devspec-remote-wait.mjs')
 
 function roomStatePath(connectionId, home = os.homedir()) {
   return path.join(home, '.devspec', 'remote-control', 'connections', `${connectionId}.room.json`)
+}
+
+/** How long /devspec-remote waits for the person to approve a new sign-in in the browser. */
+export const SIGN_IN_CONNECT_WAIT_MS = 90_000
+
+/**
+ * The credential to connect with. With no sign-in for this install's server (or one
+ * that ended), asking to connect is the person asking for remote control, so this
+ * opens the one browser approval it needs, as Antigravity, and waits a little for
+ * this machine's own login file to show the result. It never asks DevSpec whether
+ * the person approved: the approval comes back only through their browser.
+ */
+export async function signedInAuth({
+  cwd,
+  env,
+  home,
+  resolveAuth = resolveDevspecMcpAuth,
+  startSignIn = startBackgroundSignIn,
+  onSignInMessage = () => {},
+  signInWaitMs = SIGN_IN_CONNECT_WAIT_MS,
+  sleepFn = sleep,
+}) {
+  let auth = resolveAuth(cwd, { env, home })
+  if (auth.ok && auth.token) return auth
+  if (auth.reason !== 'not_signed_in' && auth.reason !== 'sign_in_ended') {
+    throw new ConnectError(auth.error || 'DevSpec sign-in is unavailable.', { reason: 'auth' })
+  }
+  const started = startSignIn({ mcpUrl: auth.mcp_url, home, env })
+  if (started.status === 'needs_code') throw new ConnectError(needsCodeMessage(), { reason: 'sign_in' })
+  if (started.status !== 'started' && started.status !== 'waiting' && started.status !== 'signed_in') {
+    throw new ConnectError(
+      started.message ? `DevSpec sign-in could not start: ${started.message}` : auth.error,
+      { reason: 'sign_in' },
+    )
+  }
+  const asked = started.status === 'waiting' ? signInWaitingMessage(started.url) : signInStartedMessage(started.url)
+  if (started.status !== 'signed_in') onSignInMessage(asked)
+  const deadline = Date.now() + signInWaitMs
+  for (;;) {
+    auth = resolveAuth(cwd, { env, home })
+    if (auth.ok && auth.token) return auth
+    if (Date.now() >= deadline) break
+    await sleepFn(1_000)
+  }
+  throw new ConnectError(`${asked}\nThen run /devspec-remote again.`, { reason: 'sign_in' })
 }
 
 export class ConnectError extends Error {
@@ -181,7 +227,10 @@ export async function connect(options = {}, deps = {}) {
     resolveAuth = resolveDevspecMcpAuth,
     projectHome = os.homedir(),
     onRetryMessage = (message) => process.stderr.write(message),
-    ensureHostHeader = ensureHostPluginHeader,
+    startSignIn = startBackgroundSignIn,
+    onSignInMessage = (message) => process.stderr.write(`${message}\n`),
+    signInWaitMs = SIGN_IN_CONNECT_WAIT_MS,
+    sleepFn = sleep,
   } = deps
 
   const [major] = process.versions.node.split('.')
@@ -233,21 +282,16 @@ export async function connect(options = {}, deps = {}) {
     })
   }
 
-  const auth = resolveAuth(cwd, {
-    hostToken: hostTokenFromEnv(env, { cwd, home: projectHome }),
+  const auth = await signedInAuth({
+    cwd,
     env,
     home: projectHome,
+    resolveAuth,
+    startSignIn,
+    onSignInMessage,
+    signInWaitMs,
+    sleepFn,
   })
-  if (!auth.ok || !auth.token) {
-    throw new ConnectError(auth.error || formatMissingAuthMessage(), { reason: 'auth' })
-  }
-  try {
-    // Connecting is the moment an updated plugin most needs Antigravity's own MCP
-    // client to name it (item 7a01644a); SessionStart does the same at window open.
-    ensureHostHeader({ home: projectHome })
-  } catch {
-    /* non-fatal: the plugin's scripts send the header themselves */
-  }
 
   if (previousProject && previousProject.endpoint !== auth.mcp_url) {
     throw new ConnectError(

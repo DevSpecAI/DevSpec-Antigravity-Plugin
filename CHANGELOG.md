@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.23.0
+
+- Signing in no longer involves a token. The plugin now brings its own DevSpec connection, naming Antigravity's own DevSpec sign-in app, so a fresh install needs no settings file edited: Antigravity asks you to approve it in your browser on DevSpec's page, and keeps and renews that sign-in itself.
+- Remote control, commit tracking and the plugin's hooks run outside Antigravity's sign-in, so they get one approval of their own, also on DevSpec's page and also naming Antigravity. The first time they need DevSpec the plugin opens it in your browser (once, however many windows ask), and `/devspec-login` does the same whenever you want it. On a machine your browser cannot reach, `/devspec-login --code` gives you a link and takes back the code DevSpec's page shows. The approval always comes back through your own browser.
+- Antigravity appears once on DevSpec's Agent setup page, and disconnecting it there signs out both. When the background sign-in stops working, the status bar and the next session say so in plain words and tell you to run `/devspec-login`. `/devspec-login --status` and `--logout` check it and sign out of it.
+- The background sign-in is kept in the plugin's own file, `~/.devspec/antigravity/auth.json` (readable only by you), one per DevSpec server, and is only ever sent to the server it was approved for. It is renewed in time without asking you again. The plugin no longer reads another tool's login or a token from Antigravity's settings, and a server address in the environment no longer redirects a saved sign-in.
+- `DEVSPEC_MCP_TOKEN` (with `DEVSPEC_MCP_URL`) is now only for machines with no browser, such as CI. When it is set it takes precedence, and `/devspec-login` says so and how to remove it.
+- Upgrading: remove the DevSpec entry you added by hand with `agy mcp remove devspec`, restart `agy` and approve Antigravity. You can then revoke the old token in Agent setup.
+
 ## 0.22.0
 
 - DevSpec now asks the project's agents to check whether open tasks are out of date when a discussion point is settled, when a Goal or one of its outcomes changes, and when someone runs the out-of-date scan over the whole backlog from the Tasks page. Antigravity now receives those checks: the wake says which one it is ("an out-of-date check on the settled discussion point …", "… on the Goal …", "the whole-backlog out-of-date scan …"), and your agent rules them like any other check. The plugin asks for the new version of check jobs, and no longer reads the high-risk count, which that version does not send.

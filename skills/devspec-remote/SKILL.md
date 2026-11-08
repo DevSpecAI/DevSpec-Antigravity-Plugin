@@ -29,6 +29,7 @@ node "$PLUGIN_DIR/scripts/devspec-remote-connect.mjs" \
 
 - **bare (no flags):** registers or reuses this conversation's **sessionless** connection (available on the Agents page).
 - **`--project <name-or-id>`:** explicit project for this conversation. If the script exits with `code: "project_choice_required"`, ask the user which project to use and re-run with `--project <id>`.
+- **Sign-in:** remote control signs in to DevSpec once, through the browser, as Antigravity. When it has not yet, the script opens that approval itself and waits up to a minute and a half for it. If it exits with a message asking the person to approve Antigravity in their browser, show them that message (with its link) and run the same command again once they have approved. Never ask for a token or open the link yourself.
 - **`--session <uuid>`:** attach to that existing session.
 - **`--new [--private] [--title "…"]`:** create a new session and attach to it.
 - Print the `━━━ DevSpec Remote Control ━━━` status block in this terminal only (never post it via `post_session_message`). Only read a `.tiers-*.txt` file path under `## Instructions in force for this run` if those rules are not already loaded in your `SessionStart` system context (or after context compaction).
