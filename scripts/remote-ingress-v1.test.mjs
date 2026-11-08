@@ -712,15 +712,15 @@ describe('strict 1.4 system notices', () => {
     assert.equal(result.envelope.system_notices[0].records.length, 2)
   })
 
-  // The channel version this plugin negotiates on the poll and the stream (2: the one
-  // that carries findings) is not the shape version inside each notice. DevSpec's
-  // version 2 adds kinds and changes none, so a server_notice on a version-2 channel
-  // still says `version: 1` and is read in full, labelled records and all (1fd34942,
-  // item 42a4a5f9).
-  it('reads a version-1 server_notice body delivered over the version-2 channel it asks for', () => {
-    assert.equal(remoteIngressNegotiationArguments().system_notice_version, 2)
-    assert.match(pushChannelUrl('https://devspec.test/api/mcp', CONNECTION), /[?&]system_notice_version=2(&|$)/)
-    const notice = serverNotice()
+  // The channel version this plugin negotiates on the poll and the stream (3: findings,
+  // each labelled) is not the shape version inside each notice. DevSpec's version 2 adds
+  // kinds and version 3 adds `audience` to every kind, so a server_notice on a version-3
+  // channel still says `version: 1` and is read in full, labelled records and all
+  // (1fd34942, items 42a4a5f9, a868f41f).
+  it('reads a version-1 server_notice body delivered over the version-3 channel it asks for', () => {
+    assert.equal(remoteIngressNegotiationArguments().system_notice_version, 3)
+    assert.match(pushChannelUrl('https://devspec.test/api/mcp', CONNECTION), /[?&]system_notice_version=3(&|$)/)
+    const notice = serverNotice({ audience: 'needs_person' })
     assert.equal(notice.version, 1)
     const result = normalizeRemoteIngressV1(noticed({
       commands: [],
@@ -734,11 +734,54 @@ describe('strict 1.4 system notices', () => {
     assert.deepEqual(result.envelope.system_notices[0].records.map((record) => record.label), notice.records.map((record) => record.label))
   })
 
+  it('accepts every notice kind with DevSpec\'s label, and one persisted before labels as before (item a868f41f)', () => {
+    const unlinked = {
+      version: 1,
+      kind: 'unlinked_commit_item_review',
+      notice_id: '73000000-0000-4000-8000-000000000003',
+      commit_sha: 'a'.repeat(40),
+      task_id: '83000000-0000-4000-8000-000000000003',
+      task_title: 'Sign in with a passkey',
+      branch: 'feat/passkeys',
+      contract_uri: 'devspec://product/remote-ingress-contract',
+      allowed_outcomes: ['correct_item', 'link_item', 'resolve_duplicate', 'dismiss_item', 'confirm_item_correct', 'defer_follow_up'],
+      allowed_tools: ['get_task', 'update_task', 'link_tasks', 'supersede_task'],
+    }
+    for (const notice of [
+      serverNotice({ audience: 'needs_person' }),
+      serverNotice({ audience: 'for_the_record' }),
+      serverNotice(),
+      { ...unlinked, audience: 'for_the_record' },
+      unlinked,
+    ]) {
+      const result = normalizeRemoteIngressV1(noticed({
+        commands: [],
+        command_message_ids: [],
+        wake: { kind: 'system_notice', active: true, reason_id: 'exact_connection_system_notice' },
+        system_notices: [notice],
+        window: metadata([], { policy_version: REMOTE_INGRESS_SYSTEM_NOTICE_POLICY_VERSION }),
+      }), CONNECTION)
+      assert.equal(result.ok, true, `${notice.kind}/${notice.audience ?? 'unlabelled'}`)
+      assert.deepEqual(result.envelope.system_notices, [notice])
+    }
+    for (const audience of ['someone', null, '', 'NEEDS_PERSON']) {
+      const result = normalizeRemoteIngressV1(noticed({
+        commands: [],
+        command_message_ids: [],
+        wake: { kind: 'system_notice', active: true, reason_id: 'exact_connection_system_notice' },
+        system_notices: [serverNotice({ audience })],
+        window: metadata([], { policy_version: REMOTE_INGRESS_SYSTEM_NOTICE_POLICY_VERSION }),
+      }), CONNECTION)
+      assert.equal(result.ok, false, `audience ${JSON.stringify(audience)}`)
+    }
+  })
+
   it('rejects malformed server_notice payloads (missing records, extra keys, bad contract_uri)', () => {
     for (const bad of [
       serverNotice({ records: [] }),
       serverNotice({ contract_uri: 'devspec://wrong' }),
       serverNotice({ extra: true }),
+      serverNotice({ audience: 'for_the_record', label: 'For the record' }),
       serverNotice({ records: [{ ...serverNotice().records[0], similarity: 0.91 }] }),
     ]) {
       const env = noticed({

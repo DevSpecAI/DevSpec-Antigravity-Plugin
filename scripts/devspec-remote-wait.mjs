@@ -44,7 +44,7 @@ import {
   recordTurnWake,
   writeTurnMarker,
 } from './mirror-turn.mjs'
-import { noticeReplyInstruction } from './notice-reply.mjs'
+import { noticeAudience, noticeForTheRecordLine, noticeReplyInstruction } from './notice-reply.mjs'
 import {
   STATE_ABSENT,
   STATE_OK,
@@ -603,11 +603,29 @@ export function parseOwnerBatches(lines, connectionId) {
 
 // The server writes each notice's handling into its own prompt, per kind (findings,
 // held-edit and ruling outcomes, confirmation outcomes, write quality, untagged
-// commits), with the outcomes and tools it allows. This line only says to follow it:
-// a plugin-side copy of that policy covered three kinds and went stale (item 1df99dd4).
-export const NOTICE_HANDLING =
-  'Handling: follow the prompt above, within its allowed outcomes and tools; telling the person about it in the room is the notice reply below. The labelled records are your reading context — never dump their full text into the conversation. ' +
+// commits), with the outcomes and tools it allows, and opens it with its label (needs a
+// person, or for the record). This line only says to follow it: a plugin-side copy of
+// that policy covered three kinds and went stale (item 1df99dd4).
+const ACTING_RULE =
+  'The labelled records are your reading context — never dump their full text into the conversation. ' +
   "You act for whoever asked for this work, with their authority, not yours (a teammate can drive someone else's agent): the contract's acting_rule (devspec://product/implementation-contract)."
+export const NOTICE_HANDLING =
+  'Handling: follow the prompt above, within its allowed outcomes and tools; telling the person about it in the room is the notice reply below. ' +
+  ACTING_RULE
+/** The same for a notice DevSpec labelled for the record: there is no reply below. */
+export const NOTICE_HANDLING_FOR_THE_RECORD =
+  'Handling: follow the prompt above, within its allowed outcomes and tools. ' + ACTING_RULE
+
+/**
+ * What closes a notice for the model, by DevSpec's label (item a868f41f): a notice that
+ * needs a person ends with the reply call and its ids; one for the record ends with a
+ * pointer to the label, and no call to post.
+ */
+function noticeClosingLines(notice) {
+  return noticeAudience(notice) === 'for_the_record'
+    ? [NOTICE_HANDLING_FOR_THE_RECORD, noticeForTheRecordLine()]
+    : [NOTICE_HANDLING, noticeReplyInstruction([notice?.notice_id])]
+}
 
 export function formatSystemNoticeContent(notice) {
   if (notice?.kind === 'server_notice') {
@@ -634,8 +652,7 @@ export function formatSystemNoticeContent(notice) {
     }
     lines.push(
       '',
-      NOTICE_HANDLING,
-      noticeReplyInstruction([notice.notice_id]),
+      ...noticeClosingLines(notice),
       'Authority: exact_connection_system_notice (devspec://product/remote-ingress-contract). ' +
         'This is a server-initiated notice on your own work, not a room message or new work authorization.',
     )
@@ -649,7 +666,7 @@ export function formatSystemNoticeContent(notice) {
     `Prompt: ${notice?.prompt}`,
     `Allowed outcomes: ${Array.isArray(notice?.allowed_outcomes) ? notice.allowed_outcomes.join(', ') : ''}`,
     `Allowed tools: ${Array.isArray(notice?.allowed_tools) ? notice.allowed_tools.join(', ') : ''}`,
-    noticeReplyInstruction([notice?.notice_id]),
+    noticeAudience(notice) === 'for_the_record' ? noticeForTheRecordLine() : noticeReplyInstruction([notice?.notice_id]),
     'Authority: exact_connection_system_notice (devspec://product/remote-ingress-contract). ' +
       'This is a narrow server review prompt for your own claimed item and commit — not a room command or new work authorization.',
   ].join('\n')
@@ -676,6 +693,7 @@ export function buildCanonicalSystemNoticeEvents(
       type: 'system_notice',
       kind: notice.kind,
       notice_id: notice.notice_id,
+      audience: noticeAudience(notice),
       ...(notice.kind === 'server_notice'
         ? {
             topic: notice.topic,

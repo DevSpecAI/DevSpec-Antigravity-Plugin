@@ -36,6 +36,14 @@ describe('Item 5 parity: rules/AGENTS.md, package version 0.15.0, and documentat
     // A reply about a DevSpec notice is a notice reply, never a command answer (fdc96b30).
     assert.match(content, /system_notice_ids/)
     assert.match(content, /semantics\.notice_reply/)
+    // Whether anything is said in the room is DevSpec's label, and a check-job ruling
+    // never is: both point at the served contract rather than restate it (a868f41f).
+    for (const text of [content, fs.readFileSync(path.join(ROOT, 'skills', 'devspec-remote', 'SKILL.md'), 'utf8')]) {
+      assert.match(text, /semantics\.notice_audience/)
+      assert.match(text, /check_job\.room/)
+      assert.match(text, /tell_person/)
+      assert.doesNotMatch(text, /close yours as its duplicate, and tell them/)
+    }
     // Which setups get full commit tracking: the same sentence in every DevSpec plugin
     // and the help page, and native Windows stated plainly until it is tested (6da10a3a).
     for (const text of [content, fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8')]) {

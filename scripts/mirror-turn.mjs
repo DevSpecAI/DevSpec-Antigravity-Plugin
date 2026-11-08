@@ -49,9 +49,12 @@ import {
 } from './requests.mjs'
 import {
   isCheckJobOnlyTurn,
+  isRoutineTurn,
   mergeTurnWake,
   postCanTakeTurnNotices,
   turnNoticeIds,
+  turnReplyNoticeIds,
+  turnStampNoticeIds,
   turnWakeFromEntry,
   turnWakeFromText,
 } from './notice-reply.mjs'
@@ -186,7 +189,7 @@ export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR) {
   }
   // A notice or check job is not a command: one that arrives during a turn typed at
   // the terminal leaves it a local turn, so that turn's answer keeps its local-turn flags.
-  const nonCommandWake = Boolean(wake?.noticeIds || wake?.checkJobWake)
+  const nonCommandWake = Boolean(wake?.noticeIds || wake?.recordNoticeIds || wake?.checkJobWake)
   const remote = existing && nonCommandWake ? {} : { remoteTurn: true }
   return writeTurnMarker(connectionId, { ...remote, ...mergeTurnWake(existing, wake) }, dir)
 }
@@ -205,6 +208,55 @@ export function currentTurnNoticeIds(
     requestState: readRequestState(connectionId, { dir }),
     connectionState,
   })
+}
+
+/** Of those, the notices that need a person (`turnReplyNoticeIds`): what Stop's reply names. */
+export function currentTurnReplyNoticeIds(
+  connectionId,
+  { dir = CONNECTIONS_DIR, connectionState = null, marker = undefined } = {},
+) {
+  if (!connectionId) return null
+  return turnReplyNoticeIds({
+    marker: marker === undefined ? readTurnMarker(connectionId, dir) : marker,
+    requestState: readRequestState(connectionId, { dir }),
+    connectionState,
+  })
+}
+
+/** The ids PreToolUse puts on a plain post in a notice-only turn (`turnStampNoticeIds`). */
+export function currentTurnStampNoticeIds(
+  connectionId,
+  { dir = CONNECTIONS_DIR, connectionState = null, marker = undefined } = {},
+) {
+  if (!connectionId) return null
+  return turnStampNoticeIds({
+    marker: marker === undefined ? readTurnMarker(connectionId, dir) : marker,
+    requestState: readRequestState(connectionId, { dir }),
+    connectionState,
+  })
+}
+
+/**
+ * True when the current turn is routine (`isRoutineTurn`): woken only by check jobs and
+ * notices DevSpec labelled for the record.
+ */
+export function isCurrentTurnRoutine(
+  connectionId,
+  { dir = CONNECTIONS_DIR, connectionState = null, marker = undefined } = {},
+) {
+  if (!connectionId) return false
+  return isRoutineTurn({
+    marker: marker === undefined ? readTurnMarker(connectionId, dir) : marker,
+    requestState: readRequestState(connectionId, { dir }),
+    connectionState,
+  })
+}
+
+/** Note on the turn marker that a write in it carried DevSpec's `tell_person` mark. */
+export function recordTellPerson(connectionId, dir = CONNECTIONS_DIR) {
+  if (!connectionId || !readTurnMarker(connectionId, dir)) return false
+  writeTurnMarker(connectionId, { tellPerson: true, preserveExplicitReply: true }, dir)
+  return true
 }
 
 /**
@@ -1921,7 +1973,7 @@ export async function handleMirrorTurn(
       if (
         connectionId &&
         isRemoteWakeInput &&
-        (wake?.checkJobWake || wake?.noticeIds?.length) &&
+        (wake?.checkJobWake || wake?.noticeIds?.length || wake?.recordNoticeIds?.length) &&
         !existingMarker?.otherWake &&
         !existingMarker?.localPromptMirrored &&
         !existingMarker?.localTurn &&
@@ -1969,14 +2021,16 @@ export async function handleMirrorTurn(
 
       const hadExplicitReply = consumeExplicitReplyMarker(connectionId, connectionsDir)
       // Read before the marker goes: a turn woken only by DevSpec notices ends with a
-      // reply to those notices, and a turn woken only by check jobs ends silently,
-      // never with an answer filed under an earlier command.
-      const turnNotices = currentTurnNoticeIds(connectionId, {
+      // reply to the ones that need a person, and a routine turn (only check jobs and
+      // notices DevSpec labelled for the record) ends silently: no answer, no trail, no
+      // error message, never an answer filed under an earlier command (`check_job.room`
+      // and `semantics.notice_audience` in the served contract).
+      const turnNotices = currentTurnReplyNoticeIds(connectionId, {
         dir: connectionsDir,
         connectionState: state,
         marker,
       })
-      const checkJobOnlyTurn = isCurrentTurnCheckJobOnly(connectionId, {
+      const routineTurn = isCurrentTurnRoutine(connectionId, {
         dir: connectionsDir,
         connectionState: state,
         marker,
@@ -2032,6 +2086,44 @@ export async function handleMirrorTurn(
             /* non-fatal fallback */
           }
         }
+      } else if (routineTurn) {
+        // Silent, except when a write in the turn changed someone else's record
+        // (`tell_person`, `semantics.notice_audience.telling_anyway`) and the model did
+        // not tell the person itself: then its last words go to the room as an ordinary
+        // message, bound to no command turn, so no trail and no complete_turn.
+        const tellText =
+          marker?.tellPerson && !hadExplicitReply && sessionId
+            ? (text ? prepareAgentMirrorText(text) : null) ||
+              extractLatestAssistantReplyFromTranscript(effectiveTranscriptPath, {
+                sinceMs: marker?.startedAt ?? null,
+              })
+            : null
+        if (tellText) {
+          const telemetry = connectionId ? readConnectionTelemetry(connectionId) : null
+          try {
+            await call({
+              mcpUrl,
+              token,
+              name: 'post_session_message',
+              arguments: {
+                connection_id: connectionId,
+                agent_name: agentName,
+                message: tellText,
+                ...(telemetry ? { agent_stats: telemetry } : {}),
+                ...(telemetry?.model?.id
+                  ? {
+                      model: {
+                        providerID: telemetry.model.provider || 'google',
+                        modelID: telemetry.model.id,
+                      },
+                    }
+                  : {}),
+              },
+            })
+          } catch {
+            /* non-fatal */
+          }
+        }
       } else if (turnFailure && isRemoteTurn && sessionId) {
         // The turn died on an error before the model could answer (item 408ad47b):
         // tell the room in Antigravity's own words instead of mirroring nothing. Posted
@@ -2066,7 +2158,6 @@ export async function handleMirrorTurn(
           /* non-fatal: report_complete below still ends the turn */
         }
       } else if (
-        !checkJobOnlyTurn &&
         !hadExplicitReply &&
         sessionId &&
         (isRemoteTurn || isLocalMirroredTurn || hadStreamedTrail)

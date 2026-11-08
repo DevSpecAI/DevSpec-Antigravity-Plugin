@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.22.0
+
+- DevSpec now asks the project's agents to check whether open tasks are out of date when a discussion point is settled, when a Goal or one of its outcomes changes, and when someone runs the out-of-date scan over the whole backlog from the Tasks page. Antigravity now receives those checks: the wake says which one it is ("an out-of-date check on the settled discussion point …", "… on the Goal …", "the whole-backlog out-of-date scan …"), and your agent rules them like any other check. The plugin asks for the new version of check jobs, and no longer reads the high-risk count, which that version does not send.
+- DevSpec now labels every notice it sends your agent as either needing you or only for the record, and the plugin follows that label instead of replying to everything. A notice that needs you is answered in the room as before. One that is only for the record (an edit going live, a duplicate of your own task folded in, a commit linked to your own task) is handled quietly: nothing is posted, and if your agent tries, DevSpec declines it without anything else being tried.
+- A turn your agent spends only on checks and for-the-record notices now leaves nothing in the room, including when it ends on an error. If something your agent does in such a turn changes someone else's record, DevSpec says so, and your agent tells you what it changed.
+- The remote skill and the rules point at DevSpec's own rules for this (which notices are replied to, and never posting about ruling a check) instead of restating them.
+
 ## 0.21.15
 
 - Updated `README.md` with an overview of shared team memory and staleness screening, sessionless **Agents** page availability versus session room attachment, `/devspec-remote --name "<codename>"`, check-ruling and automation wake behavior, single-claim commit tagging across linked repositories (including Git worktrees) and `.devspec/project.json`-pinned folders, observed criterion verification, Protected intent holds, and GitHub pull-request checks.

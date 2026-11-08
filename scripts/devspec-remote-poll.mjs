@@ -7,10 +7,10 @@
  *   + durable per-connection JSONL inbox (`.inbox.jsonl`) → `devspec-remote-wait.mjs` / `devspec-remote-listen.mjs`.
  *
  * Negotiates remote-ingress 1.6.0 (`ingress_version: 1`, `delegated_scope_version: 1`,
- * `active_plan_projection_version: 1`, `system_notice_version: 2`, `sender_style_version: 1`,
+ * `active_plan_projection_version: 1`, `system_notice_version: 3`, `sender_style_version: 1`,
  * `room_context_version: 1`, `session_polls_projection_version: 2`), `known_instruction_tiers_hash`,
  * `interaction_event_version: 1`, `question_dismissal_event_version: 1`, `command_offer_version: 1`,
- * and `check_job_version: 1` (check jobs beside automation runs in `dispatches[]`; check-job.mjs).
+ * and `check_job_version: 2` (check jobs beside automation runs in `dispatches[]`; check-job.mjs).
  * Authority: devspec://product/implementation-contract
  *
  * Usage:
@@ -124,16 +124,18 @@ export const DELEGATED_SCOPE_VERSION = 1
 export const ACTIVE_PLAN_PROJECTION_VERSION = 1
 /**
  * The notice CHANNEL version this poller negotiates, on `poll_connection` and on the
- * SSE stream: which notice kinds DevSpec may send, not the shape each notice carries.
- * 1 carries `unlinked_commit_item_review`; 2 also carries `server_notice` (confirmed
- * findings and pending-edit outcomes about this agent's own work). DevSpec sends a
- * `server_notice` only to a channel that asked for 2 and records the last version
- * asked for on the connection, so both negotiations ask for the same one, or the
- * Agents page shows "Not receiving findings" (1fd34942, item 42a4a5f9). Version 2
- * adds kinds and changes none: every notice still arrives as a `version: 1` body,
- * read by `isSystemNoticeV1` in remote-ingress-v1.mjs.
+ * SSE stream: which notice kinds DevSpec may send and what rides on each, not the
+ * shape version each notice carries. 1 carries `unlinked_commit_item_review`; 2 also
+ * carries `server_notice` (confirmed findings and pending-edit outcomes about this
+ * agent's own work). DevSpec sends a `server_notice` only to a channel that asked for
+ * 2 or later and records the last version asked for on the connection, so both
+ * negotiations ask for the same one, or the Agents page shows "Not receiving findings"
+ * (1fd34942, item 42a4a5f9). 3 adds `audience` to every notice (item a868f41f):
+ * DevSpec's label for whether it needs a person or is for the record, which decides
+ * whether anything is said in the room (notice-reply.mjs). Every notice still arrives
+ * as a `version: 1` body, read by `isSystemNoticeV1` in remote-ingress-v1.mjs.
  */
-export const SYSTEM_NOTICE_CHANNEL_VERSION = 2
+export const SYSTEM_NOTICE_CHANNEL_VERSION = 3
 export const SENDER_STYLE_VERSION = 1
 
 export { roomStatePath }

@@ -3,7 +3,9 @@
  * Antigravity PostToolUse dispatcher (`scripts/post-tool-dispatch.mjs`).
  *
  * Routes PostToolUse events by `tool_name` in-process:
- * 1. `mcp_devspec_post_session_message` → marks explicit reply (`explicitReplyMarkerPath`)
+ * 1. `mcp_devspec_post_session_message` → marks explicit reply (`explicitReplyMarkerPath`);
+ *    any other DevSpec tool whose result carries DevSpec's `tell_person` mark → notes it
+ *    on the turn (`recordTellPerson`), so a routine turn still tells the person.
  * 2. `invoke_subagent`, `run_command`, `schedule` → records background work launches
  *    against both the open turn (`recordBackgroundLaunch` in `mirror-turn.mjs`) and
  *    the request chain (`<connectionId>.requests.jsonl` via `requests.mjs`).
@@ -17,10 +19,11 @@ import path from 'node:path'
 import { handleBashPost } from './commit-observation.mjs'
 import { handlePost, stagePendingNudge } from './commit-provenance.mjs'
 import { reportObservedCommits } from './commit-reports.mjs'
+import { unwrapDevspecToolCall } from './devspec-tool-input.mjs'
 import { withoutObserverPrefix } from './git-observer.mjs'
 import { resolveOwnConnectionId } from './launch-guard.mjs'
 import {
-  currentTurnNoticeIds,
+  currentTurnStampNoticeIds,
   explicitReplyMarkerPath,
   isNoticeReplyToolCall,
   isRemotePlumbingToolCall,
@@ -29,6 +32,7 @@ import {
   parseTranscriptPath,
   readTurnMarker,
   recordBackgroundLaunch,
+  recordTellPerson,
   resolveHookConversationId,
   streamTurnTrailIfChanged,
   syncStateTranscriptPath,
@@ -42,6 +46,7 @@ import {
   readRequestState,
   requestForLaunch,
 } from './requests.mjs'
+import { resultCarriesTellPerson } from './notice-reply.mjs'
 import { postToolNotice } from './room-unread.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
@@ -118,8 +123,22 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
   const noticeReply =
     connectionId &&
     isNoticeReplyToolCall(toolName, toolInput, {
-      turnNotices: currentTurnNoticeIds(connectionId, { dir: connectionsDir, connectionState: state }),
+      turnNotices: currentTurnStampNoticeIds(connectionId, { dir: connectionsDir, connectionState: state }),
     })
+  // A DevSpec write that changed someone else's record says so on its result
+  // (`tell_person`, item a868f41f). Noted on the turn, so Stop's silence for a routine
+  // turn gives way and PreToolUse leaves the model's own post to the person unstamped.
+  if (
+    connectionId &&
+    unwrapDevspecToolCall(toolName, toolInput).verb &&
+    resultCarriesTellPerson(toolResponse)
+  ) {
+    try {
+      recordTellPerson(connectionId, connectionsDir)
+    } catch {
+      /* non-fatal */
+    }
+  }
   if (connectionId && !noticeReply && isSessionReplyToolCall(toolName, toolInput)) {
     try {
       const p = explicitReplyMarkerPath(connectionId, connectionsDir)
