@@ -42,8 +42,11 @@ describe('Item 5 parity: rules/AGENTS.md, package version 0.15.0, and documentat
       assert.match(text, /semantics\.notice_audience/)
       assert.match(text, /check_job\.room/)
       assert.match(text, /tell_person/)
-      assert.doesNotMatch(text, /close yours as its duplicate, and tell them/)
+      // Whose duplicate it is, and who is told, are core.resolve-duplicates-on-the-spot's:
+      // a restatement here contradicted the server the moment that rule changed.
+      assert.doesNotMatch(text, /or one they may change|close yours as its duplicate/)
     }
+    assert.match(fs.readFileSync(path.join(ROOT, 'skills', 'devspec-remote', 'SKILL.md'), 'utf8'), /served contract's `core\.resolve-duplicates-on-the-spot`/)
     // Which setups get full commit tracking: the same sentence in every DevSpec plugin
     // and the help page, and native Windows stated plainly until it is tested (6da10a3a).
     for (const text of [content, fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8')]) {
