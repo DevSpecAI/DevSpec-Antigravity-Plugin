@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.23.1
+
+- **Browser sign-in polish.** The local browser callback page now renders with the DevSpec logo and adapts cleanly to light and dark mode, `/devspec-login` places the browser link on its own line with a clearer remote-machine `--code` hint, sign-in confirmation prompts you to restart Antigravity to finish connecting, and the Quick Start copy no longer mentions the retired token setup to new users.
+
 ## 0.23.0
 
 - Signing in no longer involves a token. The plugin now brings its own DevSpec connection, naming Antigravity's own DevSpec sign-in app, so a fresh install needs no settings file edited: Antigravity asks you to approve it in your browser on DevSpec's page, and keeps and renews that sign-in itself.

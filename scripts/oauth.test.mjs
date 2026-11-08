@@ -54,7 +54,12 @@ describe('browser sign-in', () => {
 
     const page = await fetch(back)
     assert.equal(page.status, 200)
-    assert.match(await page.text(), /Signed in to DevSpec/)
+    const html = await page.text()
+    assert.match(html, /Signed in to DevSpec/)
+    assert.match(html, /Restart Antigravity to finish connecting\./)
+    assert.match(html, /color-scheme:light dark/)
+    assert.match(html, /@media \(prefers-color-scheme:dark\)/)
+    assert.match(html, /logo-icon\.png/)
     const tokens = await pending.done
     assert.match(tokens.accessToken, /^oat_/)
     assert.ok(tokens.expiresAt > tokens.issuedAt)

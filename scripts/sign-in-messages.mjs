@@ -60,13 +60,13 @@ export function signInEndedMessage(mcpUrl) {
 
 export function signInStartedMessage(url) {
   return url
-    ? `To turn on remote control and commit tracking, approve Antigravity on DevSpec's page in the browser tab that just opened (a one-time step). If no tab opened, open this link:\n${url}`
+    ? `To turn on remote control and commit tracking, approve Antigravity on DevSpec's page in the browser tab that just opened (a one-time step). If no tab opened, open this link:\n\n${url}`
     : "To turn on remote control and commit tracking, approve Antigravity on DevSpec's page in the browser tab that just opened (a one-time step). If no tab opened, run /devspec-login."
 }
 
 export function signInWaitingMessage(url) {
   return url
-    ? `Waiting for you to approve Antigravity on DevSpec's page in your browser. If you closed the tab, open this link:\n${url}`
+    ? `Waiting for you to approve Antigravity on DevSpec's page in your browser. If you closed the tab, open this link:\n\n${url}`
     : "Waiting for you to approve Antigravity on DevSpec's page in your browser. If you closed the tab, run /devspec-login."
 }
 

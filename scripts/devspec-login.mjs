@@ -221,7 +221,7 @@ async function discover(mcpUrl, fetchImpl) {
 
 function signedInText(mcpUrl, login) {
   const who = login.signedInAs ? ` as ${login.signedInAs}` : ''
-  return `Signed in to DevSpec ${serverLabel(mcpUrl)}${who}. Remote control and commit tracking are ready in Antigravity.`
+  return `Signed in to DevSpec ${serverLabel(mcpUrl)}${who}. Remote control and commit tracking are ready in Antigravity. Restart Antigravity to finish connecting.`
 }
 
 /**
@@ -425,7 +425,7 @@ function startText(result, mcpUrl, pluginRoot) {
       return `DevSpec sign-in could not start: ${result.message || 'see the message above'}`
     default:
       return result.url
-        ? `Approve Antigravity on DevSpec's page in your browser to turn on remote control and commit tracking. If no browser tab opened, open this link:\n${result.url}`
+        ? `Approve Antigravity on DevSpec's page in your browser to turn on remote control and commit tracking. If no browser tab opened, open this link:\n\n${result.url}`
         : 'Approve Antigravity on DevSpec\'s page in your browser to turn on remote control and commit tracking. Run /devspec-login --status for the link if no browser tab opened.'
   }
 }
@@ -486,9 +486,9 @@ export async function main(argv = process.argv.slice(2), { env = process.env, ho
       }
       const url = await beginCodeSignIn({ mcpUrl, home })
       if (browserCanReachThisMachine(env)) openInBrowser(url)
-      say(`Sign in to DevSpec ${label}: open this link in a browser, approve Antigravity, then copy the code the page shows.\n${url}`)
+      say(`Sign in to DevSpec ${label}: open this link in a browser, approve Antigravity, then copy the code the page shows.\n\n${url}`)
       if (!process.stdin.isTTY) {
-        say(`Then run: node "${path.join(pluginRoot, 'scripts', 'devspec-login.mjs')}" --code "<the code>" (or paste the code to Antigravity after /devspec-login --code).`)
+        say(`\nThen run: node "${path.join(pluginRoot, 'scripts', 'devspec-login.mjs')}" --code "<the code>" (or paste the code to Antigravity after /devspec-login --code).`)
         return 0
       }
       const answer = (await ask('Paste the code from the DevSpec page: ')).trim()
@@ -505,7 +505,7 @@ export async function main(argv = process.argv.slice(2), { env = process.env, ho
       return 1
     }
     const login = await runPendingSignIn(mcpUrl, home, (url) =>
-      say(`Approve Antigravity on DevSpec's page in your browser (DevSpec ${label}). If no browser tab opened, open this link:\n${url}\nOn a machine your browser cannot reach, run this again with --code.`),
+      say(`Approve Antigravity on DevSpec's page in your browser (DevSpec ${label}). If no browser tab opened, open this link:\n\n${url}\n\nRunning Antigravity on a remote machine where a browser cannot open locally? Run this again with --code.`),
     )
     if (!login) {
       // Another window already opened the approval: join it rather than open a second.

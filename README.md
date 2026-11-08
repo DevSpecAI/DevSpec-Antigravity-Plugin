@@ -17,7 +17,7 @@ Connect [Google Antigravity CLI](https://antigravity.google/product/antigravity-
 
 - **[Antigravity CLI](https://antigravity.google/download#antigravity-cli)** (`agy`)
 - **Node.js 18 or later** (`node --version` — install from [nodejs.org](https://nodejs.org/en/download) if needed) and **`git`** on your `PATH`
-- A **[DevSpec](https://devspec.ai)** account. You approve Antigravity in your browser; there is no token to copy.
+- A **[DevSpec](https://devspec.ai)** account. You approve Antigravity in your browser.
 
 Full commit tracking — every commit reported to DevSpec and tagged with its task automatically — needs macOS, Linux, or Windows through WSL. On native Windows, Antigravity falls back to the simpler check that reads the command, which catches single-line commits only, in the project's repositories (an `origin` the project tracks, or a `.devspec/project.json` pin).
 
@@ -74,7 +74,7 @@ git clone https://github.com/DevSpecAI/DevSpec-Antigravity-Plugin.git "$HOME\.ge
 Start `agy`. Signing in takes two quick approvals in your browser, both on DevSpec's own page and both naming Antigravity as the tool asking:
 
 1. **DevSpec's tools.** Type `/mcp`: the DevSpec server shows **Auth Needed**. Choose **Authenticate**, approve Antigravity on the DevSpec page that opens, then paste the code Antigravity's page shows back into `agy`. Antigravity keeps this sign-in and renews it by itself.
-2. **Remote control and commit tracking.** These run in the background, outside Antigravity's own sign-in, so the first time you send a message the plugin opens one more DevSpec approval in your browser. Approve it and you're done. If you missed the tab, run `/devspec-login`. Over SSH, or on any machine your browser cannot reach, run `/devspec-login --code` and paste back the code DevSpec's page shows.
+2. **Remote control and commit tracking.** These run in the background, outside Antigravity's own sign-in, so the first time you send a message the plugin opens one more DevSpec approval in your browser. Approve it and restart `agy` so your status bar and agent connection load cleanly. If you missed the tab, run `/devspec-login`. Over SSH, or on any machine your browser cannot reach, run `/devspec-login --code` and paste back the code DevSpec's page shows.
 
 You stay signed in until you sign out or disconnect Antigravity on DevSpec's [Agent setup](https://app.devspec.ai/settings/agents) page, which signs out both. If the background sign-in stops working, the status bar and the next session say so and tell you to run `/devspec-login`.
 
