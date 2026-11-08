@@ -96,8 +96,8 @@ import {
 } from './remote-ingress-v1.mjs'
 import { openRequest } from './requests.mjs'
 import {
-  hostTokenFromEnv,
   resolveDevspecMcpAuth,
+  stateWithCurrentToken,
 } from './resolve-mcp-auth.mjs'
 import {
   applyIngressToStore,
@@ -410,9 +410,10 @@ function readStateResult(connectionId, { dir = CONNECTIONS_DIR, legacyPath = LEG
   return legacy
 }
 
+/** The connection's state, with the current token of the browser login it was made with. */
 function readState(connectionId) {
   const result = readStateResult(connectionId)
-  return result.status === STATE_OK ? result.value : null
+  return result.status === STATE_OK ? stateWithCurrentToken(result.value) : null
 }
 
 export function patchConnectionState(connectionId, patch, paths = {}) {
@@ -1241,6 +1242,10 @@ export function parseSseFrame(block) {
   return null
 }
 
+/**
+ * `token` may be a function returning the current token: a reconnect after a browser
+ * login renewed then sends the renewed one.
+ */
 export function openPushChannel({
   mcpUrl,
   token,
@@ -1289,7 +1294,7 @@ export function openPushChannel({
       const res = await fetchImpl(pushChannelUrl(mcpUrl, connectionId), {
         method: 'GET',
         headers: {
-          Authorization: `Bearer ${token}`,
+          Authorization: `Bearer ${typeof token === 'function' ? token() : token}`,
           Accept: 'text/event-stream',
           ...pluginHeaders(),
           ...(connectionCapability ? { 'x-devspec-connection-capability': connectionCapability } : {}),
@@ -1431,18 +1436,21 @@ async function main() {
     process.exit(1)
   }
 
+  // The token is re-read from the state at the top of every loop (readState gives
+  // the browser login's current one), so a login renewed while this poller runs is
+  // picked up, never a different identity.
   let token = state?.token || null
   let mcpUrl = state?.mcp_url || null
   if (!token) {
-    const auth = resolveDevspecMcpAuth(state?.cwd || process.cwd(), {
-      hostToken: hostTokenFromEnv(process.env),
-    })
-    token = auth.token
-    mcpUrl = mcpUrl || auth.mcp_url
+    const auth = resolveDevspecMcpAuth(state?.cwd || process.cwd())
+    if (auth.ok && (!mcpUrl || auth.mcp_url === mcpUrl)) {
+      token = auth.token
+      mcpUrl = auth.mcp_url
+    }
   }
   if (!token) {
     process.stderr.write(
-      'devspec-remote-poll: no token. Run remote-control-state.mjs write after connect, or set DEVSPEC_MCP_TOKEN.\n',
+      'devspec-remote-poll: no token. Run /devspec-remote again, or /devspec-login to sign in.\n',
     )
     process.exit(1)
   }
@@ -2299,7 +2307,7 @@ async function main() {
   if (process.env.DEVSPEC_DISABLE_SSE !== '1') {
     openPushChannel({
       mcpUrl,
-      token,
+      token: () => token,
       connectionId,
       connectionCapability,
       onEvent: (evt) => {
@@ -2327,6 +2335,7 @@ async function main() {
   // eslint-disable-next-line no-constant-condition
   while (true) {
     const liveState = readState(connectionId)
+    if (liveState?.token && liveState.mcp_url === mcpUrl) token = liveState.token
     if (liveState && liveState.enabled === false) {
       process.stderr.write('devspec-remote-poll: disabled — exiting\n')
       process.exit(1)

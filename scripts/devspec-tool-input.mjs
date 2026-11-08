@@ -40,6 +40,7 @@ import {
 } from './mirror-turn.mjs'
 import { normalizeNoticeIds, postCanTakeTurnNotices } from './notice-reply.mjs'
 import { inferAntigravityTranscriptPath, readStateFile } from './remote-control-state.mjs'
+import { devspecToolFromName, isDevspecServerName } from './devspec-server.mjs'
 import { PROVENANCE_REF_TOOLS, REQUEST_REF_TOOLS, stampRequest } from './request-ref.mjs'
 import { readRequestState } from './requests.mjs'
 import { prePostHoldObject } from './room-unread.mjs'
@@ -74,9 +75,7 @@ const AGENT_NAME_TOOLS = new Set([
 ])
 
 export function parseDevspecToolName(toolName) {
-  const s = String(toolName || '')
-  const match = /^(?:mcp__(?:plugin_devspec_)?devspec__|mcp_devspec_|devspec__)([a-z0-9_]+)$/.exec(s)
-  return match ? match[1] : null
+  return devspecToolFromName(toolName)
 }
 
 function unquoteString(val) {
@@ -118,7 +117,7 @@ export function unwrapDevspecToolCall(toolName, rawToolInput) {
   const serverName = String(
     unquoteString(rawToolInput.ServerName ?? rawToolInput.server_name ?? ''),
   ).toLowerCase()
-  if (serverName !== 'devspec') {
+  if (!isDevspecServerName(serverName)) {
     return { verb: null, args: null, wrapped: false, argumentsWasString: false, argumentsKey: null }
   }
   const verb = unquoteString(rawToolInput.ToolName ?? rawToolInput.tool_name ?? '')

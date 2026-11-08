@@ -1,5 +1,4 @@
-# Never commit a filled-in MCP config (it contains your personal DevSpec token)
-mcp_config.json
+# Local overrides (mcp_config.json is the plugin's own DevSpec connection, and is shipped)
 *.local.json
 .env
 .env.*

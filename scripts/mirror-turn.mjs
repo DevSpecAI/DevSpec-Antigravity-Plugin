@@ -19,7 +19,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { mcpToolsCall } from './mcp-call.mjs'
-import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { connectionCredential, stateWithCurrentToken } from './resolve-mcp-auth.mjs'
+import { devspecToolFromName, isDevspecServerName } from './devspec-server.mjs'
 import { ensurePrivateDir, writePrivateJson } from './private-state.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import {
@@ -894,7 +895,7 @@ export function loadState(
   } catch {
     /* selection below fails closed when no readable matching state exists */
   }
-  return selectBoundState(candidates, conversationId, AGENT_NAME, { ownerPid })
+  return stateWithCurrentToken(selectBoundState(candidates, conversationId, AGENT_NAME, { ownerPid }))
 }
 
 /**
@@ -1044,7 +1045,7 @@ function unwrapMcpCallArgs(toolName, args = {}) {
   const name = String(toolName || '').replace(/^default_api:/, '')
   if (name === 'call_mcp_tool' && args && typeof args === 'object') {
     const serverName = String(unquoteTranscriptString(args.ServerName ?? args.server_name ?? '')).toLowerCase()
-    if (serverName === 'devspec') {
+    if (isDevspecServerName(serverName)) {
       const innerTool = String(unquoteTranscriptString(args.ToolName ?? args.tool_name ?? ''))
       let innerArgs = args.Arguments ?? args.arguments ?? {}
       if (typeof innerArgs === 'string') {
@@ -1153,11 +1154,8 @@ export function redactSecretsFromText(text) {
 
 function classifyDevspecDomainTool(toolName, args = {}) {
   const { effectiveName, effectiveArgs } = unwrapMcpCallArgs(toolName, args)
-  const match = /^(?:mcp__(?:plugin_devspec_)?devspec__|mcp_devspec_|devspec__)([a-z0-9_]+)$/.exec(
-    effectiveName,
-  )
-  if (!match) return null
-  const verb = match[1]
+  const verb = devspecToolFromName(effectiveName)
+  if (!verb) return null
   const id = unquoteTranscriptString(
     effectiveArgs?.task_id || effectiveArgs?.id || effectiveArgs?.resource_id || '',
   )
@@ -1541,15 +1539,9 @@ export async function streamTurnTrailIfChanged(
     }
   }
 
-  let token = state.token
-  let mcpUrl = state.mcp_url
-  if (!token || !mcpUrl) {
-    const auth = resolveDevspecMcpAuth(state.cwd || process.cwd())
-    token = token || auth.token
-    mcpUrl = mcpUrl || auth.mcp_url
-  }
-  if (!token) return { streamed: false, reason: 'no_auth_token' }
-  mcpUrl = mcpUrl || 'https://api.devspec.ai/api/mcp'
+  const credential = connectionCredential(state)
+  if (!credential) return { streamed: false, reason: 'no_auth_token' }
+  const { token, mcpUrl } = credential
 
   const isLocalMirroredTurn = Boolean(
     !marker.remoteTurn &&
@@ -1785,16 +1777,10 @@ export async function handleMirrorTurn(
   const hookTranscriptPath = parseTranscriptPath(raw)
   syncStateTranscriptPath(state, hookTranscriptPath, conversationId, { connectionsDir, env })
 
-  let token = state.token
-  let mcpUrl = state.mcp_url
-  if (!token || !mcpUrl) {
-    const auth = resolveDevspecMcpAuth(state.cwd || process.cwd())
-    token = token || auth.token
-    mcpUrl = mcpUrl || auth.mcp_url
-  }
-  if (!token) return { ok: true, skipped: 'no_auth_token' }
+  const credential = connectionCredential(state)
+  if (!credential) return { ok: true, skipped: 'no_auth_token' }
+  const { token, mcpUrl } = credential
 
-  mcpUrl = mcpUrl || 'https://api.devspec.ai/api/mcp'
   const agentName = AGENT_NAME
   const connectionId = state.connection_id
   const sessionId = state.session_id || null

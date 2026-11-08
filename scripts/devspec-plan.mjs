@@ -9,6 +9,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { mcpToolsCall } from './mcp-call.mjs'
+import { stateWithCurrentToken } from './resolve-mcp-auth.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
 const REMOTE_CONTROL_DIR = path.join(os.homedir(), '.devspec', 'remote-control')
@@ -187,7 +188,8 @@ export function readPlanState(
   const bond = readBond(localBondPath)
   if (!bond || bond.status !== 'live' || bond.connection_id !== state.connection_id ||
       (bond.local_id && bond.local_id !== state.local_id)) return null
-  return { ...state, bond_verified: true }
+  // The browser login's current token: it changes about daily (stateWithCurrentToken).
+  return { ...stateWithCurrentToken(state), bond_verified: true }
 }
 
 export async function callManagePlan(input, { state, call = mcpToolsCall } = {}) {

@@ -23,7 +23,8 @@ import { commitScope, connectedProject } from './commit-scope.mjs'
 import { gitRemoteOrigin } from './devspec-scope.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveHookConversationId } from './mirror-turn.mjs'
-import { hostTokenFromEnv, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { devspecToolFromName, isDevspecServerName } from './devspec-server.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
 export const CONTRACT_URI = 'devspec://product/implementation-contract'
@@ -59,14 +60,14 @@ function bareToolName(toolName) {
 
 export function devspecToolVerb(toolName, toolInput = null) {
   const s = String(toolName || '')
-  const match = /^(?:mcp__(?:plugin_devspec_)?devspec__|mcp_devspec_|devspec__)([a-z0-9_]+)$/.exec(s)
-  if (match) return match[1]
+  const direct = devspecToolFromName(s)
+  if (direct) return direct
   if (bareToolName(s) === 'call_mcp_tool' && toolInput && typeof toolInput === 'object') {
     const server = String(
       toolInput.ServerName ?? toolInput.server_name ?? toolInput.serverName ?? '',
     ).toLowerCase()
     const inner = String(toolInput.ToolName ?? toolInput.tool_name ?? toolInput.toolName ?? '')
-    if (server === 'devspec' && /^[a-z0-9_]+$/.test(inner)) return inner
+    if (isDevspecServerName(server) && /^[a-z0-9_]+$/.test(inner)) return inner
   }
   return null
 }
@@ -875,15 +876,11 @@ export function recoveryText(claims) {
 }
 
 function resolveAuth(cwd, mainWorktree, env) {
-  const hostToken = hostTokenFromEnv(env)
-  for (const dir of [cwd, mainWorktree]) {
-    if (!dir) continue
-    try {
-      const auth = resolveDevspecMcpAuth(dir, { env, hostToken })
-      if (auth?.ok && auth.token && auth.mcp_url) return auth
-    } catch {
-      /* an unreadable config is simply not a source of credentials */
-    }
+  try {
+    const auth = resolveDevspecMcpAuth(cwd || mainWorktree, { env })
+    if (auth?.ok && auth.token && auth.mcp_url) return auth
+  } catch {
+    /* an unreadable login is simply not a credential */
   }
   return null
 }

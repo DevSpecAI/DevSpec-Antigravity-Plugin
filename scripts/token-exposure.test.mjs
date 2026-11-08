@@ -15,7 +15,6 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, it } from 'node:test'
-import { ensureHostPluginHeader, hostMcpConfigFiles } from './host-mcp-header.mjs'
 import {
   ensurePrivateDir,
   openPrivateAppend,
@@ -23,7 +22,7 @@ import {
   tightenPrivateTree,
   writePrivateJson,
 } from './private-state.mjs'
-import { pinnedAuthPath, printableAuth, tokenFingerprint, writePinnedAuth } from './resolve-mcp-auth.mjs'
+import { printableAuth, tokenFingerprint } from './resolve-mcp-auth.mjs'
 import { writeStateFile } from './remote-control-state.mjs'
 
 const SCRIPTS = path.dirname(fileURLToPath(import.meta.url))
@@ -38,31 +37,11 @@ function tempDir(label) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `agy-key-${label}-`))
 }
 
-function writeAgyConfig(home, mode = 0o644) {
-  const [primary] = hostMcpConfigFiles(home)
-  fs.mkdirSync(path.dirname(primary), { recursive: true, mode: 0o755 })
-  fs.chmodSync(path.dirname(primary), 0o755)
-  fs.writeFileSync(
-    primary,
-    JSON.stringify(
-      {
-        mcpServers: {
-          devspec: { type: 'http', serverUrl: 'https://api.devspec.example/api/mcp', headers: { Authorization: `Bearer ${KEY}` } },
-        },
-      },
-      null,
-      2,
-    ) + '\n',
-  )
-  fs.chmodSync(primary, mode)
-  return primary
-}
-
 /** Run a plugin command as a separate process with its own HOME; returns stdout + stderr. */
-function runPlugin(script, args, home) {
+function runPlugin(script, args, home, env = {}) {
   const result = spawnSync(process.execPath, [path.join(SCRIPTS, script), ...args], {
     cwd: home,
-    env: { PATH: process.env.PATH, HOME: home, USERPROFILE: home },
+    env: { PATH: process.env.PATH, HOME: home, USERPROFILE: home, ...env },
     encoding: 'utf8',
     timeout: 20_000,
   })
@@ -87,8 +66,7 @@ describe('no documented or shipped command carries the key', () => {
   it('resolve-mcp-auth.mjs reports the key by fingerprint only', () => {
     const home = tempDir('resolve')
     try {
-      writeAgyConfig(home)
-      const out = runPlugin('resolve-mcp-auth.mjs', [], home)
+      const out = runPlugin('resolve-mcp-auth.mjs', [], home, { DEVSPEC_MCP_TOKEN: KEY })
       assert.ok(!out.includes(KEY), 'the key was printed')
       assert.equal(JSON.parse(out.trim().split('\n')[0]).token_fingerprint, tokenFingerprint(KEY))
     } finally {
@@ -99,13 +77,12 @@ describe('no documented or shipped command carries the key', () => {
   it('remote-control-state.mjs resolve-auth and read print no key and no CSRF token', () => {
     const home = tempDir('state-cli')
     try {
-      writeAgyConfig(home)
       const connDir = path.join(home, '.devspec', 'remote-control', 'connections')
       const state = { connection_id: 'conn-fixture-1', token: KEY, csrf_token: CSRF, connection_capability: 'dvsc_fixture' }
       writePrivateJson(path.join(connDir, 'conn-fixture-1.json'), state, { root: path.join(home, '.devspec') })
       writePrivateJson(path.join(home, '.devspec', 'remote-control.json'), state, { root: path.join(home, '.devspec') })
 
-      const resolved = runPlugin('remote-control-state.mjs', ['resolve-auth'], home)
+      const resolved = runPlugin('remote-control-state.mjs', ['resolve-auth'], home, { DEVSPEC_MCP_TOKEN: KEY })
       assert.ok(!resolved.includes(KEY), 'resolve-auth printed the key')
       assert.match(resolved, new RegExp(tokenFingerprint(KEY)))
 
@@ -164,45 +141,6 @@ describe('files holding the key are owner-only after every write', posixOnly, ()
       assert.equal(modeOf(dir), 0o700)
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
-    }
-  })
-
-  it('the pinned ~/.devspec/auth.json is rewritten 0600 over a looser copy', () => {
-    const home = tempDir('pinned')
-    try {
-      const file = pinnedAuthPath(home)
-      fs.mkdirSync(path.dirname(file), { recursive: true })
-      fs.chmodSync(path.dirname(file), 0o775)
-      fs.writeFileSync(file, '{}\n')
-      fs.chmodSync(file, 0o644)
-      assert.ok(writePinnedAuth({ token: KEY, mcp_url: 'https://x/api/mcp' }, { home }))
-      assert.equal(modeOf(file), 0o600)
-      assert.equal(modeOf(path.dirname(file)), 0o700)
-    } finally {
-      fs.rmSync(home, { recursive: true, force: true })
-    }
-  })
-
-  it("Antigravity's mcp_config.json goes back to 0600 in a 0700 folder, rewritten or not", () => {
-    const home = tempDir('agy')
-    try {
-      const primary = writeAgyConfig(home, 0o644)
-      // First pass adds the plugin header (a rewrite).
-      const first = ensureHostPluginHeader({ home, value: 'antigravity/9.9.9' })
-      assert.deepEqual(first.updated, [primary])
-      assert.equal(modeOf(primary), 0o600)
-      assert.equal(modeOf(path.dirname(primary)), 0o700)
-      // agy rewrites the file 0644 on any `agy mcp` command; the next pass has
-      // nothing to rewrite but still tightens it.
-      fs.chmodSync(primary, 0o644)
-      const before = fs.readFileSync(primary, 'utf8')
-      const second = ensureHostPluginHeader({ home, value: 'antigravity/9.9.9' })
-      assert.deepEqual(second.updated, [])
-      assert.deepEqual(second.tightened, [primary])
-      assert.equal(modeOf(primary), 0o600)
-      assert.equal(fs.readFileSync(primary, 'utf8'), before)
-    } finally {
-      fs.rmSync(home, { recursive: true, force: true })
     }
   })
 
