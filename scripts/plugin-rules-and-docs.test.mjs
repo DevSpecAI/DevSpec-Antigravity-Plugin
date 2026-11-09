@@ -56,6 +56,12 @@ describe('Item 5 parity: rules/AGENTS.md, package version 0.15.0, and documentat
     assert.match(content, /never pass `provenance_ref`/)
     assert.match(content, /wake: ALREADY ARMED/)
     assert.match(content, /rearm:\s*"already_armed"/)
+    assert.match(content, /core\.push-safely/)
+    assert.match(content, /merge_when_cleared/)
+    assert.match(content, /pr_ready_to_merge/)
+    assert.match(fs.readFileSync(path.join(ROOT, 'skills', 'devspec-remote', 'SKILL.md'), 'utf8'), /pr_ready_to_merge/)
+    assert.match(fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8'), /core\.push-safely/)
+    assert.match(fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8'), /merge_when_cleared/)
   })
 
   it('opens CHANGELOG.md with the version package.json ships', () => {
