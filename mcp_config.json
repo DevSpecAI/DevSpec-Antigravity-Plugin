@@ -6,7 +6,7 @@
         "clientId": "Gmbtf7QgaoSw7WJ0"
       },
       "headers": {
-        "x-devspec-plugin": "antigravity/0.23.1"
+        "x-devspec-plugin": "antigravity/0.24.0"
       }
     }
   }

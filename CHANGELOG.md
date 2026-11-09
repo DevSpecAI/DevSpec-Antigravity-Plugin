@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.24.0
+
+- **Universal pull-request delivery and Merge when cleared (`core.push-safely`).** `rules/AGENTS.md`, `skills/devspec-remote/SKILL.md`, and `README.md` point to [`devspec://product/implementation-contract`](devspec://product/implementation-contract) (`core.push-safely` and `core.pending-checks-hold-the-merge`) so the agent builds every change on its own branch, opens a pull request into the repository's tracking branch with the owner's GitHub credentials wherever pull requests are supported (small changes and unprotected branches included), never pushes straight to the tracking branch when pull requests are supported, marks the pull request ready for review (`gh pr ready`), switches on DevSpec's Merge when cleared (`record_implementation` with `merge_when_cleared: true`, or `gh pr merge --auto` where DevSpec's check is required) without polling GitHub in an open turn, and merges the cleared commit on a `pr_ready_to_merge` system-notice wake when the GitHub App installation lacks merge write permissions.
+
 ## 0.23.1
 
 - **Browser sign-in polish.** The local browser callback page now renders with the DevSpec logo and adapts cleanly to light and dark mode, `/devspec-login` places the browser link on its own line with a clearer remote-machine `--code` hint, sign-in confirmation prompts you to restart Antigravity to finish connecting, and the Quick Start copy no longer mentions the retired token setup to new users.
