@@ -91,5 +91,5 @@ When working in a DevSpec-connected project or remote-controlled session in Anti
        - For large list/search spills, pass `fields: "compact"` / `limit` or extract only the needed fields with a single `node -e` command whose stdout is **<4 KB** (Antigravity's `run_command` truncates the **beginning** of stdout when output exceeds ~8 KB).
 
 7. **Never handle DevSpec credentials yourself.**
-   - DevSpec's tools sign in through Antigravity (`/mcp`); remote control and commit tracking sign in once with `/devspec-login`. Never ask for a token, or open or approve a sign-in link for the person.
+   - Antigravity signs in to DevSpec once with `/devspec-login` (for DevSpec's tools, remote control and commit tracking). Never ask for a token, or open or approve a sign-in link for the person.
    - Never put a credential on a command line (no `curl -H "Authorization: Bearer …"`, no `agy mcp add --header`): every account on the computer can read a running command line, and it lands in shell history. Never print the files under `~/.devspec/antigravity/` or `~/.devspec/remote-control/`, or copy a credential into a file, message or command. Use the DevSpec MCP tools or the plugin's scripts. `node "<plugin>/scripts/devspec-login.mjs" --status` (`<plugin>` from rule 3) shows how remote control is signed in, never a credential.
