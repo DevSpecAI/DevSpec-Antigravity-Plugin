@@ -1020,5 +1020,195 @@ describe('Antigravity native hook payload & transcript handling', () => {
       fs.rmSync(tmpHome, { recursive: true, force: true })
     }
   })
+
+  it('preserves notice, check-job, and background-task continuation turn context across tool calls without sending unbound room-command trails', async () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-nonchat-context-'))
+    try {
+      const connectionsDir = path.join(tmpHome, '.devspec', 'remote-control', 'connections')
+      const legacyPath = path.join(tmpHome, '.devspec', 'remote-control.json')
+      fs.mkdirSync(connectionsDir, { recursive: true })
+
+      const connId = '4b2db8bc-e182-4514-9087-442ced71f324'
+      const sessionId = '8a0e6bc5-dc53-49c8-a502-90fd02b7f764'
+      const convId = 'conv-nonchat-context'
+      const noticeId = 'c3c8c000-0000-4000-8000-000000000099'
+      const transcriptPath = path.join(
+        tmpHome,
+        '.gemini',
+        'antigravity-cli',
+        'brain',
+        convId,
+        '.system_generated',
+        'logs',
+        'transcript.jsonl',
+      )
+      fs.mkdirSync(path.dirname(transcriptPath), { recursive: true })
+
+      fs.writeFileSync(
+        path.join(connectionsDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          session_id: sessionId,
+          local_id: convId,
+          transcript_path: transcriptPath,
+          token: 'dvs_test_tok_fake1234',
+          mcp_url: 'https://api.devspec.ai/api/mcp',
+        }),
+      )
+
+      const t0 = Date.now()
+      fs.writeFileSync(
+        transcriptPath,
+        [
+          JSON.stringify({
+            step_index: 1,
+            type: 'USER_INPUT',
+            created_at: new Date(t0).toISOString(),
+            content: `<USER_REQUEST>\n[DevSpec Remote Wake]\n[DevSpec System Notice: ci_failure]\nTell the person with post_session_message and system_notice_ids: ["${noticeId}"]\n</USER_REQUEST>`,
+          }),
+          JSON.stringify({
+            step_index: 2,
+            type: 'PLANNER_RESPONSE',
+            created_at: new Date(t0 + 1000).toISOString(),
+            thinking: 'Inspecting broken PR checks.',
+            tool_calls: [
+              {
+                name: 'default_api:run_command',
+                args: { CommandLine: 'gh pr checks 1235', toolSummary: 'Check PR 1235 status' },
+              },
+            ],
+          }),
+          JSON.stringify({
+            step_index: 3,
+            type: 'GENERIC',
+            created_at: new Date(t0 + 1500).toISOString(),
+            content: `Tool is running as a background task with task id: ${convId}/task-2`,
+          }),
+        ].join('\n') + '\n',
+      )
+
+      const calls = []
+      const mockCall = async (req) => {
+        calls.push(req)
+        return { ok: true }
+      }
+
+      // 1. Even if .turn was missing when PostToolUse ran, inferTurnContextFromTranscript recovers noticeIds
+      //    and suppresses unbound trail streaming.
+      await runPostToolDispatch(
+        JSON.stringify({
+          conversationId: convId,
+          transcriptPath,
+          stepIdx: 2,
+          toolCall: {
+            name: 'run_command',
+            args: { CommandLine: 'gh pr checks 1235', WaitMsBeforeAsync: 500, toolSummary: 'Check PR 1235 status' },
+          },
+        }),
+        { env: {}, home: tmpHome, call: mockCall },
+      )
+      const markerAfterTool = readTurnMarker(connId, connectionsDir)
+      assert.deepEqual(markerAfterTool?.noticeIds, [noticeId])
+      assert.equal(
+        calls.filter((c) => c.name === 'post_session_message' && c.arguments?.phase === 'trail').length,
+        0,
+        'notice turn tool call must never stream an unbound room-command trail',
+      )
+
+      // 2. Stop holds .turn open because background task `${convId}/task-2` is in flight!
+      const stopHeld = await handleMirrorTurn(
+        'stop',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        { env: {}, connectionsDir, legacyPath, call: mockCall },
+      )
+      assert.equal(stopHeld.held, true)
+      assert.deepEqual(stopHeld.outstanding, [`${convId}/task-2`])
+      assert.equal(readTurnMarker(connId, connectionsDir)?.held, true)
+      assert.equal(
+        calls.filter((c) => c.name === 'report_complete').length,
+        0,
+        'Stop must not call report_complete while background task is still running',
+      )
+
+      // 3. Background task completes via <SYSTEM_MESSAGE> (even if its stdout mentions "type":"owner_message").
+      fs.appendFileSync(
+        transcriptPath,
+        [
+          JSON.stringify({
+            step_index: 4,
+            type: 'SYSTEM_MESSAGE',
+            created_at: new Date(t0 + 5000).toISOString(),
+            content: `<SYSTEM_MESSAGE>\n[SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated background-task event, not a message from the user.\nBackground command "task-2" (Check PR 1235 status) finished with exit code 0.\nOutput path: ${path.join(path.dirname(path.dirname(transcriptPath)), 'tasks', 'task-2.log')}\nFinal output:\n{"type":"owner_message","message_id":"00000000-0000-4000-8000-000000000001"}\n</SYSTEM_MESSAGE>`,
+          }),
+          JSON.stringify({
+            step_index: 5,
+            type: 'PLANNER_RESPONSE',
+            created_at: new Date(t0 + 6000).toISOString(),
+            thinking: 'Applying fix after background task finished.',
+            content: 'Fixed PR #1235 and verified CI passes.',
+            tool_calls: [
+              {
+                name: 'default_api:run_command',
+                args: { CommandLine: 'git status', toolSummary: 'Check git status' },
+              },
+            ],
+          }),
+        ].join('\n') + '\n',
+      )
+
+      await handleMirrorTurn(
+        'user_prompt',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        { env: {}, connectionsDir, legacyPath, call: mockCall },
+      )
+      const markerAfterWake = readTurnMarker(connId, connectionsDir)
+      assert.equal(markerAfterWake?.held, false)
+      assert.equal(markerAfterWake?.backgroundContinuation, true)
+      assert.deepEqual(markerAfterWake?.noticeIds, [noticeId])
+      assert.equal(
+        markerAfterWake?.otherWake,
+        undefined,
+        'background task stdout containing owner_message JSON must not set otherWake on a notice turn',
+      )
+
+      // 4. Tool call during the background-task continuation turn still preserves noticeIds and sends no trail
+      await runPostToolDispatch(
+        JSON.stringify({
+          conversationId: convId,
+          transcriptPath,
+          stepIdx: 5,
+          toolCall: {
+            name: 'run_command',
+            args: { CommandLine: 'git status', WaitMsBeforeAsync: 5000, toolSummary: 'Check git status' },
+          },
+        }),
+        { env: {}, home: tmpHome, call: mockCall },
+      )
+      assert.equal(
+        calls.filter((c) => c.name === 'post_session_message' && c.arguments?.phase === 'trail').length,
+        0,
+        'background continuation of notice turn must not stream an unbound room-command trail',
+      )
+
+      // 5. Final Stop reconciles the finished background task, posts the notice reply with system_notice_ids, and completes the turn!
+      const stopFinal = await handleMirrorTurn(
+        'stop',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        { env: {}, connectionsDir, legacyPath, call: mockCall },
+      )
+      assert.equal(stopFinal.held, undefined)
+      assert.equal(stopFinal.busy, false)
+      assert.equal(readTurnMarker(connId, connectionsDir), null)
+      const noticePosts = calls.filter(
+        (c) => c.name === 'post_session_message' && Array.isArray(c.arguments?.system_notice_ids),
+      )
+      assert.equal(noticePosts.length, 1)
+      assert.deepEqual(noticePosts[0].arguments.system_notice_ids, [noticeId])
+      assert.equal(calls.filter((c) => c.name === 'report_complete').length, 1)
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
+    }
+  })
 })
 
