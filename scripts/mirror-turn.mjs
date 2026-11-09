@@ -43,6 +43,7 @@ import {
   openRequest,
   promptArrival,
   readRequestState,
+   requestForLaunch,
   requestsWithWorkPending,
   rotateRequestLog,
   setCurrentRequest,
@@ -391,10 +392,29 @@ export function readOwnedIds(
   return ids
 }
 
+function stepMatchesOwnedId(stepContent, id) {
+  if (typeof stepContent !== 'string' || typeof id !== 'string' || !id) return false
+  if (stepContent.includes(id)) return true
+  const slashIdx = id.lastIndexOf('/')
+  if (slashIdx > 0) {
+    const shortId = id.slice(slashIdx + 1)
+    if (
+      shortId &&
+      (stepContent.includes(`"${shortId}"`) ||
+        stepContent.includes(`/${shortId}.log`) ||
+        stepContent.includes(`/${shortId}`))
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
 /**
- * Reconcile completed background tasks and subagents from `<SYSTEM_MESSAGE>` steps in
- * `transcript.jsonl`, whether the completion arrived while the turn was still running
- * (`existingMarker.held === false`) or while Stop was holding the turn open.
+ * Reconcile background task and subagent launches (`GENERIC` steps) and completions
+ * (`<SYSTEM_MESSAGE>` steps) from `transcript.jsonl`, whether the completion arrived
+ * while the turn was still running (`existingMarker.held === false`) or while Stop
+ * was holding the turn open.
  */
 export function reconcileCompletedOwnedWork(
   connectionId,
@@ -403,12 +423,15 @@ export function reconcileCompletedOwnedWork(
   dir = CONNECTIONS_DIR,
 ) {
   if (!connectionId || !transcriptPath) return
-  const ownedIds = marker ? readOwnedIds(connectionId, marker, dir) : []
-  const reqState = readRequestState(connectionId, { dir })
-  const unnotifiedKeys = [...new Set(reqState.launches.values())]
+  let ownedLines = marker ? readOwnedLines(connectionId, marker, dir) : []
+  let ownedIds = marker ? readOwnedIds(connectionId, marker, dir) : []
+  let reqState = readRequestState(connectionId, { dir })
+  let unnotifiedKeys = [...new Set(reqState.launches.values())]
     .filter((launch) => launch.notifies && !launch.notified)
     .map((launch) => launch.key)
-  if (ownedIds.length === 0 && unnotifiedKeys.length === 0) return
+  if (!marker && ownedIds.length === 0 && unnotifiedKeys.length === 0 && reqState.open.size === 0) {
+    return
+  }
 
   let raw = ''
   try {
@@ -427,8 +450,14 @@ export function reconcileCompletedOwnedWork(
     return
   }
 
-  const endedOwned = new Set()
+  const knownOwned = new Set(ownedLines.map((e) => e.id))
+  const endedOwned = new Set(
+    ownedLines.filter((e) => typeof e.ended === 'string').map((e) => e.id),
+  )
   const newlyNotified = new Set()
+  let lastRunCommandInput = null
+  let lastSubagentInput = null
+
   for (const line of raw.split(/\r?\n/)) {
     const trimmed = line.trim()
     if (!trimmed) continue
@@ -438,20 +467,99 @@ export function reconcileCompletedOwnedWork(
     } catch {
       continue
     }
-    if (step?.type !== 'SYSTEM_MESSAGE' || typeof step.content !== 'string') continue
-    if (typeof marker?.startedAt === 'number' && step.created_at) {
+    if (typeof marker?.startedAt === 'number' && step?.created_at) {
       const stepMs = Date.parse(step.created_at)
       if (Number.isFinite(stepMs) && stepMs < marker.startedAt - 1000) continue
     }
+    if (step?.type === 'PLANNER_RESPONSE' && Array.isArray(step.tool_calls)) {
+      for (const tc of step.tool_calls) {
+        const name = String(tc?.name || '').replace(/^default_api:/, '')
+        const args = tc?.args && typeof tc.args === 'object' ? tc.args : {}
+        if (name === 'run_command') lastRunCommandInput = args
+        else if (name === 'invoke_subagent') lastSubagentInput = args
+      }
+      continue
+    }
+    if (step?.type === 'GENERIC' && typeof step.content === 'string') {
+      const bgMatch =
+        step.content.match(/(?:background task ID|with task id)[:\s]+([A-Za-z0-9_.:/-]+)/i) ||
+        step.content.match(/TaskId[:\s"]+([A-Za-z0-9_.:/-]+)/i)
+      if (bgMatch) {
+        const cmdLine = String(
+          lastRunCommandInput?.CommandLine || lastRunCommandInput?.command || '',
+        )
+        const isDaemon =
+          lastRunCommandInput?.IsDaemon === true || lastRunCommandInput?.IsDaemon === 'true'
+        const isPlumbing =
+          isDaemon ||
+          cmdLine.includes('devspec-remote-wait.mjs') ||
+          cmdLine.includes('devspec-remote-listen.mjs') ||
+          cmdLine.includes('devspec-remote-poll.mjs')
+        if (!isPlumbing) {
+          const id = bgMatch[1]
+          const label =
+            unquoteTranscriptString(lastRunCommandInput?.toolSummary) ||
+            unquoteTranscriptString(lastRunCommandInput?.CommandLine) ||
+            'background command'
+          if (marker && !knownOwned.has(id)) {
+            if (recordOwnedLaunch(connectionId, { id, kind: 'command', label }, { dir })) {
+              knownOwned.add(id)
+              if (!ownedIds.includes(id)) ownedIds.push(id)
+            }
+          }
+          if (!reqState.launches.has(id)) {
+            const { request, also } = requestForLaunch(reqState)
+            appendRequestEvent(
+              connectionId,
+              { op: 'launch', key: id, kind: 'shell', notifies: true, request, also },
+              { dir },
+            )
+            reqState = readRequestState(connectionId, { dir })
+            if (!unnotifiedKeys.includes(id)) unnotifiedKeys.push(id)
+          }
+        }
+      }
+      const subMatch = step.content.match(
+        /Created the following subagent:[\s\S]*?"conversationId"\s*:\s*"([^"]+)"/,
+      )
+      if (subMatch) {
+        const id = subMatch[1]
+        const label =
+          unquoteTranscriptString(lastSubagentInput?.Role) ||
+          unquoteTranscriptString(lastSubagentInput?.TypeName) ||
+          'subagent'
+        if (marker && !knownOwned.has(id)) {
+          if (recordOwnedLaunch(connectionId, { id, kind: 'subagent', label }, { dir })) {
+            knownOwned.add(id)
+            if (!ownedIds.includes(id)) ownedIds.push(id)
+          }
+        }
+        if (!reqState.launches.has(id)) {
+          const { request, also } = requestForLaunch(reqState)
+          appendRequestEvent(
+            connectionId,
+            { op: 'launch', key: id, kind: 'subagent', notifies: true, request, also },
+            { dir },
+          )
+          reqState = readRequestState(connectionId, { dir })
+          if (!unnotifiedKeys.includes(id)) unnotifiedKeys.push(id)
+        }
+      }
+      continue
+    }
+    if (step?.type !== 'SYSTEM_MESSAGE' || typeof step.content !== 'string') continue
     for (const id of ownedIds) {
-      if (!endedOwned.has(id) && step.content.includes(id)) {
+      if (!endedOwned.has(id) && stepMatchesOwnedId(step.content, id)) {
         recordOwnedEnd(connectionId, id, { dir })
         endedOwned.add(id)
       }
     }
     const keysInStep = notifiedKeys(step.content)
     for (const key of unnotifiedKeys) {
-      if (!newlyNotified.has(key) && (keysInStep.includes(key) || step.content.includes(key))) {
+      if (
+        !newlyNotified.has(key) &&
+        (keysInStep.includes(key) || stepMatchesOwnedId(step.content, key))
+      ) {
         appendRequestEvent(connectionId, { op: 'notified', key }, { dir })
         newlyNotified.add(key)
       }
@@ -546,24 +654,141 @@ export function launchedAntigravityBackgroundWork(toolName, toolInput, toolRespo
   return null
 }
 
+export function resolveAntigravityToolResponse(
+  input,
+  { transcriptPath = null, conversationId = null } = {},
+) {
+  if (!input || typeof input !== 'object') return undefined
+  const direct = input.tool_response ?? input.toolResponse ?? input.result
+  if (direct !== undefined && direct !== null) return direct
+
+  const stepIdx = typeof input.stepIdx === 'number' ? input.stepIdx : null
+  const convId =
+    conversationId ||
+    (typeof input.conversationId === 'string' && input.conversationId.trim()) ||
+    (typeof input.conversation_id === 'string' && input.conversation_id.trim()) ||
+    null
+  const tPath =
+    normalizeTranscriptPath(transcriptPath) ||
+    normalizeTranscriptPath(input.transcriptPath) ||
+    normalizeTranscriptPath(input.transcript_path) ||
+    null
+  const brainDir =
+    (typeof input.artifactDirectoryPath === 'string' && input.artifactDirectoryPath.trim()) ||
+    (tPath && tPath.includes(`${path.sep}.system_generated${path.sep}`)
+      ? tPath.split(`${path.sep}.system_generated${path.sep}`)[0]
+      : null)
+
+  if (brainDir && stepIdx !== null) {
+    try {
+      const stepOutPath = path.join(
+        brainDir,
+        '.system_generated',
+        'steps',
+        String(stepIdx),
+        'output.txt',
+      )
+      if (fs.existsSync(stepOutPath)) {
+        const text = fs.readFileSync(stepOutPath, 'utf8')
+        if (text.trim()) return { output: text }
+      }
+    } catch {
+      /* ignore */
+    }
+    try {
+      const taskLogPath = path.join(
+        brainDir,
+        '.system_generated',
+        'tasks',
+        `task-${stepIdx}.log`,
+      )
+      if (fs.existsSync(taskLogPath)) {
+        const taskId = convId ? `${convId}/task-${stepIdx}` : `task-${stepIdx}`
+        return { output: `Tool is running as a background task with task id: ${taskId}` }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (tPath && fs.existsSync(tPath)) {
+    try {
+      const stat = fs.statSync(tPath)
+      if (stat.isFile() && stat.size > 0) {
+        const readSize = Math.min(stat.size, 65536)
+        const fd = fs.openSync(tPath, 'r')
+        try {
+          const buf = Buffer.alloc(readSize)
+          fs.readSync(fd, buf, 0, readSize, stat.size - readSize)
+          const lines = buf
+            .toString('utf8')
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .filter(Boolean)
+          for (let i = lines.length - 1; i >= 0; i--) {
+            let step
+            try {
+              step = JSON.parse(lines[i])
+            } catch {
+              continue
+            }
+            if (stepIdx !== null && typeof step?.step_index === 'number' && step.step_index < stepIdx) {
+              break
+            }
+            if (
+              step?.type === 'GENERIC' &&
+              typeof step.content === 'string' &&
+              (/(?:background task ID|with task id|TaskId)/i.test(step.content) ||
+                step.content.includes('Created the following subagent:'))
+            ) {
+              return { output: step.content }
+            }
+            if (step?.type === 'PLANNER_RESPONSE' && stepIdx === null) {
+              break
+            }
+          }
+        } finally {
+          fs.closeSync(fd)
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  return undefined
+}
+
 export function recordBackgroundLaunch(
   raw,
-  { load = loadState, record = recordOwnedLaunch, dir = CONNECTIONS_DIR } = {},
+  {
+    load = loadState,
+    record = recordOwnedLaunch,
+    dir = CONNECTIONS_DIR,
+    transcriptPath = null,
+    env = process.env,
+  } = {},
 ) {
   let input
   try {
-    input = JSON.parse(raw || '{}')
+    input = typeof raw === 'string' ? JSON.parse(raw || '{}') : raw || {}
   } catch {
     return false
   }
+  const conversationId = resolveHookConversationId(raw, env)
+  const state = load(conversationId)
+  const effectiveTranscriptPath =
+    transcriptPath || parseTranscriptPath(raw) || state?.transcript_path || null
+  const toolResponse = resolveAntigravityToolResponse(input, {
+    transcriptPath: effectiveTranscriptPath,
+    conversationId: conversationId || state?.local_id || null,
+  })
   const found = launchedAntigravityBackgroundWork(
     input?.tool_name ?? input?.toolName ?? input?.toolCall?.name,
     input?.tool_input ?? input?.toolInput ?? input?.toolCall?.args,
-    input?.tool_response ?? input?.toolResponse ?? input?.result,
+    toolResponse,
   )
-  if (!found) return false
-  const state = load(resolveHookConversationId(raw))
-  if (!state?.connection_id) return false
+  if (!found || !state?.connection_id) return false
   const recorded = record(state.connection_id, found, { dir })
   return recorded ? { state, launch: found } : false
 }
@@ -1013,6 +1238,121 @@ export function isHarnessInjection(text) {
     t.includes('<system-reminder>') ||
     t.includes('[DevSpec Remote Wake]')
   )
+}
+
+/**
+ * True when a prompt or `<SYSTEM_MESSAGE>` step is a background command, subagent,
+ * or timer notification rather than user input or a DevSpec Remote Wake.
+ */
+export function isBackgroundTaskNotification(text) {
+  const t = String(text ?? '')
+  if (!t) return false
+  if (
+    t.includes('<task-notification') ||
+    t.includes('[SYSTEM NOTIFICATION - NOT USER INPUT]') ||
+    t.includes('This is an automated background-task event') ||
+    /\bsender=(?!system\b)[A-Za-z0-9_.:/-]+/.test(t) ||
+    /Background command\s+"[^"]+"\s+\([^)]*\)\s+finished/i.test(t) ||
+    /\bcontent=Task id\s+"[^"]+"\s+finished/i.test(t)
+  ) {
+    return true
+  }
+  if (
+    t.includes('[DevSpec Remote Wake]') ||
+    t.includes('"event":"wake"') ||
+    t.includes('"type":"system_notice"') ||
+    t.includes('"type":"check_job"') ||
+    t.includes('"event":"directives"') ||
+    t.includes('"event":"automation_run"') ||
+    t.includes('"event":"interaction_answer"') ||
+    t.includes('"event":"question_dismissal"')
+  ) {
+    return false
+  }
+  return t.includes('<SYSTEM_MESSAGE>')
+}
+
+/**
+ * Inspect the tail of `transcript.jsonl` to recover the active turn's context
+ * (`remoteTurn`, `localPromptMirrored`, `noticeIds`, `recordNoticeIds`, `checkJobWake`,
+ * `otherWake`, `backgroundContinuation`) when `.turn` was missing or when a background
+ * task / subagent `<SYSTEM_MESSAGE>` continues an earlier turn.
+ */
+export function inferTurnContextFromTranscript(transcriptPath) {
+  const tPath = normalizeTranscriptPath(transcriptPath)
+  if (!tPath) return null
+  let raw = ''
+  try {
+    const stat = fs.statSync(tPath)
+    if (!stat.isFile() || stat.size === 0) return null
+    const readSize = Math.min(stat.size, 262_144)
+    const fd = fs.openSync(tPath, 'r')
+    try {
+      const buf = Buffer.alloc(readSize)
+      fs.readSync(fd, buf, 0, readSize, stat.size - readSize)
+      raw = buf.toString('utf8')
+    } finally {
+      fs.closeSync(fd)
+    }
+  } catch {
+    return null
+  }
+
+  const steps = []
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    try {
+      steps.push(JSON.parse(trimmed))
+    } catch {
+      /* skip partial first line in tail chunk */
+    }
+  }
+
+  let sawBgNotification = false
+  for (let i = steps.length - 1; i >= 0; i--) {
+    const step = steps[i]
+    if (!step || typeof step.content !== 'string') continue
+    if (step.type === 'SYSTEM_MESSAGE') {
+      if (isBackgroundTaskNotification(step.content)) {
+        sawBgNotification = true
+        continue
+      }
+      const wake = turnWakeFromText(step.content)
+      return {
+        remoteTurn: true,
+        localPromptMirrored: false,
+        ...(sawBgNotification ? { backgroundContinuation: true } : {}),
+        ...(wake || {}),
+      }
+    }
+    if (step.type === 'USER_INPUT') {
+      if (step.content.includes('[DevSpec Remote Wake]')) {
+        const wake = turnWakeFromText(step.content)
+        return {
+          remoteTurn: true,
+          localPromptMirrored: false,
+          ...(sawBgNotification ? { backgroundContinuation: true } : {}),
+          ...(wake || {}),
+        }
+      }
+      return {
+        remoteTurn: false,
+        localPromptMirrored: true,
+        otherWake: true,
+        ...(sawBgNotification ? { backgroundContinuation: true } : {}),
+      }
+    }
+  }
+
+  if (sawBgNotification) {
+    return {
+      remoteTurn: false,
+      localPromptMirrored: false,
+      backgroundContinuation: true,
+    }
+  }
+  return null
 }
 
 function unquoteTranscriptString(val) {
@@ -1498,6 +1838,17 @@ export async function streamTurnTrailIfChanged(
   if (isCurrentTurnCheckJobOnly(connectionId, { dir: connectionsDir, connectionState: state, marker })) {
     return { streamed: false, reason: 'check_job_turn' }
   }
+  const isLocalMirroredTurn = Boolean(
+    !marker.remoteTurn &&
+      (marker.localPromptMirrored || marker.localTurn || state.local_turn),
+  )
+  if (marker.backgroundContinuation && !isLocalMirroredTurn) {
+    const reqState = readRequestState(connectionId, { dir: connectionsDir })
+    const hasOpenCommand = [...reqState.open.values()].some((r) => r.kind === 'command')
+    if (!hasOpenCommand) {
+      return { streamed: false, reason: 'background_continuation_turn' }
+    }
+  }
   const tPath =
     normalizeTranscriptPath(state.transcript_path) ||
     inferAntigravityTranscriptPath(state.local_id)
@@ -1543,10 +1894,6 @@ export async function streamTurnTrailIfChanged(
   if (!credential) return { streamed: false, reason: 'no_auth_token' }
   const { token, mcpUrl } = credential
 
-  const isLocalMirroredTurn = Boolean(
-    !marker.remoteTurn &&
-      (marker.localPromptMirrored || marker.localTurn || state.local_turn),
-  )
   const telemetry = readConnectionTelemetry(connectionId, { home })
   const postArgs = {
     connection_id: connectionId,
@@ -1753,6 +2100,7 @@ export async function handleMirrorTurn(
     return recordBackgroundLaunch(raw, {
       load: (id) => loadState(id, { connectionsDir, legacyPath }),
       dir: connectionsDir,
+      env,
     })
   }
 
@@ -1793,7 +2141,15 @@ export async function handleMirrorTurn(
   const existingMarker = readTurnMarker(connectionId, connectionsDir)
   reconcileCompletedOwnedWork(connectionId, existingMarker, effectiveTranscriptPath, connectionsDir)
   const latestStep = extractLatestTranscriptStep(effectiveTranscriptPath)
+  const latestStepMs = latestStep?.created_at ? Date.parse(latestStep.created_at) : NaN
+  const latestStepIsBeforeMarker =
+    Boolean(
+      existingMarker && !existingMarker.held && typeof existingMarker.startedAt === 'number',
+    ) &&
+    Number.isFinite(latestStepMs) &&
+    latestStepMs < existingMarker.startedAt - 2000
   const isNewUserInputStep =
+    !latestStepIsBeforeMarker &&
     latestStep?.type === 'USER_INPUT' &&
     (typeof latestStep.step_index !== 'number' ||
       existingMarker?.lastStepIndex !== latestStep.step_index)
@@ -1814,33 +2170,60 @@ export async function handleMirrorTurn(
     }
   }
 
-  const text = extractLastText(raw, modeArg)
-  const rawStepContent = typeof latestStep?.content === 'string' ? latestStep.content : ''
+  const text = latestStepIsBeforeMarker
+    ? parsedHookInput?.prompt ||
+      parsedHookInput?.user_prompt ||
+      parsedHookInput?.message ||
+      parsedHookInput?.text ||
+      null
+    : extractLastText(raw, modeArg)
+  const rawStepContent =
+    !latestStepIsBeforeMarker && typeof latestStep?.content === 'string' ? latestStep.content : ''
+  const inferredTranscriptContext =
+    modeArg === 'user_prompt' && !isNewUserInputStep
+      ? inferTurnContextFromTranscript(effectiveTranscriptPath)
+      : null
+  const isBgContinuation =
+    modeArg === 'user_prompt' &&
+    !isNewUserInputStep &&
+    (isBackgroundTaskNotification(rawStepContent || text) ||
+      Boolean(inferredTranscriptContext?.backgroundContinuation) ||
+      (Boolean(existingMarker?.held) &&
+        latestStep?.type === 'SYSTEM_MESSAGE' &&
+        !rawStepContent.includes('[DevSpec Remote Wake]')))
+  const bgParentContext = isBgContinuation
+    ? existingMarker || inferredTranscriptContext || {}
+    : null
   const isExplicitUserInputStep =
+    !isBgContinuation &&
     latestStep?.type === 'USER_INPUT' &&
     !rawStepContent.includes('[DevSpec Remote Wake]') &&
     parsedHookInput?.remote_turn !== true
-  const isRemoteWakeInput =
-    !isExplicitUserInputStep &&
-    (Boolean(existingMarker?.remoteTurn) ||
-      parsedHookInput?.remote_turn === true ||
-      (typeof text === 'string' && text.includes('[DevSpec Remote Wake]')) ||
-      rawStepContent.includes('[DevSpec Remote Wake]') ||
-      (latestStep?.type === 'SYSTEM_MESSAGE' &&
-        (rawStepContent.includes('"event":"wake"') ||
-          rawStepContent.includes('"type":"system_notice"') ||
-          rawStepContent.includes('"type":"check_job"') ||
-          rawStepContent.includes('"event":"directives"') ||
-          rawStepContent.includes('"event":"automation_run"') ||
-          rawStepContent.includes('"event":"interaction_answer"') ||
-          rawStepContent.includes('"event":"question_dismissal"'))))
+  const isRemoteWakeInput = isBgContinuation
+    ? Boolean(bgParentContext?.remoteTurn)
+    : !isExplicitUserInputStep &&
+      (Boolean(existingMarker?.remoteTurn) ||
+        parsedHookInput?.remote_turn === true ||
+        (typeof text === 'string' && text.includes('[DevSpec Remote Wake]')) ||
+        rawStepContent.includes('[DevSpec Remote Wake]') ||
+        (latestStep?.type === 'SYSTEM_MESSAGE' &&
+          (rawStepContent.includes('"event":"wake"') ||
+            rawStepContent.includes('"type":"system_notice"') ||
+            rawStepContent.includes('"type":"check_job"') ||
+            rawStepContent.includes('"event":"directives"') ||
+            rawStepContent.includes('"event":"automation_run"') ||
+            rawStepContent.includes('"event":"interaction_answer"') ||
+            rawStepContent.includes('"event":"question_dismissal"'))))
 
   const skipMirror =
     modeArg === 'user_prompt' &&
-    ((!!text && isHarnessInjection(text)) || latestStep?.type === 'SYSTEM_MESSAGE')
+    (isBgContinuation ||
+      (!!text && isHarnessInjection(text)) ||
+      latestStep?.type === 'SYSTEM_MESSAGE')
 
   const fromAPerson =
     modeArg === 'user_prompt' &&
+    !isBgContinuation &&
     !isRemoteWakeInput &&
     !skipMirror &&
     Boolean(text && String(text).trim())
@@ -1858,6 +2241,21 @@ export async function handleMirrorTurn(
         appendRequestEvent(connectionId, event, { dir: connectionsDir })
       }
       if (arrival.typedId) typedRequest = { id: arrival.typedId, midTurn: false }
+    } catch {
+      /* non-fatal */
+    }
+  } else if (isBgContinuation && connectionId) {
+    try {
+      const arrival = promptArrival({
+        fromAPerson: false,
+        origin: 'task-notification',
+        text: rawStepContent || text || '',
+        midTurn: false,
+        state: readRequestState(connectionId, { dir: connectionsDir }),
+      })
+      for (const event of arrival.events) {
+        appendRequestEvent(connectionId, event, { dir: connectionsDir })
+      }
     } catch {
       /* non-fatal */
     }
@@ -1950,19 +2348,36 @@ export async function handleMirrorTurn(
     if (turnActive) {
       // What woke the turn (notice-reply.mjs): the wake's own notice ids, checkJobWake,
       // or that a person or a command did. The listener records the same as it delivers;
-      // both write, so neither ordering of the two loses it.
-      const wake = isRemoteWakeInput
-        ? turnWakeFromText(rawStepContent || text)
-        : fromAPerson
-          ? { otherWake: true }
-          : null
+      // both write, so neither ordering of the two loses it. A background task or
+      // subagent continuation inherits its parent turn's wake context instead of parsing
+      // background stdout as a new wake.
+      const wake = isBgContinuation
+        ? {
+            ...(Array.isArray(bgParentContext?.noticeIds) && bgParentContext.noticeIds.length > 0
+              ? { noticeIds: bgParentContext.noticeIds }
+              : {}),
+            ...(Array.isArray(bgParentContext?.recordNoticeIds) &&
+            bgParentContext.recordNoticeIds.length > 0
+              ? { recordNoticeIds: bgParentContext.recordNoticeIds }
+              : {}),
+            ...(bgParentContext?.checkJobWake ? { checkJobWake: true } : {}),
+            ...(bgParentContext?.otherWake ? { otherWake: true } : {}),
+          }
+        : isRemoteWakeInput
+          ? turnWakeFromText(rawStepContent || text)
+          : fromAPerson
+            ? { otherWake: true }
+            : null
       if (
         connectionId &&
         isRemoteWakeInput &&
         (wake?.checkJobWake || wake?.noticeIds?.length || wake?.recordNoticeIds?.length) &&
         !existingMarker?.otherWake &&
+        !bgParentContext?.otherWake &&
         !existingMarker?.localPromptMirrored &&
+        !bgParentContext?.localPromptMirrored &&
         !existingMarker?.localTurn &&
+        !bgParentContext?.localTurn &&
         !state?.local_turn
       ) {
         try {
@@ -1971,11 +2386,20 @@ export async function handleMirrorTurn(
           /* non-fatal */
         }
       }
+      const preservedLocalMirrored = Boolean(
+        localPromptMirrored ||
+          (isBgContinuation &&
+            (existingMarker?.localPromptMirrored || bgParentContext?.localPromptMirrored)),
+      )
+      const preservedLocalTurn =
+        admittedLocalTurn ||
+        (isBgContinuation ? existingMarker?.localTurn || bgParentContext?.localTurn || null : null)
       const markerExtra = {
         held: false,
         remoteTurn: Boolean(isRemoteWakeInput),
-        localPromptMirrored: Boolean(localPromptMirrored),
-        ...(admittedLocalTurn ? { localTurn: admittedLocalTurn } : {}),
+        localPromptMirrored: preservedLocalMirrored,
+        ...(isBgContinuation ? { backgroundContinuation: true } : {}),
+        ...(preservedLocalTurn ? { localTurn: preservedLocalTurn } : {}),
         ...mergeTurnWake(readTurnMarker(connectionId, connectionsDir), wake),
       }
       if (typeof latestStep?.step_index === 'number') {
@@ -1988,7 +2412,7 @@ export async function handleMirrorTurn(
       const marker = readTurnMarker(connectionId, connectionsDir)
       reconcileCompletedOwnedWork(connectionId, marker, effectiveTranscriptPath, connectionsDir)
       const outstandingIds = marker ? readOwnedIds(connectionId, marker, connectionsDir) : []
-      if (outstandingIds.length > 0 && !marker?.held) {
+      if (outstandingIds.length > 0) {
         writeTurnMarker(connectionId, { held: true }, connectionsDir)
         return { ok: true, held: true, outstanding: outstandingIds }
       }
@@ -2032,6 +2456,14 @@ export async function handleMirrorTurn(
       const isLocalMirroredTurn = Boolean(
         !isRemoteTurn &&
           (marker?.localPromptMirrored || marker?.localTurn || state?.local_turn),
+      )
+      const isUnboundBgContinuation = Boolean(
+        marker?.backgroundContinuation &&
+          !isLocalMirroredTurn &&
+          !hadStreamedTrail &&
+          ![...readRequestState(connectionId, { dir: connectionsDir }).open.values()].some(
+            (r) => r.kind === 'command',
+          ),
       )
       const turnFailure = parseTurnFailure(parsedHookInput)
       if (turnNotices) {
@@ -2110,7 +2542,7 @@ export async function handleMirrorTurn(
             /* non-fatal */
           }
         }
-      } else if (turnFailure && isRemoteTurn && sessionId) {
+      } else if (turnFailure && isRemoteTurn && sessionId && !isUnboundBgContinuation) {
         // The turn died on an error before the model could answer (item 408ad47b):
         // tell the room in Antigravity's own words instead of mirroring nothing. Posted
         // even after an explicit progress post, because the command still failed. An
@@ -2146,6 +2578,7 @@ export async function handleMirrorTurn(
       } else if (
         !hadExplicitReply &&
         sessionId &&
+        !isUnboundBgContinuation &&
         (isRemoteTurn || isLocalMirroredTurn || hadStreamedTrail)
       ) {
         let trail = { markdown: '', events: [] }

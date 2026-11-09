@@ -1588,7 +1588,17 @@ async function main() {
       process.stderr.write(`devspec-remote-poll: activity verb ${verb} (${name}) failed: ${e.message}\n`)
       if (isNoWorkingAttemptRefusal(e)) {
         const currentMarker = readTurnMarker(connectionId)
-        if (verb === 'keepalive' && hasPostReplyToolActivity(currentMarker)) {
+        if (
+          verb === 'keepalive' &&
+          (hasPostReplyToolActivity(currentMarker) ||
+            currentMarker?.held === true ||
+            currentMarker?.checkJobWake === true ||
+            (Array.isArray(currentMarker?.noticeIds) && currentMarker.noticeIds.length > 0) ||
+            (Array.isArray(currentMarker?.recordNoticeIds) &&
+              currentMarker.recordNoticeIds.length > 0) ||
+            (typeof currentMarker?.startedAt === 'number' &&
+              Date.now() - currentMarker.startedAt <= 60_000))
+        ) {
           try {
             await mcpToolsCall({
               mcpUrl,
@@ -1598,7 +1608,7 @@ async function main() {
               timeoutMs: 10_000,
             })
             process.stderr.write(
-              'devspec-remote-poll: post-reply tool activity detected — re-opened working attempt via report_pickup\n',
+              'devspec-remote-poll: active turn detected — re-opened working attempt via report_pickup\n',
             )
             return
           } catch (pickupErr) {

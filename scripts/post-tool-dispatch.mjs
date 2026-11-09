@@ -25,6 +25,7 @@ import { resolveOwnConnectionId } from './launch-guard.mjs'
 import {
   currentTurnStampNoticeIds,
   explicitReplyMarkerPath,
+  inferTurnContextFromTranscript,
   isNoticeReplyToolCall,
   isRemotePlumbingToolCall,
   isSessionReplyToolCall,
@@ -33,6 +34,7 @@ import {
   readTurnMarker,
   recordBackgroundLaunch,
   recordTellPerson,
+  resolveAntigravityToolResponse,
   resolveHookConversationId,
   streamTurnTrailIfChanged,
   syncStateTranscriptPath,
@@ -45,6 +47,8 @@ import {
   launchForRequest,
   readRequestState,
   requestForLaunch,
+  setCurrentRequest,
+  UNSTATED,
 } from './requests.mjs'
 import { resultCarriesTellPerson } from './notice-reply.mjs'
 import { postToolNotice } from './room-unread.mjs'
@@ -157,10 +161,30 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
   } else if (connectionId && !isRemotePlumbingToolCall(toolName, toolInput)) {
     try {
       const existingMarker = readTurnMarker(connectionId, connectionsDir)
+      const effectiveTranscriptPath = parseTranscriptPath(raw) || state?.transcript_path || null
+      const inferred = existingMarker
+        ? null
+        : inferTurnContextFromTranscript(effectiveTranscriptPath)
+      if (
+        !existingMarker &&
+        inferred &&
+        (inferred.checkJobWake ||
+          inferred.noticeIds?.length ||
+          inferred.recordNoticeIds?.length) &&
+        !inferred.otherWake &&
+        !inferred.localPromptMirrored &&
+        !state?.local_turn
+      ) {
+        try {
+          setCurrentRequest(connectionId, UNSTATED, { dir: connectionsDir })
+        } catch {
+          /* non-fatal */
+        }
+      }
       writeTurnMarker(
         connectionId,
         {
-          ...(existingMarker ? {} : { remoteTurn: Boolean(state?.session_id) }),
+          ...(existingMarker ? {} : inferred || { remoteTurn: Boolean(state?.session_id) }),
           lastToolAt: now,
           preserveExplicitReply: true,
         },
@@ -211,8 +235,24 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
     bareToolName === 'Bash' ||
     bareToolName === 'Agent'
   ) {
+    const effectiveTranscriptPath = parseTranscriptPath(raw) || state?.transcript_path || null
+    const effectiveToolResponse =
+      toolResponse ??
+      resolveAntigravityToolResponse(payload, {
+        transcriptPath: effectiveTranscriptPath,
+        conversationId: conversationId || state?.local_id || null,
+      })
     try {
-      recordBackgroundLaunch(typeof raw === 'string' ? raw : JSON.stringify(payload))
+      recordBackgroundLaunch(typeof raw === 'string' ? raw : JSON.stringify(payload), {
+        load: (id) =>
+          loadState(id, {
+            connectionsDir,
+            legacyPath: path.join(home, '.devspec', 'remote-control.json'),
+          }),
+        dir: connectionsDir,
+        transcriptPath: effectiveTranscriptPath,
+        env,
+      })
     } catch {
       /* non-fatal */
     }
@@ -223,7 +263,7 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
         const launch = launchForRequest(
           bareToolName,
           toolInput,
-          toolResponse,
+          effectiveToolResponse,
           payload.tool_use_id ?? payload.toolUseId
         )
         if (launch) {

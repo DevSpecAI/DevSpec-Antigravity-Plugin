@@ -287,8 +287,19 @@ function carriedBy(entry, state) {
 
 function senderKeys(text) {
   const out = []
-  for (const match of String(text || '').matchAll(/\bsender=([A-Za-z0-9_.:/-]{1,128})/g)) {
-    if (KEY.test(match[1]) && !out.includes(match[1])) out.push(match[1])
+  const s = String(text || '')
+  const push = (val) => {
+    if (val && KEY.test(val) && !out.includes(val)) out.push(val)
+  }
+  for (const match of s.matchAll(/\bsender=([A-Za-z0-9_.:/-]{1,128})/g)) {
+    push(match[1])
+  }
+  for (const match of s.matchAll(/\/brain\/([0-9a-f-]{36})\/\.system_generated\/tasks\/(task-\d+)\.log/gi)) {
+    push(`${match[1]}/${match[2]}`)
+    push(match[2])
+  }
+  for (const match of s.matchAll(/\b(?:Background command|Task id)\s+"([A-Za-z0-9_.:/-]{1,128})"/gi)) {
+    push(match[1])
   }
   return out
 }
@@ -591,7 +602,19 @@ export function startsBackgroundWork(toolName, toolInput) {
 }
 
 export function launchForRequest(toolName, toolInput, toolResponse, toolUseId = null) {
-  const res = toolResponse && typeof toolResponse === 'object' ? toolResponse : null
+  const res =
+    typeof toolResponse === 'string'
+      ? (() => {
+          try {
+            const parsed = JSON.parse(toolResponse)
+            return parsed && typeof parsed === 'object' ? parsed : { raw: toolResponse }
+          } catch {
+            return { raw: toolResponse }
+          }
+        })()
+      : toolResponse && typeof toolResponse === 'object'
+        ? toolResponse
+        : null
   const input = toolInput && typeof toolInput === 'object' ? toolInput : {}
   const id = (value) => (typeof value === 'string' && KEY.test(value) ? value : null)
   const alias = id(toolUseId)
@@ -600,7 +623,21 @@ export function launchForRequest(toolName, toolInput, toolResponse, toolUseId = 
   switch (name) {
     case 'invoke_subagent': {
       const sub = Array.isArray(res.subagents) ? res.subagents[0] : res
-      const key = id(sub?.conversationId ?? sub?.conversation_id ?? res.agentId ?? res.taskId ?? toolUseId)
+      const outText =
+        typeof res.output === 'string'
+          ? res.output
+          : typeof res.raw === 'string'
+            ? res.raw
+            : JSON.stringify(res)
+      const convMatch = outText.match(/"conversationId"\s*:\s*"([^"]+)"/)
+      const key = id(
+        sub?.conversationId ??
+          sub?.conversation_id ??
+          res.agentId ??
+          res.taskId ??
+          convMatch?.[1] ??
+          toolUseId,
+      )
       return key ? { key, alias, kind: 'subagent', notifies: true } : null
     }
     case 'run_command': {

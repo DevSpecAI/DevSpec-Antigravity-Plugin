@@ -300,6 +300,15 @@ export function turnWakeFromText(text) {
     }
   }
   if (otherWake) return { otherWake: true }
+  if (noticeIds.length === 0) {
+    for (const match of String(text || '').matchAll(/system_notice_ids\s*:\s*(\[[^\]]*\])/g)) {
+      const parsed = normalizeNoticeIds(match[1])
+      if (Array.isArray(parsed)) noticeIds.push(...parsed)
+    }
+  }
+  if (!checkJobWake && /\btake it with claim_check_job\b/.test(String(text || ''))) {
+    checkJobWake = true
+  }
   const split = splitByAudience(noticeIds, (id) => audiences.get(id))
   if (split.noticeIds || split.recordNoticeIds || checkJobWake) {
     return {

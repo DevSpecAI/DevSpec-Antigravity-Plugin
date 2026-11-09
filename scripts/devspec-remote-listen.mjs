@@ -838,7 +838,7 @@ function adoptPersistedQueue(queueState, live, { inboxPath, connectionId }) {
  *   never replays the commands delivered past it (item b68df72d).
  * - Once the active turn finishes, drains queued `check_job` / `canonical_system_notices`
  *   one follow-up turn at a time in arrival order, resetting `current` request to `null`
- *   and skipping `report_pickup` (check jobs and system notices are not server commands).
+ *   and immediately reporting `report_pickup` so DevSpec shows Working right away.
  */
 export async function processListenerInboxTick(
   queueState,
@@ -906,7 +906,7 @@ export async function processListenerInboxTick(
         )
         queueState.lastDeliveryError = null
       }
-      if (!queuedEntry && live?.token && live?.mcp_url) {
+      if (live?.token && live?.mcp_url) {
         callMcp({
           mcpUrl: live.mcp_url,
           token: live.token,

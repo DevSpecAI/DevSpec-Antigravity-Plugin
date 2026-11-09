@@ -267,10 +267,15 @@ describe('active-turn FIFO queueing in devspec-remote-listen.mjs', () => {
       assert.deepEqual(fx.live.inbox_held_records, [heldBoth[1]])
       assert.equal(isCurrentTurnCheckJobOnly(CONN_ID, { dir: fx.connDir }), true)
       assert.equal(readRequestState(CONN_ID, { dir: fx.connDir }).current, null)
-      assert.equal(mcpCalls.length, 0, 'check_job delivery never calls report_pickup')
+      assert.equal(
+        mcpCalls.filter((c) => c.name === 'report_pickup').length,
+        1,
+        'check_job delivery immediately reports pickup so the UI shows Working right away',
+      )
 
       // 4. Check-job turn finishes -> next tick drains the queued system_notice with full identity intact!
       clearTurnMarker(CONN_ID, fx.connDir)
+      mcpCalls.length = 0
       const fourthTick = await tick()
       assert.equal(deliveredMessages.length, 3)
       assert.match(deliveredMessages[2], new RegExp(`system_notice_ids: \\["${NOTICE_ID}"\\]`))
@@ -279,7 +284,11 @@ describe('active-turn FIFO queueing in devspec-remote-listen.mjs', () => {
       assert.equal(fx.live.inbox_byte_offset, Buffer.byteLength(checkLine + noticeLine + commandLine, 'utf8'))
       assert.deepEqual(readTurnMarker(CONN_ID, fx.connDir).noticeIds, [NOTICE_ID])
       assert.equal(readRequestState(CONN_ID, { dir: fx.connDir }).current, null)
-      assert.equal(mcpCalls.length, 0, 'system_notice delivery never calls report_pickup')
+      assert.equal(
+        mcpCalls.filter((c) => c.name === 'report_pickup').length,
+        1,
+        'system_notice delivery immediately reports pickup so the UI shows Working right away',
+      )
     } finally {
       fx.cleanup()
     }
