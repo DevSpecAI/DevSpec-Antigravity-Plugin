@@ -3,11 +3,9 @@
  * The DevSpec server and credential the plugin's background features use: the
  * poller, listener, connect script, turn mirroring, commit tracking and the hooks.
  *
- * Antigravity's own DevSpec tools sign in through Antigravity itself (the plugin's
- * bundled mcp_config.json names Antigravity's sign-in app), and Antigravity keeps
- * that credential where these scripts cannot read it. So the background features
- * have their own browser sign-in, as Antigravity, in this plugin's own login file
- * (auth-store.mjs). They resolve:
+ * Antigravity's bundled DevSpec MCP server (`scripts/mcp-bridge.mjs`) and the
+ * background features share one browser sign-in, as Antigravity, in this plugin's own
+ * login file (`auth-store.mjs`). They resolve:
  *
  *   1. DEVSPEC_MCP_TOKEN, for machines with no browser (CI, cloud workers). It goes
  *      to DEVSPEC_MCP_URL, or this install's server when that is unset, and it wins

@@ -1,11 +1,11 @@
 ---
 name: devspec-login
-description: "Sign DevSpec remote control and commit tracking in through the browser, as Antigravity (one approval), check that sign-in, or sign out of it. Use when asked to sign in or log in to DevSpec, when a DevSpec message says to run /devspec-login, or for /devspec-login."
+description: "Sign Antigravity in to DevSpec through the browser (one approval), check that sign-in, or sign out of it. Use when asked to sign in or log in to DevSpec, when a DevSpec message says to run /devspec-login, or for /devspec-login."
 ---
 
-# DevSpec sign-in for remote control and commit tracking
+# DevSpec sign-in for Antigravity
 
-DevSpec's tools sign in through Antigravity itself (the DevSpec server in `/mcp`). Remote control, commit tracking and the plugin's hooks run outside Antigravity's sign-in, so they have one approval of their own, on DevSpec's page, naming Antigravity. This skill starts, checks or ends that one.
+One browser approval on DevSpec's page, naming Antigravity, signs in all of Antigravity — DevSpec's tools, remote control, commit tracking and the plugin's hooks. This skill starts, checks or ends that sign-in.
 
 Never ask the person for a token, never open the link or approve anything for them, and never read the files under `~/.devspec/`: the script handles all of it.
 
@@ -21,7 +21,7 @@ PLUGIN_DIR="$HOME/.gemini/config/plugins/devspec"; [ -d "$PLUGIN_DIR" ] || PLUGI
 node "$PLUGIN_DIR/scripts/devspec-login.mjs" --start
 ```
 
-It opens DevSpec's approval page in the person's browser and returns at once. Show the person the text it prints, including the link (it is for them to open if no tab appeared). Once they approve, remote control and commit tracking are ready; there is nothing to wait for or run afterwards.
+It opens DevSpec's approval page in the person's browser and returns at once. Show the person the text it prints, including the link (it is for them to open if no tab appeared), and tell them to restart Antigravity once they approve so DevSpec's tools and the status bar load cleanly.
 
 ## Sign in with a code (`/devspec-login --code`)
 
@@ -42,6 +42,6 @@ node "$PLUGIN_DIR/scripts/devspec-login.mjs" --status
 node "$PLUGIN_DIR/scripts/devspec-login.mjs" --logout
 ```
 
-This signs out remote control and commit tracking only. To disconnect Antigravity from DevSpec entirely, the person uses Agent setup in their DevSpec settings.
+This signs Antigravity out of DevSpec on this machine. To disconnect Antigravity from DevSpec entirely across all machines, the person uses Agent setup in their DevSpec settings.
 
 If any of these prints that `DEVSPEC_MCP_TOKEN` is set, show that text: the token takes precedence, and the text says how to remove it.

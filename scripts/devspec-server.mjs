@@ -3,14 +3,12 @@
  * Which DevSpec server this install of the plugin talks to, the Antigravity sign-in
  * app for it, and how Antigravity names it.
  *
- * ONE SETTING FOR BOTH HALVES. The plugin bundles its own DevSpec connection in its
- * root `mcp_config.json`: the server address and Antigravity's own pre-registered
- * DevSpec sign-in app (a public client id, not a secret; DevSpec keeps open
- * self-registration off, so Antigravity needs it named). Antigravity signs in
- * through the browser when it connects and keeps and renews that credential itself.
- * The background features (remote control, commit tracking, the hooks) read the same
- * file for the server they sign in to, so the tools and the background features can
- * never point at different servers. Nobody edits Antigravity's global settings file.
+ * ONE SETTING FOR ALL OF ANTIGRAVITY. The plugin bundles its own DevSpec connection in
+ * its root `mcp_config.json`, running `scripts/mcp-bridge.mjs` with the target DevSpec
+ * server address. Both DevSpec's tools (through `mcp-bridge.mjs`) and the background
+ * features (remote control, commit tracking, the hooks) read that same file for the
+ * server they sign in to, and share one browser login in `~/.devspec/antigravity/auth.json`
+ * renewed under a cross-process lock. Nobody edits Antigravity's global settings file.
  *
  * Antigravity expands no variables in a bundled `mcp_config.json` (measured on agy
  * 1.5.3: a `${VAR}` server address is used literally), so an install is pointed at
@@ -33,12 +31,12 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { PLUGIN_HEADER, pluginHeaderValue } from './connection-version.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 import { discoverSignIn, normalizeResource, SignInError } from './oauth.mjs'
 
 export const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 export const SERVER_KEY = 'devspec'
+export const BRIDGE_SCRIPT_ARG = '${PLUGIN_ROOT}/scripts/mcp-bridge.mjs'
 export const PRODUCTION_MCP_URL = 'https://api.devspec.ai/api/mcp'
 export const STAGING_MCP_URL = 'https://api.devspecstaging.com/api/mcp'
 
@@ -95,7 +93,17 @@ export function readBundledEntry(pluginRoot = PLUGIN_ROOT) {
  */
 export function configuredServer({ pluginRoot = PLUGIN_ROOT } = {}) {
   const entry = readBundledEntry(pluginRoot)
-  const url = typeof entry?.url === 'string' ? entry.url : typeof entry?.serverUrl === 'string' ? entry.serverUrl : null
+  const argUrl = Array.isArray(entry?.args)
+    ? entry.args.find((a) => typeof a === 'string' && /^https?:\/\//i.test(a.trim()))
+    : null
+  const url =
+    typeof argUrl === 'string'
+      ? argUrl
+      : typeof entry?.url === 'string'
+        ? entry.url
+        : typeof entry?.serverUrl === 'string'
+          ? entry.serverUrl
+          : null
   if (url) {
     try {
       return normalizeResource(url)
@@ -145,14 +153,13 @@ export function clientIdForIssuer(issuer) {
   return clientId
 }
 
-/** The plugin's own mcp_config.json for a server: its address, sign-in app and plugin header. */
-export function bundledMcpConfig({ mcpUrl, clientId, headerValue = pluginHeaderValue() }) {
+/** The plugin's own mcp_config.json for a server: local stdio bridge and server address. */
+export function bundledMcpConfig({ mcpUrl = PRODUCTION_MCP_URL } = {}) {
   return {
     mcpServers: {
       [SERVER_KEY]: {
-        serverUrl: mcpUrl,
-        oauth: { clientId },
-        ...(headerValue ? { headers: { [PLUGIN_HEADER]: headerValue } } : {}),
+        command: 'node',
+        args: [BRIDGE_SCRIPT_ARG, mcpUrl],
       },
     },
   }
@@ -254,7 +261,7 @@ async function main() {
       result.changed
         ? `This install now connects Antigravity to DevSpec ${label} (${result.mcpUrl}), signing in as Antigravity.`
         : `This install already connects Antigravity to DevSpec ${label} (${result.mcpUrl}).`,
-      'Restart agy to use it. Antigravity asks you to approve its DevSpec sign-in the first time it connects there, and remote control and commit tracking ask once more if they have not signed in there yet.',
+      'Restart agy to use it. Run /devspec-login if you have not signed in to that server yet.',
     ]
     if (result.changed && isGitCheckout(PLUGIN_ROOT) && label !== 'production') {
       lines.push(
