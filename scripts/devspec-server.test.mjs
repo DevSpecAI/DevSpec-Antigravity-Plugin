@@ -33,24 +33,24 @@ function tempPlugin() {
 }
 
 describe("the plugin's own DevSpec connection", () => {
-  it('ships production with Antigravity’s production sign-in app and this release’s plugin header, and no secret', () => {
+  it('ships production through the local stdio MCP bridge, with no secret', () => {
     const shipped = fs.readFileSync(path.join(ROOT, 'mcp_config.json'), 'utf8')
-    const expected = bundledMcpConfig({ mcpUrl: PRODUCTION_MCP_URL, clientId: 'Gmbtf7QgaoSw7WJ0', headerValue: `antigravity/${VERSION}` })
+    const expected = bundledMcpConfig({ mcpUrl: PRODUCTION_MCP_URL })
     assert.deepEqual(JSON.parse(shipped), expected)
     assert.doesNotMatch(shipped, /Authorization|Bearer|dvs_|secret/i)
     assert.equal(configuredServer({ pluginRoot: ROOT }), PRODUCTION_MCP_URL)
   })
 
-  it('points an install at staging with staging’s sign-in app, together, and back to the exact shipped file', async () => {
+  it('points an install at staging and back to the exact shipped file', async () => {
     const root = tempPlugin()
     try {
       const shipped = fs.readFileSync(path.join(root, 'mcp_config.json'), 'utf8')
       const staging = await pointInstallAt('staging', { pluginRoot: root })
       assert.equal(staging.changed, true)
+      assert.equal(staging.clientId, 'TucS1MNZZlWpOUc7')
       const entry = JSON.parse(fs.readFileSync(path.join(root, 'mcp_config.json'), 'utf8')).mcpServers.devspec
-      assert.equal(entry.serverUrl, STAGING_MCP_URL)
-      assert.equal(entry.oauth.clientId, 'TucS1MNZZlWpOUc7')
-      assert.equal(entry.headers['x-devspec-plugin'], `antigravity/${VERSION}`)
+      assert.equal(entry.command, 'node')
+      assert.deepEqual(entry.args, ['${PLUGIN_ROOT}/scripts/mcp-bridge.mjs', STAGING_MCP_URL])
       assert.equal(configuredServer({ pluginRoot: root }), STAGING_MCP_URL)
       // The background features follow the same setting.
       assert.equal(resolveDevspecMcpAuth('/x', { env: {}, home: root, pluginRoot: root }).mcp_url, STAGING_MCP_URL)

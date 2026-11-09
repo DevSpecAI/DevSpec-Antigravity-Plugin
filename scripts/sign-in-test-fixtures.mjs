@@ -162,7 +162,7 @@ export function pluginCopy(root, { mcpUrl, issuer }) {
   fs.writeFileSync(serverFile, patched)
   fs.writeFileSync(
     path.join(pluginRoot, 'mcp_config.json'),
-    `${JSON.stringify({ mcpServers: { devspec: { serverUrl: mcpUrl, oauth: { clientId: 'TucS1MNZZlWpOUc7' } } } }, null, 2)}\n`,
+    `${JSON.stringify({ mcpServers: { devspec: { command: 'node', args: ['${PLUGIN_ROOT}/scripts/mcp-bridge.mjs', mcpUrl] } } }, null, 2)}\n`,
   )
   return pluginRoot
 }

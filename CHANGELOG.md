@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.24.0
+
+- **One browser sign-in for all of Antigravity, with no 24-hour multi-window sign-outs.** Antigravity's bundled DevSpec connection (`mcp_config.json`) now runs through the plugin's local stdio relay (`scripts/mcp-bridge.mjs`), sharing the single browser login in `~/.devspec/antigravity/auth.json` with remote control, commit tracking, and the hooks. Because the relay renews credentials under the plugin's cross-process file lock, having multiple Antigravity windows open no longer triggers a 24-hour `invalid_grant` sign-out from concurrent refresh token rotation, and onboarding now takes a single `/devspec-login` browser approval with no `/mcp` verification code to copy and paste.
+
 ## 0.23.1
 
 - **Browser sign-in polish.** The local browser callback page now renders with the DevSpec logo and adapts cleanly to light and dark mode, `/devspec-login` places the browser link on its own line with a clearer remote-machine `--code` hint, sign-in confirmation prompts you to restart Antigravity to finish connecting, and the Quick Start copy no longer mentions the retired token setup to new users.

@@ -71,12 +71,15 @@ git clone https://github.com/DevSpecAI/DevSpec-Antigravity-Plugin.git "$HOME\.ge
 
 ### 3. Approve Antigravity in your browser
 
-Start `agy`. Signing in takes two quick approvals in your browser, both on DevSpec's own page and both naming Antigravity as the tool asking:
+Start `agy` and run `/devspec-login` (or approve the DevSpec browser tab that opens automatically at startup):
 
-1. **DevSpec's tools.** Type `/mcp`: the DevSpec server shows **Auth Needed**. Choose **Authenticate**, approve Antigravity on the DevSpec page that opens, then paste the code Antigravity's page shows back into `agy`. Antigravity keeps this sign-in and renews it by itself.
-2. **Remote control and commit tracking.** These run in the background, outside Antigravity's own sign-in, so the first time you send a message the plugin opens one more DevSpec approval in your browser. Approve it and restart `agy` so your status bar and agent connection load cleanly. If you missed the tab, run `/devspec-login`. Over SSH, or on any machine your browser cannot reach, run `/devspec-login --code` and paste back the code DevSpec's page shows.
+```text
+/devspec-login
+```
 
-You stay signed in until you sign out or disconnect Antigravity on DevSpec's [Agent setup](https://app.devspec.ai/settings/agents) page, which signs out both. If the background sign-in stops working, the status bar and the next session say so and tell you to run `/devspec-login`.
+Click **Allow** on DevSpec's approval page naming **Antigravity**, then restart `agy` so DevSpec's tools, your status bar, and your agent connection load cleanly. Over SSH, or on any machine your browser cannot reach, run `/devspec-login --code` and paste back the code DevSpec's page shows.
+
+One approval covers everything in Antigravity — DevSpec's tools, remote control, commit tracking, and the session hooks — and appears as one **Antigravity** entry on DevSpec's [Agent setup](https://app.devspec.ai/settings/agents) page. You stay signed in across all open Antigravity windows until you sign out or disconnect Antigravity on Agent setup. If your sign-in stops working, the status bar and DevSpec's tools say so plainly and tell you to run `/devspec-login`.
 
 ### 4. Optional — recommended for phone and voice control: skip permission prompts
 
@@ -121,7 +124,7 @@ Everything in DevSpec can be asked in plain words ("Work on DevSpec task 4f2a", 
 | `/devspec-remote --name "Night Owl"` | Connects using a custom agent codename. |
 | `/devspec-remote-stop` | Disconnects this conversation from DevSpec while leaving other `agy` terminals running. |
 | `/devspec-project` | Shows the current project and folder default, or lets you `choose`, `remember`, or `forget` a project. |
-| `/devspec-login` | Signs remote control and commit tracking in to DevSpec through your browser (`--code` on a machine your browser cannot reach, `--status` to check, `--logout` to sign out). |
+| `/devspec-login` | Signs Antigravity in to DevSpec through your browser (`--code` on a machine your browser cannot reach, `--status` to check, `--logout` to sign out). |
 
 ## Choosing and remembering a project
 
