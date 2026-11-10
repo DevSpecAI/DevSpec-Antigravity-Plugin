@@ -1210,5 +1210,92 @@ describe('Antigravity native hook payload & transcript handling', () => {
       fs.rmSync(tmpHome, { recursive: true, force: true })
     }
   })
+
+  it('resolves human task titles for truncated create_task, claim_work_item, and record_implementation calls without falling back to branch names or UUIDs', () => {
+    const taskId = '5773f417-11d6-4665-a79b-df4137982d5d'
+    const taskTitle =
+      'Unify pending memory version view with one-click accept and connected conflict rulings'
+    const lines = [
+      JSON.stringify({
+        step_index: 10,
+        type: 'PLANNER_RESPONSE',
+        created_at: '2026-11-10T14:13:46Z',
+        truncated_fields: ['tool_calls'],
+        tool_calls: [
+          {
+            name: 'default_api:call_mcp_tool',
+            args: {
+              ServerName: '"devspec_devspec"',
+              ToolName: '"create_task"',
+              Arguments: '"{\\"description\\":\\"Long spec... [truncated]',
+            },
+          },
+        ],
+      }),
+      JSON.stringify({
+        step_index: 11,
+        type: 'GENERIC',
+        created_at: '2026-11-10T14:13:47Z',
+        content: JSON.stringify({
+          outcome: 'committed',
+          id: taskId,
+          title: taskTitle,
+        }),
+      }),
+      JSON.stringify({
+        step_index: 12,
+        type: 'PLANNER_RESPONSE',
+        created_at: '2026-11-10T14:20:13Z',
+        tool_calls: [
+          {
+            name: 'default_api:call_mcp_tool',
+            args: {
+              ServerName: '"devspec_devspec"',
+              ToolName: '"claim_work_item"',
+              Arguments: JSON.stringify(
+                JSON.stringify({
+                  agent_branch: 'feat/unify-pending-memory-view-5773f417',
+                  task_id: taskId,
+                }),
+              ),
+            },
+          },
+        ],
+      }),
+      JSON.stringify({
+        step_index: 13,
+        type: 'PLANNER_RESPONSE',
+        created_at: '2026-11-10T14:43:06Z',
+        truncated_fields: ['tool_calls'],
+        tool_calls: [
+          {
+            name: 'default_api:call_mcp_tool',
+            args: {
+              ServerName: '"devspec_devspec"',
+              ToolName: '"record_implementation"',
+              Arguments: `"{\\"task_id\\":\\"${taskId}\\",\\"completion_note\\":\\"Long note... [truncated]`,
+            },
+          },
+        ],
+      }),
+    ].join('\n')
+
+    const { events, markdown } = extractAntigravityTrailFromTranscript(lines, {
+      stopAtReply: false,
+    })
+    assert.equal(events.length, 3)
+    assert.deepEqual(
+      events.map((e) => ({ domain: e.domain, action: e.action, id: e.id, title: e.title })),
+      [
+        { domain: 'task', action: 'created', id: taskId, title: taskTitle },
+        { domain: 'task', action: 'claimed', id: taskId, title: taskTitle },
+        { domain: 'implementation', action: 'recorded', id: taskId, title: taskTitle },
+      ],
+    )
+    assert.ok(!markdown.includes('feat/unify-pending-memory-view-5773f417'))
+    assert.ok(markdown.includes(`\`create_task\` — \`${taskTitle}\``))
+    assert.ok(markdown.includes(`\`claim_work_item\` — \`${taskTitle}\``))
+    assert.ok(markdown.includes(`\`record_implementation\` — \`${taskTitle}\``))
+  })
 })
 

@@ -380,7 +380,11 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
         try {
           const { events, markdown } = extractAntigravityTrailFromTranscript(
             fs.readFileSync(tPath, 'utf8'),
-            { sinceMs: turnMarker?.startedAt ?? null, stopAtReply: true },
+            {
+              sinceMs: turnMarker?.startedAt ?? null,
+              stopAtReply: true,
+              transcriptPath: tPath,
+            },
           )
           if (markdown && events.length > 0) {
             next = { ...next, work_trail: markdown, trail_events: events }

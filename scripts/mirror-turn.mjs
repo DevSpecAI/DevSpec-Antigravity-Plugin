@@ -1381,6 +1381,41 @@ export function summarizeThinkingText(text, maxLen = 140) {
     : firstParagraph
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const SNAKE_TOOL_NAME_RE = /^[a-z0-9]+(?:_[a-z0-9]+)+$/i
+const GIT_BRANCH_TITLE_RE = /^[a-z0-9._-]+\/[a-z0-9._/-]*…?$/i
+
+function isHumanDomainTitle(value) {
+  if (typeof value !== 'string') return false
+  const trimmed = value.replace(/\s+/g, ' ').trim()
+  if (!trimmed) return false
+  if (UUID_RE.test(trimmed)) return false
+  if (SNAKE_TOOL_NAME_RE.test(trimmed)) return false
+  if (GIT_BRANCH_TITLE_RE.test(trimmed)) return false
+  return true
+}
+
+function salvageTruncatedJsonStringFields(raw) {
+  if (typeof raw !== 'string' || !raw) return {}
+  const normalized = raw.includes('\\"')
+    ? raw.replace(/^\s*"/, '').replace(/\\"/g, '"').replace(/\\\\/g, '\\')
+    : raw
+  const out = {}
+  const fieldRe =
+    /"(title|task_id|id|resource_id|summary|completion_summary|query|agent_branch|phase|turn_kind)"\s*:\s*"((?:\\.|[^"\\])*)"/g
+  let match
+  while ((match = fieldRe.exec(normalized)) !== null) {
+    const key = match[1]
+    if (key in out) continue
+    try {
+      out[key] = JSON.parse(`"${match[2]}"`)
+    } catch {
+      out[key] = match[2]
+    }
+  }
+  return out
+}
+
 function unwrapMcpCallArgs(toolName, args = {}) {
   const name = String(toolName || '').replace(/^default_api:/, '')
   if (name === 'call_mcp_tool' && args && typeof args === 'object') {
@@ -1393,7 +1428,7 @@ function unwrapMcpCallArgs(toolName, args = {}) {
         try {
           innerArgs = typeof unquoted === 'string' ? JSON.parse(unquoted) : unquoted
         } catch {
-          innerArgs = {}
+          innerArgs = typeof unquoted === 'string' ? salvageTruncatedJsonStringFields(unquoted) : {}
         }
       }
       return {
@@ -1492,21 +1527,27 @@ export function redactSecretsFromText(text) {
     .replace(/(ANTIGRAVITY_CSRF_TOKEN\s*=\s*)[^\s"']+/g, '$1[REDACTED]')
 }
 
-function classifyDevspecDomainTool(toolName, args = {}) {
+function classifyDevspecDomainTool(toolName, args = {}, { titleById = null } = {}) {
   const { effectiveName, effectiveArgs } = unwrapMcpCallArgs(toolName, args)
   const verb = devspecToolFromName(effectiveName)
   if (!verb) return null
   const id = unquoteTranscriptString(
     effectiveArgs?.task_id || effectiveArgs?.id || effectiveArgs?.resource_id || '',
   )
-  const title = unquoteTranscriptString(
-    effectiveArgs?.title ||
-      effectiveArgs?.summary ||
-      effectiveArgs?.query ||
-      effectiveArgs?.agent_branch ||
-      id ||
-      '',
-  )
+  const candidates = [
+    effectiveArgs?.title,
+    id && titleById ? titleById.get(String(id)) : '',
+    effectiveArgs?.summary,
+    effectiveArgs?.query,
+  ]
+  let title = ''
+  for (const candidate of candidates) {
+    const clean = unquoteTranscriptString(candidate || '')
+    if (isHumanDomainTitle(clean)) {
+      title = clean.replace(/\s+/g, ' ').trim()
+      break
+    }
+  }
 
   const domainMap = {
     create_task: { domain: 'task', action: 'created' },
@@ -1603,6 +1644,73 @@ function normalizeCanonicalToolEvent(toolName, args = {}) {
   }
 }
 
+function extractRecordIdAndTitleFromToolOutput(rawContent) {
+  if (typeof rawContent !== 'string' || !rawContent) return null
+  let text = rawContent
+  const spillMatch = rawContent.match(/saved to:\s*file:\/\/(\/[^\s"'<>]+\/output\.txt)/i)
+  if (spillMatch?.[1] && fs.existsSync(spillMatch[1])) {
+    try {
+      const fd = fs.openSync(spillMatch[1], 'r')
+      try {
+        const buf = Buffer.alloc(4096)
+        const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0)
+        text = buf.slice(0, bytesRead).toString('utf8')
+      } finally {
+        fs.closeSync(fd)
+      }
+    } catch {
+      /* ignore spill read errors */
+    }
+  }
+  const head = text.slice(0, 4096)
+  const idMatch = head.match(
+    /"id"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"/i,
+  )
+  const titleMatch = head.match(/"title"\s*:\s*"((?:\\.|[^"\\])*)"/)
+  if (!idMatch?.[1] || !titleMatch?.[1]) return null
+  let title = titleMatch[1]
+  try {
+    title = JSON.parse(`"${titleMatch[1]}"`)
+  } catch {
+    /* keep raw */
+  }
+  if (!isHumanDomainTitle(title)) return null
+  return {
+    id: idMatch[1],
+    title: title.replace(/\s+/g, ' ').trim(),
+  }
+}
+
+function loadFullTranscriptTruncatedSteps(transcriptPath, fullTranscriptText, neededStepIndices) {
+  const byIndex = new Map()
+  if (!neededStepIndices || neededStepIndices.size === 0) return byIndex
+  let rawFull = typeof fullTranscriptText === 'string' ? fullTranscriptText : null
+  if (!rawFull && typeof transcriptPath === 'string' && /transcript\.jsonl$/.test(transcriptPath)) {
+    const fullPath = transcriptPath.replace(/transcript\.jsonl$/, 'transcript_full.jsonl')
+    if (fs.existsSync(fullPath)) {
+      try {
+        rawFull = fs.readFileSync(fullPath, 'utf8')
+      } catch {
+        rawFull = null
+      }
+    }
+  }
+  if (!rawFull) return byIndex
+  for (const rawLine of rawFull.split(/\r?\n/)) {
+    const trimmed = rawLine.trim()
+    if (!trimmed) continue
+    try {
+      const step = JSON.parse(trimmed)
+      if (step && neededStepIndices.has(step.step_index)) {
+        byIndex.set(step.step_index, step)
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return byIndex
+}
+
 /**
  * Extract structured trail events and cumulative Markdown from an Antigravity
  * `transcript.jsonl` raw string for the active turn (Pi-style `work_trail` and
@@ -1610,7 +1718,13 @@ function normalizeCanonicalToolEvent(toolName, args = {}) {
  */
 export function extractAntigravityTrailFromTranscript(
   rawText,
-  { sinceIso = null, sinceMs = null, stopAtReply = true } = {},
+  {
+    sinceIso = null,
+    sinceMs = null,
+    stopAtReply = true,
+    transcriptPath = null,
+    fullTranscriptText = null,
+  } = {},
 ) {
   const cutoffMs =
     typeof sinceMs === 'number' && Number.isFinite(sinceMs)
@@ -1621,9 +1735,14 @@ export function extractAntigravityTrailFromTranscript(
 
   const events = []
   const bullets = []
+  const domainBulletMeta = new Map()
+  const titleById = new Map()
+  let pendingCreatedDomainEvent = null
   let seq = 0
   let replyPosted = false
 
+  const parsedSteps = []
+  const truncatedStepIndices = new Set()
   for (const rawLine of String(rawText || '').split(/\r?\n/)) {
     const trimmed = rawLine.trim()
     if (!trimmed) continue
@@ -1633,17 +1752,45 @@ export function extractAntigravityTrailFromTranscript(
     } catch {
       continue
     }
-    if (!step || step.type !== 'PLANNER_RESPONSE') continue
+    if (!step) continue
+    if (
+      step.type === 'PLANNER_RESPONSE' &&
+      Array.isArray(step.truncated_fields) &&
+      step.truncated_fields.includes('tool_calls') &&
+      step.step_index !== undefined
+    ) {
+      truncatedStepIndices.add(step.step_index)
+    }
+    parsedSteps.push(step)
+  }
 
-    if (cutoffMs !== null && Number.isFinite(cutoffMs) && step.created_at) {
-      const stepMs = Date.parse(step.created_at)
-      if (Number.isFinite(stepMs) && stepMs < cutoffMs) continue
+  const fullStepsByIndex = loadFullTranscriptTruncatedSteps(
+    transcriptPath,
+    fullTranscriptText,
+    truncatedStepIndices,
+  )
+
+  for (let rawStep of parsedSteps) {
+    const step =
+      rawStep.type === 'PLANNER_RESPONSE' && fullStepsByIndex.has(rawStep.step_index)
+        ? fullStepsByIndex.get(rawStep.step_index)
+        : rawStep
+
+    if (step.type === 'GENERIC') {
+      const extracted = extractRecordIdAndTitleFromToolOutput(step.content)
+      if (extracted) {
+        titleById.set(extracted.id, extracted.title)
+        if (pendingCreatedDomainEvent) {
+          if (!pendingCreatedDomainEvent.id) pendingCreatedDomainEvent.id = extracted.id
+          if (!pendingCreatedDomainEvent.title) pendingCreatedDomainEvent.title = extracted.title
+          pendingCreatedDomainEvent = null
+        }
+      }
+      continue
     }
 
-    const occurredAt =
-      typeof step.created_at === 'string' && Number.isFinite(Date.parse(step.created_at))
-        ? new Date(Date.parse(step.created_at)).toISOString()
-        : undefined
+    if (step.type !== 'PLANNER_RESPONSE') continue
+    pendingCreatedDomainEvent = null
 
     const rawToolCalls = Array.isArray(step.tool_calls) ? step.tool_calls : []
     const parsedToolCalls = rawToolCalls.map((tc) => {
@@ -1658,6 +1805,23 @@ export function extractAntigravityTrailFromTranscript(
       }
       return { toolName, args }
     })
+
+    for (const { toolName, args } of parsedToolCalls) {
+      const info = classifyDevspecDomainTool(toolName, args, { titleById })
+      if (info?.id && info?.title && isHumanDomainTitle(info.title)) {
+        titleById.set(String(info.id), info.title)
+      }
+    }
+
+    if (cutoffMs !== null && Number.isFinite(cutoffMs) && step.created_at) {
+      const stepMs = Date.parse(step.created_at)
+      if (Number.isFinite(stepMs) && stepMs < cutoffMs) continue
+    }
+
+    const occurredAt =
+      typeof step.created_at === 'string' && Number.isFinite(Date.parse(step.created_at))
+        ? new Date(Date.parse(step.created_at)).toISOString()
+        : undefined
 
     if (stopAtReply && parsedToolCalls.some((tc) => isSessionReplyToolCall(tc.toolName, tc.args))) {
       replyPosted = true
@@ -1749,10 +1913,10 @@ export function extractAntigravityTrailFromTranscript(
         toolName
       const summary = (typeof rawSummary === 'string' && rawSummary.trim()) || action
 
-      const domainInfo = classifyDevspecDomainTool(toolName, args)
+      const domainInfo = classifyDevspecDomainTool(toolName, args, { titleById })
       if (domainInfo?.domain) {
         seq++
-        events.push({
+        const domainEvent = {
           seq,
           kind: 'domain',
           domain: domainInfo.domain,
@@ -1764,9 +1928,19 @@ export function extractAntigravityTrailFromTranscript(
           ...(summary ? { result: summary } : {}),
           ...(occurredAt ? { occurredAt } : {}),
           step_index: step.step_index ?? null,
-        })
-        const argBit = domainInfo.title ? ` — \`${domainInfo.title}\`` : ''
+        }
+        events.push(domainEvent)
+        const bulletIdx = bullets.length
+        const argBit = domainEvent.title ? ` — \`${domainEvent.title}\`` : ''
         bullets.push(`✓ \`${domainInfo.verb}\`${argBit} → ${action}`)
+        domainBulletMeta.set(domainEvent, { bulletIdx, verb: domainInfo.verb, action })
+        if (
+          domainInfo.verb === 'create_task' ||
+          domainInfo.verb === 'record_memory' ||
+          domainInfo.verb === 'create_resource'
+        ) {
+          pendingCreatedDomainEvent = domainEvent
+        }
         continue
       }
 
@@ -1789,6 +1963,53 @@ export function extractAntigravityTrailFromTranscript(
       const excerpt = oneLine.length > TRAIL_LINE_ARGS_CHARS ? `${oneLine.slice(0, TRAIL_LINE_ARGS_CHARS - 1)}…` : oneLine
       const shortArgs = excerpt ? ` — \`${excerpt}\`` : ''
       bullets.push(`✓ \`${canonicalName}\`${shortArgs} → ${action}`)
+    }
+  }
+
+  const taskIds = new Set()
+  let createdTaskEvents = []
+  for (const ev of events) {
+    if (ev.kind !== 'domain') continue
+    if (
+      (ev.domain === 'task' || ev.domain === 'implementation' || ev.domain === 'criterion') &&
+      ev.id &&
+      UUID_RE.test(ev.id)
+    ) {
+      taskIds.add(ev.id)
+    }
+    if (ev.name === 'create_task') {
+      createdTaskEvents.push(ev)
+    }
+    if (ev.id && ev.title && isHumanDomainTitle(ev.title)) {
+      titleById.set(ev.id, ev.title)
+    }
+  }
+  const singleTaskId = taskIds.size === 1 ? [...taskIds][0] : null
+  if (singleTaskId && createdTaskEvents.length === 1) {
+    const createdEv = createdTaskEvents[0]
+    if (!createdEv.id) createdEv.id = singleTaskId
+    if (createdEv.title && isHumanDomainTitle(createdEv.title) && !titleById.has(singleTaskId)) {
+      titleById.set(singleTaskId, createdEv.title)
+    }
+  }
+  for (const ev of events) {
+    if (ev.kind !== 'domain') continue
+    if (
+      !ev.id &&
+      singleTaskId &&
+      (ev.name === 'create_task' ||
+        ev.name === 'claim_work_item' ||
+        ev.name === 'record_implementation' ||
+        ev.name === 'record_criterion_verdicts')
+    ) {
+      ev.id = singleTaskId
+    }
+    if (!ev.title && ev.id && titleById.has(ev.id)) {
+      ev.title = titleById.get(ev.id)
+    }
+    const meta = domainBulletMeta.get(ev)
+    if (meta && ev.title) {
+      bullets[meta.bulletIdx] = `✓ \`${meta.verb}\` — \`${ev.title}\` → ${meta.action}`
     }
   }
 
@@ -1866,6 +2087,7 @@ export async function streamTurnTrailIfChanged(
   const trail = extractAntigravityTrailFromTranscript(rawTranscript, {
     sinceMs: marker.startedAt,
     stopAtReply: true,
+    transcriptPath: tPath,
   })
   if (trail.replyPosted) {
     return { streamed: false, reason: 'reply_posted_in_transcript' }
@@ -2586,7 +2808,11 @@ export async function handleMirrorTurn(
           try {
             trail = extractAntigravityTrailFromTranscript(
               fs.readFileSync(effectiveTranscriptPath, 'utf8'),
-              { sinceMs: marker?.startedAt ?? null, stopAtReply: false },
+              {
+                sinceMs: marker?.startedAt ?? null,
+                stopAtReply: false,
+                transcriptPath: effectiveTranscriptPath,
+              },
             )
           } catch {
             /* ignore */
