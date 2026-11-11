@@ -863,12 +863,42 @@ export async function processListenerInboxTick(
   const isTurnBusy = () =>
     isTurnMarkerActive(readTurnMarker(connectionId, connectionsDir), nowFn())
 
-  const deliverSingleRecord = async (rec, { queuedEntry }) => {
+  const deliverSingleRecord = async (rec, { queuedEntry, heldRecord = false }) => {
     const message = buildWakeDeliveryMessage(rec.entry, {
       connectionId,
       inboxFile: inboxPath,
     })
     if (!message) return { ok: true, skipped: true }
+
+    if (
+      heldRecord &&
+      rec?.entry?.type === CHECK_JOB_RECORD_TYPE &&
+      typeof rec.entry?.dispatch?.check_job_id === 'string' &&
+      rec.entry.dispatch.check_job_id &&
+      live?.token &&
+      live?.mcp_url
+    ) {
+      try {
+        const dispatchRes = await callMcp({
+          mcpUrl: live.mcp_url,
+          token: live.token,
+          ...(live.connection_capability
+            ? { connectionCapability: live.connection_capability }
+            : {}),
+          name: 'get_connection_dispatch',
+          arguments: {
+            connection_id: connectionId,
+            dispatch_id: rec.entry.dispatch.check_job_id,
+          },
+          timeoutMs: 5_000,
+        })
+        if (Array.isArray(dispatchRes?.dispatches) && dispatchRes.dispatches.length === 0) {
+          return { ok: true, skipped: true }
+        }
+      } catch {
+        /* non-fatal: deliver on transient network error */
+      }
+    }
 
     let deliveredVia = 'stdout'
     if (useAgentApi) {
@@ -952,7 +982,7 @@ export async function processListenerInboxTick(
   let deliveryFailed = false
   while (queueState.heldRecords.length > 0 && !isTurnBusy()) {
     const rec = queueState.heldRecords[0]
-    const outcome = await deliverSingleRecord(rec, { queuedEntry: true })
+    const outcome = await deliverSingleRecord(rec, { queuedEntry: true, heldRecord: true })
     if (!outcome.ok) {
       deliveryFailed = true
       break
