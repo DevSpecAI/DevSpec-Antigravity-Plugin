@@ -293,6 +293,76 @@ describe('active-turn FIFO queueing in devspec-remote-listen.mjs', () => {
       fx.cleanup()
     }
   })
+
+  it('skips a held check-job wake that was already settled on the server and advances to the next held wake without waking the agent', async () => {
+    const fx = makeFixture()
+    try {
+      recordTurnWake(CONN_ID, { type: 'canonical_commands', execute_message_ids: [CMD_MSG_ID] }, fx.connDir)
+      const settledCheckLine = `${JSON.stringify(makeCheckJobRecord(CHECK_JOB_ID))}\n`
+      const openCheckLine = `${JSON.stringify(makeCheckJobRecord(SECOND_CHECK_JOB_ID))}\n`
+      fs.writeFileSync(fx.inboxPath, settledCheckLine + openCheckLine)
+
+      const deliveredMessages = []
+      const mcpCalls = []
+      const queueState = createListenerQueueState(0)
+
+      const tick = () =>
+        processListenerInboxTick(queueState, {
+          connectionId: CONN_ID,
+          conversationId: CONV_ID,
+          inboxPath: fx.inboxPath,
+          live: fx.live,
+          useAgentApi: true,
+          once: false,
+          connectionsDir: fx.connDir,
+          deliver: async ({ message }) => {
+            deliveredMessages.push(message)
+            return { ok: true }
+          },
+          callMcp: async (req) => {
+            mcpCalls.push(req)
+            if (req.name === 'get_connection_dispatch') {
+              if (req.arguments?.dispatch_id === CHECK_JOB_ID) {
+                return { connection_id: CONN_ID, dispatches: [], count: 0 }
+              }
+              return {
+                connection_id: CONN_ID,
+                dispatches: [{ id: req.arguments?.dispatch_id, kind: 'check_job' }],
+                count: 1,
+              }
+            }
+            return { ok: true }
+          },
+          writeState: (_id, next) => {
+            fx.live.inbox_byte_offset = next.inbox_byte_offset
+            fx.live.inbox_held_records = next.inbox_held_records
+          },
+          writeStdout: () => {},
+          env: {},
+        })
+
+      // First tick while turn is active holds both check jobs.
+      const firstTick = await tick()
+      assert.equal(firstTick.heldCount, 2)
+      assert.equal(deliveredMessages.length, 0)
+
+      // Active turn ends: next tick checks CHECK_JOB_ID via get_connection_dispatch, sees dispatches: [],
+      // drops it without waking the agent, and immediately delivers SECOND_CHECK_JOB_ID!
+      clearTurnMarker(CONN_ID, fx.connDir)
+      const secondTick = await tick()
+      assert.equal(secondTick.heldCount, 0)
+      assert.equal(deliveredMessages.length, 1)
+      assert.doesNotMatch(deliveredMessages[0], new RegExp(CHECK_JOB_ID))
+      assert.match(deliveredMessages[0], new RegExp(SECOND_CHECK_JOB_ID))
+      assert.deepEqual(
+        mcpCalls.filter((c) => c.name === 'get_connection_dispatch').map((c) => c.arguments.dispatch_id),
+        [CHECK_JOB_ID, SECOND_CHECK_JOB_ID],
+      )
+      assert.deepEqual(fx.live.inbox_held_records, [])
+    } finally {
+      fx.cleanup()
+    }
+  })
 })
 
 describe('dedicated check-job follow-up turns in mirror-turn.mjs and devspec-tool-input.mjs', () => {
