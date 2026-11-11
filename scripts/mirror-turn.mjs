@@ -39,11 +39,12 @@ import {
   absentLaunches,
   appendRequestEvent,
   closeRequest,
+  extractBackgroundCommandTaskId,
   notifiedKeys,
   openRequest,
   promptArrival,
   readRequestState,
-   requestForLaunch,
+  requestForLaunch,
   requestsWithWorkPending,
   rotateRequestLog,
   setCurrentRequest,
@@ -455,8 +456,8 @@ export function reconcileCompletedOwnedWork(
     ownedLines.filter((e) => typeof e.ended === 'string').map((e) => e.id),
   )
   const newlyNotified = new Set()
-  let lastRunCommandInput = null
-  let lastSubagentInput = null
+  let seenPlannerResponse = false
+  let pendingPlannerTools = []
 
   for (const line of raw.split(/\r?\n/)) {
     const trimmed = line.trim()
@@ -471,35 +472,40 @@ export function reconcileCompletedOwnedWork(
       const stepMs = Date.parse(step.created_at)
       if (Number.isFinite(stepMs) && stepMs < marker.startedAt - 1000) continue
     }
-    if (step?.type === 'PLANNER_RESPONSE' && Array.isArray(step.tool_calls)) {
-      for (const tc of step.tool_calls) {
-        const name = String(tc?.name || '').replace(/^default_api:/, '')
-        const args = tc?.args && typeof tc.args === 'object' ? tc.args : {}
-        if (name === 'run_command') lastRunCommandInput = args
-        else if (name === 'invoke_subagent') lastSubagentInput = args
-      }
+    if (step?.type === 'PLANNER_RESPONSE') {
+      seenPlannerResponse = true
+      pendingPlannerTools = Array.isArray(step.tool_calls)
+        ? step.tool_calls.map((tc) => ({
+            name: String(tc?.name || '').replace(/^default_api:/, ''),
+            args: tc?.args && typeof tc.args === 'object' ? tc.args : {},
+          }))
+        : []
       continue
     }
     if (step?.type === 'GENERIC' && typeof step.content === 'string') {
-      const bgMatch =
-        step.content.match(/(?:background task ID|with task id)[:\s]+([A-Za-z0-9_.:/-]+)/i) ||
-        step.content.match(/TaskId[:\s"]+([A-Za-z0-9_.:/-]+)/i)
-      if (bgMatch) {
+      const currentTool = pendingPlannerTools.shift() || null
+      const canBeRunCommand = !seenPlannerResponse || currentTool?.name === 'run_command'
+      const canBeSubagent = !seenPlannerResponse || currentTool?.name === 'invoke_subagent'
+      const runCommandInput = currentTool?.name === 'run_command' ? currentTool.args : null
+      const subagentInput = currentTool?.name === 'invoke_subagent' ? currentTool.args : null
+
+      const bgId = canBeRunCommand ? extractBackgroundCommandTaskId(step.content) : null
+      if (bgId) {
         const cmdLine = String(
-          lastRunCommandInput?.CommandLine || lastRunCommandInput?.command || '',
+          runCommandInput?.CommandLine || runCommandInput?.command || '',
         )
         const isDaemon =
-          lastRunCommandInput?.IsDaemon === true || lastRunCommandInput?.IsDaemon === 'true'
+          runCommandInput?.IsDaemon === true || runCommandInput?.IsDaemon === 'true'
         const isPlumbing =
           isDaemon ||
           cmdLine.includes('devspec-remote-wait.mjs') ||
           cmdLine.includes('devspec-remote-listen.mjs') ||
           cmdLine.includes('devspec-remote-poll.mjs')
         if (!isPlumbing) {
-          const id = bgMatch[1]
+          const id = bgId
           const label =
-            unquoteTranscriptString(lastRunCommandInput?.toolSummary) ||
-            unquoteTranscriptString(lastRunCommandInput?.CommandLine) ||
+            unquoteTranscriptString(runCommandInput?.toolSummary) ||
+            unquoteTranscriptString(runCommandInput?.CommandLine) ||
             'background command'
           if (marker && !knownOwned.has(id)) {
             if (recordOwnedLaunch(connectionId, { id, kind: 'command', label }, { dir })) {
@@ -519,14 +525,16 @@ export function reconcileCompletedOwnedWork(
           }
         }
       }
-      const subMatch = step.content.match(
-        /Created the following subagent:[\s\S]*?"conversationId"\s*:\s*"([^"]+)"/,
-      )
+      const subMatch = canBeSubagent
+        ? step.content.match(
+            /Created the following subagent:[\s\S]*?"conversationId"\s*:\s*"([^"]+)"/,
+          )
+        : null
       if (subMatch) {
         const id = subMatch[1]
         const label =
-          unquoteTranscriptString(lastSubagentInput?.Role) ||
-          unquoteTranscriptString(lastSubagentInput?.TypeName) ||
+          unquoteTranscriptString(subagentInput?.Role) ||
+          unquoteTranscriptString(subagentInput?.TypeName) ||
           'subagent'
         if (marker && !knownOwned.has(id)) {
           if (recordOwnedLaunch(connectionId, { id, kind: 'subagent', label }, { dir })) {
@@ -620,12 +628,10 @@ export function launchedAntigravityBackgroundWork(toolName, toolInput, toolRespo
         : typeof resp.raw === 'string'
           ? resp.raw
           : ''
-    const bgMatch =
-      outText.match(/(?:background task ID|with task id)[:\s]+([A-Za-z0-9_.:/-]+)/i) ||
-      outText.match(/TaskId[:\s"]+([A-Za-z0-9_.:/-]+)/i)
-    if (bgMatch) {
+    const bgId = extractBackgroundCommandTaskId(outText)
+    if (bgId) {
       return {
-        id: bgMatch[1],
+        id: bgId,
         kind: 'command',
         label: input.toolSummary || input.CommandLine || 'background command',
       }
@@ -738,7 +744,7 @@ export function resolveAntigravityToolResponse(
             if (
               step?.type === 'GENERIC' &&
               typeof step.content === 'string' &&
-              (/(?:background task ID|with task id|TaskId)/i.test(step.content) ||
+              (Boolean(extractBackgroundCommandTaskId(step.content)) ||
                 step.content.includes('Created the following subagent:'))
             ) {
               return { output: step.content }

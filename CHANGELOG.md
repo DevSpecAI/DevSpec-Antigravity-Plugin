@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.24.1
+
+- **Tighten background-command hold detection and skip settled held check jobs.** Transcript reconciliation in `scripts/mirror-turn.mjs` now pairs each `GENERIC` tool-response step with the specific tool call from the immediately preceding `PLANNER_RESPONSE`, checking for a background command launch only on `run_command` steps that have not already completed synchronously and requiring a leading boundary before `TaskId` across `mirror-turn.mjs` and `requests.mjs` so camelCase JSON fields like `"parentTaskId"` in inspected files never hold a turn open. When draining held check-job wakes in `scripts/devspec-remote-listen.mjs`, the listener verifies via `get_connection_dispatch` that the check job is still open and silently drops already-settled check jobs.
+
 ## 0.24.0
 
 - **One browser sign-in for all of Antigravity, with no 24-hour multi-window sign-outs.** Antigravity's bundled DevSpec connection (`mcp_config.json`) now runs through the plugin's local stdio relay (`scripts/mcp-bridge.mjs`), sharing the single browser login in `~/.devspec/antigravity/auth.json` with remote control, commit tracking, and the hooks. Because the relay renews credentials under the plugin's cross-process file lock, having multiple Antigravity windows open no longer triggers a 24-hour `invalid_grant` sign-out from concurrent refresh token rotation, and onboarding now takes a single `/devspec-login` browser approval with no `/mcp` verification code to copy and paste.

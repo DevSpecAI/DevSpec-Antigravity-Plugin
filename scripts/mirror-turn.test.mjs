@@ -28,6 +28,7 @@ import {
   launchedAntigravityBackgroundWork,
   handleMirrorTurn,
   recordOwnedLaunch,
+  recordTurnWake,
   writeTurnMarker,
   readTurnMarker,
   extractAntigravityTrailFromTranscript,
@@ -1296,6 +1297,137 @@ describe('Antigravity native hook payload & transcript handling', () => {
     assert.ok(markdown.includes(`\`create_task\` — \`${taskTitle}\``))
     assert.ok(markdown.includes(`\`claim_work_item\` — \`${taskTitle}\``))
     assert.ok(markdown.includes(`\`record_implementation\` — \`${taskTitle}\``))
+  })
+
+  it('does not mistake read_file outputs containing "parentTaskId" after an earlier run_command step for a background command launch', async () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-parent-task-id-'))
+    try {
+      const rcDir = path.join(tmpHome, '.devspec', 'remote-control')
+      const connectionsDir = path.join(rcDir, 'connections')
+      const legacyPath = path.join(rcDir, 'state.json')
+      fs.mkdirSync(connectionsDir, { recursive: true })
+
+      const connId = '11111111-2222-4333-8444-555555555555'
+      const convId = 'b9b9b9b9-b9b9-4b9b-8b9b-b9b9b9b9b9b9'
+      const msgId = 'd9d9d9d9-d9d9-4d9d-8d9d-d9d9d9d9d9d9'
+      const transcriptPath = path.join(
+        tmpHome,
+        '.gemini',
+        'antigravity-cli',
+        'brain',
+        convId,
+        '.system_generated',
+        'logs',
+        'transcript.jsonl',
+      )
+      fs.mkdirSync(path.dirname(transcriptPath), { recursive: true })
+
+      fs.writeFileSync(
+        path.join(connectionsDir, `${connId}.json`),
+        JSON.stringify({
+          connection_id: connId,
+          session_id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+          project_id: '24c4abaa-2cb9-496a-8492-cf1f1aa1090b',
+          local_id: convId,
+          agent_name: 'Antigravity',
+          enabled: true,
+          token: 'dvs_tok',
+          mcp_url: 'https://fixture.invalid/api/mcp',
+          connection_capability: 'cap_1',
+          transcript_path: transcriptPath,
+        }),
+      )
+      fs.writeFileSync(
+        path.join(rcDir, 'local-bonds.json'),
+        JSON.stringify({ bonds: { [`Antigravity:${convId}`]: { connection_id: connId } } }),
+      )
+
+      const t0 = Date.now()
+      recordTurnWake(
+        connId,
+        { type: 'canonical_commands', execute_message_ids: [msgId] },
+        connectionsDir,
+      )
+
+      // 1. Earlier PLANNER_RESPONSE ran a normal synchronous run_command, followed by a
+      //    PLANNER_RESPONSE that called read_file on a subagent log containing `"parentTaskId": "task-662"`.
+      fs.writeFileSync(
+        transcriptPath,
+        [
+          JSON.stringify({
+            step_index: 1,
+            type: 'USER_INPUT',
+            created_at: new Date(t0).toISOString(),
+            content: '<USER_REQUEST>Inspect the transcript</USER_REQUEST>',
+          }),
+          JSON.stringify({
+            step_index: 2,
+            type: 'PLANNER_RESPONSE',
+            created_at: new Date(t0 + 1000).toISOString(),
+            tool_calls: [
+              {
+                name: 'default_api:run_command',
+                args: { CommandLine: 'git status --short', toolSummary: 'Git status check' },
+              },
+            ],
+          }),
+          JSON.stringify({
+            step_index: 3,
+            type: 'GENERIC',
+            created_at: new Date(t0 + 1500).toISOString(),
+            content:
+              'Created At: 2026-11-11T10:00:00Z\nCompleted At: 2026-11-11T10:00:01Z\nCommand exited with code 0.',
+          }),
+          JSON.stringify({
+            step_index: 4,
+            type: 'PLANNER_RESPONSE',
+            created_at: new Date(t0 + 2000).toISOString(),
+            tool_calls: [
+              {
+                name: 'default_api:read_file',
+                args: { Path: '/tmp/subagent-transcript.jsonl' },
+              },
+            ],
+          }),
+          JSON.stringify({
+            step_index: 5,
+            type: 'GENERIC',
+            created_at: new Date(t0 + 2500).toISOString(),
+            content:
+              'Showing lines 1-5 of 5\n1: {"step_index":1,"parentTaskId":"task-662","TaskId":"should-not-match-on-read-file"}',
+          }),
+        ].join('\n') + '\n',
+      )
+
+      assert.equal(
+        launchedAntigravityBackgroundWork(
+          'run_command',
+          { CommandLine: 'cat file' },
+          { output: '{"parentTaskId":"task-662"}' },
+        ),
+        null,
+      )
+
+      const calls = []
+      const stopRes = await handleMirrorTurn(
+        'stop',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        {
+          env: {},
+          connectionsDir,
+          legacyPath,
+          call: async (req) => {
+            calls.push(req)
+            return { ok: true }
+          },
+        },
+      )
+
+      assert.notEqual(stopRes.held, true, 'Stop must not hold the turn open on read_file output')
+      assert.equal(readTurnMarker(connId, connectionsDir), null, '.turn marker must be cleared on Stop')
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
+    }
   })
 })
 
