@@ -601,6 +601,15 @@ export function startsBackgroundWork(toolName, toolInput) {
   }
 }
 
+export function extractBackgroundCommandTaskId(text) {
+  if (typeof text !== 'string' || !text) return null
+  if (/^Completed At:\s/m.test(text)) return null
+  const match =
+    text.match(/(?:background task ID|with task id)[:\s]+([A-Za-z0-9_.:/-]+)/i) ||
+    text.match(/(?:^|[\r\n\s"{,])TaskId[:\s"]+([A-Za-z0-9_.:/-]+)/)
+  return match?.[1] ?? null
+}
+
 export function launchForRequest(toolName, toolInput, toolResponse, toolUseId = null) {
   const res =
     typeof toolResponse === 'string'
@@ -643,10 +652,8 @@ export function launchForRequest(toolName, toolInput, toolResponse, toolUseId = 
     case 'run_command': {
       if (isDevSpecListener(input)) return null
       const outText = typeof res.output === 'string' ? res.output : typeof res.raw === 'string' ? res.raw : ''
-      const textMatch =
-        outText.match(/(?:background task ID|with task id)[:\s]+([A-Za-z0-9_.:/-]+)/i) ||
-        outText.match(/TaskId[:\s"]+([A-Za-z0-9_.:/-]+)/i)
-      const key = id(res.taskId ?? res.task_id ?? res.backgroundTaskId ?? textMatch?.[1])
+      const extractedId = extractBackgroundCommandTaskId(outText)
+      const key = id(res.taskId ?? res.task_id ?? res.backgroundTaskId ?? extractedId)
       return key ? { key, alias, kind: 'shell', notifies: true } : null
     }
     case 'schedule': {
