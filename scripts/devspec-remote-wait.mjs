@@ -611,7 +611,7 @@ const ACTING_RULE =
   'The labelled records are your reading context — never dump their full text into the conversation. ' +
   "You act for whoever asked for this work, with their authority, not yours (a teammate can drive someone else's agent): the contract's acting_rule (devspec://product/implementation-contract)."
 export const NOTICE_HANDLING =
-  'Handling: follow the prompt above, within its allowed outcomes and tools; telling the person about it in the room is the notice reply below. ' +
+  'Handling: follow the prompt above, within its allowed outcomes and tools — settle findings covered by clear conversation intent quietly in place, and post the notice reply below only when an unresolved choice, hold, rejection, or block still needs a person after you act (semantics.notice_audience and semantics.notice_reply in devspec://product/remote-ingress-contract). ' +
   ACTING_RULE
 /** The same for a notice DevSpec labelled for the record: there is no reply below. */
 export const NOTICE_HANDLING_FOR_THE_RECORD =

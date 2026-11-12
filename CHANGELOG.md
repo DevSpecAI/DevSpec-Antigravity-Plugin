@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.24.3
+
+- **Post-action room silence on settled notices.** `rules/AGENTS.md`, `skills/devspec-remote/SKILL.md`, `NOTICE_HANDLING`, and `noticeReplyInstruction` now align with `semantics.notice_audience` and `semantics.notice_reply` in [`devspec://product/remote-ingress-contract`](devspec://product/remote-ingress-contract): findings covered by explicit conversation intent are settled quietly in place without posting a chat acknowledgment, and a room notice reply (`post_session_message` with `system_notice_ids`) is posted only when an unresolved choice, hold, rejection, or block still needs a person after acting (or when a write carries `tell_person`).
+
 ## 0.24.2
 
 - **Keep held background and one-shot timer waits Working without a clock cutoff or mid-wait check resets.** Turns parked waiting on owned background commands, subagents, or one-shot `schedule` wait timers (`DurationSeconds` without `CronExpression` or `IsDaemon`) now remain active past ten minutes with no clock cutoff until all owned background work finishes or is cancelled (`manage_task` `kill`), while unheld foreground turns keep a 60-minute dead-air fallback (`NO_SIGN_OF_LIFE_MS`). Queued check jobs and system notices deliver cleanly while a parent turn is held for background work without resetting the parent turn start time, orphaning owned work, closing the open command attempt, or sealing the open session reply bubble; when the mid-wait check finishes, the turn returns to its held Working state with check-wake flags cleared so the subsequent background or timer wakeup resumes live progress reporting and preserves open request tracking until completion.

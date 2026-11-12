@@ -40,6 +40,8 @@ describe('Item 5 parity: rules/AGENTS.md, package version 0.15.0, and documentat
     // never is: both point at the served contract rather than restate it (a868f41f).
     for (const text of [content, fs.readFileSync(path.join(ROOT, 'skills', 'devspec-remote', 'SKILL.md'), 'utf8')]) {
       assert.match(text, /semantics\.notice_audience/)
+      assert.match(text, /semantics\.notice_reply/)
+      assert.match(text, /unresolved choice, hold, rejection, or block/)
       assert.match(text, /check_job\.room/)
       assert.match(text, /tell_person/)
       // Whose duplicate it is, and who is told, are core.resolve-duplicates-on-the-spot's:

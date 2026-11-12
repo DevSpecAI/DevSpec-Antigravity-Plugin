@@ -68,7 +68,7 @@ export function noticeReplyInstruction(ids) {
   const list = (Array.isArray(ids) ? ids : [ids]).filter((id) => typeof id === 'string' && id)
   const subject = list.length === 1 ? 'this notice' : `these ${list.length} notices`
   return (
-    `Telling the person about ${subject} in the room is a notice reply: ` +
+    `When an unresolved choice, hold, rejection, or block still needs the person on ${subject} in the room after you act, post a notice reply: ` +
     `post_session_message({ message, system_notice_ids: ${JSON.stringify(list)} }). ` +
     'It is your own message, labelled as a reply to the notice and never as an answer to a command: ' +
     'complete_turn has no effect on it, and a command you are working on still ends with its own answer. ' +
