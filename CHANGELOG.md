@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.24.3
+
+- **Passive `project_incidents` turn context and incident MCP tool support (`core.respect-incidents-and-escalate-delivery-blockers`).** `scripts/remote-ingress-v1.mjs`, `scripts/devspec-remote-poll.mjs`, and `scripts/devspec-remote-wait.mjs` validate and materialize `project_incidents` from changed `poll_connection` responses into `.room.json` and carry passive `project_incidents` awareness on command and automation wakes without waking idle connections. `scripts/request-ref.mjs` stamps `request_ref` and `provenance_ref` onto `report_incident` and `manage_incident`, and `rules/AGENTS.md` plus `skills/devspec-remote/SKILL.md` point to [`devspec://product/implementation-contract`](devspec://product/implementation-contract) (`core.respect-incidents-and-escalate-delivery-blockers`) and [`devspec://product/remote-ingress-contract`](devspec://product/remote-ingress-contract) (`semantics.project_incidents`).
+
 ## 0.24.2
 
 - **Keep held background and one-shot timer waits Working without a clock cutoff or mid-wait check resets.** Turns parked waiting on owned background commands, subagents, or one-shot `schedule` wait timers (`DurationSeconds` without `CronExpression` or `IsDaemon`) now remain active past ten minutes with no clock cutoff until all owned background work finishes or is cancelled (`manage_task` `kill`), while unheld foreground turns keep a 60-minute dead-air fallback (`NO_SIGN_OF_LIFE_MS`). Queued check jobs and system notices deliver cleanly while a parent turn is held for background work without resetting the parent turn start time, orphaning owned work, closing the open command attempt, or sealing the open session reply bubble; when the mid-wait check finishes, the turn returns to its held Working state with check-wake flags cleared so the subsequent background or timer wakeup resumes live progress reporting and preserves open request tracking until completion.

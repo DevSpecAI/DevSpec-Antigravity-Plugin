@@ -59,6 +59,7 @@ import {
   resolveOwnerPid as resolveOwnerPidFromState,
 } from './remote-control-state.mjs'
 import {
+  isProjectIncidentsProjectionV1,
   isRemoteCommandProjectScope,
   normalizeRemoteIngressV1,
   REMOTE_INGRESS_RESOURCE_URI,
@@ -456,6 +457,7 @@ const ROOM_STATE_SECTIONS = new Set([
   'session_polls',
   'still_to_discuss',
   'active_session_plans',
+  'project_incidents',
   'session_activity',
 ])
 
@@ -527,8 +529,10 @@ export function parseInboxBatches(lines, connectionId) {
           : parsed.envelope.command_message_ids
         const commandIds = new Set(parsed.envelope.commands.map((command) => command.message_id))
         if (ids.length === 0 || new Set(ids).size !== ids.length || ids.some((id) => !commandIds.has(id))) continue
+        const { project_incidents: rawIncidents, ...commandRecordRest } = record
         batches.push({
-          ...record,
+          ...commandRecordRest,
+          ...(isProjectIncidentsProjectionV1(rawIncidents) ? { project_incidents: rawIncidents } : {}),
           execute_message_ids: ids,
           wake_context: validWakeContext(record.wake_context),
           question_handoff: validQuestionHandoff(record.question_handoff, new Set(ids)),
@@ -575,7 +579,12 @@ export function parseInboxBatches(lines, connectionId) {
         if (!targetConnId || !validateInteractionAnswerRecord(record, targetConnId)) continue
         batches.push(record)
       } else if (connectionId && validateAutomationInboxRecord(record, connectionId)) {
-        batches.push(record)
+        if (Object.hasOwn(record, 'project_incidents') && !isProjectIncidentsProjectionV1(record.project_incidents)) {
+          const { project_incidents: _droppedIncidents, ...automationRest } = record
+          batches.push(automationRest)
+        } else {
+          batches.push(record)
+        }
       } else if (connectionId && validateCheckJobInboxRecord(record, connectionId)) {
         batches.push(record)
       } else if (
@@ -828,6 +837,15 @@ export function buildCanonicalCommandEvents(
   if (commands.length > 0 && unread && (Number(unread.unread) || 0) + (Number(unread.updated) || 0) > 0) {
     events.push({ type: 'room_unread', session_id: sessionId, advisory: true, executable: false, ...unread })
   }
+  if (commands.length > 0 && isProjectIncidentsProjectionV1(batch?.project_incidents)) {
+    events.push({
+      type: 'project_incidents',
+      session_id: sessionId,
+      advisory: true,
+      executable: false,
+      ...batch.project_incidents,
+    })
+  }
 
   events.push({
     type: 'wake',
@@ -885,16 +903,28 @@ function automationRunCommandText(d) {
 }
 
 export function buildAutomationRunEvents(batch, { inboxFile } = {}) {
+  const sessionId = batch.session_id ?? null
   return [
     {
       type: 'automation_run',
-      session_id: batch.session_id ?? null,
+      session_id: sessionId,
       authoritative: true,
       executable: true,
       channel: 'explicit_automation_dispatch',
       dispatch: batch.dispatch,
       content: automationRunCommandText(batch.dispatch),
     },
+    ...(isProjectIncidentsProjectionV1(batch?.project_incidents)
+      ? [
+          {
+            type: 'project_incidents',
+            session_id: sessionId,
+            advisory: true,
+            executable: false,
+            ...batch.project_incidents,
+          },
+        ]
+      : []),
     {
       type: 'wake',
       reason: 'automation_run',

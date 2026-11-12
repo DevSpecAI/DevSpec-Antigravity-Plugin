@@ -683,6 +683,125 @@ export function isStillToDiscussProjectionV1(value) {
   )
 }
 
+const PROJECT_INCIDENTS_PROJECTION_VERSION = 1
+const PROJECT_INCIDENTS_MAX_ACTIVE = 25
+const PROJECT_INCIDENTS_MAX_RECENT_RESOLVED = 10
+const INCIDENT_SHORT_CODE = /^[0-9a-f]{8}$/i
+const INCIDENT_KINDS = new Set([
+  'deploy_failed',
+  'checks_failing',
+  'security_advisory',
+  'unlinked_work',
+  'undo_requested',
+  'followup_failed',
+  'reported',
+])
+const ACTIVE_INCIDENT_STATES = new Set(['open', 'handled', 'awaiting_followup', 'needs_decision'])
+const INCIDENT_HANDLER_KINDS = new Set(['person', 'agent_connection', 'automation_run'])
+
+function incidentHandler(value) {
+  return (
+    exactKeys(value, ['kind', 'label', 'user_id', 'connection_id', 'run_id', 'expires_at']) &&
+    INCIDENT_HANDLER_KINDS.has(value.kind) &&
+    nullable(value.label, (s) => nonempty(s) && s.length <= 240) &&
+    nullable(value.user_id, uuid) &&
+    nullable(value.connection_id, uuid) &&
+    nullable(value.run_id, uuid) &&
+    nullable(value.expires_at, datetime)
+  )
+}
+
+function activeIncidentSummary(value) {
+  return (
+    exactKeys(value, [
+      'id',
+      'short_code',
+      'kind',
+      'kind_label',
+      'title',
+      'summary',
+      'state',
+      'since',
+      'last_seen_at',
+      'status_line',
+      'handler',
+      'decision_prompt',
+      'blocked_pull_request_count',
+      'blocked_task_count',
+    ]) &&
+    uuid(value.id) &&
+    typeof value.short_code === 'string' && INCIDENT_SHORT_CODE.test(value.short_code) &&
+    INCIDENT_KINDS.has(value.kind) &&
+    nonempty(value.kind_label) && value.kind_label.length <= 120 &&
+    nonempty(value.title) && value.title.length <= 500 &&
+    nullable(value.summary, (s) => nonempty(s) && s.length <= 500) &&
+    ACTIVE_INCIDENT_STATES.has(value.state) &&
+    datetime(value.since) &&
+    datetime(value.last_seen_at) &&
+    nonempty(value.status_line) && value.status_line.length <= 500 &&
+    nullable(value.handler, incidentHandler) &&
+    nullable(value.decision_prompt, (s) => nonempty(s) && s.length <= 500) &&
+    nonnegativeInt(value.blocked_pull_request_count) &&
+    nonnegativeInt(value.blocked_task_count)
+  )
+}
+
+function resolvedIncidentSummary(value) {
+  return (
+    exactKeys(value, [
+      'id',
+      'short_code',
+      'kind',
+      'kind_label',
+      'title',
+      'state',
+      'resolved_at',
+      'resolution_kind',
+      'resolution_summary',
+    ]) &&
+    uuid(value.id) &&
+    typeof value.short_code === 'string' && INCIDENT_SHORT_CODE.test(value.short_code) &&
+    INCIDENT_KINDS.has(value.kind) &&
+    nonempty(value.kind_label) && value.kind_label.length <= 120 &&
+    nonempty(value.title) && value.title.length <= 500 &&
+    (value.state === 'cleared' || value.state === 'closed') &&
+    datetime(value.resolved_at) &&
+    nullable(value.resolution_kind, (s) => nonempty(s) && s.length <= 120) &&
+    nullable(value.resolution_summary, (s) => nonempty(s) && s.length <= 500)
+  )
+}
+
+/** Passive project incidents projection carried beside changed poll responses (7115301e). */
+export function isProjectIncidentsProjectionV1(value) {
+  return (
+    exactKeys(value, [
+      'version',
+      'authority',
+      'recent_resolved_window_minutes',
+      'active',
+      'recently_resolved',
+      'truncated',
+      'note',
+    ]) &&
+    value.version === PROJECT_INCIDENTS_PROJECTION_VERSION &&
+    value.authority === 'advisory_read_awareness' &&
+    positiveInt(value.recent_resolved_window_minutes) &&
+    Array.isArray(value.active) &&
+    value.active.length <= PROJECT_INCIDENTS_MAX_ACTIVE &&
+    value.active.every(activeIncidentSummary) &&
+    new Set(value.active.map((row) => row.id)).size === value.active.length &&
+    Array.isArray(value.recently_resolved) &&
+    value.recently_resolved.length <= PROJECT_INCIDENTS_MAX_RECENT_RESOLVED &&
+    value.recently_resolved.every(resolvedIncidentSummary) &&
+    new Set(value.recently_resolved.map((row) => row.id)).size === value.recently_resolved.length &&
+    value.active.length + value.recently_resolved.length >= 1 &&
+    exactKeys(value.truncated, ['active_omitted', 'resolved_omitted']) &&
+    nonnegativeInt(value.truncated.active_omitted) &&
+    nonnegativeInt(value.truncated.resolved_omitted) &&
+    nonempty(value.note) && value.note.length <= 500
+  )
+}
+
 const FULL_LOWERCASE_SHA = /^[0-9a-f]{40}$/
 const UNLINKED_COMMIT_NOTICE_OUTCOMES = [
   'correct_item',
