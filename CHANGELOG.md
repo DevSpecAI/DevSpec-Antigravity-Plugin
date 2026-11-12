@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.24.4
+
+- **Passive `project_incidents` turn context and incident MCP tool support (`core.respect-incidents-and-escalate-delivery-blockers`).** `scripts/remote-ingress-v1.mjs`, `scripts/devspec-remote-poll.mjs`, and `scripts/devspec-remote-wait.mjs` validate and materialize `project_incidents` from changed `poll_connection` responses into `.room.json` and carry passive `project_incidents` awareness on command and automation wakes without waking idle connections. `scripts/request-ref.mjs` stamps `request_ref` and `provenance_ref` onto `report_incident` and `manage_incident`, and `rules/AGENTS.md` plus `skills/devspec-remote/SKILL.md` point to [`devspec://product/implementation-contract`](devspec://product/implementation-contract) (`core.respect-incidents-and-escalate-delivery-blockers`) and [`devspec://product/remote-ingress-contract`](devspec://product/remote-ingress-contract) (`semantics.project_incidents`).
+- **Align commit-provenance and protected-intent guidance with `unlinked_work` incidents (`devspec://product/implementation-contract`).** Removed the retired `take_ownership` and `move_commit` actions from `rules/AGENTS.md` and updated notice guidance in `rules/AGENTS.md` and `skills/devspec-remote/SKILL.md` for routine unlinked-commit heads-ups without automatic task creation.
+
 ## 0.24.3
 
 - **Post-action room silence on settled notices.** `rules/AGENTS.md`, `skills/devspec-remote/SKILL.md`, `NOTICE_HANDLING`, and `noticeReplyInstruction` now align with `semantics.notice_audience` and `semantics.notice_reply` in [`devspec://product/remote-ingress-contract`](devspec://product/remote-ingress-contract): findings covered by explicit conversation intent are settled quietly in place without posting a chat acknowledgment, and a room notice reply (`post_session_message` with `system_notice_ids`) is posted only when an unresolved choice, hold, rejection, or block still needs a person after acting (or when a write carries `tell_person`).

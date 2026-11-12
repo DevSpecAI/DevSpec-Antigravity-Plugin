@@ -84,6 +84,7 @@ import {
 } from './question-dismissal-events.mjs'
 import {
   isActiveSessionPlansProjectionV1,
+  isProjectIncidentsProjectionV1,
   isRemoteCommandProjectScope,
   isSessionActivityV1,
   isSessionEventsV1,
@@ -658,6 +659,7 @@ export function appendCanonicalInbox(
     instructionContextFile = null,
     channel = 'context',
     questionHandoff = null,
+    projectIncidents = null,
     writeRecord = appendDurableRecord,
   } = {},
 ) {
@@ -718,6 +720,9 @@ export function appendCanonicalInbox(
     executeMessageIds.includes(questionHandoff.source_message_id)
       ? { question_handoff: questionHandoff }
       : {}),
+    ...(channel === 'command' && isProjectIncidentsProjectionV1(projectIncidents)
+      ? { project_incidents: projectIncidents }
+      : {}),
   }
   if (!writeRecord(connectionId, record)) return { ok: false, appended: false }
   index.envelopeIds.add(ingress.envelope_id)
@@ -747,6 +752,7 @@ export function appendWakeDispatches(
   index,
   sessionId,
   writeRecord = appendDurableRecord,
+  { projectIncidents = null } = {},
 ) {
   const validated = []
   for (const offered of Array.isArray(dispatches) ? dispatches : []) {
@@ -754,6 +760,7 @@ export function appendWakeDispatches(
     if (!parsed.ok) return { ok: false, appended: 0, error: parsed.error }
     validated.push(parsed.dispatch)
   }
+  const validIncidents = isProjectIncidentsProjectionV1(projectIncidents) ? projectIncidents : null
   let appended = 0
   const appendedByType = { automation_run: 0, [CHECK_JOB_RECORD_TYPE]: 0 }
   for (const dispatch of validated) {
@@ -766,6 +773,7 @@ export function appendWakeDispatches(
       received_at: new Date().toISOString(),
       dispatch_cursor: dispatchCursor,
       dispatch,
+      ...(type === 'automation_run' && validIncidents ? { project_incidents: validIncidents } : {}),
     }
     if (!writeRecord(connectionId, record)) {
       return { ok: false, appended, appendedByType, error: 'dispatch inbox persistence failed' }
@@ -873,6 +881,9 @@ export function roomChangesSince(res, activity, seen = {}) {
       ? JSON.stringify(res.still_to_discuss)
       : null,
     active_session_plans: isActiveSessionPlansProjectionV1(plans) ? JSON.stringify(plans) : null,
+    project_incidents: isProjectIncidentsProjectionV1(res?.project_incidents)
+      ? JSON.stringify(res.project_incidents)
+      : null,
     session_activity: activity
       ? JSON.stringify({ items: activity.items, events: activity.events.length })
       : null,
@@ -920,6 +931,19 @@ export function formatRoomStateJson(doc) {
           },
         }
       : {}),
+    ...(doc.project_incidents && typeof doc.project_incidents === 'object'
+      ? {
+          project_incidents: {
+            ...doc.project_incidents,
+            ...(Array.isArray(doc.project_incidents.active)
+              ? { active: markArray(doc.project_incidents.active) }
+              : {}),
+            ...(Array.isArray(doc.project_incidents.recently_resolved)
+              ? { recently_resolved: markArray(doc.project_incidents.recently_resolved) }
+              : {}),
+          },
+        }
+      : {}),
     ...(doc.session_activity && typeof doc.session_activity === 'object'
       ? {
           session_activity: {
@@ -961,6 +985,9 @@ export function writeRoomState(
   const plans = isActiveSessionPlansProjectionV1(ingress?.active_session_plans)
     ? ingress.active_session_plans
     : null
+  const incidents = isProjectIncidentsProjectionV1(res?.project_incidents)
+    ? res.project_incidents
+    : null
   const notices = Array.isArray(ingress?.system_notices) ? ingress.system_notices : null
   const body = {
     advisory: true,
@@ -973,6 +1000,7 @@ export function writeRoomState(
     session_polls: polls,
     still_to_discuss: discuss,
     active_session_plans: plans,
+    project_incidents: incidents,
     system_notices: notices ?? [],
     session_activity: activity,
     transcript,
@@ -980,6 +1008,7 @@ export function writeRoomState(
       session_polls: polls ? 'present' : 'none_or_unavailable',
       still_to_discuss: discuss ? 'present' : 'none_or_unavailable',
       active_session_plans: plans ? 'present' : ingress ? 'none' : 'not_sent',
+      project_incidents: incidents ? 'present' : 'none_or_unavailable',
       system_notices: notices === null ? 'not_sent' : notices.length > 0 ? 'present' : 'none',
       session_activity: activity ? (activity.list_readable ? 'present' : 'unavailable') : 'not_sent',
       transcript: transcript ? transcript.status : 'not_sent',
@@ -2165,6 +2194,9 @@ async function main() {
             source_message_id: sentCommandHandoff.ready.source_message_id,
           }
         : null,
+      projectIncidents: isProjectIncidentsProjectionV1(res?.project_incidents)
+        ? res.project_incidents
+        : null,
     })
     if (!persisted.ok) return { ok: false, delivered: false }
 
@@ -2255,6 +2287,12 @@ async function main() {
       nextDispatchCursor,
       persistedInbox,
       sessionId,
+      appendDurableRecord,
+      {
+        projectIncidents: isProjectIncidentsProjectionV1(res?.project_incidents)
+          ? res.project_incidents
+          : null,
+      },
     )
     if (!persisted.ok) {
       process.stderr.write(`devspec-remote-poll: rejected dispatch batch (${persisted.error})\n`)
