@@ -117,7 +117,8 @@ export function turnMarkerPath(connectionId, dir = CONNECTIONS_DIR) {
   return path.join(dir, `${connectionId}.turn`)
 }
 
-const DEFAULT_MAX_TURN_MS = 10 * 60 * 1000
+export const NO_SIGN_OF_LIFE_MS = 60 * 60 * 1000
+const DEFAULT_MAX_TURN_MS = NO_SIGN_OF_LIFE_MS
 
 export function readTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
   if (!connectionId) return null
@@ -131,11 +132,17 @@ export function readTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
 
 export function isTurnMarkerActive(marker, now = Date.now(), maxTurnMs = DEFAULT_MAX_TURN_MS) {
   if (!marker || typeof marker.startedAt !== 'number') return false
+  if (marker.held === true) return true
   const lastActiveAt = Math.max(
     marker.startedAt,
     typeof marker.lastToolAt === 'number' ? marker.lastToolAt : 0,
   )
   return now - lastActiveAt < maxTurnMs
+}
+
+export function isForegroundTurnRunning(marker, now = Date.now(), maxTurnMs = DEFAULT_MAX_TURN_MS) {
+  if (!marker || marker.held === true) return false
+  return isTurnMarkerActive(marker, now, maxTurnMs)
 }
 
 export function trailStatePath(connectionId, dir = CONNECTIONS_DIR) {
@@ -167,12 +174,24 @@ export function writeTurnMarker(connectionId, extra = {}, dir = CONNECTIONS_DIR)
   return payload
 }
 
+function snapshotHeldParent(marker) {
+  if (!marker) return null
+  if (marker.heldParent && typeof marker.heldParent === 'object') return marker.heldParent
+  return {
+    remoteTurn: Boolean(marker.remoteTurn),
+    localPromptMirrored: Boolean(marker.localPromptMirrored),
+    localTurn: marker.localTurn || null,
+    otherWake: Boolean(marker.otherWake),
+    backgroundContinuation: Boolean(marker.backgroundContinuation),
+  }
+}
+
 /**
  * Mark the turn remote and record what one delivered inbox entry brought into it
  * (notice-reply.mjs): its notice ids, or that something other than a notice woke it.
  * The listener and the wait script call this for each entry they deliver.
  */
-export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR) {
+export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR, now = Date.now()) {
   if (!connectionId) return null
   const wake = turnWakeFromEntry(entry)
   let existing = readTurnMarker(connectionId, dir)
@@ -182,7 +201,7 @@ export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR) {
   // stay stale and every queued check job and notice behind this one would be released
   // at once instead of one per turn (item b68df72d). Only the marker goes; writing the
   // fresh one below clears the old turn's reply and trail state as any new turn does.
-  if (existing && !isTurnMarkerActive(existing)) {
+  if (existing && !isTurnMarkerActive(existing, now)) {
     try {
       fs.rmSync(turnMarkerPath(connectionId, dir), { force: true })
     } catch {
@@ -193,6 +212,53 @@ export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR) {
   // A notice or check job is not a command: one that arrives during a turn typed at
   // the terminal leaves it a local turn, so that turn's answer keeps its local-turn flags.
   const nonCommandWake = Boolean(wake?.noticeIds || wake?.recordNoticeIds || wake?.checkJobWake)
+  if (existing?.held === true) {
+    if (nonCommandWake) {
+      return writeTurnMarker(
+        connectionId,
+        {
+          held: false,
+          heldParent: snapshotHeldParent(existing),
+          remoteTurn: true,
+          localPromptMirrored: false,
+          localTurn: null,
+          otherWake: false,
+          backgroundContinuation: false,
+          noticeIds: wake?.noticeIds ?? [],
+          recordNoticeIds: wake?.recordNoticeIds ?? [],
+          checkJobWake: Boolean(wake?.checkJobWake),
+          tellPerson: false,
+          noticeReplyAt: null,
+          preserveExplicitReply: true,
+        },
+        dir,
+      )
+    }
+    return writeTurnMarker(
+      connectionId,
+      {
+        held: false,
+        heldParent: null,
+        remoteTurn: true,
+        ...mergeTurnWake(existing, wake),
+        preserveExplicitReply: true,
+      },
+      dir,
+    )
+  }
+  if (existing?.heldParent && !existing?.otherWake && nonCommandWake) {
+    return writeTurnMarker(
+      connectionId,
+      {
+        held: false,
+        heldParent: existing.heldParent,
+        remoteTurn: true,
+        ...mergeTurnWake(existing, wake),
+        preserveExplicitReply: true,
+      },
+      dir,
+    )
+  }
   const remote = existing && nonCommandWake ? {} : { remoteTurn: true }
   return writeTurnMarker(connectionId, { ...remote, ...mergeTurnWake(existing, wake) }, dir)
 }
@@ -375,7 +441,7 @@ export function readOwnedIds(
   connectionId,
   marker,
   dir = CONNECTIONS_DIR,
-  { now = Date.now(), maxAgeMs = 60 * 60 * 1000 } = {},
+  { now = Date.now(), maxAgeMs = null } = {},
 ) {
   const lines = readOwnedLines(connectionId, marker, dir)
   const ended = new Set(
@@ -484,10 +550,41 @@ export function reconcileCompletedOwnedWork(
     }
     if (step?.type === 'GENERIC' && typeof step.content === 'string') {
       const currentTool = pendingPlannerTools.shift() || null
-      const canBeRunCommand = !seenPlannerResponse || currentTool?.name === 'run_command'
+      const canBeRunCommand =
+        (!seenPlannerResponse &&
+          !step.content.includes('Task Description: Timer:') &&
+          !step.content.includes('Task Description: Cron:')) ||
+        currentTool?.name === 'run_command'
+      const canBeSchedule =
+        (!seenPlannerResponse && step.content.includes('Task Description: Timer:')) ||
+        currentTool?.name === 'schedule'
       const canBeSubagent = !seenPlannerResponse || currentTool?.name === 'invoke_subagent'
       const runCommandInput = currentTool?.name === 'run_command' ? currentTool.args : null
+      const scheduleInput = currentTool?.name === 'schedule' ? currentTool.args : null
       const subagentInput = currentTool?.name === 'invoke_subagent' ? currentTool.args : null
+
+      if (currentTool?.name === 'manage_task') {
+        const action = String(currentTool.args?.Action ?? currentTool.args?.action ?? '').toLowerCase()
+        const rawKilledId = String(currentTool.args?.TaskId ?? currentTool.args?.taskId ?? '').trim()
+        if (action === 'kill' && rawKilledId && !/^Error:/m.test(step.content)) {
+          for (const id of ownedIds) {
+            if (!endedOwned.has(id) && (id === rawKilledId || id.endsWith(`/${rawKilledId}`))) {
+              recordOwnedEnd(connectionId, id, { status: 'killed', dir })
+              endedOwned.add(id)
+            }
+          }
+          for (const key of unnotifiedKeys) {
+            if (
+              !newlyNotified.has(key) &&
+              (key === rawKilledId || key.endsWith(`/${rawKilledId}`))
+            ) {
+              appendRequestEvent(connectionId, { op: 'notified', key }, { dir })
+              newlyNotified.add(key)
+            }
+          }
+        }
+        continue
+      }
 
       const bgId = canBeRunCommand ? extractBackgroundCommandTaskId(step.content) : null
       if (bgId) {
@@ -523,6 +620,30 @@ export function reconcileCompletedOwnedWork(
             reqState = readRequestState(connectionId, { dir })
             if (!unnotifiedKeys.includes(id)) unnotifiedKeys.push(id)
           }
+        }
+      }
+      const timerId =
+        canBeSchedule && (!scheduleInput || isOneShotScheduleTimer(scheduleInput))
+          ? extractBackgroundCommandTaskId(step.content)
+          : null
+      if (timerId) {
+        const label =
+          unquoteTranscriptString(scheduleInput?.Prompt ?? scheduleInput?.prompt) || 'timer'
+        if (marker && !knownOwned.has(timerId)) {
+          if (recordOwnedLaunch(connectionId, { id: timerId, kind: 'timer', label }, { dir })) {
+            knownOwned.add(timerId)
+            if (!ownedIds.includes(timerId)) ownedIds.push(timerId)
+          }
+        }
+        if (!reqState.launches.has(timerId)) {
+          const { request, also } = requestForLaunch(reqState)
+          appendRequestEvent(
+            connectionId,
+            { op: 'launch', key: timerId, kind: 'timer', notifies: true, request, also },
+            { dir },
+          )
+          reqState = readRequestState(connectionId, { dir })
+          if (!unnotifiedKeys.includes(timerId)) unnotifiedKeys.push(timerId)
         }
       }
       const subMatch = canBeSubagent
@@ -573,6 +694,16 @@ export function reconcileCompletedOwnedWork(
       }
     }
   }
+}
+
+export function isOneShotScheduleTimer(input) {
+  if (!input || typeof input !== 'object') return false
+  if (input.CronExpression || input.cron_expression) return false
+  if (input.IsDaemon === true || input.IsDaemon === 'true') return false
+  const dur = input.DurationSeconds ?? input.duration_seconds
+  if (dur === undefined || dur === null || dur === '') return false
+  const n = Number(dur)
+  return Number.isFinite(n) && n > 0
 }
 
 /**
@@ -634,6 +765,27 @@ export function launchedAntigravityBackgroundWork(toolName, toolInput, toolRespo
         id: bgId,
         kind: 'command',
         label: input.toolSummary || input.CommandLine || 'background command',
+      }
+    }
+    return null
+  }
+
+  // Antigravity: one-shot schedule wait timer (`DurationSeconds` without `CronExpression` / `IsDaemon`).
+  if (name === 'schedule' || name === 'default_api:schedule') {
+    if (!isOneShotScheduleTimer(input)) return null
+    const outText =
+      typeof resp.output === 'string'
+        ? resp.output
+        : typeof resp.raw === 'string'
+          ? resp.raw
+          : ''
+    const bgId =
+      extractBackgroundCommandTaskId(outText) || resp.taskId || resp.task_id || resp.id || null
+    if (bgId) {
+      return {
+        id: String(bgId),
+        kind: 'timer',
+        label: input.Prompt || input.prompt || 'timer',
       }
     }
     return null
@@ -1325,6 +1477,14 @@ export function inferTurnContextFromTranscript(transcriptPath) {
         continue
       }
       const wake = turnWakeFromText(step.content)
+      if (
+        sawBgNotification &&
+        wake &&
+        !wake.otherWake &&
+        (wake.checkJobWake || wake.noticeIds?.length || wake.recordNoticeIds?.length)
+      ) {
+        continue
+      }
       return {
         remoteTurn: true,
         localPromptMirrored: false,
@@ -1335,6 +1495,14 @@ export function inferTurnContextFromTranscript(transcriptPath) {
     if (step.type === 'USER_INPUT') {
       if (step.content.includes('[DevSpec Remote Wake]')) {
         const wake = turnWakeFromText(step.content)
+        if (
+          sawBgNotification &&
+          wake &&
+          !wake.otherWake &&
+          (wake.checkJobWake || wake.noticeIds?.length || wake.recordNoticeIds?.length)
+        ) {
+          continue
+        }
         return {
           remoteTurn: true,
           localPromptMirrored: false,
@@ -2176,7 +2344,10 @@ export async function streamTurnTrailIfChanged(
  * for the current turn (after the latest `USER_INPUT` / `SYSTEM_MESSAGE` boundary
  * or since `sinceMs`).
  */
-export function extractLatestAssistantReplyFromTranscript(transcriptPath, { sinceMs = null } = {}) {
+export function extractLatestAssistantReplyFromTranscript(
+  transcriptPath,
+  { sinceMs = null, afterLastSystemMessage = false } = {},
+) {
   if (!transcriptPath) return null
   let raw = ''
   try {
@@ -2208,10 +2379,13 @@ export function extractLatestAssistantReplyFromTranscript(transcriptPath, { sinc
     }
   }
 
-  // Find the last USER_INPUT step index so we only look at the current turn
+  // Find the last USER_INPUT (or SYSTEM_MESSAGE for isolated sub-turns) boundary
   let lastUserBoundary = -1
   for (let i = steps.length - 1; i >= 0; i--) {
-    if (steps[i]?.type === 'USER_INPUT') {
+    if (
+      steps[i]?.type === 'USER_INPUT' ||
+      (afterLastSystemMessage && steps[i]?.type === 'SYSTEM_MESSAGE')
+    ) {
       lastUserBoundary = i
       break
     }
@@ -2420,7 +2594,7 @@ export async function handleMirrorTurn(
         latestStep?.type === 'SYSTEM_MESSAGE' &&
         !rawStepContent.includes('[DevSpec Remote Wake]')))
   const bgParentContext = isBgContinuation
-    ? existingMarker || inferredTranscriptContext || {}
+    ? existingMarker?.heldParent || existingMarker || inferredTranscriptContext || {}
     : null
   const isExplicitUserInputStep =
     !isBgContinuation &&
@@ -2579,16 +2753,27 @@ export async function handleMirrorTurn(
       // both write, so neither ordering of the two loses it. A background task or
       // subagent continuation inherits its parent turn's wake context instead of parsing
       // background stdout as a new wake.
+      const bgParentHasCommandOrPrompt = Boolean(
+        bgParentContext?.otherWake ||
+          bgParentContext?.localPromptMirrored ||
+          bgParentContext?.localTurn ||
+          existingMarker?.heldParent,
+      )
       const wake = isBgContinuation
         ? {
-            ...(Array.isArray(bgParentContext?.noticeIds) && bgParentContext.noticeIds.length > 0
+            ...(!bgParentHasCommandOrPrompt &&
+            Array.isArray(bgParentContext?.noticeIds) &&
+            bgParentContext.noticeIds.length > 0
               ? { noticeIds: bgParentContext.noticeIds }
               : {}),
-            ...(Array.isArray(bgParentContext?.recordNoticeIds) &&
+            ...(!bgParentHasCommandOrPrompt &&
+            Array.isArray(bgParentContext?.recordNoticeIds) &&
             bgParentContext.recordNoticeIds.length > 0
               ? { recordNoticeIds: bgParentContext.recordNoticeIds }
               : {}),
-            ...(bgParentContext?.checkJobWake ? { checkJobWake: true } : {}),
+            ...(!bgParentHasCommandOrPrompt && bgParentContext?.checkJobWake
+              ? { checkJobWake: true }
+              : {}),
             ...(bgParentContext?.otherWake ? { otherWake: true } : {}),
           }
         : isRemoteWakeInput
@@ -2596,17 +2781,27 @@ export async function handleMirrorTurn(
           : fromAPerson
             ? { otherWake: true }
             : null
+      const isMidWaitNonCommandWake = Boolean(
+        !isBgContinuation &&
+          isRemoteWakeInput &&
+          (existingMarker?.held === true ||
+            (existingMarker?.heldParent && !existingMarker?.otherWake)) &&
+          wake &&
+          !wake.otherWake &&
+          (wake.checkJobWake || wake.noticeIds?.length || wake.recordNoticeIds?.length),
+      )
       if (
         connectionId &&
         isRemoteWakeInput &&
         (wake?.checkJobWake || wake?.noticeIds?.length || wake?.recordNoticeIds?.length) &&
-        !existingMarker?.otherWake &&
-        !bgParentContext?.otherWake &&
-        !existingMarker?.localPromptMirrored &&
-        !bgParentContext?.localPromptMirrored &&
-        !existingMarker?.localTurn &&
-        !bgParentContext?.localTurn &&
-        !state?.local_turn
+        (isMidWaitNonCommandWake ||
+          (!existingMarker?.otherWake &&
+            !bgParentContext?.otherWake &&
+            !existingMarker?.localPromptMirrored &&
+            !bgParentContext?.localPromptMirrored &&
+            !existingMarker?.localTurn &&
+            !bgParentContext?.localTurn &&
+            !state?.local_turn))
       ) {
         try {
           setCurrentRequest(connectionId, UNSTATED, { dir: connectionsDir })
@@ -2614,34 +2809,182 @@ export async function handleMirrorTurn(
           /* non-fatal */
         }
       }
-      const preservedLocalMirrored = Boolean(
-        localPromptMirrored ||
-          (isBgContinuation &&
-            (existingMarker?.localPromptMirrored || bgParentContext?.localPromptMirrored)),
-      )
-      const preservedLocalTurn =
-        admittedLocalTurn ||
-        (isBgContinuation ? existingMarker?.localTurn || bgParentContext?.localTurn || null : null)
-      const markerExtra = {
-        held: false,
-        remoteTurn: Boolean(isRemoteWakeInput),
-        localPromptMirrored: preservedLocalMirrored,
-        ...(isBgContinuation ? { backgroundContinuation: true } : {}),
-        ...(preservedLocalTurn ? { localTurn: preservedLocalTurn } : {}),
-        ...mergeTurnWake(readTurnMarker(connectionId, connectionsDir), wake),
-      }
+      const preservedLocalMirrored = isMidWaitNonCommandWake
+        ? false
+        : Boolean(
+            localPromptMirrored ||
+              (isBgContinuation &&
+                (bgParentContext?.localPromptMirrored || existingMarker?.localPromptMirrored)),
+          )
+      const preservedLocalTurn = isMidWaitNonCommandWake
+        ? null
+        : admittedLocalTurn ||
+          (isBgContinuation ? bgParentContext?.localTurn || existingMarker?.localTurn || null : null)
+      const currentMarkerForMerge = readTurnMarker(connectionId, connectionsDir)
+      const markerExtra = isMidWaitNonCommandWake
+        ? {
+            held: false,
+            heldParent: snapshotHeldParent(existingMarker),
+            remoteTurn: true,
+            localPromptMirrored: false,
+            localTurn: null,
+            otherWake: false,
+            backgroundContinuation: false,
+            ...mergeTurnWake(
+              currentMarkerForMerge?.held === true ? null : currentMarkerForMerge,
+              wake,
+            ),
+            preserveExplicitReply: true,
+          }
+        : {
+            held: false,
+            heldParent: null,
+            remoteTurn: Boolean(isRemoteWakeInput),
+            localPromptMirrored: preservedLocalMirrored,
+            ...(isBgContinuation
+              ? {
+                  backgroundContinuation: true,
+                  ...(bgParentHasCommandOrPrompt
+                    ? { noticeIds: [], recordNoticeIds: [], checkJobWake: false }
+                    : {}),
+                }
+              : {}),
+            ...(preservedLocalTurn ? { localTurn: preservedLocalTurn } : { localTurn: null }),
+            ...mergeTurnWake(
+              isBgContinuation && bgParentHasCommandOrPrompt
+                ? { otherWake: Boolean(bgParentContext?.otherWake) }
+                : currentMarkerForMerge,
+              wake,
+            ),
+            ...(isBgContinuation ? { preserveExplicitReply: true } : {}),
+          }
       if (typeof latestStep?.step_index === 'number') {
         markerExtra.lastStepIndex = latestStep.step_index
       }
       writeTurnMarker(connectionId, markerExtra, connectionsDir)
     } else {
-      // On Stop: check if this turn launched background work (e.g. subagent or async command)
-      // that has not yet reported back. If so, hold the turn open instead of closing it.
+      // On Stop: check if this turn launched background work (e.g. subagent, async command,
+      // or one-shot timer) that has not yet reported back. If so, hold the turn open instead
+      // of closing it.
       const marker = readTurnMarker(connectionId, connectionsDir)
       reconcileCompletedOwnedWork(connectionId, marker, effectiveTranscriptPath, connectionsDir)
       const outstandingIds = marker ? readOwnedIds(connectionId, marker, connectionsDir) : []
       if (outstandingIds.length > 0) {
-        writeTurnMarker(connectionId, { held: true }, connectionsDir)
+        if (marker?.heldParent) {
+          const midWaitNotices = currentTurnReplyNoticeIds(connectionId, {
+            dir: connectionsDir,
+            connectionState: state,
+            marker,
+          })
+          const midWaitRoutine = isCurrentTurnRoutine(connectionId, {
+            dir: connectionsDir,
+            connectionState: state,
+            marker,
+          })
+          if (midWaitNotices && !marker.noticeReplyAt && sessionId) {
+            const replyText =
+              (text ? prepareAgentMirrorText(text) : null) ||
+              extractLatestAssistantReplyFromTranscript(effectiveTranscriptPath, {
+                sinceMs: marker.startedAt ?? null,
+                afterLastSystemMessage: true,
+              })
+            if (replyText) {
+              const telemetry = connectionId ? readConnectionTelemetry(connectionId) : null
+              try {
+                await call({
+                  mcpUrl,
+                  token,
+                  name: 'post_session_message',
+                  arguments: {
+                    connection_id: connectionId,
+                    agent_name: agentName,
+                    message: replyText,
+                    system_notice_ids: midWaitNotices,
+                    ...(telemetry ? { agent_stats: telemetry } : {}),
+                    ...(telemetry?.model?.id
+                      ? {
+                          model: {
+                            providerID: telemetry.model.provider || 'google',
+                            modelID: telemetry.model.id,
+                          },
+                        }
+                      : {}),
+                  },
+                })
+              } catch {
+                /* non-fatal fallback */
+              }
+            }
+          } else if (midWaitRoutine && marker.tellPerson && sessionId) {
+            const tellText =
+              (text ? prepareAgentMirrorText(text) : null) ||
+              extractLatestAssistantReplyFromTranscript(effectiveTranscriptPath, {
+                sinceMs: marker.startedAt ?? null,
+                afterLastSystemMessage: true,
+              })
+            if (tellText) {
+              const telemetry = connectionId ? readConnectionTelemetry(connectionId) : null
+              try {
+                await call({
+                  mcpUrl,
+                  token,
+                  name: 'post_session_message',
+                  arguments: {
+                    connection_id: connectionId,
+                    agent_name: agentName,
+                    message: tellText,
+                    ...(telemetry ? { agent_stats: telemetry } : {}),
+                    ...(telemetry?.model?.id
+                      ? {
+                          model: {
+                            providerID: telemetry.model.provider || 'google',
+                            modelID: telemetry.model.id,
+                          },
+                        }
+                      : {}),
+                  },
+                })
+              } catch {
+                /* non-fatal */
+              }
+            }
+          }
+          const parent = marker.heldParent
+          writeTurnMarker(
+            connectionId,
+            {
+              held: true,
+              heldParent: null,
+              remoteTurn: Boolean(parent.remoteTurn),
+              localPromptMirrored: Boolean(parent.localPromptMirrored),
+              localTurn: parent.localTurn || null,
+              otherWake: Boolean(parent.otherWake),
+              backgroundContinuation: Boolean(parent.backgroundContinuation),
+              noticeIds: [],
+              recordNoticeIds: [],
+              checkJobWake: false,
+              tellPerson: false,
+              noticeReplyAt: null,
+              preserveExplicitReply: true,
+            },
+            connectionsDir,
+          )
+          return { ok: true, held: true, outstanding: outstandingIds }
+        }
+        const parentIsCommandOrPrompt = Boolean(
+          marker?.otherWake || marker?.localPromptMirrored || marker?.localTurn,
+        )
+        writeTurnMarker(
+          connectionId,
+          {
+            held: true,
+            ...(parentIsCommandOrPrompt
+              ? { noticeIds: [], recordNoticeIds: [], checkJobWake: false }
+              : {}),
+            preserveExplicitReply: true,
+          },
+          connectionsDir,
+        )
         return { ok: true, held: true, outstanding: outstandingIds }
       }
 
@@ -2917,9 +3260,14 @@ export async function handleMirrorTurn(
         }
         if (state.connection_capability) {
           try {
+            const hostBackgroundTasks = Array.isArray(parsedHookInput?.background_tasks)
+              ? parsedHookInput.background_tasks
+              : null
             const requests = readRequestState(connectionId, { dir: connectionsDir })
             if (requests.open.size > 0) {
-              const pending = requestsWithWorkPending(requests, { backgroundTasks: [] })
+              const pending = requestsWithWorkPending(requests, {
+                backgroundTasks: hostBackgroundTasks,
+              })
               const finished = [...requests.open.keys()].filter(
                 (id) => requests.started.has(id) && !pending.has(id),
               )
@@ -2934,7 +3282,7 @@ export async function handleMirrorTurn(
                 ),
               )
             }
-            for (const key of absentLaunches(requests, [])) {
+            for (const key of absentLaunches(requests, hostBackgroundTasks)) {
               appendRequestEvent(connectionId, { op: 'absent', key }, { dir: connectionsDir })
             }
             rotateRequestLog(connectionId, { dir: connectionsDir })

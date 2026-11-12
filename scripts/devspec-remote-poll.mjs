@@ -314,7 +314,7 @@ export function countUnconsumedCommands(connectionId, inboxOffset, dir = CONNECT
 const ATTENDED_CADENCE = { waitMs: 25_000, tier: 'attended', checkTier: 'responsive' }
 const IDLE_CADENCE = { waitMs: 30_000, tier: 'idle', checkTier: 'responsive' }
 const POLL_HTTP_GRACE_MS = 15_000
-const MAX_TURN_MS = 10 * 60 * 1000
+const MAX_TURN_MS = 60 * 60 * 1000
 
 function turnMarkerPath(connectionId, dir = CONNECTIONS_DIR) {
   return path.join(dir, `${connectionId}.turn`)
@@ -354,6 +354,7 @@ export function isNoWorkingAttemptRefusal(err) {
 
 export function isTurnMarkerActive(marker, now = Date.now(), maxTurnMs = MAX_TURN_MS) {
   if (!marker || typeof marker.startedAt !== 'number') return false
+  if (marker.held === true) return true
   const lastActiveAt = Math.max(
     marker.startedAt,
     typeof marker.lastToolAt === 'number' ? marker.lastToolAt : 0,

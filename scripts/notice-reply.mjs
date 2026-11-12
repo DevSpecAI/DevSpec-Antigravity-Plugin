@@ -153,7 +153,12 @@ const uniqueIds = (list) => [...new Set(list.map((id) => id.toLowerCase()))]
  * marker or request left by an earlier turn only ever makes this true.
  */
 function turnHasOtherSubject({ marker, requestState = null, connectionState = null }) {
-  if (marker?.otherWake || marker?.localPromptMirrored || marker?.localTurn || connectionState?.local_turn) {
+  const parentParked = Boolean(marker?.heldParent && !marker?.otherWake)
+  if (
+    marker?.otherWake ||
+    (!parentParked &&
+      (marker?.localPromptMirrored || marker?.localTurn || connectionState?.local_turn))
+  ) {
     return true
   }
   if (requestState) {

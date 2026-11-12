@@ -31,8 +31,10 @@ import {
   isSessionReplyToolCall,
   loadState,
   parseTranscriptPath,
+  readOwnedLines,
   readTurnMarker,
   recordBackgroundLaunch,
+  recordOwnedEnd,
   recordTellPerson,
   resolveAntigravityToolResponse,
   resolveHookConversationId,
@@ -225,6 +227,42 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
       }
     } catch {
       /* non-fatal */
+    }
+  }
+
+  if (bareToolName === 'manage_task' && connectionId) {
+    const action = String(toolInput?.Action ?? toolInput?.action ?? '').toLowerCase()
+    const rawKilledId = String(toolInput?.TaskId ?? toolInput?.taskId ?? '').trim()
+    if (action === 'kill' && rawKilledId) {
+      try {
+        const marker = readTurnMarker(connectionId, connectionsDir)
+        if (marker) {
+          for (const entry of readOwnedLines(connectionId, marker, connectionsDir)) {
+            if (
+              typeof entry.ended !== 'string' &&
+              (entry.id === rawKilledId || entry.id.endsWith(`/${rawKilledId}`))
+            ) {
+              recordOwnedEnd(connectionId, entry.id, { status: 'killed', dir: connectionsDir })
+            }
+          }
+        }
+        const reqState = readRequestState(connectionId, { dir: connectionsDir })
+        for (const launch of new Set(reqState.launches.values())) {
+          if (
+            launch.notifies &&
+            !launch.notified &&
+            (launch.key === rawKilledId || launch.key.endsWith(`/${rawKilledId}`))
+          ) {
+            appendRequestEvent(
+              connectionId,
+              { op: 'notified', key: launch.key },
+              { dir: connectionsDir },
+            )
+          }
+        }
+      } catch {
+        /* non-fatal */
+      }
     }
   }
 

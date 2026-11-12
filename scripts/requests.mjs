@@ -657,8 +657,26 @@ export function launchForRequest(toolName, toolInput, toolResponse, toolUseId = 
       return key ? { key, alias, kind: 'shell', notifies: true } : null
     }
     case 'schedule': {
+      const dur = input.DurationSeconds ?? input.duration_seconds
+      const isOneShotTimer =
+        dur !== undefined &&
+        dur !== null &&
+        dur !== '' &&
+        Number.isFinite(Number(dur)) &&
+        Number(dur) > 0 &&
+        !input.CronExpression &&
+        !input.cron_expression &&
+        input.IsDaemon !== true &&
+        input.IsDaemon !== 'true'
+      const outText =
+        typeof res.output === 'string' ? res.output : typeof res.raw === 'string' ? res.raw : ''
+      const extractedId = extractBackgroundCommandTaskId(outText)
+      const key = id(res.taskId ?? res.task_id ?? res.backgroundTaskId ?? res.id ?? extractedId)
+      if (isOneShotTimer && key) {
+        return { key, alias, kind: 'timer', notifies: true }
+      }
       const prompt = String(input.Prompt ?? input.prompt ?? '').trim()
-      return prompt ? { schedule: true, prompt, id: id(res.taskId ?? res.id) } : null
+      return prompt ? { schedule: true, prompt, id: key } : null
     }
     case 'Bash': {
       const key = id(res.backgroundTaskId)
