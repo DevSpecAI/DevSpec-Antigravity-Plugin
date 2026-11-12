@@ -39,6 +39,7 @@ import {
   validateInteractionAnswerRecord,
 } from './interaction-events.mjs'
 import {
+  isForegroundTurnRunning,
   isTurnMarkerActive,
   readTurnMarker,
   recordTurnWake,
@@ -1257,7 +1258,7 @@ async function main() {
 
   // Queued work waits while a turn is running, in both modes. A one-shot arm exits on
   // its first wake and leaves what it held in the state file for the next arm.
-  const turnRunning = () => isTurnMarkerActive(readTurnMarker(connectionId, CONNECTIONS_DIR))
+  const turnRunning = () => isForegroundTurnRunning(readTurnMarker(connectionId, CONNECTIONS_DIR))
 
   let delivered = 0
   let sawLive = Boolean(

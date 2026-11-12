@@ -1137,16 +1137,21 @@ describe('Parity 3: room transcript, 4-tier instruction files, repository contex
     assert.equal(res.session_id, '7069bedd-878d-4c5a-b52c-b5cfc1bcd544')
   })
 
-  it('keeps >10m turns active via lastToolAt and re-asserts .turn after an opening post_session_message acknowledgment', async () => {
+  it('keeps held turns active indefinitely without a clock cutoff, expires unheld dead-air turns at 60m, and keeps >10m turns active via lastToolAt', async () => {
     const now = 1_700_000_000_000
+    const fourHoursAgo = now - 4 * 60 * 60 * 1000
+    const ninetyMinsAgo = now - 90 * 60 * 1000
     const thirtyMinsAgo = now - 30 * 60 * 1000
     const fiveSecsAgo = now - 5_000
 
-    // Without lastToolAt, a 30-minute-old turn marker expires at MAX_TURN_MS (10m)
-    assert.equal(isTurnMarkerActive({ startedAt: thirtyMinsAgo }, now), false)
-    // With recent lastToolAt, the turn remains active even 30 minutes into the turn
+    // A held turn waiting on background work or a wait timer never expires on a clock
+    assert.equal(isTurnMarkerActive({ startedAt: fourHoursAgo, held: true }, now), true)
+    // Without lastToolAt, an unheld 90-minute-old turn marker expires at MAX_TURN_MS (60m)
+    assert.equal(isTurnMarkerActive({ startedAt: ninetyMinsAgo }, now), false)
+    // Within 60m or with recent lastToolAt, an unheld turn remains active
+    assert.equal(isTurnMarkerActive({ startedAt: thirtyMinsAgo }, now), true)
     assert.equal(
-      isTurnMarkerActive({ startedAt: thirtyMinsAgo, lastToolAt: fiveSecsAgo }, now),
+      isTurnMarkerActive({ startedAt: ninetyMinsAgo, lastToolAt: fiveSecsAgo }, now),
       true,
     )
 

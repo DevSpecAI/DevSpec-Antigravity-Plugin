@@ -34,7 +34,13 @@ import {
   readHeldInboxRecords,
 } from './devspec-remote-wait.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
-import { isTurnMarkerActive, loadState, readTurnMarker, recordTurnWake } from './mirror-turn.mjs'
+import {
+  isForegroundTurnRunning,
+  isTurnMarkerActive,
+  loadState,
+  readTurnMarker,
+  recordTurnWake,
+} from './mirror-turn.mjs'
 import { noticeAudience, noticeReplyInstruction } from './notice-reply.mjs'
 import {
   ensurePollerForConnection,
@@ -861,7 +867,7 @@ export async function processListenerInboxTick(
   adoptPersistedQueue(queueState, live, { inboxPath, connectionId })
 
   const isTurnBusy = () =>
-    isTurnMarkerActive(readTurnMarker(connectionId, connectionsDir), nowFn())
+    isForegroundTurnRunning(readTurnMarker(connectionId, connectionsDir), nowFn())
 
   const deliverSingleRecord = async (rec, { queuedEntry, heldRecord = false }) => {
     const message = buildWakeDeliveryMessage(rec.entry, {

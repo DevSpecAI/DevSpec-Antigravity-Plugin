@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.24.2
+
+- **Keep held background and one-shot timer waits Working without a clock cutoff or mid-wait check resets.** Turns parked waiting on owned background commands, subagents, or one-shot `schedule` wait timers (`DurationSeconds` without `CronExpression` or `IsDaemon`) now remain active past ten minutes with no clock cutoff until all owned background work finishes or is cancelled (`manage_task` `kill`), while unheld foreground turns keep a 60-minute dead-air fallback (`NO_SIGN_OF_LIFE_MS`). Queued check jobs and system notices deliver cleanly while a parent turn is held for background work without resetting the parent turn start time, orphaning owned work, closing the open command attempt, or sealing the open session reply bubble; when the mid-wait check finishes, the turn returns to its held Working state with check-wake flags cleared so the subsequent background or timer wakeup resumes live progress reporting and preserves open request tracking until completion.
+
 ## 0.24.1
 
 - **Tighten background-command hold detection and skip settled held check jobs.** Transcript reconciliation in `scripts/mirror-turn.mjs` now pairs each `GENERIC` tool-response step with the specific tool call from the immediately preceding `PLANNER_RESPONSE`, checking for a background command launch only on `run_command` steps that have not already completed synchronously and requiring a leading boundary before `TaskId` across `mirror-turn.mjs` and `requests.mjs` so camelCase JSON fields like `"parentTaskId"` in inspected files never hold a turn open. When draining held check-job wakes in `scripts/devspec-remote-listen.mjs`, the listener verifies via `get_connection_dispatch` that the check job is still open and silently drops already-settled check jobs.

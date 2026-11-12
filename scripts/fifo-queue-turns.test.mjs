@@ -29,7 +29,10 @@ import { prepareDevspecToolInput } from './devspec-tool-input.mjs'
 import {
   clearTurnMarker,
   handleMirrorTurn,
+  inferTurnContextFromTranscript,
   isCurrentTurnCheckJobOnly,
+  isForegroundTurnRunning,
+  isTurnMarkerActive,
   launchedAntigravityBackgroundWork,
   readOwnedIds,
   readTurnMarker,
@@ -38,6 +41,7 @@ import {
   streamTurnTrailIfChanged,
   writeTurnMarker,
 } from './mirror-turn.mjs'
+import { runPostToolDispatch } from './post-tool-dispatch.mjs'
 import { readStateFile, writeLocalBond, writeStateFile } from './remote-control-state.mjs'
 import {
   FIXTURE_ID,
@@ -582,9 +586,9 @@ describe('Antigravity <conversationId>/task-<n> background launch & mid-turn rec
 // that survive a restart or a hand-off, and one per turn after a stale turn marker.
 // ---------------------------------------------------------------------------------
 
-/** A turn marker no reader counts as a running turn: no sign of life for 11 minutes. */
+/** A turn marker no reader counts as a running turn: no sign of life past 60 minutes. */
 function writeStaleTurnMarker(connectionId, dir) {
-  const longAgo = Date.now() - 11 * 60 * 1000
+  const longAgo = Date.now() - 61 * 60 * 1000
   fs.writeFileSync(
     path.join(dir, `${connectionId}.turn`),
     JSON.stringify({ startedAt: longAgo, lastToolAt: longAgo, remoteTurn: true, otherWake: true }),
@@ -1048,5 +1052,290 @@ describe('the poller asserting a turn ahead of the armed wait script', () => {
     assert.equal(dispatchesStartTurn({ automation_run: 1, check_job: 0 }), true)
     assert.equal(dispatchesStartTurn({ automation_run: 1, check_job: 1 }), true)
     assert.equal(dispatchesStartTurn({ automation_run: 0, check_job: 1 }), false)
+  })
+})
+
+describe('held background & one-shot timer waits across >10m pauses and mid-wait check jobs (item 70981c12)', () => {
+  it('tracks one-shot schedule timers (not recurring crons), clears on timer wakeup or manage_task kill, and keeps held turns + owned work active past hours', async () => {
+    const fx = makeFixture()
+    try {
+      const timerId = `${CONV_ID}/task-1113`
+      const cronId = `${CONV_ID}/task-1114`
+
+      // One-shot schedule timer is tracked as owned work + notifying request launch
+      const oneShot = launchedAntigravityBackgroundWork(
+        'default_api:schedule',
+        { DurationSeconds: '420', Prompt: 'Check benchmark progress', TimerCondition: 'never' },
+        { output: `Tool is running as a background task with task id: ${timerId}\nTask Description: Timer: 7m, Prompt: Check benchmark progress` },
+      )
+      assert.deepEqual(oneShot, {
+        id: timerId,
+        kind: 'timer',
+        label: 'Check benchmark progress',
+      })
+      const oneShotReq = launchForRequest(
+        'default_api:schedule',
+        { DurationSeconds: '420', Prompt: 'Check benchmark progress', TimerCondition: 'never' },
+        { output: `Tool is running as a background task with task id: ${timerId}` },
+      )
+      assert.equal(oneShotReq?.key, timerId)
+      assert.equal(oneShotReq?.kind, 'timer')
+      assert.equal(oneShotReq?.notifies, true)
+
+      // Recurring cron schedule does NOT hold the turn open
+      assert.equal(
+        launchedAntigravityBackgroundWork(
+          'default_api:schedule',
+          { CronExpression: '*/5 * * * *', Prompt: 'Poll status' },
+          { output: `Tool is running as a background task with task id: ${cronId}\nTask Description: Cron: */5 * * * *` },
+        ),
+        null,
+      )
+      const cronReq = launchForRequest(
+        'default_api:schedule',
+        { CronExpression: '*/5 * * * *', Prompt: 'Poll status' },
+        { taskId: cronId },
+      )
+      assert.equal(cronReq?.schedule, true)
+
+      // A held turn and its owned timer/task remain active 3 hours later with no clock cutoff
+      const t0 = Date.now() - 3 * 60 * 60 * 1000
+      writeTurnMarker(CONN_ID, { startedAt: t0, remoteTurn: true, otherWake: true, held: true }, fx.connDir)
+      recordOwnedLaunch(CONN_ID, { id: timerId, kind: 'timer', label: 'Check benchmark progress' }, { dir: fx.connDir, now: t0 })
+      appendRequestEvent(
+        CONN_ID,
+        { op: 'open', id: REQ_ID, kind: 'command', message_id: CMD_MSG_ID, provenance_ref: PROV_ID, requested_by: USER_ID },
+        { dir: fx.connDir },
+      )
+      appendRequestEvent(CONN_ID, { op: 'current', ref: REQ_ID }, { dir: fx.connDir })
+      appendRequestEvent(
+        CONN_ID,
+        { op: 'launch', key: timerId, kind: 'timer', notifies: true, request: REQ_ID, also: [] },
+        { dir: fx.connDir },
+      )
+
+      const now = Date.now()
+      assert.equal(isTurnMarkerActive(readTurnMarker(CONN_ID, fx.connDir), now), true)
+      assert.equal(isForegroundTurnRunning(readTurnMarker(CONN_ID, fx.connDir), now), false)
+      assert.deepEqual(readOwnedIds(CONN_ID, readTurnMarker(CONN_ID, fx.connDir), fx.connDir, { now }), [timerId])
+
+      // Cancelling the timer via manage_task kill clears both owned work and pending request hold
+      await runPostToolDispatch(
+        JSON.stringify({
+          conversationId: CONV_ID,
+          tool_name: 'default_api:manage_task',
+          tool_input: { Action: 'kill', TaskId: timerId },
+          tool_response: { output: 'Killed task' },
+        }),
+        { home: fx.home, env: {}, call: async () => ({ ok: true }) },
+      )
+      assert.deepEqual(readOwnedIds(CONN_ID, readTurnMarker(CONN_ID, fx.connDir), fx.connDir, { now }), [])
+      assert.equal(requestsWithWorkPending(readRequestState(CONN_ID, { dir: fx.connDir })).has(REQ_ID), false)
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('delivers and completes a check job during a >10m held wait without resetting the parent turn, calling report_complete, or suppressing the subsequent background/timer wake', async () => {
+    const fx = makeFixture()
+    try {
+      const benchTaskId = `${CONV_ID}/task-900`
+      const timerId = `${CONV_ID}/task-1113`
+      const t0 = Date.now() - 25 * 60 * 1000 // 25 minutes ago!
+
+      // Parent remote command turn launched a long benchmark + wait timer and parked on Stop (held: true)
+      writeTurnMarker(
+        CONN_ID,
+        { startedAt: t0, remoteTurn: true, otherWake: true, held: true },
+        fx.connDir,
+      )
+      recordOwnedLaunch(CONN_ID, { id: benchTaskId, kind: 'command', label: 'Stage 2 benchmark' }, { dir: fx.connDir, now: t0 })
+      recordOwnedLaunch(CONN_ID, { id: timerId, kind: 'timer', label: 'Wait 7m' }, { dir: fx.connDir, now: t0 + 1000 })
+      appendRequestEvent(
+        CONN_ID,
+        { op: 'open', id: REQ_ID, kind: 'command', message_id: CMD_MSG_ID, provenance_ref: PROV_ID, requested_by: USER_ID },
+        { dir: fx.connDir },
+      )
+      appendRequestEvent(CONN_ID, { op: 'current', ref: REQ_ID }, { dir: fx.connDir })
+      appendRequestEvent(
+        CONN_ID,
+        { op: 'launch', key: benchTaskId, kind: 'shell', notifies: true, request: REQ_ID, also: [] },
+        { dir: fx.connDir },
+      )
+      appendRequestEvent(
+        CONN_ID,
+        { op: 'launch', key: timerId, kind: 'timer', notifies: true, request: REQ_ID, also: [] },
+        { dir: fx.connDir },
+      )
+
+      // Two check jobs arrive 25 minutes into the background wait
+      fs.writeFileSync(
+        fx.inboxPath,
+        `${JSON.stringify(makeCheckJobRecord(CHECK_JOB_ID))}\n${JSON.stringify(makeCheckJobRecord(SECOND_CHECK_JOB_ID))}\n`,
+      )
+      const deliveredMessages = []
+      const tick = listenerTicker(fx, { deliveredMessages, queueState: createListenerQueueState(0) })
+
+      // First check job delivers immediately during the held wait; second check job stays queued!
+      const firstTick = await tick()
+      assert.equal(deliveredMessages.length, 1)
+      assert.match(deliveredMessages[0], new RegExp(CHECK_JOB_ID))
+      assert.equal(firstTick.heldCount, 1, 'second check job waits behind the running first check job')
+
+      const duringCheckMarker = readTurnMarker(CONN_ID, fx.connDir)
+      assert.equal(duringCheckMarker.startedAt, t0, 'parent startedAt must NOT be reset')
+      assert.equal(duringCheckMarker.held, false, 'foreground check turn is now running')
+      assert.equal(duringCheckMarker.checkJobWake, true)
+      assert.equal(duringCheckMarker.otherWake, false)
+      assert.equal(duringCheckMarker.heldParent?.otherWake, true)
+      assert.deepEqual(
+        readOwnedIds(CONN_ID, duringCheckMarker, fx.connDir),
+        [benchTaskId, timerId],
+        'owned background work from parent turn remains intact',
+      )
+      assert.equal(
+        isCurrentTurnCheckJobOnly(CONN_ID, { dir: fx.connDir, connectionState: fx.live }),
+        true,
+        'foreground check sub-turn is recognized as check-job-only so it does not pollute room trail',
+      )
+
+      // Transcript gets the check_job SYSTEM_MESSAGE and check ruling steps
+      const checkWakeMsg = deliveredMessages[0]
+      fs.writeFileSync(
+        fx.transcriptPath,
+        [
+          JSON.stringify({
+            step_index: 1,
+            type: 'USER_INPUT',
+            created_at: new Date(t0).toISOString(),
+            content: `[DevSpec Remote Wake]\n${JSON.stringify({ type: 'owner_message', message_id: CMD_MSG_ID })}`,
+          }),
+          JSON.stringify({
+            step_index: 2,
+            type: 'SYSTEM_MESSAGE',
+            created_at: new Date(Date.now() - 2000).toISOString(),
+            content: `<SYSTEM_MESSAGE>\n${checkWakeMsg}\n</SYSTEM_MESSAGE>`,
+          }),
+          JSON.stringify({
+            step_index: 3,
+            type: 'PLANNER_RESPONSE',
+            created_at: new Date(Date.now() - 1000).toISOString(),
+            content: '',
+            tool_calls: [{ name: 'call_mcp_tool', args: { ServerName: 'devspec_devspec', ToolName: 'record_check_rulings', Arguments: {} } }],
+          }),
+        ].join('\n') + '\n',
+      )
+
+      const mcpCalls = []
+      const hookOpts = {
+        env: {},
+        connectionsDir: fx.connDir,
+        legacyPath: path.join(fx.home, 'legacy.json'),
+        call: async (req) => {
+          mcpCalls.push(req)
+          if (req.name === 'report_request' && req.arguments.action === 'close') {
+            return { status: 'closed' }
+          }
+          return { ok: true }
+        },
+      }
+      const hookInput = JSON.stringify({ conversationId: CONV_ID, transcriptPath: fx.transcriptPath })
+
+      // Check-job turn stops: parent owned tasks are STILL running!
+      const stopAfterCheck = await handleMirrorTurn('stop', hookInput, hookOpts)
+      assert.equal(stopAfterCheck.held, true)
+      assert.deepEqual(stopAfterCheck.outstanding, [benchTaskId, timerId])
+      assert.equal(
+        mcpCalls.some((c) => c.name === 'report_complete'),
+        false,
+        'must NOT call report_complete while parent background work is still running',
+      )
+      assert.equal(
+        mcpCalls.some((c) => c.name === 'heartbeat_connection' && c.arguments?.busy === false),
+        false,
+        'must NOT mark connection busy:false while parent background work is still running',
+      )
+
+      const restoredHeldMarker = readTurnMarker(CONN_ID, fx.connDir)
+      assert.equal(restoredHeldMarker.startedAt, t0)
+      assert.equal(restoredHeldMarker.held, true)
+      assert.equal(restoredHeldMarker.heldParent, null)
+      assert.equal(restoredHeldMarker.otherWake, true)
+      assert.equal(restoredHeldMarker.checkJobWake, false, 'checkJobWake must be cleared on return to held state')
+      assert.equal(isTurnMarkerActive(restoredHeldMarker), true)
+
+      // Now the 7m timer fires while benchTaskId is still running!
+      const timerWakeStep = {
+        step_index: 4,
+        type: 'SYSTEM_MESSAGE',
+        created_at: new Date().toISOString(),
+        content: `<SYSTEM_MESSAGE>\n[Message] timestamp=${new Date().toISOString()} sender=${timerId} priority=MESSAGE_PRIORITY_HIGH content=Check benchmark progress\n</SYSTEM_MESSAGE>`,
+      }
+      fs.appendFileSync(fx.transcriptPath, `${JSON.stringify(timerWakeStep)}\n`)
+
+      // Even if .turn were missing, inferTurnContextFromTranscript skips the intermediate check_job step!
+      const inferred = inferTurnContextFromTranscript(fx.transcriptPath)
+      assert.equal(inferred.backgroundContinuation, true)
+      assert.equal(inferred.remoteTurn, true)
+      assert.equal(inferred.otherWake, true)
+      assert.equal(Boolean(inferred.checkJobWake), false, 'timer continuation must NOT inherit checkJobWake')
+
+      // PreInvocation runs for the timer wakeup
+      await handleMirrorTurn('user_prompt', hookInput, hookOpts)
+      const afterTimerWakeMarker = readTurnMarker(CONN_ID, fx.connDir)
+      assert.equal(afterTimerWakeMarker.held, false)
+      assert.equal(afterTimerWakeMarker.backgroundContinuation, true)
+      assert.equal(afterTimerWakeMarker.otherWake, true)
+      assert.equal(Boolean(afterTimerWakeMarker.checkJobWake), false)
+      assert.equal(
+        isCurrentTurnCheckJobOnly(CONN_ID, { dir: fx.connDir, connectionState: fx.live }),
+        false,
+        'timer continuation turn is NOT check-job-only and streams progress normally',
+      )
+      assert.equal(
+        readRequestState(CONN_ID, { dir: fx.connDir }).current,
+        REQ_ID,
+        'timer wake restores REQ_ID as current request',
+      )
+      assert.deepEqual(
+        readOwnedIds(CONN_ID, afterTimerWakeMarker, fx.connDir),
+        [benchTaskId],
+        'timer cleared, benchmark command still owned',
+      )
+
+      // Timer turn stops while benchmark is still running -> stays held and keeps REQ_ID open!
+      const stopAfterTimer = await handleMirrorTurn('stop', hookInput, hookOpts)
+      assert.equal(stopAfterTimer.held, true)
+      assert.deepEqual(stopAfterTimer.outstanding, [benchTaskId])
+      assert.equal(readRequestState(CONN_ID, { dir: fx.connDir }).open.has(REQ_ID), true)
+
+      // Finally benchmark finishes -> wakes, answers, and Stop closes both the turn and REQ_ID!
+      fs.appendFileSync(
+        fx.transcriptPath,
+        [
+          JSON.stringify({
+            step_index: 5,
+            type: 'SYSTEM_MESSAGE',
+            created_at: new Date(Date.now() + 1000).toISOString(),
+            content: `<SYSTEM_MESSAGE>\n[Message] timestamp=${new Date().toISOString()} sender=${benchTaskId} priority=MESSAGE_PRIORITY_HIGH content=Task id "${benchTaskId}" finished with result: Command exited with code 0.\n</SYSTEM_MESSAGE>`,
+          }),
+          JSON.stringify({
+            step_index: 6,
+            type: 'PLANNER_RESPONSE',
+            created_at: new Date(Date.now() + 2000).toISOString(),
+            content: 'Benchmark completed cleanly.',
+          }),
+        ].join('\n') + '\n',
+      )
+      await handleMirrorTurn('user_prompt', hookInput, hookOpts)
+      const finalStop = await handleMirrorTurn('stop', hookInput, hookOpts)
+      assert.equal(finalStop.held, undefined)
+      assert.equal(finalStop.busy, false)
+      assert.equal(readTurnMarker(CONN_ID, fx.connDir), null)
+      assert.equal(readRequestState(CONN_ID, { dir: fx.connDir }).open.size, 0)
+      assert.equal(mcpCalls.some((c) => c.name === 'report_complete'), true)
+    } finally {
+      fx.cleanup()
+    }
   })
 })
