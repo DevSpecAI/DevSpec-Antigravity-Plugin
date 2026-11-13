@@ -1250,6 +1250,10 @@ export function loadState(
     connectionsDir = CONNECTIONS_DIR,
     legacyPath = LEGACY_STATE_PATH,
     ownerPid = resolveOwnerPid({}),
+    // How long to wait for a background renewal of the login (default RENEW_WAIT_MS).
+    // 0 starts the detached renewal and carries on with the token in hand: for a hook
+    // on a short deadline, such as the turn-recall hook (scripts/turn-recall.mjs).
+    renewWaitMs = undefined,
   } = {},
 ) {
   // Gather every candidate (legacy singleton + per-connection files) but NEVER
@@ -1278,7 +1282,7 @@ export function loadState(
   } catch {
     /* selection below fails closed when no readable matching state exists */
   }
-  return stateWithCurrentToken(selectBoundState(candidates, conversationId, AGENT_NAME, { ownerPid }))
+  return stateWithCurrentToken(selectBoundState(candidates, conversationId, AGENT_NAME, { ownerPid }), renewWaitMs === undefined ? {} : { waitMs: renewWaitMs })
 }
 
 /**

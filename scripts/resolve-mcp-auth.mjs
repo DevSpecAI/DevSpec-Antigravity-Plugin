@@ -191,7 +191,11 @@ export function stateWithCurrentToken(state, opts = {}) {
   }
   let auth
   try {
-    auth = resolveLoginFor(state.mcp_url, { home: opts.home || os.homedir(), ...(opts.renew === false ? { renew: false } : {}) })
+    auth = resolveLoginFor(state.mcp_url, {
+      home: opts.home || os.homedir(),
+      ...(opts.renew === false ? { renew: false } : {}),
+      ...(opts.waitMs !== undefined ? { waitMs: opts.waitMs } : {}),
+    })
   } catch {
     return state
   }
