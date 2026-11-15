@@ -93,7 +93,7 @@ describe('MCP-served implementation contract', () => {
       {
         type: 'command',
         command: 'node ./scripts/pre-invocation.mjs',
-        timeout: 10,
+        timeout: 12,
       },
     ])
   })

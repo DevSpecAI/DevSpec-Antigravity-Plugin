@@ -343,8 +343,12 @@ describe('one PreInvocation', () => {
       const out = await turnRecallSteps(fx.input(), { home: fx.home, env: {}, fetchImpl, target: target(), hardExitMs: 100 })
       assert.equal(out, null)
       assert.ok(Date.now() - started < 1_000)
-      assert.equal(TURN_RECALL_LIMITS.hardExitMs, 3_000)
-      assert.equal(TURN_RECALL_LIMITS.clientHttpTimeoutMs, 2_800)
+      // The limits only work in this order: the request is abandoned first, the whole
+      // recall ends after it, and Antigravity's own limit on the hook comes last, so
+      // the hook, never the host, decides that a slow recall is over.
+      const hook = JSON.parse(fs.readFileSync(new URL('../hooks.json', import.meta.url), 'utf8'))['devspec-remote-control-mirror'].PreInvocation[0]
+      assert.ok(TURN_RECALL_LIMITS.clientHttpTimeoutMs < TURN_RECALL_LIMITS.hardExitMs)
+      assert.ok(TURN_RECALL_LIMITS.hardExitMs < hook.timeout * 1000)
     } finally {
       fx.cleanup()
     }
