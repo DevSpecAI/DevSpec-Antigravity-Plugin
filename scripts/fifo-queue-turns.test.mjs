@@ -42,6 +42,7 @@ import {
   writeTurnMarker,
 } from './mirror-turn.mjs'
 import { runPostToolDispatch } from './post-tool-dispatch.mjs'
+import { readWakeDelivery } from './wake-delivery.mjs'
 import { readStateFile, writeLocalBond, writeStateFile } from './remote-control-state.mjs'
 import {
   FIXTURE_ID,
@@ -1334,6 +1335,56 @@ describe('held background & one-shot timer waits across >10m pauses and mid-wait
       assert.equal(readTurnMarker(CONN_ID, fx.connDir), null)
       assert.equal(readRequestState(CONN_ID, { dir: fx.connDir }).open.size, 0)
       assert.equal(mcpCalls.some((c) => c.name === 'report_complete'), true)
+    } finally {
+      fx.cleanup()
+    }
+  })
+})
+
+describe('the listener notes a wake before it hands it over (item 4f140d6c)', () => {
+  const tickWith = (fx, deliver) =>
+    processListenerInboxTick(createListenerQueueState(0), {
+      connectionId: CONN_ID,
+      conversationId: CONV_ID,
+      inboxPath: fx.inboxPath,
+      live: fx.live,
+      useAgentApi: true,
+      connectionsDir: fx.connDir,
+      deliver,
+      callMcp: async () => ({ ok: true }),
+      writeState: () => {},
+      writeStdout: () => {},
+      env: {},
+    })
+
+  it('the note is on disk, for that conversation, when Antigravity is given the message, and stays after a delivery', async () => {
+    const fx = makeFixture()
+    try {
+      fs.writeFileSync(fx.inboxPath, `${JSON.stringify(makeCommandRecord())}\n`)
+      let atHandOver = null
+      let delivered = null
+      await tickWith(fx, async ({ message }) => {
+        // Antigravity runs the recall hook from here on, before the transcript has the wake.
+        atHandOver = readWakeDelivery(CONN_ID, CONV_ID, fx.connDir)
+        delivered = message
+        return { ok: true }
+      })
+      assert.ok(delivered, 'the command was delivered')
+      assert.equal(atHandOver?.message, delivered)
+      assert.match(atHandOver.message, /Please pause and check staging first\./)
+      assert.equal(readWakeDelivery(CONN_ID, CONV_ID, fx.connDir)?.deliveryId, atHandOver.deliveryId)
+      assert.equal(readWakeDelivery(CONN_ID, 'another-conversation', fx.connDir), null)
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('a delivery Antigravity refused leaves no note behind', async () => {
+    const fx = makeFixture()
+    try {
+      fs.writeFileSync(fx.inboxPath, `${JSON.stringify(makeCommandRecord())}\n`)
+      await tickWith(fx, async () => ({ ok: false, error: 'agentapi_failed' }))
+      assert.equal(readWakeDelivery(CONN_ID, CONV_ID, fx.connDir), null)
     } finally {
       fx.cleanup()
     }

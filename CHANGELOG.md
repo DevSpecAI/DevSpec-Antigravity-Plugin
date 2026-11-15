@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.26.2
+
+- **A command sent from a room now gets its project recall.** A command sent to an Antigravity agent from a DevSpec room, on the web or a phone, woke the agent and it answered, but DevSpec's recall cards (the project's relevant decisions, requirements, tasks and documents) never reached that turn. Typed at the terminal, the same question got them. Antigravity runs the `PreInvocation` hook for a room command about a tenth of a second before it writes the command into the conversation's transcript, so the hook saw the last turn's final step, took the call for one inside a turn, and asked nothing; by the turn's next model call the model's own steps followed the command, and it asked nothing again.
+- The listener now notes each wake immediately before it hands it to Antigravity (`scripts/wake-delivery.mjs`, one owner-only file per connection, removed if the delivery fails), and the recall hook reads that note when the transcript shows no turn opening it has not handled. The cards arrive before the model's first call.
+- The hook also looks for the turn's opening step instead of judging only the newest one (`findTurnOpening` in `scripts/turn-recall.mjs`), so a command whose reply and tool steps already follow it is still found.
+- Unchanged: each command is recalled once, each card is shown once per conversation, a short reply or a slash command asks nothing, a failed lookup injects nothing, and typed prompts behave as before.
+
 ## 0.26.1
 
 - **Project recall gets 5 seconds instead of 3.** After a quiet spell the first lookup on a message can take over 2.5 seconds, and at the old 2.8-second limit that message went ahead with no cards. The request is now abandoned at 4.8 s and the whole recall at 5 s (`TURN_RECALL_LIMITS` in `scripts/turn-recall.mjs`); DevSpec's own limit moved up in step and now counts from when the request reached it, so it has answered or given up before the hook stops waiting. An answer that is ready sooner is used at once, and signed out, no project in sight, an error or a timeout still injects nothing.

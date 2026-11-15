@@ -34,6 +34,7 @@ import {
   readHeldInboxRecords,
 } from './devspec-remote-wait.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
+import { clearWakeDelivery, recordWakeDelivery } from './wake-delivery.mjs'
 import {
   isForegroundTurnRunning,
   isTurnMarkerActive,
@@ -908,6 +909,10 @@ export async function processListenerInboxTick(
 
     let deliveredVia = 'stdout'
     if (useAgentApi) {
+      // Before the hand-over, never after it: Antigravity starts the turn, and runs
+      // the recall hook, before it writes this message into the transcript the hook
+      // reads (wake-delivery.mjs).
+      recordWakeDelivery(connectionId, { conversationId, message }, connectionsDir, nowFn())
       const res = await deliver({
         conversationId,
         message,
@@ -915,6 +920,7 @@ export async function processListenerInboxTick(
         state: live,
       })
       if (!res?.ok) {
+        clearWakeDelivery(connectionId, connectionsDir)
         const error = String(res?.error || 'agentapi_failed')
         if (error !== queueState.lastDeliveryError) {
           writeStdout(
