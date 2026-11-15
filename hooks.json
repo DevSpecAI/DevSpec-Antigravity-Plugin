@@ -11,7 +11,7 @@
       {
         "type": "command",
         "command": "node ./scripts/pre-invocation.mjs",
-        "timeout": 10
+        "timeout": 12
       }
     ],
     "PostInvocation": [

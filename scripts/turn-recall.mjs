@@ -29,7 +29,9 @@
  *   left the context can return.
  * - **Never in the way.** Signed out, no project in sight, a slow or failing server:
  *   the hook injects nothing and the turn goes ahead. The HTTP call is abandoned at
- *   2.8 s and the whole recall at 3 s. The hook never renews the sign-in itself, or
+ *   4.8 s and the whole recall at 5 s (2.8 s and 3 s until item b2b70df7: the first
+ *   lookup after an idle spell can take over 2.5 s, and then got no cards). An answer
+ *   that is ready sooner is used at once. The hook never renews the sign-in itself, or
  *   waits for a renewal: a renewal cut off by the hook's deadline could lose the
  *   rotated refresh key. A login past half its life gets the plugin's usual detached
  *   `devspec-login.mjs --renew`, which finishes on its own under the store's lock,
@@ -59,10 +61,10 @@ import { connectionCredential, resolveDevspecMcpAuth } from './resolve-mcp-auth.
 export const TURN_RECALL_LIMITS = Object.freeze({
   /** Shorter than this is an acknowledgement, not a topic (the server skips it too). */
   minQueryChars: 18,
-  /** The HTTP call is abandoned here; the server answers by 2.4 s. */
-  clientHttpTimeoutMs: 2_800,
+  /** The HTTP call is abandoned here; the server gives up 400 ms sooner, counted from when the request reached it. */
+  clientHttpTimeoutMs: 4_800,
   /** The whole recall, gating and state included, never holds the turn longer. */
-  hardExitMs: 3_000,
+  hardExitMs: 5_000,
   /** Seen keys kept per conversation: all of them go with every request (server cap 512). */
   seenStoreMaxEntries: 512,
   /** One conversation's state file never grows past this. */

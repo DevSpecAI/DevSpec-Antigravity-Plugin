@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.26.1
+
+- **Project recall gets 5 seconds instead of 3.** After a quiet spell the first lookup on a message can take over 2.5 seconds, and at the old 2.8-second limit that message went ahead with no cards. The request is now abandoned at 4.8 s and the whole recall at 5 s (`TURN_RECALL_LIMITS` in `scripts/turn-recall.mjs`); DevSpec's own limit moved up in step and now counts from when the request reached it, so it has answered or given up before the hook stops waiting. An answer that is ready sooner is used at once, and signed out, no project in sight, an error or a timeout still injects nothing.
+- The `PreInvocation` hook's limit in `hooks.json` is 12 s (was 10 s), so the steps that run beside recall keep the room they had.
+
 ## 0.26.0
 
 - **Requirements, overlap previews and recording intent, pointed at the served contract (5.25.0).** `rules/AGENTS.md` now tells the agent to ask before recording a decision and to record nothing on a "no" or no answer (`core.record-decisions-only-on-confirmation`); that a task's `intent` is the person's own reason, never an invented one (`core.write-the-persons-intent`); that requirements are rare and asked for first, then recorded in one step once the person agrees (`core.ask-before-recording-requirements`); to hold work to the requirements a claim returns, reading every linked document in full (`core.hold-work-to-claimed-context`), and to check delivered work against them before recording it, linking each one seen met as evidence (`core.check-deliverables-against-requirements`); and, when `create_task` or `record_memory` answers `preview_required`, to prefer updating, superseding or extending the record it names, talk a prior rejection through with the person, and confirm with `preview_ack` only when a separate record is genuinely intended (`core.prefer-existing-records-on-overlap`). Each points at its rule rather than restating it.
