@@ -16,9 +16,18 @@
  * - **One hook, at the turn's tail.** Only a turn-opening step recalls: the person's
  *   own `USER_INPUT`, or a `[DevSpec Remote Wake]` that delivers a command or an
  *   automation run. PreInvocation also fires before every model call inside a turn;
- *   those see a tool or planner step as the newest one and return at once, with no
+ *   those find no turn opening they have not handled and return at once, with no
  *   network call. The cards go in as a new `systemMessage` step, never into the
  *   system prompt or an earlier step, so the conversation's cached prefix stays warm.
+ * - **The opening is looked for, not assumed to be the newest step.** A typed prompt
+ *   is the newest step when its hook runs. A room command is not: Antigravity runs
+ *   the hook about a tenth of a second before it writes the wake into the
+ *   transcript, and by the turn's next model call the model's own steps follow it
+ *   (item 4f140d6c, measured on agy 1.5.9). So the hook takes the newest opening
+ *   past the last step it handled, wherever it sits in the transcript's tail, and
+ *   when there is none it reads the wake the listener noted as it delivered it
+ *   (`wake-delivery.mjs`). That second read is what gets a room command its cards
+ *   before the model's first call rather than its second.
  * - **Once per command.** The plugin never asks `poll_connection` to attach recall
  *   to a delivered command, so this hook is the only path that delivers it. A
  *   command seen at two steps is recalled once, by its message id.
@@ -54,8 +63,9 @@ import { readConversationProject } from './conversation-project.mjs'
 import { findProjectPin, gitRemoteOrigin } from './devspec-scope.mjs'
 import { loadState, normalizeTranscriptPath, resolveHookConversationId, extractUserRequestText } from './mirror-turn.mjs'
 import { writePrivateText } from './private-state.mjs'
-import { inferAntigravityTranscriptPath } from './remote-control-state.mjs'
+import { inferAntigravityTranscriptPath, readLocalBond } from './remote-control-state.mjs'
 import { connectionCredential, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { readWakeDelivery } from './wake-delivery.mjs'
 
 /** The host delivery contract's numbers (7c87f509 `RECALL_TIMEOUT_BUDGETS`). */
 export const TURN_RECALL_LIMITS = Object.freeze({
@@ -73,7 +83,7 @@ export const TURN_RECALL_LIMITS = Object.freeze({
   seenStoreTtlMs: 30 * 24 * 60 * 60 * 1_000,
   /** Recent command ids and scope misses remembered per conversation. */
   recentIdsKept: 32,
-  /** The newest step is found in the last this-many bytes of the compact transcript. */
+  /** The newest step, and a turn opening not handled yet, are found in the last this-many bytes of the compact transcript. */
   transcriptTailBytes: 65_536,
 })
 
@@ -112,6 +122,8 @@ function emptyState(conversationId) {
     updated_at: 0,
     last_processed_step_index: null,
     last_checkpoint_step_index: null,
+    /** The wake delivery this conversation last acted on (wake-delivery.mjs), whatever came of it. */
+    last_wake_delivery_id: null,
     handled_remote_ids: [],
     scope_misses: [],
     entries: [],
@@ -140,6 +152,7 @@ export function loadSeenState(conversationId, { home = os.homedir() } = {}) {
       updated_at: Number.isFinite(parsed.updated_at) ? parsed.updated_at : 0,
       last_processed_step_index: isInt(parsed.last_processed_step_index) ? parsed.last_processed_step_index : null,
       last_checkpoint_step_index: isInt(parsed.last_checkpoint_step_index) ? parsed.last_checkpoint_step_index : null,
+      last_wake_delivery_id: typeof parsed.last_wake_delivery_id === 'string' && parsed.last_wake_delivery_id ? parsed.last_wake_delivery_id : null,
       handled_remote_ids: stringList(parsed.handled_remote_ids),
       scope_misses: stringList(parsed.scope_misses),
       entries: (Array.isArray(parsed.entries) ? parsed.entries : []).filter(
@@ -285,21 +298,22 @@ export function scanJsonlFromEnd(filePath, visit, { chunkBytes = 65_536 } = {}) 
 }
 
 /**
- * The newest step in the compact `transcript.jsonl` and the newest CHECKPOINT, from
- * its last 64 KB. A step whose `content` the compact file cut short is read whole
- * from `transcript_full.jsonl`.
+ * The steps in the last 64 KB of the compact `transcript.jsonl`, oldest first, and
+ * the newest CHECKPOINT among them. Each step is `{ stepIndex, type, content,
+ * truncated }`; a `content` the compact file cut short is still short here
+ * (`hydrateStep` reads it whole).
  */
-export function readLatestStep(transcriptPath) {
-  if (!transcriptPath) return { step: null, checkpoint: null }
+export function readTailSteps(transcriptPath) {
+  if (!transcriptPath) return { steps: [], checkpoint: null }
   let tail
   try {
     tail = readTail(transcriptPath, TURN_RECALL_LIMITS.transcriptTailBytes)
   } catch {
-    return { step: null, checkpoint: null }
+    return { steps: [], checkpoint: null }
   }
   const lines = tail.text.split('\n')
   if (tail.start > 0) lines.shift() // the first line may begin mid-record
-  let step = null
+  const byIndex = new Map()
   let checkpoint = null
   for (const line of lines) {
     const trimmed = line.trim()
@@ -312,28 +326,44 @@ export function readLatestStep(transcriptPath) {
     }
     if (!isInt(obj?.step_index)) continue
     if (obj.type === 'CHECKPOINT') checkpoint = Math.max(checkpoint ?? -1, obj.step_index)
-    if (!step || obj.step_index >= step.step_index) step = obj
-  }
-  if (!step) return { step: null, checkpoint }
-  const out = {
-    stepIndex: step.step_index,
-    type: String(step.type ?? ''),
-    content: typeof step.content === 'string' ? step.content : '',
-    truncated: Array.isArray(step.truncated_fields) && step.truncated_fields.includes('content'),
-  }
-  if (out.truncated) {
-    const full = path.join(path.dirname(transcriptPath), 'transcript_full.jsonl')
-    scanJsonlFromEnd(full, (obj) => {
-      if (!isInt(obj?.step_index) || obj.step_index < out.stepIndex) return true
-      if (obj.step_index === out.stepIndex && typeof obj.content === 'string') {
-        out.content = obj.content
-        out.truncated = false
-        return true
-      }
-      return false
+    // A step written twice keeps its later line, as the newest-step read always did.
+    byIndex.set(obj.step_index, {
+      stepIndex: obj.step_index,
+      type: String(obj.type ?? ''),
+      content: typeof obj.content === 'string' ? obj.content : '',
+      truncated: Array.isArray(obj.truncated_fields) && obj.truncated_fields.includes('content'),
     })
   }
-  return { step: out, checkpoint }
+  const steps = Array.from(byIndex.values()).sort((a, b) => a.stepIndex - b.stepIndex)
+  return { steps, checkpoint }
+}
+
+/** `step` with its whole `content`, read from `transcript_full.jsonl` when the compact file cut it short. */
+export function hydrateStep(transcriptPath, step) {
+  if (!step?.truncated) return step
+  const out = { ...step }
+  const full = path.join(path.dirname(transcriptPath), 'transcript_full.jsonl')
+  scanJsonlFromEnd(full, (obj) => {
+    if (!isInt(obj?.step_index) || obj.step_index < out.stepIndex) return true
+    if (obj.step_index === out.stepIndex && typeof obj.content === 'string') {
+      out.content = obj.content
+      out.truncated = false
+      return true
+    }
+    return false
+  })
+  return out
+}
+
+/**
+ * The newest step in the compact `transcript.jsonl` and the newest CHECKPOINT, from
+ * its last 64 KB. A step whose `content` the compact file cut short is read whole
+ * from `transcript_full.jsonl`.
+ */
+export function readLatestStep(transcriptPath) {
+  const { steps, checkpoint } = readTailSteps(transcriptPath)
+  const newest = steps.at(-1)
+  return { step: newest ? hydrateStep(transcriptPath, newest) : null, checkpoint }
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +504,49 @@ export function classifyStep(step, { home = os.homedir() } = {}) {
   if (query.startsWith('/')) return skip('slash_command', { remote, ids })
   if (query.length < TURN_RECALL_LIMITS.minQueryChars) return skip('short_prompt', { remote, ids })
   return { recall: true, reason: remote ? 'remote_command' : 'local_prompt', query, ids, remote }
+}
+
+/**
+ * The step that opened the turn in front of us, when this conversation has not
+ * handled it yet: the newest step past `afterStepIndex` that is a `USER_INPUT` or a
+ * command wake. Returns `{ stepIndex, decision }` or `null`.
+ *
+ * The model's own steps, the recall block this hook injects and a wake that is not a
+ * command (a check job, a notice, an answered question) open nothing to recall and
+ * are passed over, so the wake that started a turn is still found once the model's
+ * reply and tool steps follow it.
+ */
+export function findTurnOpening(transcriptPath, steps, afterStepIndex, { home = os.homedir() } = {}) {
+  for (let i = steps.length - 1; i >= 0; i--) {
+    const step = steps[i]
+    if (isInt(afterStepIndex) && step.stepIndex <= afterStepIndex) break
+    if (step.type === 'USER_INPUT') {
+      return { stepIndex: step.stepIndex, decision: classifyStep(hydrateStep(transcriptPath, step), { home }) }
+    }
+    if (step.type === 'SYSTEM_MESSAGE' && step.content.includes(REMOTE_WAKE)) {
+      const decision = classifyStep(hydrateStep(transcriptPath, step), { home })
+      if (decision.reason !== 'not_a_command_wake') return { stepIndex: step.stepIndex, decision }
+    }
+  }
+  return null
+}
+
+/**
+ * The wake the listener noted as it handed it to this conversation, unless this
+ * conversation has already acted on that delivery. `null` with no connection bound
+ * to the conversation, which is every conversation that is not under remote control.
+ */
+export function pendingWakeDelivery(conversationId, state, { home = os.homedir() } = {}) {
+  let bond = null
+  try {
+    bond = readLocalBond(conversationId, path.join(home, '.devspec', 'remote-control'))
+  } catch {
+    bond = null
+  }
+  if (typeof bond?.connection_id !== 'string' || !bond.connection_id) return null
+  const delivery = readWakeDelivery(bond.connection_id, conversationId, connectionsDirOf(home))
+  if (!delivery || delivery.deliveryId === state.last_wake_delivery_id) return null
+  return delivery
 }
 
 // ---------------------------------------------------------------------------
@@ -665,8 +738,9 @@ export async function runTurnRecall(raw, {
   const conversationId = resolveHookConversationId(input, env)
   if (!conversationId) return { result: null, reason: 'no_conversation_id' }
   const transcriptPath = compactTranscriptPath(input, conversationId, env)
-  const { step, checkpoint } = readLatestStep(transcriptPath)
-  if (!step) return { result: null, reason: 'no_transcript_step' }
+  const { steps, checkpoint } = readTailSteps(transcriptPath)
+  const newest = steps.at(-1)
+  if (!newest) return { result: null, reason: 'no_transcript_step' }
 
   const { state, existed } = loadSeenState(conversationId, { home })
   let dirty = applyCheckpoint(state, checkpoint)
@@ -681,16 +755,31 @@ export async function runTurnRecall(raw, {
     dirty = false
   }
 
-  if (isInt(state.last_processed_step_index) && step.stepIndex <= state.last_processed_step_index) {
-    persist()
-    return { result: null, reason: 'already_processed' }
+  // What opened this turn: a step in the transcript this conversation has not
+  // handled, else the wake being delivered right now, which the transcript does not
+  // hold yet (see the header). `atStep` is where the cards will sit.
+  let decision
+  let atStep
+  const opening = findTurnOpening(transcriptPath, steps, state.last_processed_step_index, { home })
+  if (opening) {
+    decision = opening.decision
+    atStep = opening.stepIndex
+    state.last_processed_step_index = opening.stepIndex
+  } else {
+    const delivery = pendingWakeDelivery(conversationId, state, { home })
+    if (!delivery) {
+      persist()
+      const handled = isInt(state.last_processed_step_index) && newest.stepIndex <= state.last_processed_step_index
+      return { result: null, reason: handled ? 'already_processed' : 'mid_turn_step' }
+    }
+    decision = classifyStep({ type: 'SYSTEM_MESSAGE', content: delivery.message }, { home })
+    atStep = newest.stepIndex
+    // Acted on once, whatever comes of it: a slow server must not be asked again
+    // before every model call of the turn. When the wake's own step reaches the
+    // transcript it is handled there, and a command recalled here is not recalled
+    // twice (`handled_remote_ids`).
+    state.last_wake_delivery_id = delivery.deliveryId
   }
-  const decision = classifyStep(step, { home })
-  if (decision.reason === 'mid_turn_step' || decision.reason === 'no_transcript_step') {
-    persist()
-    return { result: null, reason: decision.reason }
-  }
-  state.last_processed_step_index = step.stepIndex
   dirty = true
   if (!decision.recall) {
     persist()
@@ -751,7 +840,7 @@ export async function runTurnRecall(raw, {
     persist()
     return { result: null, reason: 'nothing_relevant' }
   }
-  recordSeenKeys(state, answer.keys, step.stepIndex, now())
+  recordSeenKeys(state, answer.keys, atStep, now())
   persist()
   return {
     result: { injectSteps: [{ systemMessage: { systemMessage: answer.block } }] },

@@ -8,7 +8,10 @@
  * a CHECKPOINT summarises it away, every failure injects nothing and remembers
  * nothing, a scope the server could not place is not asked again, the state stays
  * private and bounded, the key never leaves memory, and the poller never asks
- * poll_connection for recall (which would deliver it twice).
+ * poll_connection for recall (which would deliver it twice). And the shape a real
+ * room command has (item 4f140d6c): its hook runs before Antigravity has written the
+ * wake into the transcript, and by the next model call the model's own steps follow
+ * it, so a hook that only judged the newest step never recalled for one.
  */
 
 import assert from 'node:assert/strict'
@@ -35,6 +38,8 @@ import {
 import { runPreInvocation } from './pre-invocation.mjs'
 import { POSIX_MODES } from './private-state.mjs'
 import { projectStatePath } from './conversation-project.mjs'
+import { writeLocalBond } from './remote-control-state.mjs'
+import { clearWakeDelivery, recordWakeDelivery, wakeDeliveryPath } from './wake-delivery.mjs'
 
 const SCRIPTS = path.dirname(fileURLToPath(import.meta.url))
 const CONV = '5b0c1f7e-1111-4222-8333-944455556666'
@@ -396,6 +401,154 @@ describe('one PreInvocation', () => {
       const out = await runTurnRecall(fx.input(), { home: fx.home, env: {}, fetchImpl: srv.fetchImpl, target: () => null })
       assert.equal(out.reason, 'no_credential_or_project')
       assert.equal(srv.calls.length, 0)
+    } finally {
+      fx.cleanup()
+    }
+  })
+})
+
+/** The wake as the listener hands it to Antigravity: the text inside the SYSTEM_MESSAGE step it becomes. */
+function deliveredWake({ body, messageId = MSG }) {
+  return [
+    '[DevSpec Remote Wake]',
+    `Session: ${SESS}`,
+    `Ali Price (owner): ${body}`,
+    JSON.stringify({ type: 'owner_message', from: 'Ali Price', authority: 'owner', message_id: messageId, body_chars: body.length, session_id: SESS }),
+    JSON.stringify({ type: 'wake', reason: 'canonical_conversational_command', command_message_ids: [messageId] }),
+  ].join('\n\n')
+}
+
+describe('a command sent from a room (item 4f140d6c)', () => {
+  const QUESTION = 'What did we decide about password strength hints on sign-up?'
+
+  /** A conversation already under remote control, one typed turn behind it. */
+  async function attached(srv) {
+    const fx = fixture()
+    writeLocalBond(CONV, { connection_id: CONN }, path.join(fx.home, '.devspec', 'remote-control'))
+    const opts = { home: fx.home, env: {}, fetchImpl: srv.fetchImpl, target: target() }
+    fx.step('USER_INPUT', userInput('How should customers sign in to our app?'))
+    await runTurnRecall(fx.input(), opts)
+    fx.step('PLANNER_RESPONSE', 'They sign in with a magic link.')
+    return { fx, opts }
+  }
+
+  it('is recalled once when the model\'s reply step already follows the wake, as it does by the turn\'s second model call', async () => {
+    const responses = [answer(BLOCK, ['requirement:r1:v1']), answer('## DevSpec recall\nmemory m2 v1', ['memory:m2:v1'])]
+    const srv = server(() => responses.shift() ?? answer(BLOCK, []))
+    const { fx, opts } = await attached(srv)
+    try {
+      const wakeAt = fx.step('SYSTEM_MESSAGE', commandWake({ body: QUESTION }))
+      fx.step('PLANNER_RESPONSE', '')
+      fx.step('GENERIC', 'read the room')
+
+      const out = await runTurnRecall(fx.input(), opts)
+      assert.equal(out.reason, 'remote_command')
+      assert.match(out.result.injectSteps[0].systemMessage.systemMessage, /m2 v1/)
+      assert.equal(srv.calls.length, 2)
+      assert.equal(srv.calls[1].body.query, QUESTION)
+      // Cards from the typed turn are sent as already seen, so the server repeats none.
+      assert.deepEqual(srv.calls[1].body.seen_versions, ['requirement:r1:v1'])
+
+      // The rest of that turn, and the same command delivered again, ask nothing more.
+      fx.step('SYSTEM_MESSAGE', `<SYSTEM_MESSAGE>\nmemory m2 v1\n</SYSTEM_MESSAGE>`)
+      fx.step('PLANNER_RESPONSE', '')
+      assert.equal((await runTurnRecall(fx.input(), opts)).reason, 'mid_turn_step')
+      fx.step('SYSTEM_MESSAGE', commandWake({ body: QUESTION }))
+      fx.step('PLANNER_RESPONSE', '')
+      assert.equal((await runTurnRecall(fx.input(), opts)).reason, 'command_already_recalled')
+      assert.equal(srv.calls.length, 2)
+
+      const { state } = loadSeenState(CONV, { home: fx.home })
+      assert.deepEqual(state.handled_remote_ids, [MSG])
+      assert.equal(state.entries.find((e) => e.key === 'memory:m2:v1').step, wakeAt)
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('is recalled from the wake the listener noted, before the transcript holds it, and not again when it does', async () => {
+    const responses = [answer(BLOCK, ['requirement:r1:v1']), answer('## DevSpec recall\nmemory m2 v1', ['memory:m2:v1'])]
+    const srv = server(() => responses.shift() ?? answer(BLOCK, []))
+    const { fx, opts } = await attached(srv)
+    try {
+      // The hook for the wake's first model call: the transcript still ends in the last turn.
+      recordWakeDelivery(CONN, { conversationId: CONV, message: deliveredWake({ body: QUESTION }) }, fx.connDir)
+      if (POSIX_MODES) assert.equal(modeOf(wakeDeliveryPath(CONN, fx.connDir)), 0o600)
+      const first = await runTurnRecall(fx.input(), opts)
+      assert.equal(first.reason, 'remote_command')
+      assert.match(first.result.injectSteps[0].systemMessage.systemMessage, /m2 v1/)
+      assert.equal(srv.calls.length, 2)
+      assert.equal(srv.calls[1].body.query, QUESTION)
+
+      // Antigravity then writes the wake, the injected cards and the model's reply.
+      fx.step('SYSTEM_MESSAGE', commandWake({ body: QUESTION }))
+      fx.step('SYSTEM_MESSAGE', `<SYSTEM_MESSAGE>\nmemory m2 v1\n</SYSTEM_MESSAGE>`)
+      fx.step('PLANNER_RESPONSE', '')
+      assert.equal((await runTurnRecall(fx.input(), opts)).reason, 'command_already_recalled')
+      fx.step('GENERIC', 'tool output')
+      assert.equal((await runTurnRecall(fx.input(), opts)).reason, 'mid_turn_step')
+      assert.equal(srv.calls.length, 2)
+
+      // A typed prompt afterwards is its own turn, as before.
+      fx.step('USER_INPUT', userInput('And is anything about sign-in still open?'))
+      assert.equal((await runTurnRecall(fx.input(), opts)).reason, 'local_prompt')
+      assert.equal(srv.calls.length, 3)
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('a short reply or a slash command from the room asks nothing, by either route', async () => {
+    const srv = server(() => answer(BLOCK, ['requirement:r1:v1']))
+    const { fx, opts } = await attached(srv)
+    try {
+      recordWakeDelivery(CONN, { conversationId: CONV, message: deliveredWake({ body: 'ok thanks' }) }, fx.connDir)
+      assert.equal((await runTurnRecall(fx.input(), opts)).reason, 'short_prompt')
+      fx.step('SYSTEM_MESSAGE', commandWake({ body: 'ok thanks' }))
+      fx.step('PLANNER_RESPONSE', '')
+      assert.equal((await runTurnRecall(fx.input(), opts)).reason, 'short_prompt')
+
+      recordWakeDelivery(CONN, { conversationId: CONV, message: deliveredWake({ body: '/devspec:devspec-status please', messageId: 'd2222222-2222-4222-8222-222222222222' }) }, fx.connDir)
+      assert.equal((await runTurnRecall(fx.input(), opts)).reason, 'slash_command')
+      assert.equal(srv.calls.length, 1, 'only the typed turn asked')
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('a noted wake is acted on once: a failed lookup is not repeated before every model call of the turn', async () => {
+    let fail = false
+    const srv = server(() => (fail ? { status: 500 } : answer(BLOCK, ['requirement:r1:v1'])))
+    const { fx, opts } = await attached(srv)
+    try {
+      fail = true
+      recordWakeDelivery(CONN, { conversationId: CONV, message: deliveredWake({ body: QUESTION }) }, fx.connDir)
+      assert.equal((await runTurnRecall(fx.input(), opts)).result, null)
+      assert.equal(srv.calls.length, 2)
+      // Still no wake step in the transcript: the next model call of the turn asks nothing.
+      fx.step('GENERIC', 'tool output')
+      assert.equal((await runTurnRecall(fx.input(), opts)).reason, 'mid_turn_step')
+      assert.equal(srv.calls.length, 2)
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('a wake noted for another conversation, a delivery that failed, and a conversation not under remote control are all left alone', async () => {
+    const srv = server(() => answer(BLOCK, ['requirement:r1:v1']))
+    const { fx, opts } = await attached(srv)
+    try {
+      recordWakeDelivery(CONN, { conversationId: 'another-conversation', message: deliveredWake({ body: QUESTION }) }, fx.connDir)
+      assert.equal((await runTurnRecall(fx.input(), opts)).reason, 'mid_turn_step')
+
+      recordWakeDelivery(CONN, { conversationId: CONV, message: deliveredWake({ body: QUESTION }) }, fx.connDir)
+      clearWakeDelivery(CONN, fx.connDir)
+      assert.equal((await runTurnRecall(fx.input(), opts)).reason, 'mid_turn_step')
+
+      recordWakeDelivery(CONN, { conversationId: CONV, message: deliveredWake({ body: QUESTION }) }, fx.connDir)
+      fs.rmSync(path.join(fx.home, '.devspec', 'remote-control', 'local'), { recursive: true, force: true })
+      assert.equal((await runTurnRecall(fx.input(), opts)).reason, 'mid_turn_step')
+      assert.equal(srv.calls.length, 1, 'only the typed turn asked')
     } finally {
       fx.cleanup()
     }
