@@ -167,31 +167,35 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
       const inferred = existingMarker
         ? null
         : inferTurnContextFromTranscript(effectiveTranscriptPath)
-      if (
-        !existingMarker &&
-        inferred &&
-        (inferred.checkJobWake ||
-          inferred.noticeIds?.length ||
-          inferred.recordNoticeIds?.length) &&
-        !inferred.otherWake &&
-        !inferred.localPromptMirrored &&
-        !state?.local_turn
-      ) {
-        try {
-          setCurrentRequest(connectionId, UNSTATED, { dir: connectionsDir })
-        } catch {
-          /* non-fatal */
+      if (!existingMarker && inferred?.remoteControlCommand) {
+        // Never open a .turn marker inside the /devspec-remote setup turn itself.
+      } else {
+        if (
+          !existingMarker &&
+          inferred &&
+          (inferred.checkJobWake ||
+            inferred.noticeIds?.length ||
+            inferred.recordNoticeIds?.length) &&
+          !inferred.otherWake &&
+          !inferred.localPromptMirrored &&
+          !state?.local_turn
+        ) {
+          try {
+            setCurrentRequest(connectionId, UNSTATED, { dir: connectionsDir })
+          } catch {
+            /* non-fatal */
+          }
         }
+        writeTurnMarker(
+          connectionId,
+          {
+            ...(existingMarker ? {} : inferred || { remoteTurn: Boolean(state?.session_id) }),
+            lastToolAt: now,
+            preserveExplicitReply: true,
+          },
+          connectionsDir,
+        )
       }
-      writeTurnMarker(
-        connectionId,
-        {
-          ...(existingMarker ? {} : inferred || { remoteTurn: Boolean(state?.session_id) }),
-          lastToolAt: now,
-          preserveExplicitReply: true,
-        },
-        connectionsDir,
-      )
     } catch {
       /* ignore */
     }

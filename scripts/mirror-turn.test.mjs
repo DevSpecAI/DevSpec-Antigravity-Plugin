@@ -1429,5 +1429,127 @@ describe('Antigravity native hook payload & transcript handling', () => {
       fs.rmSync(tmpHome, { recursive: true, force: true })
     }
   })
+
+  it('does not mark the connection busy during the /devspec:devspec-remote setup turn, then marks busy on a real prompt', async () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-remote-connect-spare-'))
+    try {
+      const connectionsDir = path.join(tmpHome, '.devspec', 'remote-control', 'connections')
+      const legacyPath = path.join(tmpHome, '.devspec', 'remote-control.json')
+      fs.mkdirSync(connectionsDir, { recursive: true })
+      const connId = '63752d51-2af6-46a5-8436-5181a5718571'
+      const convId = 'a7702ea3-eccc-471a-abb0-ff4268edeb41'
+      const transcriptPath = path.join(tmpHome, 'transcript.jsonl')
+
+      // Step 0: user invokes /devspec:devspec-remote; Step 1: model runs devspec-remote-connect.mjs;
+      // Step 2: run_command output after connection state is registered.
+      const steps = [
+        {
+          step_index: 0,
+          source: 'USER_EXPLICIT',
+          type: 'USER_INPUT',
+          status: 'DONE',
+          created_at: new Date(Date.now() - 5000).toISOString(),
+          content: '<USER_REQUEST>\n/devspec:devspec-remote\n</USER_REQUEST>\n<ADDITIONAL_METADATA>...</ADDITIONAL_METADATA>',
+        },
+        {
+          step_index: 1,
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: new Date(Date.now() - 4000).toISOString(),
+          tool_calls: [{ name: 'run_command', args: { CommandLine: 'node devspec-remote-connect.mjs --owner-pid $PPID' } }],
+        },
+        {
+          step_index: 2,
+          source: 'SYSTEM',
+          type: 'GENERIC',
+          status: 'DONE',
+          created_at: new Date(Date.now() - 1000).toISOString(),
+          content: '━━━ DevSpec Remote Control ━━━\nStatus: registered\nwake: ALREADY ARMED',
+        },
+      ]
+      fs.writeFileSync(transcriptPath, steps.map((s) => JSON.stringify(s)).join('\n') + '\n')
+
+      // State file written during Step 2 (sessionless spare connection)
+      fs.writeFileSync(
+        path.join(connectionsDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          session_id: null,
+          agent_name: 'Antigravity',
+          local_id: convId,
+          transcript_path: transcriptPath,
+          mcp_url: 'https://example.invalid/api/mcp',
+          token: 'test-token',
+          connection_capability: 'dvsc_test',
+        }),
+      )
+
+      const calls = []
+      const preStep3 = await handleMirrorTurn(
+        'user_prompt',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        {
+          env: {},
+          connectionsDir,
+          legacyPath,
+          call: async (req) => {
+            calls.push(req)
+            return { ok: true }
+          },
+        },
+      )
+      assert.equal(preStep3.skipped, 'remote_control_command')
+      assert.equal(readTurnMarker(connId, connectionsDir), null)
+      assert.equal(calls.length, 0)
+
+      const stopStep3 = await handleMirrorTurn(
+        'stop',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        {
+          env: {},
+          connectionsDir,
+          legacyPath,
+          call: async (req) => {
+            calls.push(req)
+            return { ok: true }
+          },
+        },
+      )
+      assert.equal(stopStep3.skipped, 'remote_control_command')
+      assert.equal(calls.length, 0)
+
+      // Now the user types a real prompt in Step 4: it must mark the connection busy.
+      steps.push({
+        step_index: 4,
+        source: 'USER_EXPLICIT',
+        type: 'USER_INPUT',
+        status: 'DONE',
+        created_at: new Date().toISOString(),
+        content: '<USER_REQUEST>\nHello from terminal\n</USER_REQUEST>',
+      })
+      fs.writeFileSync(transcriptPath, steps.map((s) => JSON.stringify(s)).join('\n') + '\n')
+
+      const preStep4 = await handleMirrorTurn(
+        'user_prompt',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        {
+          env: {},
+          connectionsDir,
+          legacyPath,
+          call: async (req) => {
+            calls.push(req)
+            return { ok: true }
+          },
+        },
+      )
+      assert.equal(preStep4.busy, true)
+      assert.notEqual(readTurnMarker(connId, connectionsDir), null)
+      assert.equal(calls.some((c) => c.name === 'heartbeat_connection' && c.arguments.busy === true), true)
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
+    }
+  })
 })
 

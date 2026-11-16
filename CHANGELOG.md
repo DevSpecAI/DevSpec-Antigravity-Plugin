@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.27.2
+
+- **An Antigravity agent connected outside a room now counts as a spare agent straight away.** When you run `/devspec:devspec-remote` in an Antigravity terminal without joining a room, the connection is registered in the middle of that setup turn. When the connect script finished and Antigravity ran one final step to print the status block, the plugin saw the newly created connection and reported the agent as busy with a turn. DevSpec took that as non-check work done after connecting, which disqualified every newly connected Antigravity agent from ever counting as a spare agent for ruling checks.
+- The plugin now treats `/devspec:devspec-remote` and `/devspec:devspec-remote-stop` turns as remote-control setup from start to finish, so connecting an Antigravity agent outside a room leaves it eligible as a spare agent until you give it real work.
+- Unchanged: typing a normal prompt in the terminal or working on a room command still marks the agent as busy and records that it has done non-check work.
+
 ## 0.27.1
 
 - **A change is no longer refused because its command had already been closed.** When your Antigravity agent makes a change that records who asked (creating or updating a task, recording a memory, handing in work and so on), the plugin tells DevSpec which request the change serves. It used to add, beside that, the command the request came from. DevSpec read the command first and refused the change with "DevSpec could not confirm who asked for this change" whenever that command had been closed, even by a timing accident, although the request beside it said exactly who asked.
