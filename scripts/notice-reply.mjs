@@ -31,10 +31,11 @@
  * persisted before this version) is read as needing a person, as DevSpec reads one:
  * an unknown never makes a notice quiet.
  *
- * Imports only `requests.mjs` and `turn-completion.mjs` (Node built-ins), so
- * mirror-turn.mjs can import it.
+ * Imports only `check-job.mjs`, `requests.mjs` and `turn-completion.mjs` (Node
+ * built-ins), so mirror-turn.mjs can import it.
  */
 
+import { isCheckJobWakeText } from './check-job.mjs'
 import { NO_REQUEST } from './requests.mjs'
 import {
   commandTurnFromCommand,
@@ -326,7 +327,7 @@ export function turnWakeFromText(text) {
       if (Array.isArray(parsed)) noticeIds.push(...parsed)
     }
   }
-  if (!checkJobWake && /\btake it with claim_check_job\b/.test(String(text || ''))) {
+  if (!checkJobWake && isCheckJobWakeText(text)) {
     checkJobWake = true
   }
   const split = splitByAudience(noticeIds, (id) => audiences.get(id))

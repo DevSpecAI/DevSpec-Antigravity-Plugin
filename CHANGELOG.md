@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.27.0
+
+- **A check now sends the agent to DevSpec's instruction for ruling it.** When DevSpec sends your Antigravity agent a check to rule, the message announcing it tells the agent to read DevSpec's instruction for ruling a check before it takes one. That instruction has the agent hand the check to a helper agent wherever it can start one, so the check's entries stay out of your main conversation. Until now the message told the agent to take the check and rule every entry itself.
+- On Antigravity the helper is a subagent. The plugin follows it as background work, as it does any subagent the agent starts: the check's turn stays open until the helper reports back, and nothing is posted in the room.
+- When no helper can be started, the agent rules the check itself, as before.
+- The plugin points to DevSpec's instruction and keeps no copy of it, so a later change to how checks are ruled reaches the agent without a plugin update.
+- Unchanged: when and how checks are delivered, the order they run in, and how commands and notices are handled. There is nothing to set.
+
 ## 0.26.3
 
 - **A command sent just as the agent finishes something else is no longer lost.** If you sent a command from a DevSpec room at the moment your Antigravity agent was finishing its previous turn (often a background check it had been asked to rule on), the command could be marked finished before the agent had started it. The agent then woke, read the command and began the work, but DevSpec refused its first change because it could no longer tell who had asked, and the agent could only ask you to send the command again.
