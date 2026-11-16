@@ -31,10 +31,16 @@
  * persisted before this version) is read as needing a person, as DevSpec reads one:
  * an unknown never makes a notice quiet.
  *
- * Imports only `requests.mjs` (Node built-ins), so mirror-turn.mjs can import it.
+ * Imports only `requests.mjs` and `turn-completion.mjs` (Node built-ins), so
+ * mirror-turn.mjs can import it.
  */
 
 import { NO_REQUEST } from './requests.mjs'
+import {
+  commandTurnFromCommand,
+  commandTurnsFromEntry,
+  mergeCommandTurns,
+} from './turn-completion.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
@@ -250,7 +256,9 @@ function splitByAudience(ids, audienceOf) {
 /**
  * What one delivered inbox entry adds to the turn marker: its notice ids by label,
  * `checkJobWake` for a check job, or `otherWake` for anything else. A control entry
- * (abort, model switch) is no input to the turn and adds nothing.
+ * (abort, model switch) is no input to the turn and adds nothing. A command also adds
+ * `commandTurns`: which command turn it is and its newest message, so the turn's end
+ * can name what it closes (turn-completion.mjs, item 6ccb8be1).
  */
 export function turnWakeFromEntry(entry) {
   if (!entry || typeof entry !== 'object') return null
@@ -265,7 +273,8 @@ export function turnWakeFromEntry(entry) {
     const split = splitByAudience(ids, (id) => audiences.get(id))
     return split.noticeIds || split.recordNoticeIds ? split : null
   }
-  return { otherWake: true }
+  const commandTurns = commandTurnsFromEntry(entry)
+  return { otherWake: true, ...(commandTurns.length > 0 ? { commandTurns } : {}) }
 }
 
 /**
@@ -275,6 +284,7 @@ export function turnWakeFromEntry(entry) {
 export function turnWakeFromText(text) {
   const noticeIds = []
   const audiences = new Map()
+  const commands = []
   let checkJobWake = false
   let otherWake = false
   for (const line of String(text || '').split('\n')) {
@@ -302,9 +312,14 @@ export function turnWakeFromText(text) {
       }
     } else if (event.type === 'owner_message' || event.type === 'automation_run') {
       otherWake = true
+      // The wake line carries the canonical command under `message`, turn id included.
+      if (event.type === 'owner_message') commands.push(commandTurnFromCommand(event.message))
     }
   }
-  if (otherWake) return { otherWake: true }
+  if (otherWake) {
+    const commandTurns = mergeCommandTurns([], commands)
+    return { otherWake: true, ...(commandTurns.length > 0 ? { commandTurns } : {}) }
+  }
   if (noticeIds.length === 0) {
     for (const match of String(text || '').matchAll(/system_notice_ids\s*:\s*(\[[^\]]*\])/g)) {
       const parsed = normalizeNoticeIds(match[1])
@@ -324,10 +339,22 @@ export function turnWakeFromText(text) {
   return null
 }
 
-/** Fold a wake into the marker's record: notice ids by label and `checkJobWake` accumulate, `otherWake` sticks. */
+/**
+ * Fold a wake into the marker's record: notice ids by label and `checkJobWake`
+ * accumulate, `otherWake` sticks, and a command's turn joins `commandTurns`. A wake
+ * that brings no command leaves the key out, so the marker keeps what it holds.
+ */
 export function mergeTurnWake(marker, wake) {
   if (!wake) return {}
-  if (wake.otherWake) return { otherWake: true }
+  if (wake.otherWake) {
+    const brought = mergeCommandTurns([], wake.commandTurns)
+    return {
+      otherWake: true,
+      ...(brought.length > 0
+        ? { commandTurns: mergeCommandTurns(marker?.commandTurns, brought) }
+        : {}),
+    }
+  }
   const held = Array.isArray(marker?.noticeIds) ? marker.noticeIds : []
   const heldRecord = Array.isArray(marker?.recordNoticeIds) ? marker.recordNoticeIds : []
   const recordNoticeIds = [...new Set([...heldRecord, ...(wake.recordNoticeIds ?? [])])]
