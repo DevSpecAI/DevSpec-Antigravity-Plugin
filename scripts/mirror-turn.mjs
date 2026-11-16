@@ -1403,6 +1403,18 @@ export function isHarnessInjection(text) {
 }
 
 /**
+ * True when a user prompt is the `/devspec-remote` or `/devspec-remote-stop` setup
+ * command itself (`/(?:devspec:)?devspec-remote(?:-stop)?`). That setup turn registers
+ * or detaches the connection and must not mark the connection busy with non-check work.
+ */
+export function isRemoteControlCommandPrompt(text) {
+  if (typeof text !== 'string') return false
+  const extracted = extractUserRequestText(text)
+  const trimmed = String(extracted ?? text).trim()
+  return /^\/(?:devspec:)?devspec-remote(?:-stop)?(?:\s|$)/i.test(trimmed)
+}
+
+/**
  * True when a prompt or `<SYSTEM_MESSAGE>` step is a background command, subagent,
  * or timer notification rather than user input or a DevSpec Remote Wake.
  */
@@ -1512,6 +1524,13 @@ export function inferTurnContextFromTranscript(transcriptPath) {
           localPromptMirrored: false,
           ...(sawBgNotification ? { backgroundContinuation: true } : {}),
           ...(wake || {}),
+        }
+      }
+      if (!sawBgNotification && isRemoteControlCommandPrompt(step.content)) {
+        return {
+          remoteTurn: false,
+          localPromptMirrored: false,
+          remoteControlCommand: true,
         }
       }
       return {
@@ -2586,9 +2605,16 @@ export async function handleMirrorTurn(
   const rawStepContent =
     !latestStepIsBeforeMarker && typeof latestStep?.content === 'string' ? latestStep.content : ''
   const inferredTranscriptContext =
-    modeArg === 'user_prompt' && !isNewUserInputStep
+    !isNewUserInputStep
       ? inferTurnContextFromTranscript(effectiveTranscriptPath)
       : null
+  const isRemoteControlCommand =
+    (isNewUserInputStep && isRemoteControlCommandPrompt(rawStepContent || text)) ||
+    (!isNewUserInputStep && Boolean(inferredTranscriptContext?.remoteControlCommand)) ||
+    (modeArg === 'user_prompt' && isRemoteControlCommandPrompt(text))
+  if (isRemoteControlCommand && !existingMarker) {
+    return { ok: true, skipped: 'remote_control_command' }
+  }
   const isBgContinuation =
     modeArg === 'user_prompt' &&
     !isNewUserInputStep &&
