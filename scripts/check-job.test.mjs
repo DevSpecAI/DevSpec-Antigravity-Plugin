@@ -10,9 +10,11 @@ import os from 'node:os'
 import path from 'node:path'
 import { describe, it } from 'node:test'
 import {
+  CHECK_JOB_HELPERS_RULE,
   CHECK_JOB_VERSION,
   CHECK_JOB_WAKE_KEYS,
   checkJobWakeText,
+  isCheckJobWakeText,
   validateCheckJobDispatch,
 } from './check-job.mjs'
 import {
@@ -25,14 +27,15 @@ import {
 } from './devspec-remote-poll.mjs'
 import { buildWakeDeliveryMessage } from './devspec-remote-listen.mjs'
 import { handleMirrorTurn, readTurnMarker } from './mirror-turn.mjs'
+import { turnWakeFromText } from './notice-reply.mjs'
 import { formatInboxEntryForStream, parseInboxBatches } from './devspec-remote-wait.mjs'
 import { FIXTURE_ID, fixtureAutomationDispatch } from './remote-ingress-test-fixtures.mjs'
 
 const CONNECTION = FIXTURE_ID.connection
 const JOB = '12121212-1212-4212-8212-121212121212'
 const RECORD = '34343434-3434-4434-8434-343434343434'
-const WAKE_TEXT =
-  'A check is waiting on "Sign in with a passkey": take it with claim_check_job, rule every entry with record_check_rulings, then carry on.'
+// What the line says before it says how: that a check is waiting, and on what.
+const WAITING = 'A check is waiting on "Sign in with a passkey". '
 
 function checkJob(over = {}) {
   return {
@@ -272,31 +275,70 @@ describe('waking the agent for a check job', () => {
   const record = { type: 'check_job', connection_id: CONNECTION, session_id: null, dispatch: checkJob() }
 
   it('says a check is waiting on the record in one line', () => {
-    assert.equal(checkJobWakeText(checkJob()), WAKE_TEXT)
-    assert.equal(
-      checkJobWakeText(checkJob({ record: { type: 'memory', id: RECORD, title: '' } })),
-      `A check is waiting on the memory ${RECORD}: take it with claim_check_job, rule every entry with record_check_rulings, then carry on.`,
+    const text = checkJobWakeText(checkJob())
+    assert.ok(text.startsWith(WAITING), text)
+    assert.ok(
+      checkJobWakeText(checkJob({ record: { type: 'memory', id: RECORD, title: '' } })).startsWith(
+        `A check is waiting on the memory ${RECORD}. `,
+      ),
     )
-    assert.equal(WAKE_TEXT.includes('\n'), false)
+    assert.equal(text.includes('\n'), false)
+  })
+
+  it('points at the instruction DevSpec serves before the agent takes the job, and restates none of it (item 509154d4)', () => {
+    // The path is the contract: served-contract pointers are checked against the server
+    // in implementation-contract.test.mjs.
+    assert.equal(CHECK_JOB_HELPERS_RULE, 'semantics.check_job.helpers in devspec://product/remote-ingress-contract')
+    for (const type of ['task', 'memory', 'artifact', 'proposal', 'discussion_point', 'goal', 'backlog_scan']) {
+      for (const title of ['Retry policy', '']) {
+        const text = checkJobWakeText(checkJob({ record: { type, id: RECORD, title } }))
+        const pointer = text.indexOf(CHECK_JOB_HELPERS_RULE)
+        assert.ok(pointer > 0, `${type}: names the served instruction`)
+        // Both places it is served, and the pointer before anything about taking the job.
+        const claim = text.indexOf('claim_check_job')
+        assert.ok(claim > pointer && text.includes('`helpers`'), `${type}: names the reply field after the pointer`)
+        // It no longer tells the agent to take and rule the job itself.
+        assert.doesNotMatch(text, /take it with|record_check_rulings|rule every entry/, type)
+        // The one step that is the plugin's: how a helper is started on this host.
+        assert.match(text, /\binvoke_subagent\b/, type)
+        // DevSpec's details stay served: batches, what a helper is handed and reports
+        // back, whose work a ruling is. Read from the pointer on, past the record's name.
+        assert.doesNotMatch(
+          text.slice(pointer),
+          /batch|remaining|settled|fresh|own work|own_work|connection id|check_job_id/i,
+          type,
+        )
+        assert.equal(text.includes('\n'), false, type)
+      }
+    }
+  })
+
+  it('is recognised as a check-job wake from its text alone, in this wording and the one before it', () => {
+    const current = `[DevSpec Remote Wake]\n\n${checkJobWakeText(checkJob())}`
+    const earlier =
+      '[DevSpec Remote Wake]\n\nA check is waiting on "Sign in with a passkey": take it with claim_check_job, rule every entry with record_check_rulings, then carry on.'
+    for (const text of [current, earlier]) {
+      assert.equal(isCheckJobWakeText(text), true)
+      assert.deepEqual(turnWakeFromText(text), { checkJobWake: true })
+    }
+    assert.equal(isCheckJobWakeText('[DevSpec Remote Wake]\n\nDirected question answered.'), false)
+    assert.equal(turnWakeFromText('[DevSpec Remote Wake]\n\nDirected question answered.'), null)
   })
 
   it('says what a check on a settled discussion point, a Goal or the whole-backlog scan is about', () => {
-    const tail = ': take it with claim_check_job, rule every entry with record_check_rulings, then carry on.'
     const stale = (type, title) => checkJob({ check_kind: 'staleness', record: { type, id: RECORD, title } })
-    assert.equal(
-      checkJobWakeText(stale('discussion_point', 'Do we keep magic links?')),
-      `An out-of-date check is waiting on the settled discussion point "Do we keep magic links?"${tail}`,
+    const opens = (job, lead) => assert.ok(checkJobWakeText(job).startsWith(`${lead}. `), checkJobWakeText(job))
+    opens(
+      stale('discussion_point', 'Do we keep magic links?'),
+      'An out-of-date check is waiting on the settled discussion point "Do we keep magic links?"',
     )
-    assert.equal(
-      checkJobWakeText(stale('goal', 'Self-serve onboarding')),
-      `An out-of-date check is waiting on the Goal "Self-serve onboarding"${tail}`,
+    opens(stale('goal', 'Self-serve onboarding'), 'An out-of-date check is waiting on the Goal "Self-serve onboarding"')
+    opens(
+      stale('backlog_scan', 'Out-of-date scan of open tasks'),
+      'The whole-backlog out-of-date scan "Out-of-date scan of open tasks" is waiting',
     )
-    assert.equal(
-      checkJobWakeText(stale('backlog_scan', 'Out-of-date scan of open tasks')),
-      `The whole-backlog out-of-date scan "Out-of-date scan of open tasks" is waiting${tail}`,
-    )
-    assert.equal(checkJobWakeText(stale('goal', '')), `An out-of-date check is waiting on the Goal ${RECORD}${tail}`)
-    assert.equal(checkJobWakeText(stale('backlog_scan', '')), `The whole-backlog out-of-date scan is waiting${tail}`)
+    opens(stale('goal', ''), `An out-of-date check is waiting on the Goal ${RECORD}`)
+    opens(stale('backlog_scan', ''), 'The whole-backlog out-of-date scan is waiting')
     // Each wakes the agent through the background listener like any other check job.
     for (const type of ['discussion_point', 'goal', 'backlog_scan']) {
       const job = stale(type, 'T')
@@ -330,7 +372,7 @@ describe('waking the agent for a check job', () => {
       channel: 'explicit_check_job_dispatch',
       check_job_id: JOB,
       dispatch: checkJob(),
-      content: WAKE_TEXT,
+      content: checkJobWakeText(checkJob()),
     })
     assert.deepEqual(lines[1], {
       type: 'wake',
@@ -346,7 +388,7 @@ describe('waking the agent for a check job', () => {
     const message = buildWakeDeliveryMessage(record, { connectionId: CONNECTION })
     const parts = message.split('\n\n')
     assert.equal(parts[0], '[DevSpec Remote Wake]')
-    assert.equal(parts[1], WAKE_TEXT)
+    assert.equal(parts[1], checkJobWakeText(checkJob()))
     assert.match(parts[2], /"type":"check_job"/)
     assert.match(parts[2], new RegExp(`"check_job_id":"${JOB}"`))
     assert.equal(

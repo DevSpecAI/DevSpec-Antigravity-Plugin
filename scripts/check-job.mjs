@@ -6,9 +6,10 @@
  * job in `poll_connection` `dispatches[]`, beside automation runs, but only to a
  * connection that sends `check_job_version`. A job is inbox metadata only (which
  * record, which kind of check, how many entries, whether this agent made the change),
- * never record text, never a command, never task work and never a requester: the
- * agent takes it with `claim_check_job`, which returns what to rule, and records its
- * rulings with `record_check_rulings`.
+ * never record text, never a command, never task work and never a requester: it is
+ * taken with `claim_check_job`, which returns what to rule, and its rulings are
+ * recorded with `record_check_rulings`. Who takes it, the agent or a helper agent it
+ * starts, is DevSpec's instruction (`CHECK_JOB_HELPERS_RULE` below).
  *
  * Version 2 (DevSpec item 1d89fe56) drops `high_risk` from the envelope and lets a job
  * name a settled discussion point, a Goal, or the manual whole-backlog out-of-date
@@ -89,7 +90,47 @@ export function validateCheckJobInboxRecord(record, connectionId) {
 }
 
 /**
- * The one line an arriving job wakes the agent with (the contract's wake text).
+ * Where DevSpec says how a check job is taken and ruled, helper agents included.
+ * Pointed at, never restated (DevSpec item 509154d4): the words are the server's, and
+ * every `claim_check_job` reply carries the same ones as `helpers`.
+ */
+export const CHECK_JOB_HELPERS_RULE = 'semantics.check_job.helpers in devspec://product/remote-ingress-contract'
+
+/**
+ * What every check-job line says after naming the check: where the instruction is,
+ * and the one step that is this plugin's to give, how a helper is started here. A
+ * helper on Antigravity is a subagent, which the plugin already tracks as background
+ * work (mirror-turn.mjs): the check's turn stays open until the helper reports back,
+ * and its report continues that turn. Everything else about ruling in a helper is the
+ * served instruction's.
+ */
+const CHECK_JOB_WAKE_LEAD = `Before you take it, read ${CHECK_JOB_HELPERS_RULE}`
+const CHECK_JOB_WAKE_HOW =
+  `${CHECK_JOB_WAKE_LEAD} (claim_check_job repeats it as \`helpers\`) ` +
+  'and rule it as that says, then carry on. ' +
+  'On Antigravity a helper agent is a subagent you start with invoke_subagent, which the plugin tracks as background work.'
+
+/** How the line read before 0.27.0. */
+const EARLIER_CHECK_JOB_WAKE_HOW = /\btake it with claim_check_job\b/
+
+/**
+ * Whether a wake's text carries a check-job line, for a wake whose JSON lines are not
+ * there to say so (notice-reply.mjs). The earlier wording still counts: a listener
+ * started before an update keeps writing the line it loaded until it restarts, while
+ * the hooks that read it run from the updated files.
+ */
+export function isCheckJobWakeText(text) {
+  const value = String(text || '')
+  return value.includes(CHECK_JOB_WAKE_LEAD) || EARLIER_CHECK_JOB_WAKE_HOW.test(value)
+}
+
+/**
+ * The one line an arriving job wakes the agent with (the contract's wake text). It
+ * says a check is waiting, on what, and where DevSpec says how it is ruled. The
+ * pointer comes before the agent takes the job (DevSpec item 509154d4): the
+ * instruction decides who takes it, so an agent that claimed first would already hold
+ * the entries the instruction keeps out of its conversation.
+ *
  * Version 1's records are named by their title alone, as they always were. The three
  * version 2 added say what they are, because a discussion point's or a Goal's title
  * alone does not say why a check is on it, and the whole-backlog scan is not a record
@@ -99,7 +140,7 @@ export function checkJobWakeText(dispatch) {
   const title = typeof dispatch?.record?.title === 'string' ? dispatch.record.title.trim() : ''
   const type = dispatch?.record?.type
   const named = title ? `"${title}"` : null
-  const tail = ': take it with claim_check_job, rule every entry with record_check_rulings, then carry on.'
+  const tail = `. ${CHECK_JOB_WAKE_HOW}`
   if (type === 'backlog_scan') return `The whole-backlog out-of-date scan${named ? ` ${named}` : ''} is waiting${tail}`
   const noun = type === 'discussion_point' ? 'the settled discussion point' : type === 'goal' ? 'the Goal' : null
   if (noun) {

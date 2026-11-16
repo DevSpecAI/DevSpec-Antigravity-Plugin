@@ -14,6 +14,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, it } from 'node:test'
+import { isCheckJobWakeText } from './check-job.mjs'
 import {
   buildWakeDeliveryMessage,
   createListenerQueueState,
@@ -267,7 +268,7 @@ describe('active-turn FIFO queueing in devspec-remote-listen.mjs', () => {
       // Next tick drains ONLY the first held item (check_job) so it gets its own clean turn!
       const thirdTick = await tick()
       assert.equal(deliveredMessages.length, 2)
-      assert.match(deliveredMessages[1], /take it with claim_check_job/)
+      assert.equal(isCheckJobWakeText(deliveredMessages[1]), true)
       assert.equal(thirdTick.heldCount, 1, 'system_notice waits for the check-job turn to finish')
       assert.deepEqual(fx.live.inbox_held_records, [heldBoth[1]])
       assert.equal(isCurrentTurnCheckJobOnly(CONN_ID, { dir: fx.connDir }), true)
@@ -921,7 +922,7 @@ describe('held records survive a listener restart and a hand-off to the wait scr
       clearTurnMarker(CONN_ID, fx.connDir)
       await tick(restarted)
       assert.equal(deliveredMessages.length, 2)
-      assert.match(deliveredMessages[1], /take it with claim_check_job/)
+      assert.equal(isCheckJobWakeText(deliveredMessages[1]), true)
       clearTurnMarker(CONN_ID, fx.connDir)
       await tick(restarted)
       assert.equal(deliveredMessages.length, 2, 'the check job is delivered exactly once')
