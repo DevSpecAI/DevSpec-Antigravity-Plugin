@@ -32,7 +32,6 @@ import {
 } from './remote-control-state.mjs'
 import {
   localTurnScope,
-  localTurnToComplete,
   startLocalTurn,
 } from './local-turn.mjs'
 import {
@@ -64,6 +63,7 @@ import {
 import { recordMirroredLocalPrompt } from './room-unread.mjs'
 import { readConnectionTelemetry } from './statusline.mjs'
 import { parseTurnFailure, turnFailureMessage } from './turn-failure.mjs'
+import { turnCompletionIdentities } from './turn-completion.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
 const MODES = new Set(['user_prompt', 'stop', 'background_launch', 'subagent_stop'])
@@ -3242,21 +3242,25 @@ export async function handleMirrorTurn(
             busy: false,
           },
         })
-        const localAttempt = localTurnToComplete(
-          state.local_turn || marker?.localTurn,
+        // Name the turn that ended (turn-completion.mjs, item 6ccb8be1), from the
+        // marker read before it was cleared above. By now the next command may already
+        // be delivered, and a completion that names nothing closes whatever is newest on
+        // the connection: that command, before the agent starts on it.
+        for (const identity of turnCompletionIdentities({
+          marker,
+          localTurn: state.local_turn,
           sessionId,
-        )
-        try {
-          await call({
-            mcpUrl,
-            token,
-            name: 'report_complete',
-            arguments: localAttempt
-              ? { connection_id: connectionId, attempt_id: localAttempt, reason: 'turn_end' }
-              : { connection_id: connectionId, reason: 'turn_end' },
-          })
-        } catch {
-          /* non-fatal — the poller's marker-driven backstop still runs */
+        })) {
+          try {
+            await call({
+              mcpUrl,
+              token,
+              name: 'report_complete',
+              arguments: { connection_id: connectionId, ...identity, reason: 'turn_end' },
+            })
+          } catch {
+            /* non-fatal — the poller's marker-driven backstop still runs */
+          }
         }
         if (state.local_turn) {
           patchOwnState(connectionId, { local_turn: null }, connectionsDir)

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.26.3
+
+- **A command sent just as the agent finishes something else is no longer lost.** If you sent a command from a DevSpec room at the moment your Antigravity agent was finishing its previous turn (often a background check it had been asked to rule on), the command could be marked finished before the agent had started it. The agent then woke, read the command and began the work, but DevSpec refused its first change because it could no longer tell who had asked, and the agent could only ask you to send the command again.
+- When a turn ends, the plugin now tells DevSpec exactly which turn ended: the command it was given, the prompt typed at the terminal, or background work that no command started. Ending one turn can no longer close a different command. Before, it only said that the agent had finished, and DevSpec applied that to whatever was newest, which could be the command that had just arrived.
+- Unchanged: how commands, checks and notices are delivered, the order they run in, and when the room shows the agent as working. There is nothing to set.
+
 ## 0.26.2
 
 - **A command sent from a room now gets its project recall.** A command sent to an Antigravity agent from a DevSpec room, on the web or a phone, woke the agent and it answered, but DevSpec's recall cards (the project's relevant decisions, requirements, tasks and documents) never reached that turn. Typed at the terminal, the same question got them. Antigravity runs the `PreInvocation` hook for a room command about a tenth of a second before it writes the command into the conversation's transcript, so the hook saw the last turn's final step, took the call for one inside a turn, and asked nothing; by the turn's next model call the model's own steps followed the command, and it asked nothing again.

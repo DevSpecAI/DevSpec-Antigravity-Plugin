@@ -95,6 +95,7 @@ import {
   ROOM_CONTEXT_VERSION,
   SESSION_POLL_PROJECTION_VERSION_2,
 } from './remote-ingress-v1.mjs'
+import { mergeTurnWake, turnWakeFromEntry } from './notice-reply.mjs'
 import { openRequest } from './requests.mjs'
 import {
   resolveDevspecMcpAuth,
@@ -119,6 +120,7 @@ import {
 import { readSessionTitle, sessionTitleReadDue } from './session-title.mjs'
 import { readConnectionTelemetry } from './statusline.mjs'
 import { isEntryPoint } from './entry-point.mjs'
+import { turnCompletionIdentities } from './turn-completion.mjs'
 
 export const REMOTE_INGRESS_VERSION = 1
 export const DELEGATED_SCOPE_VERSION = 1
@@ -1097,6 +1099,167 @@ const ACTIVITY_VERB_TOOL = {
   complete: 'report_complete',
 }
 
+/**
+ * What the poller reports for the turn marker it sees now, given the turn it saw last
+ * (item 6ccb8be1). `seen` is the poller's memory of that turn: the marker's `startedAt`,
+ * which tells one turn from the next, and what its end closes
+ * (`turnCompletionIdentities`), read while the marker was still there.
+ *
+ * The end of a turn is reported with that remembered identity, never with what is on
+ * the connection by then: a long poll can return the next command before this loop
+ * looks at the marker again, and a completion that names nothing closes that command.
+ * When the marker on disk already belongs to a newer turn (the old one ended and the
+ * next began between two looks), the old turn is completed by its own identity and
+ * the new one is a pickup, never a keepalive of the old.
+ *
+ * @param {{ startedAt: number, identities: object[], reopened?: boolean } | null} seen
+ * @param {object | null} marker the ACTIVE marker, or null when no turn is running
+ */
+export function planTurnActivity(seen, marker, { localTurn = null, sessionId = null } = {}) {
+  const sameTurn = Boolean(seen && marker && seen.startedAt === marker.startedAt)
+  const current = marker
+    ? {
+        startedAt: marker.startedAt,
+        identities: turnCompletionIdentities({ marker, localTurn, sessionId }),
+        reopened: sameTurn && seen.reopened === true,
+      }
+    : null
+  const ended = () => {
+    // `reopened`: this poller sent a second bare pickup for the turn's work
+    // (createTurnActivityReporter). When the turn's command had already been answered,
+    // that pickup opened an attempt with no source command, and naming only the command
+    // would leave it showing Working until its lease ran out.
+    const identities =
+      seen.reopened && !seen.identities.some((identity) => identity.command_turn_unbound)
+        ? [...seen.identities, { command_turn_unbound: true }]
+        : seen.identities
+    return { verb: 'complete', identities }
+  }
+  const steps = []
+  if (seen && current && !sameTurn) {
+    steps.push(ended(), { verb: 'pickup' })
+  } else {
+    const verb = verbForTurnTransition(Boolean(seen), Boolean(current))
+    if (verb === 'complete') steps.push(ended())
+    else if (verb) steps.push({ verb })
+  }
+  return { steps, seen: current }
+}
+
+/**
+ * The poller's activity reports (`report_pickup` / `report_keepalive` /
+ * `report_complete`), driven by the turn marker. `observe` is called once per loop
+ * with the active marker (or null); it sends what `planTurnActivity` plans and keeps
+ * the memory of the turn between calls.
+ *
+ * While a directed-question continuation is held, its own exact reports stand in for
+ * these (interactionActivityPlan): a keepalive renews the continuation and the other
+ * two are not sent.
+ *
+ * A pickup names nothing, so the server resolves it: the newest pending attempt, else
+ * a new one with no source command. The first pickup after a command is delivered
+ * lands on that command. A second one for the same work does not when the command has
+ * been answered meanwhile (its answer closed it and the agent kept working), and it
+ * happens two ways: the server refuses a keepalive because nothing is working and
+ * this re-opens the attempt, or the marker is cleared here for that reason and written
+ * again by the next tool call. Either way the turn is marked `reopened`, and its end
+ * also closes source-less activity (planTurnActivity).
+ *
+ * @param {object} deps
+ * @param {(request: { name: string, arguments: object }) => Promise<unknown>} deps.callTool
+ * @param {() => object | null} deps.readMarker the marker on disk, read fresh
+ * @param {() => void} deps.clearMarker
+ */
+export function createTurnActivityReporter({
+  connectionId,
+  callTool,
+  readMarker,
+  clearMarker,
+  getContinuation = () => null,
+  keepaliveContinuation = async () => {},
+  log = (line) => process.stderr.write(line),
+  now = () => Date.now(),
+}) {
+  let seen = null
+  // The commands of the turn this poller last reported a pickup for.
+  let pickedUp = []
+
+  function notePickup() {
+    if (!seen) return
+    const commands = seen.identities
+      .filter((identity) => identity.command_turn_id)
+      .map((identity) => `${identity.command_turn_id}:${identity.command_message_id}`)
+    if (commands.length > 0 && commands.every((key) => pickedUp.includes(key))) {
+      seen.reopened = true
+    }
+    pickedUp = commands
+  }
+
+  async function recoverLostAttempt() {
+    const currentMarker = readMarker()
+    if (
+      hasPostReplyToolActivity(currentMarker, now()) ||
+      currentMarker?.held === true ||
+      currentMarker?.checkJobWake === true ||
+      (Array.isArray(currentMarker?.noticeIds) && currentMarker.noticeIds.length > 0) ||
+      (Array.isArray(currentMarker?.recordNoticeIds) && currentMarker.recordNoticeIds.length > 0) ||
+      (typeof currentMarker?.startedAt === 'number' && now() - currentMarker.startedAt <= 60_000)
+    ) {
+      try {
+        await callTool({ name: 'report_pickup', arguments: { connection_id: connectionId } })
+        if (seen) seen.reopened = true
+        log('devspec-remote-poll: active turn detected — re-opened working attempt via report_pickup\n')
+        return true
+      } catch (pickupErr) {
+        log(`devspec-remote-poll: continuation report_pickup failed: ${pickupErr.message}\n`)
+      }
+    }
+    return false
+  }
+
+  async function send(verb, identity = {}) {
+    const name = ACTIVITY_VERB_TOOL[verb]
+    try {
+      await callTool({
+        name,
+        arguments: {
+          connection_id: connectionId,
+          ...identity,
+          ...(verb === 'complete' ? { reason: 'turn_marker_cleared' } : {}),
+        },
+      })
+      if (verb === 'pickup') notePickup()
+    } catch (e) {
+      log(`devspec-remote-poll: activity verb ${verb} (${name}) failed: ${e.message}\n`)
+      if (!isNoWorkingAttemptRefusal(e)) return
+      if (verb === 'keepalive' && (await recoverLostAttempt())) return
+      clearMarker()
+      seen = null
+      log('devspec-remote-poll: server reports no working attempt — clearing the stale turn marker\n')
+    }
+  }
+
+  return {
+    async observe(marker, context = {}) {
+      const plan = planTurnActivity(seen, marker, context)
+      seen = plan.seen
+      for (const step of plan.steps) {
+        const exact = interactionActivityPlan({ verb: step.verb, continuation: getContinuation() })
+        if (exact.kind === 'suppress') continue
+        if (exact.kind === 'exact_keepalive') {
+          await keepaliveContinuation()
+          continue
+        }
+        if (step.verb === 'complete') {
+          for (const identity of step.identities) await send('complete', identity)
+        } else {
+          await send(step.verb)
+        }
+      }
+    },
+  }
+}
+
 export function resolveServerAttachment(currentSessionId, hb) {
   if (!hb || typeof hb !== 'object' || hb.status === 'not_found') {
     return { sessionId: currentSessionId, changed: false }
@@ -1591,70 +1754,16 @@ async function main() {
     }
   }
 
-  let prevTurnActive = false
-
-  async function emitActivityVerb(verb) {
-    if (!verb) return
-    const plan = interactionActivityPlan({ verb, continuation: interactionContinuation })
-    if (plan.kind === 'suppress') return
-    if (plan.kind === 'exact_keepalive') {
-      await keepaliveInteractionContinuation()
-      return
-    }
-    const name = ACTIVITY_VERB_TOOL[verb]
-    if (!name) return
-    try {
-      await mcpToolsCall({
-        mcpUrl,
-        token,
-        name,
-        arguments: {
-          connection_id: connectionId,
-          ...(verb === 'complete' ? { reason: 'turn_marker_cleared' } : {}),
-        },
-        timeoutMs: 10_000,
-      })
-    } catch (e) {
-      process.stderr.write(`devspec-remote-poll: activity verb ${verb} (${name}) failed: ${e.message}\n`)
-      if (isNoWorkingAttemptRefusal(e)) {
-        const currentMarker = readTurnMarker(connectionId)
-        if (
-          verb === 'keepalive' &&
-          (hasPostReplyToolActivity(currentMarker) ||
-            currentMarker?.held === true ||
-            currentMarker?.checkJobWake === true ||
-            (Array.isArray(currentMarker?.noticeIds) && currentMarker.noticeIds.length > 0) ||
-            (Array.isArray(currentMarker?.recordNoticeIds) &&
-              currentMarker.recordNoticeIds.length > 0) ||
-            (typeof currentMarker?.startedAt === 'number' &&
-              Date.now() - currentMarker.startedAt <= 60_000))
-        ) {
-          try {
-            await mcpToolsCall({
-              mcpUrl,
-              token,
-              name: 'report_pickup',
-              arguments: { connection_id: connectionId },
-              timeoutMs: 10_000,
-            })
-            process.stderr.write(
-              'devspec-remote-poll: active turn detected — re-opened working attempt via report_pickup\n',
-            )
-            return
-          } catch (pickupErr) {
-            process.stderr.write(
-              `devspec-remote-poll: continuation report_pickup failed: ${pickupErr.message}\n`,
-            )
-          }
-        }
-        clearTurnMarker(connectionId)
-        prevTurnActive = false
-        process.stderr.write(
-          'devspec-remote-poll: server reports no working attempt — clearing the stale turn marker\n',
-        )
-      }
-    }
-  }
+  const turnActivity = createTurnActivityReporter({
+    connectionId,
+    // `mcpUrl` and `token` are read at call time: the loop below refreshes the token.
+    callTool: ({ name, arguments: toolArguments }) =>
+      mcpToolsCall({ mcpUrl, token, name, arguments: toolArguments, timeoutMs: 10_000 }),
+    readMarker: () => readTurnMarker(connectionId),
+    clearMarker: () => clearTurnMarker(connectionId),
+    getContinuation: () => interactionContinuation,
+    keepaliveContinuation: keepaliveInteractionContinuation,
+  })
 
   let shuttingDown = false
   async function offlineAndExit(reason, code) {
@@ -2239,7 +2348,19 @@ async function main() {
         }) + '\n',
       )
       if (shouldAssertTurnOnPollerInboxWrite(connectionId, readState(connectionId))) {
-        writeTurnMarker(connectionId, { remoteTurn: true, otherWake: true })
+        // With the command's own turn and message, so this turn's end can name what
+        // it closes (turn-completion.mjs, item 6ccb8be1).
+        writeTurnMarker(connectionId, {
+          remoteTurn: true,
+          ...mergeTurnWake(
+            readTurnMarker(connectionId),
+            turnWakeFromEntry({
+              type: 'canonical_commands',
+              ingress,
+              execute_message_ids: persisted.executeMessageIds,
+            }),
+          ),
+        })
       }
       patchState({ last_owner_wake_at: new Date().toISOString() })
       if (persisted.handedOff) {
@@ -2433,9 +2554,10 @@ async function main() {
     if (turnActive) busyArg = true
     else if (lastBusySent === true) busyArg = false
 
-    const turnTransitionVerb = verbForTurnTransition(prevTurnActive, turnActive)
-    prevTurnActive = turnActive
-    await emitActivityVerb(turnTransitionVerb)
+    await turnActivity.observe(turnActive ? marker : null, {
+      localTurn: liveState?.local_turn ?? null,
+      sessionId,
+    })
 
     const tier = cadenceFor({ attached: !!sessionId, turnActive })
     if (tier.tier !== lastTier) {
