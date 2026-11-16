@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.27.1
+
+- **A change is no longer refused because its command had already been closed.** When your Antigravity agent makes a change that records who asked (creating or updating a task, recording a memory, handing in work and so on), the plugin tells DevSpec which request the change serves. It used to add, beside that, the command the request came from. DevSpec read the command first and refused the change with "DevSpec could not confirm who asked for this change" whenever that command had been closed, even by a timing accident, although the request beside it said exactly who asked.
+- The plugin now sends only the request on those changes. A request answers for its work after its command has closed, and the access of the person who asked is still checked at the moment of each change.
+- When the plugin knows of no request, it sends nothing about who asked and DevSpec works it out from the connection. It no longer falls back to a command it remembered from earlier.
+- Unchanged: a command or a claim the agent names itself is passed through as written; reserving and claiming a task, asking a directed question and previewing a replacement still carry the command, because DevSpec takes no request on those; and a change is still held when one turn carries two people's requests, until the agent says which it serves. There is nothing to set.
+
 ## 0.27.0
 
 - **A check now sends the agent to DevSpec's instruction for ruling it.** When DevSpec sends your Antigravity agent a check to rule, the message announcing it tells the agent to read DevSpec's instruction for ruling a check before it takes one. That instruction has the agent hand the check to a helper agent wherever it can start one, so the check's entries stay out of your main conversation. Until now the message told the agent to take the check and rule every entry itself.

@@ -66,7 +66,7 @@ function makeFixture() {
 }
 
 describe('PreToolUse mechanical input stamping (overwrite)', () => {
-  it('stamps connection_id, project_id, local_session_id, request_ref, and provenance_ref when unambiguous', () => {
+  it('stamps connection_id, project_id, local_session_id and request_ref when unambiguous, and the command only where no request can be named', () => {
     const fx = makeFixture()
     try {
       appendRequestEvent(
@@ -101,7 +101,8 @@ describe('PreToolUse mechanical input stamping (overwrite)', () => {
       assert.equal(res.overwrite.project_id, PROJ_ID)
       assert.equal(res.overwrite.local_session_id, CONV_ID)
       assert.equal(res.overwrite.request_ref, REQ_1)
-      assert.equal(res.overwrite.provenance_ref, PROV_1)
+      // The request names who asked; the command is never sent beside it.
+      assert.equal(res.overwrite.provenance_ref, undefined)
 
       // Also stamps connection_id when session_id is passed on create_task / update_task
       // so request_ref never arrives without the connection_id that carries it.
@@ -121,7 +122,20 @@ describe('PreToolUse mechanical input stamping (overwrite)', () => {
       assert.equal(createWithSession.overwrite.connection_id, CONN_ID)
       assert.equal(createWithSession.overwrite.session_id, SESS_ID)
       assert.equal(createWithSession.overwrite.request_ref, REQ_1)
-      assert.equal(createWithSession.overwrite.provenance_ref, PROV_1)
+      assert.equal(createWithSession.overwrite.provenance_ref, undefined)
+
+      // Claiming a task takes the command and no request, so it still carries it.
+      const claim = prepareDevspecToolInput(
+        {
+          conversationId: CONV_ID,
+          tool_name: 'mcp_devspec_claim_work_item',
+          tool_input: { task_id: '98788aaf-9ce0-4299-a91c-ef4507bd2df0' },
+        },
+        { home: fx.home, env: {} }
+      )
+      assert.equal(claim.decision, 'allow')
+      assert.equal(claim.overwrite.provenance_ref, PROV_1)
+      assert.equal(claim.overwrite.request_ref, undefined)
     } finally {
       fx.cleanup()
     }
@@ -367,7 +381,7 @@ describe('Multi-requester ambiguity guard & devspec-serve-request.mjs', () => {
       assert.equal(served.ok, true)
       assert.equal(served.request_ref, REQ_2)
 
-      // 4. Subsequent PreToolUse stamps REQ_2 and PROV_2
+      // 4. Subsequent PreToolUse stamps REQ_2, and never the command beside it
       const allowedWrite = prepareDevspecToolInput(
         {
           conversationId: CONV_ID,
@@ -378,7 +392,19 @@ describe('Multi-requester ambiguity guard & devspec-serve-request.mjs', () => {
       )
       assert.equal(allowedWrite.decision, 'allow')
       assert.equal(allowedWrite.overwrite.request_ref, REQ_2)
-      assert.equal(allowedWrite.overwrite.provenance_ref, PROV_2)
+      assert.equal(allowedWrite.overwrite.provenance_ref, undefined)
+
+      // 5. A tool that takes only the command follows the chosen request's command
+      const allowedClaim = prepareDevspecToolInput(
+        {
+          conversationId: CONV_ID,
+          tool_name: 'mcp_devspec_claim_work_item',
+          tool_input: { task_id: '98788aaf-9ce0-4299-a91c-ef4507bd2df0' },
+        },
+        { home: fx.home, env: {} }
+      )
+      assert.equal(allowedClaim.decision, 'allow')
+      assert.equal(allowedClaim.overwrite.provenance_ref, PROV_2)
     } finally {
       fx.cleanup()
     }
