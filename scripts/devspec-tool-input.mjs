@@ -275,7 +275,8 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
     next.agent_name = AGENT_NAME
   }
 
-  // 7. Request ref & provenance_ref stamping (or multi-requester denial)
+  // 7. Who asked: request_ref, or provenance_ref on the tools that take no request
+  //    (or multi-requester denial)
   const request = stampRequest(verb, next, connectionId, input.agent_id, {
     home,
     connectionState: connState,

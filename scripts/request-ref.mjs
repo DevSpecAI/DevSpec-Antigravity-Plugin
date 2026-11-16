@@ -1,7 +1,14 @@
 /**
- * Stamp `request_ref` and `provenance_ref` onto DevSpec MCP writes, or refuse
- * when the turn carries multiple requesters and the agent has not named which
- * one the write serves via `devspec-serve-request.mjs`.
+ * Say which request a DevSpec MCP write serves, or refuse when the turn carries
+ * multiple requesters and the agent has not named which one the write serves via
+ * `devspec-serve-request.mjs`.
+ *
+ * A write that takes `request_ref` gets the request and nothing else. The request
+ * answers for its work after its command has closed; the command tag
+ * (`provenance_ref`) is read first by DevSpec and must still be live, so sending
+ * it beside the request made a write fail on a closed command although the
+ * request said who asked. Only the few tools that take the command and not the
+ * request still get `provenance_ref`.
  */
 
 import os from 'node:os'
@@ -69,7 +76,9 @@ export const REQUEST_REF_TOOLS = new Set([
 ])
 
 /**
- * DevSpec tools that accept `provenance_ref`.
+ * DevSpec tools that accept `provenance_ref`. Kept equal to the server's list by
+ * `server-tool-names.test.mjs`; it is not the list of tools that get one stamped
+ * (see `stampsCommand`).
  */
 export const PROVENANCE_REF_TOOLS = new Set([
   ...REQUEST_REF_TOOLS,
@@ -79,6 +88,14 @@ export const PROVENANCE_REF_TOOLS = new Set([
   'report_request',
   'reserve_work_items',
 ])
+
+/**
+ * Whether PreToolUse adds the command tag to this tool: only where the server
+ * takes the command and has no `request_ref` to name the request with.
+ */
+export function stampsCommand(toolName) {
+  return PROVENANCE_REF_TOOLS.has(toolName) && !REQUEST_REF_TOOLS.has(toolName)
+}
 
 export function stampRequest(
   toolName,
@@ -114,7 +131,7 @@ export function stampRequest(
       request_ref: ref,
     }
   }
-  if (next.provenance_ref === undefined && PROVENANCE_REF_TOOLS.has(toolName)) {
+  if (next.provenance_ref === undefined && stampsCommand(toolName)) {
     const provRef =
       provenanceRefForWrite(state, agent) ||
       (typeof connectionState?.provenance_ref === 'string' && connectionState.provenance_ref
