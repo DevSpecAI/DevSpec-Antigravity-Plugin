@@ -279,7 +279,7 @@ export function currentTurnNoticeIds(
   })
 }
 
-/** Of those, the notices that need a person (`turnReplyNoticeIds`): what Stop's reply names. */
+/** Of those, the notices that need a person (`turnReplyNoticeIds`). */
 export function currentTurnReplyNoticeIds(
   connectionId,
   { dir = CONNECTIONS_DIR, connectionState = null, marker = undefined } = {},
@@ -2911,41 +2911,7 @@ export async function handleMirrorTurn(
             connectionState: state,
             marker,
           })
-          if (midWaitNotices && !marker.noticeReplyAt && sessionId) {
-            const replyText =
-              (text ? prepareAgentMirrorText(text) : null) ||
-              extractLatestAssistantReplyFromTranscript(effectiveTranscriptPath, {
-                sinceMs: marker.startedAt ?? null,
-                afterLastSystemMessage: true,
-              })
-            if (replyText) {
-              const telemetry = connectionId ? readConnectionTelemetry(connectionId) : null
-              try {
-                await call({
-                  mcpUrl,
-                  token,
-                  name: 'post_session_message',
-                  arguments: {
-                    connection_id: connectionId,
-                    agent_name: agentName,
-                    message: replyText,
-                    system_notice_ids: midWaitNotices,
-                    ...(telemetry ? { agent_stats: telemetry } : {}),
-                    ...(telemetry?.model?.id
-                      ? {
-                          model: {
-                            providerID: telemetry.model.provider || 'google',
-                            modelID: telemetry.model.id,
-                          },
-                        }
-                      : {}),
-                  },
-                })
-              } catch {
-                /* non-fatal fallback */
-              }
-            }
-          } else if (midWaitRoutine && marker.tellPerson && sessionId) {
+          if ((midWaitNotices || midWaitRoutine) && marker.tellPerson && !marker.noticeReplyAt && sessionId) {
             const tellText =
               (text ? prepareAgentMirrorText(text) : null) ||
               extractLatestAssistantReplyFromTranscript(effectiveTranscriptPath, {
@@ -3031,20 +2997,30 @@ export async function handleMirrorTurn(
       }
 
       const hadExplicitReply = consumeExplicitReplyMarker(connectionId, connectionsDir)
-      // Read before the marker goes: a turn woken only by DevSpec notices ends with a
-      // reply to the ones that need a person, and a routine turn (only check jobs and
-      // notices DevSpec labelled for the record) ends silently: no answer, no trail, no
-      // error message, never an answer filed under an earlier command (`check_job.room`
-      // and `semantics.notice_audience` in the served contract).
+      // Read before the marker goes: a turn woken only by DevSpec notices or check jobs
+      // ends silently on Stop when the model did not call post_session_message itself —
+      // never scraping local terminal notes into the room as a notice reply or command
+      // answer (`check_job.room` and `semantics.notice_audience` in the served contract;
+      // item 699517ad, decision 0fdb1237).
+      const effectiveStopMarker =
+        marker ||
+        (inferredTranscriptContext &&
+        !inferredTranscriptContext.otherWake &&
+        !inferredTranscriptContext.localPromptMirrored &&
+        (inferredTranscriptContext.checkJobWake ||
+          inferredTranscriptContext.noticeIds?.length ||
+          inferredTranscriptContext.recordNoticeIds?.length)
+          ? { startedAt: Date.now(), ...inferredTranscriptContext }
+          : null)
       const turnNotices = currentTurnReplyNoticeIds(connectionId, {
         dir: connectionsDir,
         connectionState: state,
-        marker,
+        marker: effectiveStopMarker,
       })
       const routineTurn = isCurrentTurnRoutine(connectionId, {
         dir: connectionsDir,
         connectionState: state,
-        marker,
+        marker: effectiveStopMarker,
       })
       clearTurnMarker(connectionId, connectionsDir)
 
@@ -3067,51 +3043,13 @@ export async function handleMirrorTurn(
           ),
       )
       const turnFailure = parseTurnFailure(parsedHookInput)
-      if (turnNotices) {
-        // The model's last words on the notices, as a reply to them: bound to no
-        // command turn, so no trail, no complete_turn and no local-turn flags, which
-        // a notice reply refuses (notice-reply.mjs). Skipped when it already replied.
-        const replyText =
-          !hadExplicitReply && !marker?.noticeReplyAt && sessionId
-            ? (text ? prepareAgentMirrorText(text) : null) ||
-              extractLatestAssistantReplyFromTranscript(effectiveTranscriptPath, {
-                sinceMs: marker?.startedAt ?? null,
-              })
-            : null
-        if (replyText) {
-          const telemetry = connectionId ? readConnectionTelemetry(connectionId) : null
-          try {
-            await call({
-              mcpUrl,
-              token,
-              name: 'post_session_message',
-              arguments: {
-                connection_id: connectionId,
-                agent_name: agentName,
-                message: replyText,
-                system_notice_ids: turnNotices,
-                ...(telemetry ? { agent_stats: telemetry } : {}),
-                ...(telemetry?.model?.id
-                  ? {
-                      model: {
-                        providerID: telemetry.model.provider || 'google',
-                        modelID: telemetry.model.id,
-                      },
-                    }
-                  : {}),
-              },
-            })
-          } catch {
-            /* non-fatal fallback */
-          }
-        }
-      } else if (routineTurn) {
+      if (turnNotices || routineTurn) {
         // Silent, except when a write in the turn changed someone else's record
         // (`tell_person`, `semantics.notice_audience.telling_anyway`) and the model did
         // not tell the person itself: then its last words go to the room as an ordinary
         // message, bound to no command turn, so no trail and no complete_turn.
         const tellText =
-          marker?.tellPerson && !hadExplicitReply && sessionId
+          marker?.tellPerson && !hadExplicitReply && !marker?.noticeReplyAt && sessionId
             ? (text ? prepareAgentMirrorText(text) : null) ||
               extractLatestAssistantReplyFromTranscript(effectiveTranscriptPath, {
                 sinceMs: marker?.startedAt ?? null,
