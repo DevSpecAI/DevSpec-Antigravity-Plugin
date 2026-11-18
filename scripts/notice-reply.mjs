@@ -21,15 +21,16 @@
  *   cannot tell which post is about the notice, so it stamps nothing and the model
  *   passes the ids it was given.
  *
- * Whether to say anything in the room at all is DevSpec's label on each notice, never
- * this plugin's guess (item a868f41f; `semantics.notice_audience` in the served
- * contract). At system notice version 3 every notice carries `audience`:
- * `needs_person` or `for_the_record`. The turn marker keeps the two apart
- * (`noticeIds` / `recordNoticeIds`): Stop replies only to notices that need a person,
- * and a turn woken only by check jobs and for-the-record notices is routine
- * (`isRoutineTurn`) and ends with nothing in the room. A notice with no label (one
- * persisted before this version) is read as needing a person, as DevSpec reads one:
- * an unknown never makes a notice quiet.
+ * Whether to say anything in the room at all is DevSpec's label on each notice and
+ * what still needs a person after the agent acts, never this plugin's guess (items
+ * a868f41f, 699517ad; `semantics.notice_audience` in the served contract). At system
+ * notice version 3 every notice carries `audience`: `needs_person` or `for_the_record`.
+ * The turn marker keeps the two apart (`noticeIds` / `recordNoticeIds`): PreToolUse
+ * stamps `noticeIds` on a post the model makes in a notice-only turn, while Stop never
+ * scrapes terminal text into the room for a notice or check-job turn (except when a
+ * write carried `tell_person` and the model did not post itself). A notice with no
+ * label (one persisted before this version) is read as needing a person, as DevSpec
+ * reads one: an unknown never makes a notice quiet.
  *
  * Imports only `check-job.mjs`, `requests.mjs` and `turn-completion.mjs` (Node
  * built-ins), so mirror-turn.mjs can import it.
@@ -191,7 +192,7 @@ export function turnNoticeIds({ marker, requestState = null, connectionState = n
   return uniqueIds(ids)
 }
 
-/** Of those, the ones that need a person: what Stop's reply names. Null when none do. */
+/** Of those, the ones that need a person: what PreToolUse stamps on a notice-turn post. Null when none do. */
 export function turnReplyNoticeIds({ marker, requestState = null, connectionState = null } = {}) {
   const ids = validIds(marker?.noticeIds)
   if (ids.length === 0) return null

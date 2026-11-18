@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.27.3
+
+- **Notice turns that finish quietly in the terminal no longer post internal notes to the room.** When DevSpec wakes your Antigravity agent with a notice and the agent either settles the finding in place from what you already agreed in the room or sees nothing that needs your decision right now, the agent finishes its turn in the terminal without sending a room message. Until now, the plugin's turn-end hook saw that no room message had been sent during the notice turn, scraped whatever sign-off note the agent printed in its terminal (including internal IDs and lines like "Finishing quietly per notice handling rules"), and posted it into the room as a reply to the notice.
+- When a turn is woken only by DevSpec notices and the agent does not send a room message itself, the turn now ends quietly without scraping terminal output into the room, whether the notice turn ran on its own or while another turn was waiting for background work.
+- Unchanged: when the agent sends a room message on a notice turn because a choice, hold, rejection, or block still needs you, the plugin still labels it as a reply to that notice; when a change during a notice or check turn updates another person's record and DevSpec asks the agent to tell you, the plugin still posts the agent's explanation if the agent did not send one itself; and ordinary room commands and terminal prompts still post their answers as before.
+
 ## 0.27.2
 
 - **An Antigravity agent connected outside a room now counts as a spare agent straight away.** When you run `/devspec:devspec-remote` in an Antigravity terminal without joining a room, the connection is registered in the middle of that setup turn. When the connect script finished and Antigravity ran one final step to print the status block, the plugin saw the newly created connection and reported the agent as busy with a turn. DevSpec took that as non-check work done after connecting, which disqualified every newly connected Antigravity agent from ever counting as a spare agent for ruling checks.

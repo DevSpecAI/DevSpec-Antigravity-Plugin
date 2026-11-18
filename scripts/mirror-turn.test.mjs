@@ -1192,7 +1192,7 @@ describe('Antigravity native hook payload & transcript handling', () => {
         'background continuation of notice turn must not stream an unbound room-command trail',
       )
 
-      // 5. Final Stop reconciles the finished background task, posts the notice reply with system_notice_ids, and completes the turn!
+      // 5. Final Stop reconciles the finished background task, ends the notice turn quietly without scraping terminal text, and completes the turn!
       const stopFinal = await handleMirrorTurn(
         'stop',
         JSON.stringify({ conversationId: convId, transcriptPath }),
@@ -1201,11 +1201,8 @@ describe('Antigravity native hook payload & transcript handling', () => {
       assert.equal(stopFinal.held, undefined)
       assert.equal(stopFinal.busy, false)
       assert.equal(readTurnMarker(connId, connectionsDir), null)
-      const noticePosts = calls.filter(
-        (c) => c.name === 'post_session_message' && Array.isArray(c.arguments?.system_notice_ids),
-      )
-      assert.equal(noticePosts.length, 1)
-      assert.deepEqual(noticePosts[0].arguments.system_notice_ids, [noticeId])
+      const postCalls = calls.filter((c) => c.name === 'post_session_message')
+      assert.equal(postCalls.length, 0, 'notice turn that finished without calling post_session_message must not scrape terminal text on Stop')
       assert.equal(calls.filter((c) => c.name === 'report_complete').length, 1)
     } finally {
       fs.rmSync(tmpHome, { recursive: true, force: true })
