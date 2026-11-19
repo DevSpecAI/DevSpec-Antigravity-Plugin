@@ -30,6 +30,8 @@ import {
   unansweredCommands,
   splitRoomWindow,
   PUSH_HEALTHY_MS,
+  PUSH_SAFETY_MS,
+  createPushGate,
   nextPushReconnectDelayMs,
   pushChannelUrl,
   parseSseFrame,
@@ -684,6 +686,58 @@ describe('SSE push channel (parseSseFrame, pushChannelUrl, nextPushReconnectDela
     await new Promise((r) => setTimeout(r, 20))
     handle.close()
     assert.equal(fallbackReason, 'push_http_404')
+  })
+
+  it('sleeps locally on the open SSE push channel, wakes immediately on SSE frames or local turn changes, and falls back to held waitMs on disconnect (59afbe7e)', async () => {
+    assert.equal(PUSH_SAFETY_MS, 45_000)
+    const gate = createPushGate({ safetyMs: 80, localCheckMs: 10 })
+
+    // Before hello: not connected, waitIfIdle returns immediately, and poll uses fallback waitMs
+    assert.equal(gate.isConnected(), false)
+    assert.equal(gate.consumePollWaitMs(25_000), 25_000)
+
+    // After hello: connected, poll uses wait_ms: 0, and waitIfIdle sleeps up to safetyMs
+    gate.onEvent({ kind: 'hello' })
+    assert.equal(gate.isConnected(), true)
+    assert.equal(gate.consumePollWaitMs(25_000), 0)
+
+    const startSafety = Date.now()
+    await gate.waitIfIdle()
+    assert.ok(Date.now() - startSafety >= 55, 'waitIfIdle sleeps until safetyMs when quiet')
+    assert.equal(gate.consumePollWaitMs(25_000), 0)
+
+    // SSE wake/notice/interaction frames wake waitIfIdle immediately
+    for (const kind of ['wake', 'system_notice', 'interaction_event', 'question_dismissal_event']) {
+      const gateFrame = createPushGate({ safetyMs: 5_000, localCheckMs: 500 })
+      gateFrame.onEvent({ kind: 'hello' })
+      setTimeout(() => gateFrame.onEvent({ kind }), 15)
+      const t0 = Date.now()
+      await gateFrame.waitIfIdle()
+      assert.ok(Date.now() - t0 < 500, `SSE ${kind} frame wakes waitIfIdle immediately`)
+      assert.equal(gateFrame.consumePollWaitMs(25_000), 0)
+    }
+
+    // Local turn marker / state change wakes waitIfIdle on the localCheckMs tick
+    let localTurnChanged = false
+    const gateLocal = createPushGate({ safetyMs: 5_000, localCheckMs: 10 })
+    gateLocal.onEvent({ kind: 'hello' })
+    setTimeout(() => {
+      localTurnChanged = true
+    }, 15)
+    const tLocal = Date.now()
+    await gateLocal.waitIfIdle({ shouldWakeImmediately: () => localTurnChanged })
+    assert.ok(Date.now() - tLocal < 500, 'local state change wakes waitIfIdle immediately')
+    assert.equal(gateLocal.consumePollWaitMs(25_000), 0)
+
+    // Disconnect wakes waitIfIdle immediately and restores the held poll waitMs fallback
+    const gateDrop = createPushGate({ safetyMs: 5_000, localCheckMs: 500 })
+    gateDrop.onEvent({ kind: 'hello' })
+    setTimeout(() => gateDrop.onDisconnect(), 15)
+    const tDrop = Date.now()
+    await gateDrop.waitIfIdle()
+    assert.ok(Date.now() - tDrop < 500, 'disconnect wakes waitIfIdle immediately')
+    assert.equal(gateDrop.isConnected(), false)
+    assert.equal(gateDrop.consumePollWaitMs(25_000), 25_000)
   })
 })
 
