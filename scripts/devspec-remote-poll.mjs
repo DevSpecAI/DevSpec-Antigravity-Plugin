@@ -1343,6 +1343,82 @@ export function buildPollConnectionArguments({
 
 export const PUSH_RECONNECT_BACKOFF_MS = [1_000, 4_000, 10_000]
 export const PUSH_HEALTHY_MS = 30_000
+export const PUSH_SAFETY_MS = 45_000
+export const PUSH_LOCAL_CHECK_MS = 1_000
+
+export function createPushGate({
+  safetyMs = PUSH_SAFETY_MS,
+  localCheckMs = PUSH_LOCAL_CHECK_MS,
+} = {}) {
+  let connected = false
+  let wakePending = false
+  let wakeWaiter = null
+
+  const notify = () => {
+    if (wakeWaiter) {
+      const fn = wakeWaiter
+      wakeWaiter = null
+      fn()
+    }
+  }
+
+  return {
+    isConnected: () => connected,
+    hasWakePending: () => wakePending,
+    onEvent(evt) {
+      if (!evt) return
+      if (evt.kind === 'hello') {
+        connected = true
+        return
+      }
+      if (
+        evt.kind === 'wake' ||
+        evt.kind === 'ended' ||
+        evt.kind === 'system_notice' ||
+        evt.kind === 'interaction_event' ||
+        evt.kind === 'question_dismissal_event'
+      ) {
+        wakePending = true
+        notify()
+      }
+    },
+    onDisconnect() {
+      connected = false
+      notify()
+    },
+    consumePollWaitMs(fallbackWaitMs) {
+      const waitMs = wakePending || connected ? 0 : fallbackWaitMs
+      wakePending = false
+      return waitMs
+    },
+    async waitIfIdle({ shouldWakeImmediately } = {}) {
+      if (!connected || wakePending) return
+      if (typeof shouldWakeImmediately === 'function' && shouldWakeImmediately()) return
+      await new Promise((resolve) => {
+        let settled = false
+        const finish = () => {
+          if (settled) return
+          settled = true
+          clearTimeout(safetyTimer)
+          clearInterval(localTimer)
+          if (wakeWaiter === finish) wakeWaiter = null
+          resolve()
+        }
+        wakeWaiter = finish
+        const safetyTimer = setTimeout(finish, safetyMs)
+        const localTimer = setInterval(() => {
+          if (!connected || wakePending) {
+            finish()
+            return
+          }
+          if (typeof shouldWakeImmediately === 'function' && shouldWakeImmediately()) {
+            finish()
+          }
+        }, localCheckMs)
+      })
+    },
+  }
+}
 
 export function nextPushReconnectDelayMs({ attempt, openedAtMs, nowMs = Date.now() }) {
   const effectiveAttempt =
@@ -1445,6 +1521,7 @@ export function openPushChannel({
   connectionId,
   connectionCapability = null,
   onEvent,
+  onDisconnect,
   onFallback,
   fetchImpl = fetch,
 }) {
@@ -1467,6 +1544,7 @@ export function openPushChannel({
 
   const scheduleReconnect = (openedAtMs, reason) => {
     if (closed) return
+    onDisconnect?.(reason)
     const { delayMs, nextAttempt } = nextPushReconnectDelayMs({ attempt, openedAtMs })
     attempt = nextAttempt
     if (delayMs === null) {
@@ -1496,6 +1574,7 @@ export function openPushChannel({
       })
       const contentType = res.headers?.get?.('content-type') || ''
       if (!res.ok || !contentType.includes('text/event-stream') || !res.body) {
+        onDisconnect?.(`push_http_${res.status}`)
         onFallback?.(`push_http_${res.status}`)
         return
       }
@@ -2473,7 +2552,7 @@ async function main() {
     process.exit(1)
   }
 
-  let sseWakePending = false
+  const pushGate = createPushGate()
   if (process.env.DEVSPEC_DISABLE_SSE !== '1') {
     openPushChannel({
       mcpUrl,
@@ -2481,16 +2560,18 @@ async function main() {
       connectionId,
       connectionCapability,
       onEvent: (evt) => {
-        if (evt.kind === 'wake') {
-          sseWakePending = true
-        } else if (evt.kind === 'ended') {
-          sseWakePending = true
+        pushGate.onEvent(evt)
+        if (evt.kind === 'ended') {
           if (evt.endReason && PERMANENT_END_REASONS.includes(evt.endReason)) {
             handlePermanentEnd(evt.endReason)
           }
         }
       },
+      onDisconnect: () => {
+        pushGate.onDisconnect()
+      },
       onFallback: (reason) => {
+        pushGate.onDisconnect()
         process.stderr.write(
           `devspec-remote-poll: SSE push unavailable (${reason}) — using poll_connection\n`,
         )
@@ -2501,10 +2582,32 @@ async function main() {
   let consecutiveEmpty = 0
   let consecutiveErrors = 0
   let consecutiveRecoverableEnds = 0
+  let lastLocalTurnKey = null
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
+    if (!needsSeed && !catchUpCursor && !pendingInteractionAck) {
+      await pushGate.waitIfIdle({
+        shouldWakeImmediately: () => {
+          const s = readState(connectionId)
+          if (s && s.enabled === false) return true
+          if (ownerAnchor && !ownerAlive(ownerAnchor)) return true
+          const m = readTurnMarker(connectionId)
+          if (isTurnMarkerActive(m) !== (lastBusySent === true)) return true
+          const localTurnKey = s?.local_turn ? JSON.stringify(s.local_turn) : null
+          if (localTurnKey !== lastLocalTurnKey) return true
+          const nextCont = activeContinuation(s?.interaction_continuation, {
+            connectionId,
+            sessionId,
+          })
+          if (Boolean(nextCont) !== Boolean(interactionContinuation)) return true
+          return false
+        },
+      })
+    }
+
     const liveState = readState(connectionId)
+    lastLocalTurnKey = liveState?.local_turn ? JSON.stringify(liveState.local_turn) : null
     if (liveState?.token && liveState.mcp_url === mcpUrl) token = liveState.token
     if (liveState && liveState.enabled === false) {
       process.stderr.write('devspec-remote-poll: disabled — exiting\n')
@@ -2572,8 +2675,7 @@ async function main() {
 
     let res = null
     try {
-      const effectiveWaitMs = sseWakePending ? 0 : tier.waitMs
-      sseWakePending = false
+      const effectiveWaitMs = pushGate.consumePollWaitMs(tier.waitMs)
       res = await pollOnce({
         waitMs: effectiveWaitMs,
         busy: busyArg,
