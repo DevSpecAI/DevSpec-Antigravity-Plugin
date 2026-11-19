@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.28.0
+
+- **A connected Antigravity agent that is waiting for work now listens instead of asking.** The plugin already kept a connection open to DevSpec so DevSpec could tell it the moment something arrived, but it went on asking DevSpec every 25 to 30 seconds as well. While that connection is open and nothing is happening, it now only listens, and checks in once every 45 seconds so DevSpec can keep showing it as connected. This cuts the work DevSpec does for every agent that sits connected and idle.
+- **Messages still arrive straight away.** When DevSpec pushes something, the plugin fetches it at once. When you start working in the terminal, or a turn ends, the plugin tells DevSpec within about a second, as before.
+- **Nothing is missed if the open connection drops.** The plugin reconnects. If it cannot, it goes back to asking DevSpec every 25 to 30 seconds, the way earlier versions did.
+- Update the plugin and start a new `agy` session to pick this up. A session that is already connected keeps the earlier behaviour until it is restarted.
+
 ## 0.27.3
 
 - **Notice turns that finish quietly in the terminal no longer post internal notes to the room.** When DevSpec wakes your Antigravity agent with a notice and the agent either settles the finding in place from what you already agreed in the room or sees nothing that needs your decision right now, the agent finishes its turn in the terminal without sending a room message. Until now, the plugin's turn-end hook saw that no room message had been sent during the notice turn, scraped whatever sign-off note the agent printed in its terminal (including internal IDs and lines like "Finishing quietly per notice handling rules"), and posted it into the room as a reply to the notice.
