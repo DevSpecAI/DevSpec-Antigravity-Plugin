@@ -106,7 +106,7 @@ beforeEach(() => {
 
 describe('a repository the project tracks, with no pin', () => {
   for (const [name, extra] of Object.entries(PATHS)) {
-    it(`${name}: one task claimed, the commit is tagged; none claimed, it is stopped`, async () => {
+    it(`${name}: one task claimed, the commit is tagged; none claimed, it goes through untagged`, async () => {
       connect()
       const tagged = repo('app', { remote: PROJECT_REMOTE })
       claim(tagged, TASK)
@@ -116,12 +116,18 @@ describe('a repository the project tracks, with no pin', () => {
       // Matching by origin stamps more commits, but allows no command it did not allow before.
       assert.equal(one.decision, 'ask')
 
+      // No task claimed: never refused (commit_provenance_contract.edit_behavior), so a
+      // dependency update or an automation run commits like any other work.
       const unclaimed = repo('unclaimed', { remote: PROJECT_REMOTE })
       const before = head(unclaimed)
       const none = await agentRuns('git commit -q --allow-empty -m "feat: unclaimed"', unclaimed, extra)
-      const text = none.result ? none.result.stderr : none.pre.reason
-      assert.match(text, /claim_work_item/)
-      assert.equal(head(unclaimed), before)
+      assert.notEqual(none.decision, 'deny')
+      assert.equal(none.result.status, 0, none.result.stderr)
+      assert.notEqual(head(unclaimed), before)
+      assert.equal(subject(unclaimed), 'feat: unclaimed')
+      const note = none.result.stderr || JSON.stringify(none.pre ?? {})
+      assert.match(note, /no task is claimed/i)
+      assert.match(note, /claim_work_item/)
     })
   }
 })

@@ -55,6 +55,7 @@ import {
 } from './remote-control-state.mjs'
 import { ensurePrivateDir, writePrivateText } from './private-state.mjs'
 import { recordDeliveredBatchRequests, setCurrentRequest, UNSTATED } from './requests.mjs'
+import { commandPickupIdentity, commandTurnsFromEntry } from './turn-completion.mjs'
 import { autoConnectAtStartup, connectAtStartupEnabled } from './session-start.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
@@ -956,7 +957,10 @@ export async function processListenerInboxTick(
             ? { connectionCapability: live.connection_capability }
             : {}),
           name: 'report_pickup',
-          arguments: { connection_id: connectionId },
+          // A command names itself, so the pickup starts exactly the command this turn
+          // was given and never one that arrived behind it (commandPickupIdentity). A
+          // check job, notice or automation run starts no command and names nothing.
+          arguments: { connection_id: connectionId, ...commandPickupIdentity(commandTurnsFromEntry(rec.entry)) },
           timeoutMs: 5_000,
         }).catch(() => {})
       }

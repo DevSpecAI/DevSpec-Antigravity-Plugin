@@ -53,7 +53,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { ensurePrivateDir, readPrivateJson, writePrivateJson } from './private-state.mjs'
 import { readStateFile } from './remote-control-state.mjs'
-import { readClaims, recoveryText, scopeFrom } from './commit-provenance.mjs'
+import { readClaims, recoveryText, scopeFrom, unlinkedCommitText } from './commit-provenance.mjs'
 import { connectedProject } from './commit-scope.mjs'
 import { MARKER_WINDOW_BYTES, STAND_IN_MARKER } from './git-observer-shim.mjs'
 
@@ -301,7 +301,8 @@ function pruneEnvelopes(dir, now) {
  * What the stand-in needs to tag or stop a commit in this command (item 31ef3d3c),
  * written beside the envelope as `stamps/<observation>.json`: the tasks claimed in
  * this conversation, the project's repositories as remote identities, the project id
- * (for a pin naming it), and the two recovery texts. The stand-in decides scope from
+ * (for a pin naming it), the note shown beside a commit made with no task claimed, and
+ * the recovery text for one made with several. The stand-in decides scope from
  * those alone (commit-scope.mjs, item cdd7f0f3). No connection id, key or other
  * credential goes in it.
  * When the claims cannot be read, nothing is written and the stand-in only observes.
@@ -319,7 +320,7 @@ function writeStampFile(input, project, dir, observationId, { env, home, now }) 
         claims,
         project_id: project.projectId,
         repositories: project.repositories,
-        messages: { unclaimed: recoveryText([]), several: claims.length > 1 ? recoveryText(claims) : null },
+        messages: { unlinked: unlinkedCommitText(), several: claims.length > 1 ? recoveryText(claims) : null },
         created_at: now,
       },
       privateRoot(home),

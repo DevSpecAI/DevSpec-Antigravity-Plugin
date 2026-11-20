@@ -120,7 +120,8 @@ import {
 import { readSessionTitle, sessionTitleReadDue } from './session-title.mjs'
 import { readConnectionTelemetry } from './statusline.mjs'
 import { isEntryPoint } from './entry-point.mjs'
-import { turnCompletionIdentities } from './turn-completion.mjs'
+import { commandPickupIdentity, turnCompletionIdentities } from './turn-completion.mjs'
+import { noteUsageRefusalSent, usageRefusalArgument } from './usage-refusal.mjs'
 
 export const REMOTE_INGRESS_VERSION = 1
 export const DELEGATED_SCOPE_VERSION = 1
@@ -1135,12 +1136,15 @@ export function planTurnActivity(seen, marker, { localTurn = null, sessionId = n
         : seen.identities
     return { verb: 'complete', identities }
   }
+  // A pickup names the command the turn was given, when one started it (item cf356677).
+  const pickup = () => ({ verb: 'pickup', identity: commandPickupIdentity(marker?.commandTurns) })
   const steps = []
   if (seen && current && !sameTurn) {
-    steps.push(ended(), { verb: 'pickup' })
+    steps.push(ended(), pickup())
   } else {
     const verb = verbForTurnTransition(Boolean(seen), Boolean(current))
     if (verb === 'complete') steps.push(ended())
+    else if (verb === 'pickup') steps.push(pickup())
     else if (verb) steps.push({ verb })
   }
   return { steps, seen: current }
@@ -1156,14 +1160,16 @@ export function planTurnActivity(seen, marker, { localTurn = null, sessionId = n
  * these (interactionActivityPlan): a keepalive renews the continuation and the other
  * two are not sent.
  *
- * A pickup names nothing, so the server resolves it: the newest pending attempt, else
- * a new one with no source command. The first pickup after a command is delivered
- * lands on that command. A second one for the same work does not when the command has
- * been answered meanwhile (its answer closed it and the agent kept working), and it
- * happens two ways: the server refuses a keepalive because nothing is working and
- * this re-opens the attempt, or the marker is cleared here for that reason and written
- * again by the next tool call. Either way the turn is marked `reopened`, and its end
- * also closes source-less activity (planTurnActivity).
+ * The first pickup for a turn a command started names that command
+ * (`command_turn_id` and `command_message_id`, item cf356677), so it starts exactly
+ * that command and never one that arrived behind it; a pickup for a turn no command
+ * started names nothing. A second pickup for the same work happens when the command
+ * has been answered meanwhile (its answer closed it and the agent kept working), two
+ * ways: the server refuses a keepalive because nothing is working and this re-opens
+ * the attempt, or the marker is cleared here for that reason and written again by the
+ * next tool call. That one names nothing, because only a pickup that names nothing can
+ * open an attempt with no source command, and the turn is marked `reopened`, so its
+ * end also closes source-less activity (planTurnActivity).
  *
  * @param {object} deps
  * @param {(request: { name: string, arguments: object }) => Promise<unknown>} deps.callTool
@@ -1217,6 +1223,12 @@ export function createTurnActivityReporter({
     return false
   }
 
+  /** What a pickup names: the command, unless that command was already picked up. */
+  function pickupIdentity(identity = {}) {
+    const key = identity.command_turn_id ? `${identity.command_turn_id}:${identity.command_message_id}` : null
+    return key && !pickedUp.includes(key) ? identity : {}
+  }
+
   async function send(verb, identity = {}) {
     const name = ACTIVITY_VERB_TOOL[verb]
     try {
@@ -1252,6 +1264,8 @@ export function createTurnActivityReporter({
         }
         if (step.verb === 'complete') {
           for (const identity of step.identities) await send('complete', identity)
+        } else if (step.verb === 'pickup') {
+          await send('pickup', pickupIdentity(step.identity))
         } else {
           await send(step.verb)
         }
@@ -1761,7 +1775,9 @@ async function main() {
     agentStats = undefined,
   }) {
     const telemetry = agentStats !== undefined ? agentStats : readConnectionTelemetry(connectionId)
-    return mcpToolsCall({
+    // A usage refusal rides every live status update while it stands (usage-refusal.mjs).
+    const usageRefusal = status === 'live' ? usageRefusalArgument(connectionId, { dir: CONNECTIONS_DIR }) : {}
+    const result = await mcpToolsCall({
       mcpUrl,
       token,
       name: 'heartbeat_connection',
@@ -1773,9 +1789,12 @@ async function main() {
         ...(busy !== null ? { busy } : {}),
         ...(status === 'offline' && endReason ? { end_reason: endReason } : {}),
         ...(telemetry ? { agent_stats: telemetry } : {}),
+        ...usageRefusal,
       },
       timeoutMs: 5_000,
     })
+    noteUsageRefusalSent(connectionId, usageRefusal, { dir: CONNECTIONS_DIR })
+    return result
   }
 
   let interactionContinuation = null
@@ -2191,6 +2210,7 @@ async function main() {
         `devspec-remote-poll: ${nowStamp()} handing the question's turn to message ${handoff.source_message_id}\n`,
       )
     }
+    const usageRefusal = usageRefusalArgument(connectionId, { dir: CONNECTIONS_DIR })
     const response = await mcpToolsCall({
       mcpUrl,
       token,
@@ -2216,10 +2236,12 @@ async function main() {
         ...(listenerArmed !== null ? { listener_armed: listenerArmed } : {}),
         unread_commands: unreadCommands,
         ...(telemetry ? { agent_stats: telemetry } : {}),
+        ...usageRefusal,
       },
       timeoutMs: waitMs + POLL_HTTP_GRACE_MS,
       isAlive: () => !ownerAnchor || ownerAlive(ownerAnchor),
     })
+    noteUsageRefusalSent(connectionId, usageRefusal, { dir: CONNECTIONS_DIR })
     if (ack && pendingInteractionAck === ack) pendingInteractionAck = null
     if (controlAck && pendingControlAck === controlAck) pendingControlAck = null
     if (handoff && pendingCommandHandoff === handoff) pendingCommandHandoff = null
