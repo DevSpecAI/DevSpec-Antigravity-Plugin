@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.29.2
+
+- **Going ahead on a decision conflict follows what DevSpec accepts.** The plugin rules no longer claim that a bare **Go ahead** or **Keep** on work that conflicts with a decision, convention or requirement is refused until the record is edited first. When you let the work go ahead, DevSpec accepts the answer and marks the overruled record as needing an update.
+- Update the plugin and start a new `agy` session to pick this up.
+
 ## 0.29.1
 
 - **Your agent now suggests turning a recurring problem into a requirement when one comes up.** Before, the rules told your agent to ask before recording a requirement without saying what a candidate requirement looks like during an ordinary conversation, so it waited for you to use the word "requirement" yourself. Now, when you point out a mistake that keeps creeping back in across tasks, or state a non-negotiable project-wide "always" or "never" rule that can be checked against what future work actually delivers, your agent explains what a requirement is and asks whether you want to record one — while still never saving a requirement without your yes.
@@ -13,7 +18,7 @@
 - **Inventory and dependency reviews record whose request they serve.** Recording, revising or retracting an infrastructure inventory entry, and reviewing a dependency update, now say whose request the change serves, like every other change your agent makes.
 - **Instructions brought in line with what DevSpec does now:**
   - A hold from a requirement your work breaks, or from a conflict it did not mean to cause, clears once the agent fixes the work on its branch and hands it in again; only work that undoes someone's decision waits for an OK.
-  - Keeping work that undoes a decision, convention or requirement means changing that record first: the agent updates, replaces or retracts it rather than answering with a bare go-ahead.
+  - How work that undoes a decision, convention or requirement is answered or kept follows DevSpec's served rules rather than a copy in the plugin.
   - DevSpec may offer a check on your agent's own change to another agent first, so the agent no longer expects every one of its checks to come back to it, and rules the ones still waiting for it when it hands work in.
   - The agent switches on Merge when cleared when it hands in work or records a dependency review, and recognises DevSpec's request to merge a cleared pull request by the name DevSpec actually sends.
   - A new requirement takes effect once its own checks are ruled, not the moment it is recorded.
