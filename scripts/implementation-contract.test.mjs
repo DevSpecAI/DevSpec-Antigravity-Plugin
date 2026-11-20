@@ -27,23 +27,18 @@ describe('MCP-served implementation contract', () => {
     })
   }
 
-  it('keeps mutation-boundary behavior inside honest Antigravity host-limitation notes', () => {
-    for (const relativePath of [
-      'skills/devspec-remote/SKILL.md',
-    ]) {
-      const source = read(relativePath)
-      const paragraphs = source.split(/\n\s*\n/)
-      const boundaryParagraphs = paragraphs.filter((paragraph) =>
-        paragraph.includes('mutation boundary'),
-      )
-      assert.equal(boundaryParagraphs.length, 1, relativePath)
-      assert.match(
-        source,
-        /(?:Antigravity host limitation|## Host limitation)[\s\S]{0,800}mutation boundary/i,
-      )
-      assert.match(boundaryParagraphs[0], /no verified blocking pre-tool hook/i)
-      assert.match(boundaryParagraphs[0], /explicit/i)
-      assert.match(boundaryParagraphs[0], /runtime authority|authoritative/i)
+  it('says honestly what the plugin enforces about the mutation boundary', () => {
+    const source = read('skills/devspec-remote/SKILL.md')
+    const boundaryParagraphs = source.split(/\n\s*\n/).filter((paragraph) => paragraph.includes('mutation boundary'))
+    assert.equal(boundaryParagraphs.length, 1)
+    assert.match(boundaryParagraphs[0], /explicit/i)
+    assert.match(boundaryParagraphs[0], /runtime authority|authoritative/i)
+    // The plugin registers a PreToolUse hook that can refuse a call, so the skill must
+    // not tell the agent there is none (it did until item cf356677).
+    const preToolUse = JSON.parse(read('hooks.json'))['devspec-remote-control-mirror'].PreToolUse ?? []
+    if (preToolUse.length > 0) {
+      assert.doesNotMatch(boundaryParagraphs[0], /no (?:verified )?(?:blocking )?pre-tool hook/i)
+      assert.match(boundaryParagraphs[0], /PreToolUse/)
     }
   })
 
@@ -117,9 +112,8 @@ describe('MCP-served implementation contract', () => {
 // and skips without one, as the server tool-name check does.
 const CONTRACT_SOURCE = 'packages/core/src/mcp/implementation-contract.ts'
 const NAMING_SURFACES = [
-  'rules/AGENTS.md',
-  'skills/devspec-remote/SKILL.md',
-  'skills/devspec-remote-stop/SKILL.md',
+  ...fs.readdirSync(path.join(ROOT, 'rules')).filter((name) => name.endsWith('.md')).map((name) => `rules/${name}`),
+  ...fs.readdirSync(path.join(ROOT, 'skills')).map((skill) => `skills/${skill}/SKILL.md`),
   'scripts/commit-provenance.mjs',
   'scripts/devspec-remote-wait.mjs',
   'README.md',

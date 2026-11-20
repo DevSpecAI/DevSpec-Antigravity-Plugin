@@ -44,4 +44,4 @@ node "$PLUGIN_DIR/scripts/devspec-login.mjs" --logout
 
 This signs Antigravity out of DevSpec on this machine. To disconnect Antigravity from DevSpec entirely across all machines, the person uses Agent setup in their DevSpec settings.
 
-If any of these prints that `DEVSPEC_MCP_TOKEN` is set, show that text: the token takes precedence, and the text says how to remove it.
+Whatever these print is for the person: show it to them as it is.
