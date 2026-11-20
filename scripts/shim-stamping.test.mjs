@@ -156,19 +156,23 @@ describe('one task claimed in a project repository with no DevSpec marker', () =
 })
 
 describe('the commit check, before git runs', () => {
-  it('no task claimed: stopped with recovery text that leaves nothing to type, and the repository is unchanged', async () => {
+  it('no task claimed: git runs exactly as asked, with a note that leaves nothing to type (cf356677)', async () => {
+    // The served contract never refuses a commit because a claim is absent
+    // (commit_provenance_contract.edit_behavior): a dependency update or an automation
+    // run needs no task, and its commits must land.
     const dir = repo('app', PROJECT_REMOTE)
-    const before = head(dir)
-    for (const command of [
-      'git commit -q --allow-empty -m "feat: unclaimed"',
-      `git commit -q --allow-empty -F - <<'MSG'\nfeat: unclaimed, multi-line\n\nBody.\nMSG`,
+    for (const [command, message] of [
+      ['git commit -q --allow-empty -m "feat: unclaimed"', 'feat: unclaimed'],
+      [`git commit -q --allow-empty -F - <<'MSG'\nfeat: unclaimed, multi-line\n\nBody.\nMSG`, 'feat: unclaimed, multi-line\n\nBody.'],
     ]) {
+      const before = head(dir)
       const { result } = await agentRuns(command, dir)
-      assert.equal(result.status, 1)
+      assert.equal(result.status, 0, result.stderr)
+      assert.notEqual(head(dir), before)
+      assert.equal(lastMessage(dir), message, 'the message, standard input included, reaches git untouched')
+      assert.match(result.stderr, /no task is claimed/i)
       assert.match(result.stderr, /claim_work_item/)
-      assert.match(result.stderr, /retry the same commit/i)
       assert.doesNotMatch(result.stderr, /<full-uuid>|<uuid>/)
-      assert.equal(head(dir), before)
     }
   })
 

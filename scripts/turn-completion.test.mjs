@@ -24,6 +24,7 @@ import {
   turnMarkerPath,
 } from './mirror-turn.mjs'
 import { mergeTurnWake, turnWakeFromEntry, turnWakeFromText } from './notice-reply.mjs'
+import * as turnCompletion from './turn-completion.mjs'
 import {
   FIXTURE_ID,
   fixtureCommand,
@@ -388,5 +389,87 @@ describe('the poller completes the turn it saw, not what is newest on the connec
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
+  })
+})
+
+describe('a turn start names the command it starts (item cf356677)', () => {
+  /**
+   * `report_pickup` with only a connection id starts whichever command is newest on the
+   * connection and supersedes every other open attempt: a command that arrived behind
+   * the one this turn was given would be started before the agent saw it.
+   */
+  const pickupsIn = (calls) =>
+    calls
+      .filter((call) => call.name === 'report_pickup')
+      .map(({ arguments: { connection_id: _connection, ...identity } }) => identity)
+
+  function poller(dir, respond = () => ({})) {
+    const calls = []
+    const reporter = remotePoll.createTurnActivityReporter({
+      connectionId: CONNECTION,
+      callTool: async (request) => {
+        calls.push(request)
+        return respond(request)
+      },
+      readMarker: () => readTurnMarker(CONNECTION, dir),
+      clearMarker: () => clearTurnMarker(CONNECTION, dir),
+      log: () => {},
+    })
+    const look = () => {
+      const marker = readTurnMarker(CONNECTION, dir)
+      return reporter.observe(isTurnMarkerActive(marker) ? marker : null, { sessionId: null })
+    }
+    return { calls, look }
+  }
+
+  it('the poller names the newest command of the turn, and nothing for a turn no command started', async () => {
+    const dir = tempDir()
+    try {
+      const { calls, look } = poller(dir)
+      startTurn(dir, deliveredEntry([command(1), command(2, { primary: 1 })]))
+      await look()
+      clearTurnMarker(CONNECTION, dir)
+      await look()
+      startTurn(dir, CHECK_JOB)
+      await look()
+      assert.deepEqual(pickupsIn(calls), [
+        { command_turn_id: TURN_A, command_message_id: fixtureUuid(2) },
+        {},
+      ])
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('re-opening work after the command was answered names nothing, so an attempt with no source can open', async () => {
+    const dir = tempDir()
+    try {
+      const { calls, look } = poller(dir, (request) => {
+        if (request.name === 'report_keepalive') throw new Error('No working attempt to keep alive for this connection.')
+        return {}
+      })
+      const entry = deliveredEntry([command(1)])
+      startTurn(dir, entry)
+      await look()
+      clearTurnMarker(CONNECTION, dir)
+      await look()
+      startTurn(dir, entry)
+      await look()
+      assert.deepEqual(pickupsIn(calls), [
+        { command_turn_id: TURN_A, command_message_id: fixtureUuid(1) },
+        {},
+      ])
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('the listener names the command it delivers, and nothing for a check job', () => {
+    const { commandPickupIdentity, commandTurnsFromEntry } = turnCompletion
+    assert.deepEqual(commandPickupIdentity(commandTurnsFromEntry(deliveredEntry([command(3)]))), {
+      command_turn_id: TURN_A,
+      command_message_id: fixtureUuid(3),
+    })
+    assert.deepEqual(commandPickupIdentity(commandTurnsFromEntry(CHECK_JOB)), {})
   })
 })

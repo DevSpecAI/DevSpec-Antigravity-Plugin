@@ -97,6 +97,24 @@ export function commandTurnsFromEntry(entry) {
 }
 
 /**
+ * The exact command a turn starts, as `report_pickup` identity fields (item cf356677):
+ * the newest command delivered into it, by the room's order. A pickup that names
+ * nothing starts whichever command is newest on the connection and supersedes every
+ * other open attempt, which can be a command that arrived behind this one and that the
+ * agent has not been given; naming the command starts exactly that one and spares the
+ * others still waiting. Empty when no command started the turn (a check job, a notice,
+ * an automation run, a prompt typed at the terminal): there is nothing to name then.
+ */
+export function commandPickupIdentity(commandTurns) {
+  const turns = mergeCommandTurns([], commandTurns)
+  if (turns.length === 0) return {}
+  const newest = turns.reduce((held, entry) =>
+    Number.isInteger(held.sequence) && Number.isInteger(entry.sequence) && entry.sequence < held.sequence ? held : entry,
+  )
+  return { command_turn_id: newest.turnId, command_message_id: newest.messageId }
+}
+
+/**
  * What ends when this turn ends, as `report_complete` identities. One call per entry,
  * each carrying exactly one identity, which is what the server accepts.
  *

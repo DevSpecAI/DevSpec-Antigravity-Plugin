@@ -63,6 +63,7 @@ import {
 import { recordMirroredLocalPrompt } from './room-unread.mjs'
 import { readConnectionTelemetry } from './statusline.mjs'
 import { parseTurnFailure, turnFailureMessage } from './turn-failure.mjs'
+import { noteUsageRefusalSent, recordTurnOutcome, usageRefusalArgument, usageRefusedUntil } from './usage-refusal.mjs'
 import { turnCompletionIdentities } from './turn-completion.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
@@ -3195,17 +3196,29 @@ export async function handleMirrorTurn(
       }
 
       if (connectionId) {
+        // A turn ended by the model provider's usage refusal keeps check jobs away from
+        // this agent until it lifts; the next turn that succeeds clears it
+        // (usage-refusal.mjs, `semantics.check_job.usage_refusal`).
+        const endedOn = parseTurnFailure(parsedHookInput)
+        recordTurnOutcome(
+          connectionId,
+          { refusedUntil: endedOn ? usageRefusedUntil(endedOn.text) : null, succeeded: !endedOn },
+          { dir: connectionsDir },
+        )
+        const heartbeatArgs = {
+          connection_id: connectionId,
+          agent_name: agentName,
+          status: 'live',
+          busy: false,
+          ...usageRefusalArgument(connectionId, { dir: connectionsDir }),
+        }
         await call({
           mcpUrl,
           token,
           name: 'heartbeat_connection',
-          arguments: {
-            connection_id: connectionId,
-            agent_name: agentName,
-            status: 'live',
-            busy: false,
-          },
+          arguments: heartbeatArgs,
         })
+        noteUsageRefusalSent(connectionId, heartbeatArgs, { dir: connectionsDir })
         // Name the turn that ended (turn-completion.mjs, item 6ccb8be1), from the
         // marker read before it was cleared above. By now the next command may already
         // be delivered, and a completion that names nothing closes whatever is newest on

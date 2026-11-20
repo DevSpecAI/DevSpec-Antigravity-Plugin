@@ -34,7 +34,7 @@ import {
   referenceIn,
   simpleGitCommit,
 } from './commit-provenance.mjs'
-import { runDevspecToolInput } from './devspec-tool-input.mjs'
+import { runDevspecToolInput, toProtoPreToolResult } from './devspec-tool-input.mjs'
 import { runPostInvocation } from './post-invocation.mjs'
 import { runPostToolDispatch } from './post-tool-dispatch.mjs'
 import { renderStatusLine } from './statusline.mjs'
@@ -239,7 +239,7 @@ describe('commit-provenance.mjs — claim/release tracking per conversation', ()
     )
   })
 
-  it('denies unreferenced git commit when zero or multiple claims are active, without blocking other commands', async () => {
+  it('lets an unreferenced commit through with a note when no task is claimed, refuses one when several are, and blocks no other command', async () => {
     // Non-commit command is always allowed
     const lsOut = await runDevspecToolInput(
       JSON.stringify({
@@ -252,8 +252,10 @@ describe('commit-provenance.mjs — claim/release tracking per conversation', ()
     )
     assert.equal(lsOut, null)
 
-    // Unreferenced commit with 0 claims is denied with recovery instructions
-    const denied = await runDevspecToolInput(
+    // An unreferenced commit with no claim goes through as written: the served contract
+    // never refuses a commit for want of a claim (dependency updates and automation runs
+    // need no task). The note reaches the model at the next PostInvocation.
+    const unlinked = await runDevspecToolInput(
       JSON.stringify({
         conversationId: CONVERSATION,
         cwd: repo,
@@ -262,8 +264,13 @@ describe('commit-provenance.mjs — claim/release tracking per conversation', ()
       }),
       { env },
     )
-    assert.equal(denied.decision, 'deny')
-    assert.match(denied.reason, new RegExp(CONTRACT_URI.replace(/[/:]/g, '\\$&')))
+    assert.notEqual(toProtoPreToolResult(unlinked).decision, 'deny')
+    assert.equal(toProtoPreToolResult(unlinked).overwrite, undefined, 'the command is left exactly as written')
+    const note = pendingNudgeNotice({ input: { conversationId: CONVERSATION }, env })
+    assert.match(JSON.stringify(note), /no task is claimed/i)
+    assert.match(JSON.stringify(note), /not stopped/)
+    // A person reads this note as ordinary command output: it names no internal contract rules.
+    assert.doesNotMatch(JSON.stringify(note), /_contract\b|core\.[a-z-]+|devspec:\/\/product/)
 
     // Multiple active claims refuse to guess
     for (const id of [ITEM, OTHER]) {
@@ -300,13 +307,14 @@ describe('commit-provenance.mjs — claim/release tracking per conversation', ()
       )
     const asksToTypeATag = /\[devspec:<(?:full-)?uuid>\]|add \[devspec|put \[devspec/i
 
-    // No claim: find or create the task, claim it, retry the same commit.
+    // No claim: the commit is not stopped, and the note says that claiming the task
+    // first gets the tag added, never that the model should type one.
     const unclaimed = await run('git commit -m "feat: the work"')
-    assert.equal(unclaimed.decision, 'deny')
-    assert.match(unclaimed.reason, /claim_work_item/)
-    assert.match(unclaimed.reason, /retry the same commit/i)
-    assert.match(unclaimed.reason, /added for you/)
-    assert.doesNotMatch(unclaimed.reason, asksToTypeATag)
+    assert.notEqual(toProtoPreToolResult(unclaimed).decision, 'deny')
+    const unclaimedNote = unclaimed.hookSpecificOutput.additionalContext
+    assert.match(unclaimedNote, /claim_work_item/)
+    assert.match(unclaimedNote, /added for you/)
+    assert.doesNotMatch(unclaimedNote, asksToTypeATag)
 
     // Claimed: retrying that exact commit is stamped by the plugin, nothing typed.
     handlePost(
@@ -331,7 +339,7 @@ describe('commit-provenance.mjs — claim/release tracking per conversation', ()
     assert.doesNotMatch(unquoted.reason, asksToTypeATag)
     assert.equal(unquoted.reason.includes(ITEM), false, 'no id handed over to be typed')
 
-    // The edit nudge says the same as the refusal.
+    // The edit nudge says the same as the commit note.
     const nudged = await handlePre(
       { conversationId: 'b0b0b0b0-1111-4222-8333-444444444444', cwd: repo, tool_name: 'replace_file_content', tool_input: { TargetFile: path.join(repo, 'x.js') } },
       { env },

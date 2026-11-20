@@ -25,8 +25,11 @@
  * - one task claimed, no reference in the message: adds ` [devspec:<id>]` to the end
  *   of the subject line (`-m` in place; `-F <file>` through a private copy, never the
  *   person's file; `-F -` by reading the message from standard input) and says so;
- * - no task claimed, or several, and no reference: stops the commit before git runs
- *   and says how to recover; the repository is left as it was;
+ * - no task claimed and no reference: git runs exactly as asked, with a note that the
+ *   commit carries no task reference; a commit is never refused for want of a claim
+ *   (commit_provenance_contract.edit_behavior, item cf356677);
+ * - several tasks claimed and no reference: stops the commit before git runs and says
+ *   how to recover; the repository is left as it was;
  * - anything else (another repository, amend, fixup, squash, a reused or reedited
  *   message, `--no-edit`, an existing reference, a message it cannot read): git runs
  *   exactly as asked, standard input included.
@@ -497,7 +500,7 @@ export function prepareCommit({ realGit, args, split, here, env, cwd = process.c
   if (ANY_REFERENCE.test(message)) return asked
 
   const claims = stamp.claims.filter((id) => UUID.test(id))
-  if (claims.length === 0) return { stop: stamp.messages?.unclaimed ?? 'DevSpec: no task is claimed for this commit.' }
+  if (claims.length === 0) return { ...asked, notice: typeof stamp.messages?.unlinked === 'string' ? stamp.messages.unlinked : null }
   if (claims.length > 1) return { stop: stamp.messages?.several ?? 'DevSpec: several tasks are claimed; put the right [devspec:<id>] in the message.' }
   const id = claims[0].toLowerCase()
   const notice = `DevSpec: added [devspec:${id}] to this commit's subject line (the one task claimed in this conversation).`

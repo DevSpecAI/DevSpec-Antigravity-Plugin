@@ -5,7 +5,8 @@
  * Enforces on the ONE artifact that is decidable: a commit message either carries a
  * well-formed DevSpec item reference or it does not.
  *
- *  - Edits and execution are NEVER denied for want of a claim.
+ *  - Edits, execution and commits are NEVER denied for want of a claim; a commit with
+ *    no task claimed goes through as written, with a note beside it.
  *  - Editing tracked files without an active claim stages a one-time provenance nudge
  *    per conversation+repo that PostInvocation injects as an `ephemeralMessage`.
  *  - Tracks `claim_work_item`, `release_work_item`, `fail_work_item`, and
@@ -846,7 +847,8 @@ function nudge(message) {
  * a `git commit -m "…"` message itself, so the model never types a UUID it does not
  * need; it writes a tag only when several tasks are claimed, because the plugin must
  * never guess between them. When the stamp applies is the served contract's
- * commit_provenance_contract, pointed at rather than restated.
+ * commit_provenance_contract, pointed at rather than restated. A commit with no task
+ * claimed is never refused: see unlinkedCommitText.
  */
 export function recoveryText(claims) {
   if (claims.length > 1) {
@@ -856,22 +858,28 @@ export function recoveryText(claims) {
       'Then retry the commit. Nothing else is blocked.',
     ].join(' ')
   }
-  if (claims.length === 1) {
-    return [
-      'DevSpec: this commit has no [devspec:<id>] reference, and its message cannot be stamped as written.',
-      'Retry it with the message in quotes after -m (git commit -m "…") and the tag of the task you claimed is added for you.',
-      `Authority: ${CONTRACT_URI} (commit_provenance_contract). Nothing else is blocked.`,
-    ].join(' ')
-  }
-  // Since item ab6a3960 the write gate refuses a thin task: create_task needs a real
-  // description and the reason behind it, so this must never suggest a one-liner.
   return [
-    'DevSpec: no task is claimed for this commit, so it would land unlinked.',
-    'Recover without leaving this turn: search_tasks for the task this work belongs to and claim it (claim_work_item);',
-    'if none covers it, create_task for the smallest adequate task, with a real description of the change',
-    'and the reason it is needed (the server refuses a thin one), and claim that. When to create one is the',
-    "contract's work_entry_contract. Then retry the same commit: its [devspec:<id>] tag is added for you.",
-    `Authority: ${CONTRACT_URI}. Nothing else is blocked, and no other command is affected.`,
+    'DevSpec: this commit has no [devspec:<id>] reference, and its message cannot be stamped as written.',
+    'Retry it with the message in quotes after -m (git commit -m "…") and the tag of the task you claimed is added for you.',
+    `Authority: ${CONTRACT_URI} (commit_provenance_contract). Nothing else is blocked.`,
+  ].join(' ')
+}
+
+/**
+ * What a commit made with no task claimed is told, beside it, while it goes through
+ * as written (item cf356677). The served contract never refuses a commit because a
+ * claim is absent (commit_provenance_contract.edit_behavior): work that needs no task,
+ * such as a dependency-only update or an automation run, commits like any other, and
+ * commit ingestion plus the unlinked-work heads-up recover a commit that should have
+ * carried one. Since item ab6a3960 create_task refuses a thin task, so this never
+ * suggests creating one in passing. The note is ordinary command output a person reads,
+ * so it names no contract rules (the 20 Nov final check's product-copy finding).
+ */
+export function unlinkedCommitText() {
+  return [
+    'DevSpec: no task is claimed in this conversation, so this commit carries no [devspec:<id>] reference. It was not stopped.',
+    'If the work delivers a task, claim that task (claim_work_item) before your next commit and the reference is added for you;',
+    'if it needs no task, there is nothing to do.',
   ].join(' ')
 }
 
@@ -1796,6 +1804,17 @@ export async function handlePre(input, options = {}) {
     return null
   }
 
+  if (claims.length === 0) {
+    // Never refused for want of a claim (commit_provenance_contract.edit_behavior).
+    // Where the git stand-in runs the command, it says so itself from inside git;
+    // here, the text reader's note reaches the model at the next PostInvocation,
+    // because Antigravity passes on only a decision from PreToolUse.
+    if (options.matchRemote === false) return null
+    const message = unlinkedCommitText()
+    stagePendingNudge(scope.sessionId, message, { env, now, platform })
+    return nudge(message)
+  }
+
   if (claims.length === 1 && commit.appendable) {
     const id = claims[0]
     const updated = `${command.slice(0, commit.insertOffset)} [devspec:${id}]${command.slice(commit.insertOffset)}`
@@ -1815,9 +1834,10 @@ function maybeNudge(scope, { env, now, platform }) {
   }
   const message =
     'DevSpec: no task is claimed in this repository, so work done here has nothing to trace it to. ' +
-    'Before you commit, search_tasks for the task this work belongs to and claim it (claim_work_item); if none covers it, ' +
-    "create the smallest adequate one with a real description and reason (the contract's work_entry_contract " +
-    'says when) and claim that. Then commit as usual: the [devspec:<id>] tag is added for you. Editing is never blocked. ' +
+    "If the work needs a task (the contract's work_entry_contract says when), search_tasks for the one it belongs to " +
+    'and claim it (claim_work_item) before you commit; if none covers it, create the smallest adequate one with a real ' +
+    'description and reason, and claim that. Then commit as usual: the [devspec:<id>] tag is added for you. ' +
+    'Editing and committing are never blocked. ' +
     `Shown once per session. Authority: ${CONTRACT_URI}`
   stagePendingNudge(scope.sessionId, message, { env, now, platform })
   return nudge(message)
