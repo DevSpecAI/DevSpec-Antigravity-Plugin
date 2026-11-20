@@ -269,7 +269,8 @@ describe('commit-provenance.mjs — claim/release tracking per conversation', ()
     const note = pendingNudgeNotice({ input: { conversationId: CONVERSATION }, env })
     assert.match(JSON.stringify(note), /no task is claimed/i)
     assert.match(JSON.stringify(note), /not stopped/)
-    assert.match(JSON.stringify(note), new RegExp(CONTRACT_URI.replace(/[/:]/g, '\\$&')))
+    // A person reads this note as ordinary command output: it names no internal contract rules.
+    assert.doesNotMatch(JSON.stringify(note), /_contract\b|core\.[a-z-]+|devspec:\/\/product/)
 
     // Multiple active claims refuse to guess
     for (const id of [ITEM, OTHER]) {

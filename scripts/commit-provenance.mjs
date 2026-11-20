@@ -872,14 +872,14 @@ export function recoveryText(claims) {
  * such as a dependency-only update or an automation run, commits like any other, and
  * commit ingestion plus the unlinked-work heads-up recover a commit that should have
  * carried one. Since item ab6a3960 create_task refuses a thin task, so this never
- * suggests creating one in passing.
+ * suggests creating one in passing. The note is ordinary command output a person reads,
+ * so it names no contract rules (the 20 Nov final check's product-copy finding).
  */
 export function unlinkedCommitText() {
   return [
     'DevSpec: no task is claimed in this conversation, so this commit carries no [devspec:<id>] reference. It was not stopped.',
     'If the work delivers a task, claim that task (claim_work_item) before your next commit and the reference is added for you;',
-    "if it needs no task, there is nothing to do. When work needs a task is the contract's work_entry_contract.",
-    `Authority: ${CONTRACT_URI} (commit_provenance_contract).`,
+    'if it needs no task, there is nothing to do.',
   ].join(' ')
 }
 
