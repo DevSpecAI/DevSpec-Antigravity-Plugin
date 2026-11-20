@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.29.1
+
+- **Your agent now suggests turning a recurring problem into a requirement when one comes up.** Before, the rules told your agent to ask before recording a requirement without saying what a candidate requirement looks like during an ordinary conversation, so it waited for you to use the word "requirement" yourself. Now, when you point out a mistake that keeps creeping back in across tasks, or state a non-negotiable project-wide "always" or "never" rule that can be checked against what future work actually delivers, your agent explains what a requirement is and asks whether you want to record one — while still never saving a requirement without your yes.
+- Update the plugin and start a new `agy` session to pick this up.
+
 ## 0.29.0
 
 - **A commit is never refused because no task is claimed.** With no task claimed, your Antigravity agent's commit now goes through as written, with a note saying it carries no task reference and that claiming the task first gets the reference added. Work that needs no task, such as a dependency update or an automation run, is no longer held up. With one task claimed, commits are still tagged for you; with several, the agent is still asked which one a commit belongs to.
