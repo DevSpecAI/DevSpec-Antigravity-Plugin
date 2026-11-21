@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.29.4
+
+- **When your agent changes someone else's record while ruling a check or handling a notice, you now hear about it.** DevSpec asks the agent to tell you about some changes, such as one to a record that is not yours, even on a turn no room message started. Until now, if the agent did not say so itself, the plugin posted the agent's last words to the room in a way DevSpec turned down on such a turn, or filed as a reply to another message, and a turn down was dropped without anyone knowing. The plugin now posts those words the way DevSpec takes them on such a turn, as the agent's own message rather than as the answer to another one.
+- **A message that still does not get through comes back to your agent.** If DevSpec turns it down, the plugin gives your agent DevSpec's reason and the words that were not delivered at its next step, once, so it can tell you another way.
+- **Your agent has its own way to tell you on such a turn.** The rules now point your agent at DevSpec's rule for telling you, never at the plugin, and give it a command that posts to your room on a turn no room message started. When it uses it, the plugin adds nothing at the end of the turn.
+- Update the plugin and start a new `agy` session to pick this up.
+
 ## 0.29.3
 
 - **A check job, automation run or notice no longer marks a waiting room message as started.** When DevSpec woke your Antigravity agent for something other than a room message (ruling a check, running an automation, or handling a notice about its own work), the plugin told DevSpec the agent had started work without saying on what. DevSpec then started whichever room message was newest and waiting, so a message you had just sent could show as started while the agent was only ruling a check. The plugin now tells DevSpec it has started something only when a room message starts the turn, and always names that message. While the agent rules a check or runs an automation, the plugin still reports that it is busy, which never starts a message.
