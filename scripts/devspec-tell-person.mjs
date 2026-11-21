@@ -34,8 +34,9 @@ import { isEntryPoint } from './entry-point.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-// The most DevSpec takes in one post's `message`.
-const MAX_MESSAGE_CHARS = 100_000
+// No size check here: DevSpec owns the limit on a post's `message` and enforces it in
+// one place. A post over it comes back as DevSpec's own refusal, which this command
+// prints as sent, so the plugin never keeps a second copy that could drift.
 
 export function parseArgs(argv) {
   const out = { connectionId: null, message: null }
@@ -65,9 +66,6 @@ export async function tellPerson(
   }
   const words = typeof message === 'string' ? message.trim() : ''
   if (!words) return localRefusal('empty_message', 'Pass what to tell your person with --message, or on stdin.')
-  if ([...words].length > MAX_MESSAGE_CHARS) {
-    return localRefusal('message_too_long', `DevSpec takes at most ${MAX_MESSAGE_CHARS} characters in one post; shorten it or split it.`)
-  }
   let state = null
   try {
     state = readState(path.join(dir, `${connectionId}.json`))
