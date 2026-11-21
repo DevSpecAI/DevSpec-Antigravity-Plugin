@@ -72,6 +72,7 @@ const URGENT_REQ_ID = 'f2222222-2222-4222-8222-222222222222'
 const PROV_ID = 'c1111111-1111-4111-8111-111111111111'
 const USER_ID = 'a1111111-1111-4111-8111-111111111111'
 const SECOND_CHECK_JOB_ID = '13131313-1313-4313-8313-131313131313'
+const COMMAND_TURN_ID = '7e7e7e7e-7e7e-47e7-87e7-7e7e7e7e7e7e'
 const WAIT_SCRIPT = fileURLToPath(new URL('./devspec-remote-wait.mjs', import.meta.url))
 
 function makeCheckJobRecord(id = CHECK_JOB_ID, connectionId = CONN_ID) {
@@ -132,9 +133,16 @@ function makeCommandRecord(messageId = URGENT_MSG_ID) {
       commands: [
         {
           message_id: messageId,
+          order: { sequence: 7, created_at: '2026-11-04T18:00:07.000Z', message_id: messageId },
           requester: { display_name: 'Ali Price' },
           authority: { kind: 'owner' },
           content: { body: 'Please pause and check staging first.' },
+          delivery: {
+            provenance_ref: URGENT_REQ_ID,
+            turn_id: COMMAND_TURN_ID,
+            primary_provenance_ref: URGENT_REQ_ID,
+            is_primary: true,
+          },
         },
       ],
     },
@@ -257,7 +265,11 @@ describe('active-turn FIFO queueing in devspec-remote-listen.mjs', () => {
         'the cursor moves past the delivered command, so a restart never replays it',
       )
       assert.deepEqual(fx.live.inbox_held_records, heldBoth, 'the held records are persisted beside it')
-      assert.equal(mcpCalls.filter((c) => c.name === 'report_pickup').length, 1, 'commands report pickup')
+      assert.deepEqual(
+        mcpCalls.filter((c) => c.name === 'report_pickup').map((c) => c.arguments),
+        [{ connection_id: CONN_ID, command_turn_id: COMMAND_TURN_ID, command_message_id: URGENT_MSG_ID }],
+        'a command is picked up by name',
+      )
 
       // 3. Active command turn finishes (Stop clears turn marker and closes finished requests).
       clearTurnMarker(CONN_ID, fx.connDir)
@@ -275,8 +287,8 @@ describe('active-turn FIFO queueing in devspec-remote-listen.mjs', () => {
       assert.equal(readRequestState(CONN_ID, { dir: fx.connDir }).current, null)
       assert.equal(
         mcpCalls.filter((c) => c.name === 'report_pickup').length,
-        1,
-        'check_job delivery immediately reports pickup so the UI shows Working right away',
+        0,
+        'a check job starts no command, so its delivery reports no pickup (item 71ce988c)',
       )
 
       // 4. Check-job turn finishes -> next tick drains the queued system_notice with full identity intact!
@@ -292,8 +304,8 @@ describe('active-turn FIFO queueing in devspec-remote-listen.mjs', () => {
       assert.equal(readRequestState(CONN_ID, { dir: fx.connDir }).current, null)
       assert.equal(
         mcpCalls.filter((c) => c.name === 'report_pickup').length,
-        1,
-        'system_notice delivery immediately reports pickup so the UI shows Working right away',
+        0,
+        'a notice starts no command, so its delivery reports no pickup (item 71ce988c)',
       )
     } finally {
       fx.cleanup()

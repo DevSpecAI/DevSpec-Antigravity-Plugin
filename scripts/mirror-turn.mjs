@@ -65,6 +65,13 @@ import { readConnectionTelemetry } from './statusline.mjs'
 import { parseTurnFailure, turnFailureMessage } from './turn-failure.mjs'
 import { noteUsageRefusalSent, recordTurnOutcome, usageRefusalArgument, usageRefusedUntil } from './usage-refusal.mjs'
 import { turnCompletionIdentities } from './turn-completion.mjs'
+import {
+  postToPerson,
+  speechSourceId,
+  stageHandBack,
+  telemetryModel,
+  tellPersonArguments,
+} from './tell-person.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
 const MODES = new Set(['user_prompt', 'stop', 'background_launch', 'subagent_stop'])
@@ -230,6 +237,7 @@ export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR, now =
           checkJobWake: Boolean(wake?.checkJobWake),
           tellPerson: false,
           noticeReplyAt: null,
+          personToldAt: null,
           preserveExplicitReply: true,
         },
         dir,
@@ -350,6 +358,42 @@ export function recordNoticeReply(connectionId, dir = CONNECTIONS_DIR, now = Dat
   if (!connectionId || !readTurnMarker(connectionId, dir)) return false
   writeTurnMarker(connectionId, { noticeReplyAt: now, preserveExplicitReply: true }, dir)
   return true
+}
+
+/**
+ * Note on the turn marker that the agent told its person itself with
+ * `devspec-tell-person.mjs` (tell-person.mjs), so Stop's backstop posts nothing more.
+ */
+export function recordPersonTold(connectionId, dir = CONNECTIONS_DIR, now = Date.now()) {
+  if (!connectionId || !readTurnMarker(connectionId, dir)) return false
+  writeTurnMarker(connectionId, { personToldAt: now, preserveExplicitReply: true }, dir)
+  return true
+}
+
+/**
+ * Stop's backstop for `tell_person` (`semantics.notice_audience.telling_anyway`): the
+ * agent's last words, posted on DevSpec's speech lane because a turn no room command
+ * started has no turn for an ordinary post to join (tell-person.mjs, item e086163c).
+ * The source id is the turn's and the words', so a Stop that runs again for the same
+ * turn stores them once. A refusal is reported here and handed back to the agent at
+ * its next step (pre-invocation.mjs), never dropped.
+ */
+async function postTellPersonBackstop({ call, mcpUrl, token, state, connectionId, agentName, message, marker, connectionsDir }) {
+  const args = tellPersonArguments({
+    connectionId,
+    message,
+    sourceId: speechSourceId('tell-person-backstop', connectionId, marker?.startedAt, message),
+    agentName,
+    model: telemetryModel(connectionId ? readConnectionTelemetry(connectionId) : null),
+  })
+  const sent = await postToPerson({ call, mcpUrl, token, connectionCapability: state?.connection_capability, args })
+  if (!sent.ok) {
+    stageHandBack(connectionId, { message, refusal: sent.refusal }, connectionsDir)
+    process.stderr.write(
+      `[devspec-remote] the tell_person post did not land; handed back to the agent: ${JSON.stringify(sent.refusal)}\n`,
+    )
+  }
+  return sent
 }
 
 export function ownedWorkPath(connectionId, dir = CONNECTIONS_DIR) {
@@ -1702,6 +1746,7 @@ export function isRemotePlumbingToolCall(toolName, args = {}) {
       cmdLine.includes('devspec-remote-connect.mjs') ||
       cmdLine.includes('devspec-remote-stop.mjs') ||
       cmdLine.includes('devspec-question.mjs') ||
+      cmdLine.includes('devspec-tell-person.mjs') ||
       cmdLine.includes('remote-control-state.mjs') ||
       cmdLine.includes('connection-call.mjs') ||
       cmdLine.includes('post_session_message') ||
@@ -2912,7 +2957,13 @@ export async function handleMirrorTurn(
             connectionState: state,
             marker,
           })
-          if ((midWaitNotices || midWaitRoutine) && marker.tellPerson && !marker.noticeReplyAt && sessionId) {
+          if (
+            (midWaitNotices || midWaitRoutine) &&
+            marker.tellPerson &&
+            !marker.noticeReplyAt &&
+            !marker.personToldAt &&
+            sessionId
+          ) {
             const tellText =
               (text ? prepareAgentMirrorText(text) : null) ||
               extractLatestAssistantReplyFromTranscript(effectiveTranscriptPath, {
@@ -2920,30 +2971,9 @@ export async function handleMirrorTurn(
                 afterLastSystemMessage: true,
               })
             if (tellText) {
-              const telemetry = connectionId ? readConnectionTelemetry(connectionId) : null
-              try {
-                await call({
-                  mcpUrl,
-                  token,
-                  name: 'post_session_message',
-                  arguments: {
-                    connection_id: connectionId,
-                    agent_name: agentName,
-                    message: tellText,
-                    ...(telemetry ? { agent_stats: telemetry } : {}),
-                    ...(telemetry?.model?.id
-                      ? {
-                          model: {
-                            providerID: telemetry.model.provider || 'google',
-                            modelID: telemetry.model.id,
-                          },
-                        }
-                      : {}),
-                  },
-                })
-              } catch {
-                /* non-fatal */
-              }
+              await postTellPersonBackstop({
+                call, mcpUrl, token, state, connectionId, agentName, message: tellText, marker, connectionsDir,
+              })
             }
           }
           const parent = marker.heldParent
@@ -2962,6 +2992,7 @@ export async function handleMirrorTurn(
               checkJobWake: false,
               tellPerson: false,
               noticeReplyAt: null,
+              personToldAt: null,
               preserveExplicitReply: true,
             },
             connectionsDir,
@@ -3045,42 +3076,21 @@ export async function handleMirrorTurn(
       )
       const turnFailure = parseTurnFailure(parsedHookInput)
       if (turnNotices || routineTurn) {
-        // Silent, except when a write in the turn changed someone else's record
-        // (`tell_person`, `semantics.notice_audience.telling_anyway`) and the model did
-        // not tell the person itself: then its last words go to the room as an ordinary
-        // message, bound to no command turn, so no trail and no complete_turn.
+        // Silent, except when a write in the turn carried `tell_person`
+        // (`semantics.notice_audience.telling_anyway`) and the agent told nobody: then
+        // its last words go to the room on DevSpec's speech lane, bound to no command
+        // turn, so no trail and no complete_turn (postTellPersonBackstop).
         const tellText =
-          marker?.tellPerson && !hadExplicitReply && !marker?.noticeReplyAt && sessionId
+          marker?.tellPerson && !hadExplicitReply && !marker?.noticeReplyAt && !marker?.personToldAt && sessionId
             ? (text ? prepareAgentMirrorText(text) : null) ||
               extractLatestAssistantReplyFromTranscript(effectiveTranscriptPath, {
                 sinceMs: marker?.startedAt ?? null,
               })
             : null
         if (tellText) {
-          const telemetry = connectionId ? readConnectionTelemetry(connectionId) : null
-          try {
-            await call({
-              mcpUrl,
-              token,
-              name: 'post_session_message',
-              arguments: {
-                connection_id: connectionId,
-                agent_name: agentName,
-                message: tellText,
-                ...(telemetry ? { agent_stats: telemetry } : {}),
-                ...(telemetry?.model?.id
-                  ? {
-                      model: {
-                        providerID: telemetry.model.provider || 'google',
-                        modelID: telemetry.model.id,
-                      },
-                    }
-                  : {}),
-              },
-            })
-          } catch {
-            /* non-fatal */
-          }
+          await postTellPersonBackstop({
+            call, mcpUrl, token, state, connectionId, agentName, message: tellText, marker, connectionsDir,
+          })
         }
       } else if (turnFailure && isRemoteTurn && sessionId && !isUnboundBgContinuation) {
         // The turn died on an error before the model could answer (item 408ad47b):

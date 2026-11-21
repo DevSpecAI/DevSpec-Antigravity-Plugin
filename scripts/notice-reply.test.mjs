@@ -586,6 +586,10 @@ describe('DevSpec labels each notice, and only one that needs a person is answer
   it('tells the person when a write in a routine or notice turn changed someone else\'s record (tell_person)', async () => {
     const fx = fixture()
     try {
+      // The post goes on DevSpec's speech lane, which needs the connection's capability
+      // (tell-person.mjs, item e086163c).
+      const statePath = path.join(fx.connDir, `${CONN_ID}.json`)
+      writeStateFile({ ...JSON.parse(fs.readFileSync(statePath, 'utf8')), connection_capability: 'dvsc_notice_reply_test' }, fx.connDir)
       recordTurnWake(CONN_ID, labelled('for_the_record', NOTICE_A), fx.connDir)
       await postTool(fx, 'update_task', { task_id: NOTICE_B, lifecycle: 'dismissed' }, TELL_PERSON_RESULT)
       assert.equal(readTurnMarker(CONN_ID, fx.connDir).tellPerson, true)
@@ -595,6 +599,9 @@ describe('DevSpec labels each notice, and only one that needs a person is answer
       assert.equal(rest.length, 0)
       assert.equal(post.arguments.message, 'I closed Brandon\'s duplicate task, which repeated mine.')
       assert.equal(post.arguments.connection_id, CONN_ID)
+      assert.equal(post.arguments.ingest_version, 2)
+      assert.equal(typeof post.arguments.assistant_source_id, 'string')
+      assert.equal(post.connectionCapability, 'dvsc_notice_reply_test')
       for (const key of [...TURN_ONLY, 'system_notice_ids', 'complete_turn']) assert.equal(post.arguments[key], undefined, key)
 
       // Same when the turn woke on a needs_person notice and a write carried tell_person.

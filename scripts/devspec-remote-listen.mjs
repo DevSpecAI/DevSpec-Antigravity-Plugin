@@ -845,8 +845,9 @@ function adoptPersistedQueue(queueState, live, { inboxPath, connectionId }) {
  *   to `devspec-remote-wait.mjs --pending` delivers each held record exactly once and
  *   never replays the commands delivered past it (item b68df72d).
  * - Once the active turn finishes, drains queued `check_job` / `canonical_system_notices`
- *   one follow-up turn at a time in arrival order, resetting `current` request to `null`
- *   and immediately reporting `report_pickup` so DevSpec shows Working right away.
+ *   one follow-up turn at a time in arrival order, resetting `current` request to `null`.
+ *   None of them is reported as a pickup: only a room command is, by name (item
+ *   71ce988c); the poller's busy goes on being reported while the turn runs.
  */
 export async function processListenerInboxTick(
   queueState,
@@ -949,7 +950,12 @@ export async function processListenerInboxTick(
         )
         queueState.lastDeliveryError = null
       }
-      if (live?.token && live?.mcp_url) {
+      // A command names itself, so the pickup starts exactly the command this turn was
+      // given and never one that arrived behind it (commandPickupIdentity). A check job,
+      // notice or automation run starts no command, so it gets no pickup at all: one
+      // naming nothing starts whichever command is newest and waiting (item 71ce988c).
+      const startsCommand = commandPickupIdentity(commandTurnsFromEntry(rec.entry))
+      if (startsCommand.command_turn_id && live?.token && live?.mcp_url) {
         callMcp({
           mcpUrl: live.mcp_url,
           token: live.token,
@@ -957,10 +963,7 @@ export async function processListenerInboxTick(
             ? { connectionCapability: live.connection_capability }
             : {}),
           name: 'report_pickup',
-          // A command names itself, so the pickup starts exactly the command this turn
-          // was given and never one that arrived behind it (commandPickupIdentity). A
-          // check job, notice or automation run starts no command and names nothing.
-          arguments: { connection_id: connectionId, ...commandPickupIdentity(commandTurnsFromEntry(rec.entry)) },
+          arguments: { connection_id: connectionId, ...startsCommand },
           timeoutMs: 5_000,
         }).catch(() => {})
       }

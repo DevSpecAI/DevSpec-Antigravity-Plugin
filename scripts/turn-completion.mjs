@@ -103,7 +103,8 @@ export function commandTurnsFromEntry(entry) {
  * other open attempt, which can be a command that arrived behind this one and that the
  * agent has not been given; naming the command starts exactly that one and spares the
  * others still waiting. Empty when no command started the turn (a check job, a notice,
- * an automation run, a prompt typed at the terminal): there is nothing to name then.
+ * an automation run, a prompt typed at the terminal): there is nothing to name then,
+ * and no pickup is sent at all (item 71ce988c).
  */
 export function commandPickupIdentity(commandTurns) {
   const turns = mergeCommandTurns([], commandTurns)
