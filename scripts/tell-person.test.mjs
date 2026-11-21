@@ -502,6 +502,36 @@ describe('the agent\'s tell-person command (devspec-tell-person.mjs)', () => {
     }
   })
 
+  it('a message over DevSpec\'s limit is sent whole, and comes back as DevSpec\'s own limit refusal with the field, the limit and the length', async () => {
+    const fx = fixture()
+    try {
+      recordTurnWake(CONN_ID, WAKES['a check job'], fx.connDir)
+      const words = 'a'.repeat(100_001)
+      // DevSpec's refusal exactly as staging returned it for a 100,001-character speech-lane
+      // post (probed 21 November 2026): its argument check refuses before the lane runs.
+      const devspec = {
+        tool: 'post_session_message', field: 'message', kind: 'limit', code: 'argument_limit_exceeded',
+        keyword: 'maxLength', limit: 100000, length: 100001, unit: 'characters',
+        error: 'post_session_message was not run: `message` is 100,001 characters, over this tool\'s 100,000-character limit. Nothing was changed.',
+      }
+      const sent = []
+      const result = await tellPerson(
+        { connectionId: CONN_ID, message: words },
+        { dir: fx.connDir, readState, call: async (request) => { sent.push(request); throw new McpToolRefusalError(JSON.stringify(devspec, null, 2), devspec) } },
+      )
+      assert.equal(sent.length, 1, 'the plugin does not refuse on size itself: DevSpec decides')
+      assert.equal(sent[0].arguments.message, words, 'nothing is cut before sending')
+      assert.equal(result.sent, false)
+      assert.deepEqual(
+        { field: result.refusal.details.field, limit: result.refusal.details.limit, length: result.refusal.details.length },
+        { field: 'message', limit: 100000, length: 100001 },
+        'the field, the limit and the actual length reach the agent intact',
+      )
+    } finally {
+      fx.cleanup()
+    }
+  })
+
   it('refuses before sending when there is nothing to say or no connection', async () => {
     const fx = fixture()
     try {
