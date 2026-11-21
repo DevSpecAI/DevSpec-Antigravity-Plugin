@@ -1113,38 +1113,53 @@ const ACTIVITY_VERB_TOOL = {
  * next began between two looks), the old turn is completed by its own identity and
  * the new one is a pickup, never a keepalive of the old.
  *
- * @param {{ startedAt: number, identities: object[], reopened?: boolean } | null} seen
+ * Only a turn a room command started is picked up, and its pickup names that command
+ * (item cf356677); `keepsAlive` says this poller keeps that work alive until the turn
+ * ends. A turn no command started (a check job, an automation run, a notice, a prompt
+ * typed at the terminal) gets no pickup from here, because `report_pickup` naming
+ * nothing starts whichever command is newest and waiting (item 71ce988c), and no
+ * keepalive of the connection's own (createTurnActivityReporter). What busy and each
+ * activity call do is in their own tool descriptions and the served remote-ingress
+ * contract; the poll's busy goes on being reported for every turn, and a typed turn's
+ * exact pickup is the prompt hook's (local-turn.mjs).
+ *
+ * @param {{ startedAt: number, identities: object[], keepsAlive?: boolean, outlivedCommand?: boolean } | null} seen
  * @param {object | null} marker the ACTIVE marker, or null when no turn is running
  */
 export function planTurnActivity(seen, marker, { localTurn = null, sessionId = null } = {}) {
   const sameTurn = Boolean(seen && marker && seen.startedAt === marker.startedAt)
+  // The command the turn was given, when one started it; empty otherwise.
+  const startedBy = commandPickupIdentity(marker?.commandTurns)
   const current = marker
     ? {
         startedAt: marker.startedAt,
         identities: turnCompletionIdentities({ marker, localTurn, sessionId }),
-        reopened: sameTurn && seen.reopened === true,
+        keepsAlive: sameTurn ? seen.keepsAlive === true : Boolean(startedBy.command_turn_id),
+        outlivedCommand: sameTurn && seen.outlivedCommand === true,
       }
     : null
   const ended = () => {
-    // `reopened`: this poller sent a second bare pickup for the turn's work
-    // (createTurnActivityReporter). When the turn's command had already been answered,
-    // that pickup opened an attempt with no source command, and naming only the command
-    // would leave it showing Working until its lease ran out.
+    // `outlivedCommand`: the turn's command was answered while the agent went on
+    // working (createTurnActivityReporter). Whatever activity carried that work has no
+    // source command, and naming only the command would leave it showing Working until
+    // its lease ran out.
     const identities =
-      seen.reopened && !seen.identities.some((identity) => identity.command_turn_unbound)
+      seen.outlivedCommand && !seen.identities.some((identity) => identity.command_turn_unbound)
         ? [...seen.identities, { command_turn_unbound: true }]
         : seen.identities
     return { verb: 'complete', identities }
   }
-  // A pickup names the command the turn was given, when one started it (item cf356677).
-  const pickup = () => ({ verb: 'pickup', identity: commandPickupIdentity(marker?.commandTurns) })
   const steps = []
+  const begin = () => {
+    if (current.keepsAlive) steps.push({ verb: 'pickup', identity: startedBy })
+  }
   if (seen && current && !sameTurn) {
-    steps.push(ended(), pickup())
+    steps.push(ended())
+    begin()
   } else {
     const verb = verbForTurnTransition(Boolean(seen), Boolean(current))
     if (verb === 'complete') steps.push(ended())
-    else if (verb === 'pickup') steps.push(pickup())
+    else if (verb === 'pickup') begin()
     else if (verb) steps.push({ verb })
   }
   return { steps, seen: current }
@@ -1160,16 +1175,16 @@ export function planTurnActivity(seen, marker, { localTurn = null, sessionId = n
  * these (interactionActivityPlan): a keepalive renews the continuation and the other
  * two are not sent.
  *
- * The first pickup for a turn a command started names that command
- * (`command_turn_id` and `command_message_id`, item cf356677), so it starts exactly
- * that command and never one that arrived behind it; a pickup for a turn no command
- * started names nothing. A second pickup for the same work happens when the command
- * has been answered meanwhile (its answer closed it and the agent kept working), two
- * ways: the server refuses a keepalive because nothing is working and this re-opens
- * the attempt, or the marker is cleared here for that reason and written again by the
- * next tool call. That one names nothing, because only a pickup that names nothing can
- * open an attempt with no source command, and the turn is marked `reopened`, so its
- * end also closes source-less activity (planTurnActivity).
+ * Every pickup sent here names the command it starts (`command_turn_id` and
+ * `command_message_id`, items cf356677 and 71ce988c), once: a pickup that names
+ * nothing starts whichever command is newest and waiting, which can be one the agent
+ * has not been given. Only the work such a pickup started is kept alive from here
+ * (`keepsAlive`). A turn can outlive its command when the command's own answer closed
+ * it and the agent kept working, seen two ways: the server refuses a keepalive because
+ * nothing is working, or the marker is cleared here for that reason and written again
+ * by the next tool call for the same command. Either way nothing is picked up again
+ * and no further keepalive is sent for that turn; it is marked `outlivedCommand`, so
+ * its end also closes activity no command started (planTurnActivity).
  *
  * @param {object} deps
  * @param {(request: { name: string, arguments: object }) => Promise<unknown>} deps.callTool
@@ -1190,43 +1205,31 @@ export function createTurnActivityReporter({
   // The commands of the turn this poller last reported a pickup for.
   let pickedUp = []
 
+  const commandKey = (identity) =>
+    identity?.command_turn_id ? `${identity.command_turn_id}:${identity.command_message_id}` : null
+
   function notePickup() {
-    if (!seen) return
-    const commands = seen.identities
-      .filter((identity) => identity.command_turn_id)
-      .map((identity) => `${identity.command_turn_id}:${identity.command_message_id}`)
-    if (commands.length > 0 && commands.every((key) => pickedUp.includes(key))) {
-      seen.reopened = true
-    }
-    pickedUp = commands
+    if (seen) pickedUp = seen.identities.map(commandKey).filter(Boolean)
   }
 
-  async function recoverLostAttempt() {
+  /** The turn goes on after its command was closed: nothing of its own is kept alive any more. */
+  function outliveCommand() {
+    if (!seen) return
+    seen.keepsAlive = false
+    seen.outlivedCommand = true
+  }
+
+  /** Whether the turn on disk is still running although nothing is working on the server. */
+  function turnStillRunning() {
     const currentMarker = readMarker()
-    if (
+    return (
       hasPostReplyToolActivity(currentMarker, now()) ||
       currentMarker?.held === true ||
       currentMarker?.checkJobWake === true ||
       (Array.isArray(currentMarker?.noticeIds) && currentMarker.noticeIds.length > 0) ||
       (Array.isArray(currentMarker?.recordNoticeIds) && currentMarker.recordNoticeIds.length > 0) ||
       (typeof currentMarker?.startedAt === 'number' && now() - currentMarker.startedAt <= 60_000)
-    ) {
-      try {
-        await callTool({ name: 'report_pickup', arguments: { connection_id: connectionId } })
-        if (seen) seen.reopened = true
-        log('devspec-remote-poll: active turn detected — re-opened working attempt via report_pickup\n')
-        return true
-      } catch (pickupErr) {
-        log(`devspec-remote-poll: continuation report_pickup failed: ${pickupErr.message}\n`)
-      }
-    }
-    return false
-  }
-
-  /** What a pickup names: the command, unless that command was already picked up. */
-  function pickupIdentity(identity = {}) {
-    const key = identity.command_turn_id ? `${identity.command_turn_id}:${identity.command_message_id}` : null
-    return key && !pickedUp.includes(key) ? identity : {}
+    )
   }
 
   async function send(verb, identity = {}) {
@@ -1244,7 +1247,13 @@ export function createTurnActivityReporter({
     } catch (e) {
       log(`devspec-remote-poll: activity verb ${verb} (${name}) failed: ${e.message}\n`)
       if (!isNoWorkingAttemptRefusal(e)) return
-      if (verb === 'keepalive' && (await recoverLostAttempt())) return
+      if (verb === 'keepalive' && turnStillRunning()) {
+        // The agent is still working, the command it was given is not. Nothing is
+        // picked up again: a pickup naming no command could start one that is waiting.
+        outliveCommand()
+        log('devspec-remote-poll: turn outlived its command — keeping the turn marker, no further keepalives\n')
+        return
+      }
       clearMarker()
       seen = null
       log('devspec-remote-poll: server reports no working attempt — clearing the stale turn marker\n')
@@ -1265,8 +1274,10 @@ export function createTurnActivityReporter({
         if (step.verb === 'complete') {
           for (const identity of step.identities) await send('complete', identity)
         } else if (step.verb === 'pickup') {
-          await send('pickup', pickupIdentity(step.identity))
-        } else {
+          // The same command again: its answer closed it, and its turn was written anew.
+          if (pickedUp.includes(commandKey(step.identity))) outliveCommand()
+          else await send('pickup', step.identity)
+        } else if (seen?.keepsAlive) {
           await send(step.verb)
         }
       }

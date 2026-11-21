@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.29.3
+
+- **A check job, automation run or notice no longer marks a waiting room message as started.** When DevSpec woke your Antigravity agent for something other than a room message (ruling a check, running an automation, or handling a notice about its own work), the plugin told DevSpec the agent had started work without saying on what. DevSpec then started whichever room message was newest and waiting, so a message you had just sent could show as started while the agent was only ruling a check. The plugin now tells DevSpec it has started something only when a room message starts the turn, and always names that message. While the agent rules a check or runs an automation, the plugin still reports that it is busy, which never starts a message.
+- **Work that carries on after the agent answered a message no longer picks up the next one.** If the agent kept working after its answer closed your message, the plugin used to report a fresh start, which could start a newer message waiting behind it. It now leaves that message waiting until the agent is given it.
+- Update the plugin and start a new `agy` session to pick this up.
+
 ## 0.29.2
 
 - **Going ahead on a decision conflict follows what DevSpec accepts.** The plugin rules no longer claim that a bare **Go ahead** or **Keep** on work that conflicts with a decision, convention or requirement is refused until the record is edited first. When you let the work go ahead, DevSpec accepts the answer and marks the overruled record as needing an update.

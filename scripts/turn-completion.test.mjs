@@ -260,10 +260,12 @@ describe('the poller completes the turn it saw, not what is newest on the connec
     try {
       const { calls, look, since } = poller(dir)
 
-      // A check job's turn is running; the poller sees it and reports working.
+      // A check job's turn is running. It started no command, so the poller picks
+      // nothing up for it and keeps nothing alive of its own (item 71ce988c).
       startTurn(dir, CHECK_JOB)
       await look()
-      assert.deepEqual(since(), ['report_pickup'])
+      await look()
+      assert.deepEqual(since(), [])
 
       // The turn ends during a long poll, and that poll returns a new command. The
       // poller has written it to the inbox, but the listener has not delivered it yet,
@@ -332,13 +334,14 @@ describe('the poller completes the turn it saw, not what is newest on the connec
     }
   })
 
-  it('also closes the source-less attempt it re-opened after the command was answered', async () => {
+  it('also closes source-less activity at the end of a turn that outlived its command', async () => {
     const dir = tempDir()
     try {
       // The command's answer closed its turn on the server while the agent kept
-      // working, so the next keepalive is refused and the poller re-opens a working
-      // attempt. That attempt belongs to no command: naming only the command at the
-      // end would leave the room showing Working until the lease ran out.
+      // working, so the next keepalive is refused. The poller picks nothing up again
+      // (item 71ce988c) and sends no further keepalive. Whatever carried the rest of the
+      // turn belongs to no command: naming only the command at the end would leave the
+      // room showing Working until the lease ran out.
       const { calls, look, since } = poller(dir, {
         respond: (request) => {
           if (request.name === 'report_keepalive') {
@@ -350,7 +353,9 @@ describe('the poller completes the turn it saw, not what is newest on the connec
       startTurn(dir, deliveredEntry([command(1)]))
       await look()
       await look()
-      assert.deepEqual(since(), ['report_pickup', 'report_keepalive', 'report_pickup'])
+      await look()
+      assert.deepEqual(since(), ['report_pickup', 'report_keepalive'])
+      assert.ok(readTurnMarker(CONNECTION, dir), 'the turn is still running')
 
       clearTurnMarker(CONNECTION, dir)
       await look()
@@ -379,7 +384,8 @@ describe('the poller completes the turn it saw, not what is newest on the connec
 
       startTurn(dir, entry)
       await look()
-      assert.deepEqual(since(), ['report_pickup'])
+      await look()
+      assert.deepEqual(since(), [], 'the command was already picked up, and its answer closed it')
       clearTurnMarker(CONNECTION, dir)
       await look()
       assert.deepEqual(completionsIn(calls), [
@@ -422,7 +428,7 @@ describe('a turn start names the command it starts (item cf356677)', () => {
     return { calls, look }
   }
 
-  it('the poller names the newest command of the turn, and nothing for a turn no command started', async () => {
+  it('the poller names the newest command of the turn, and sends no pickup for a turn no command started', async () => {
     const dir = tempDir()
     try {
       const { calls, look } = poller(dir)
@@ -434,14 +440,13 @@ describe('a turn start names the command it starts (item cf356677)', () => {
       await look()
       assert.deepEqual(pickupsIn(calls), [
         { command_turn_id: TURN_A, command_message_id: fixtureUuid(2) },
-        {},
       ])
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
 
-  it('re-opening work after the command was answered names nothing, so an attempt with no source can open', async () => {
+  it('work that goes on after the command was answered is never picked up again', async () => {
     const dir = tempDir()
     try {
       const { calls, look } = poller(dir, (request) => {
@@ -457,14 +462,13 @@ describe('a turn start names the command it starts (item cf356677)', () => {
       await look()
       assert.deepEqual(pickupsIn(calls), [
         { command_turn_id: TURN_A, command_message_id: fixtureUuid(1) },
-        {},
       ])
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
 
-  it('the listener names the command it delivers, and nothing for a check job', () => {
+  it('the listener names the command it delivers, and has nothing to name for a check job', () => {
     const { commandPickupIdentity, commandTurnsFromEntry } = turnCompletion
     assert.deepEqual(commandPickupIdentity(commandTurnsFromEntry(deliveredEntry([command(3)]))), {
       command_turn_id: TURN_A,
