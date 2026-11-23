@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "devspec": {
+      "command": "node",
+      "args": [
+        "${PLUGIN_ROOT}/scripts/mcp-bridge.mjs",
+        "https://api.devspec.ai/api/mcp"
+      ]
+    }
+  }
+}

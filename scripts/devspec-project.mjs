@@ -27,7 +27,7 @@ import {
   resolveOwnerPid,
   scanConnectionStates,
 } from './remote-control-state.mjs'
-import { hostTokenFromEnv, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
 function fingerprint(file) {
@@ -129,9 +129,9 @@ export async function prepareFreshConversation(
   if (typeof selector !== 'string' || !selector.trim()) {
     throw new Error('prepare requires --project <name-or-id>.')
   }
-  const auth = resolveAuth(cwd, { hostToken: hostTokenFromEnv(env, { cwd, home }), env, home })
+  const auth = resolveAuth(cwd, { env, home })
   if (!auth.ok || !auth.token) {
-    throw new Error('Connect your DevSpec account before preparing a project choice.')
+    throw new Error(auth.error || 'Run /devspec-login to sign in before choosing a project.')
   }
   const listing = await call({
     mcpUrl: auth.mcp_url,
@@ -252,12 +252,10 @@ async function main() {
     )
     return
   }
-  const auth = resolveDevspecMcpAuth(options.cwd, {
-    hostToken: hostTokenFromEnv(process.env, { cwd: options.cwd }),
-  })
+  const auth = resolveDevspecMcpAuth(options.cwd)
   if (action === 'list') {
     if (!auth.ok || !auth.token) {
-      throw new Error('Connect your DevSpec account before listing projects.')
+      throw new Error(auth.error || 'Run /devspec-login to sign in before listing projects.')
     }
     const result = await mcpToolsCall({
       mcpUrl: auth.mcp_url,

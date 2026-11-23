@@ -39,12 +39,13 @@ import {
   validateInteractionAnswerRecord,
 } from './interaction-events.mjs'
 import {
+  isForegroundTurnRunning,
   isTurnMarkerActive,
   readTurnMarker,
   recordTurnWake,
   writeTurnMarker,
 } from './mirror-turn.mjs'
-import { noticeReplyInstruction } from './notice-reply.mjs'
+import { noticeAudience, noticeForTheRecordLine, noticeReplyInstruction } from './notice-reply.mjs'
 import {
   STATE_ABSENT,
   STATE_OK,
@@ -58,6 +59,7 @@ import {
   resolveOwnerPid as resolveOwnerPidFromState,
 } from './remote-control-state.mjs'
 import {
+  isProjectIncidentsProjectionV1,
   isRemoteCommandProjectScope,
   normalizeRemoteIngressV1,
   REMOTE_INGRESS_RESOURCE_URI,
@@ -455,6 +457,7 @@ const ROOM_STATE_SECTIONS = new Set([
   'session_polls',
   'still_to_discuss',
   'active_session_plans',
+  'project_incidents',
   'session_activity',
 ])
 
@@ -526,8 +529,10 @@ export function parseInboxBatches(lines, connectionId) {
           : parsed.envelope.command_message_ids
         const commandIds = new Set(parsed.envelope.commands.map((command) => command.message_id))
         if (ids.length === 0 || new Set(ids).size !== ids.length || ids.some((id) => !commandIds.has(id))) continue
+        const { project_incidents: rawIncidents, ...commandRecordRest } = record
         batches.push({
-          ...record,
+          ...commandRecordRest,
+          ...(isProjectIncidentsProjectionV1(rawIncidents) ? { project_incidents: rawIncidents } : {}),
           execute_message_ids: ids,
           wake_context: validWakeContext(record.wake_context),
           question_handoff: validQuestionHandoff(record.question_handoff, new Set(ids)),
@@ -574,7 +579,12 @@ export function parseInboxBatches(lines, connectionId) {
         if (!targetConnId || !validateInteractionAnswerRecord(record, targetConnId)) continue
         batches.push(record)
       } else if (connectionId && validateAutomationInboxRecord(record, connectionId)) {
-        batches.push(record)
+        if (Object.hasOwn(record, 'project_incidents') && !isProjectIncidentsProjectionV1(record.project_incidents)) {
+          const { project_incidents: _droppedIncidents, ...automationRest } = record
+          batches.push(automationRest)
+        } else {
+          batches.push(record)
+        }
       } else if (connectionId && validateCheckJobInboxRecord(record, connectionId)) {
         batches.push(record)
       } else if (
@@ -603,11 +613,29 @@ export function parseOwnerBatches(lines, connectionId) {
 
 // The server writes each notice's handling into its own prompt, per kind (findings,
 // held-edit and ruling outcomes, confirmation outcomes, write quality, untagged
-// commits), with the outcomes and tools it allows. This line only says to follow it:
-// a plugin-side copy of that policy covered three kinds and went stale (item 1df99dd4).
-export const NOTICE_HANDLING =
-  'Handling: follow the prompt above, within its allowed outcomes and tools; telling the person about it in the room is the notice reply below. The labelled records are your reading context — never dump their full text into the conversation. ' +
+// commits), with the outcomes and tools it allows, and opens it with its label (needs a
+// person, or for the record). This line only says to follow it: a plugin-side copy of
+// that policy covered three kinds and went stale (item 1df99dd4).
+const ACTING_RULE =
+  'The labelled records are your reading context — never dump their full text into the conversation. ' +
   "You act for whoever asked for this work, with their authority, not yours (a teammate can drive someone else's agent): the contract's acting_rule (devspec://product/implementation-contract)."
+export const NOTICE_HANDLING =
+  'Handling: follow the prompt above, within its allowed outcomes and tools — settle findings covered by clear conversation intent quietly in place, and post the notice reply below only when an unresolved choice, hold, rejection, or block still needs a person after you act (semantics.notice_audience and semantics.notice_reply in devspec://product/remote-ingress-contract). ' +
+  ACTING_RULE
+/** The same for a notice DevSpec labelled for the record: there is no reply below. */
+export const NOTICE_HANDLING_FOR_THE_RECORD =
+  'Handling: follow the prompt above, within its allowed outcomes and tools. ' + ACTING_RULE
+
+/**
+ * What closes a notice for the model, by DevSpec's label (item a868f41f): a notice that
+ * needs a person ends with the reply call and its ids; one for the record ends with a
+ * pointer to the label, and no call to post.
+ */
+function noticeClosingLines(notice) {
+  return noticeAudience(notice) === 'for_the_record'
+    ? [NOTICE_HANDLING_FOR_THE_RECORD, noticeForTheRecordLine()]
+    : [NOTICE_HANDLING, noticeReplyInstruction([notice?.notice_id])]
+}
 
 export function formatSystemNoticeContent(notice) {
   if (notice?.kind === 'server_notice') {
@@ -634,8 +662,7 @@ export function formatSystemNoticeContent(notice) {
     }
     lines.push(
       '',
-      NOTICE_HANDLING,
-      noticeReplyInstruction([notice.notice_id]),
+      ...noticeClosingLines(notice),
       'Authority: exact_connection_system_notice (devspec://product/remote-ingress-contract). ' +
         'This is a server-initiated notice on your own work, not a room message or new work authorization.',
     )
@@ -649,7 +676,7 @@ export function formatSystemNoticeContent(notice) {
     `Prompt: ${notice?.prompt}`,
     `Allowed outcomes: ${Array.isArray(notice?.allowed_outcomes) ? notice.allowed_outcomes.join(', ') : ''}`,
     `Allowed tools: ${Array.isArray(notice?.allowed_tools) ? notice.allowed_tools.join(', ') : ''}`,
-    noticeReplyInstruction([notice?.notice_id]),
+    noticeAudience(notice) === 'for_the_record' ? noticeForTheRecordLine() : noticeReplyInstruction([notice?.notice_id]),
     'Authority: exact_connection_system_notice (devspec://product/remote-ingress-contract). ' +
       'This is a narrow server review prompt for your own claimed item and commit — not a room command or new work authorization.',
   ].join('\n')
@@ -676,6 +703,7 @@ export function buildCanonicalSystemNoticeEvents(
       type: 'system_notice',
       kind: notice.kind,
       notice_id: notice.notice_id,
+      audience: noticeAudience(notice),
       ...(notice.kind === 'server_notice'
         ? {
             topic: notice.topic,
@@ -809,6 +837,15 @@ export function buildCanonicalCommandEvents(
   if (commands.length > 0 && unread && (Number(unread.unread) || 0) + (Number(unread.updated) || 0) > 0) {
     events.push({ type: 'room_unread', session_id: sessionId, advisory: true, executable: false, ...unread })
   }
+  if (commands.length > 0 && isProjectIncidentsProjectionV1(batch?.project_incidents)) {
+    events.push({
+      type: 'project_incidents',
+      session_id: sessionId,
+      advisory: true,
+      executable: false,
+      ...batch.project_incidents,
+    })
+  }
 
   events.push({
     type: 'wake',
@@ -866,16 +903,28 @@ function automationRunCommandText(d) {
 }
 
 export function buildAutomationRunEvents(batch, { inboxFile } = {}) {
+  const sessionId = batch.session_id ?? null
   return [
     {
       type: 'automation_run',
-      session_id: batch.session_id ?? null,
+      session_id: sessionId,
       authoritative: true,
       executable: true,
       channel: 'explicit_automation_dispatch',
       dispatch: batch.dispatch,
       content: automationRunCommandText(batch.dispatch),
     },
+    ...(isProjectIncidentsProjectionV1(batch?.project_incidents)
+      ? [
+          {
+            type: 'project_incidents',
+            session_id: sessionId,
+            advisory: true,
+            executable: false,
+            ...batch.project_incidents,
+          },
+        ]
+      : []),
     {
       type: 'wake',
       reason: 'automation_run',
@@ -1239,7 +1288,7 @@ async function main() {
 
   // Queued work waits while a turn is running, in both modes. A one-shot arm exits on
   // its first wake and leaves what it held in the state file for the next arm.
-  const turnRunning = () => isTurnMarkerActive(readTurnMarker(connectionId, CONNECTIONS_DIR))
+  const turnRunning = () => isForegroundTurnRunning(readTurnMarker(connectionId, CONNECTIONS_DIR))
 
   let delivered = 0
   let sawLive = Boolean(

@@ -14,8 +14,10 @@
  *    `overwrite` (and `hookSpecificOutput.updatedInput`) when unambiguous.
  * 5. Makes a `post_session_message` that replies to DevSpec notices a notice reply
  *    (`system_notice_ids`, notice-reply.mjs): the model's ids as an array, or the
- *    turn's own notices when every wake of the turn was a notice; no trail and no
- *    local-turn flags on it, and it never counts as the reply to a command.
+ *    turn's own notices when every wake of the turn was a notice (those that need a
+ *    person; if none do, the for-the-record ones, which DevSpec refuses to post, unless
+ *    a write in the turn carried `tell_person`); no trail and no local-turn flags on it,
+ *    and it never counts as the reply to a command.
  */
 
 import fs from 'node:fs'
@@ -28,7 +30,7 @@ import { prepareGitObservation } from './git-observer.mjs'
 import { versionedConnectionArguments } from './connection-version.mjs'
 import { launchGuard, resolveOwnConnectionId } from './launch-guard.mjs'
 import {
-  currentTurnNoticeIds,
+  currentTurnStampNoticeIds,
   extractAntigravityTrailFromTranscript,
   parseTranscriptPath,
   readTurnMarker,
@@ -38,6 +40,7 @@ import {
 } from './mirror-turn.mjs'
 import { normalizeNoticeIds, postCanTakeTurnNotices } from './notice-reply.mjs'
 import { inferAntigravityTranscriptPath, readStateFile } from './remote-control-state.mjs'
+import { devspecToolFromName, isDevspecServerName } from './devspec-server.mjs'
 import { PROVENANCE_REF_TOOLS, REQUEST_REF_TOOLS, stampRequest } from './request-ref.mjs'
 import { readRequestState } from './requests.mjs'
 import { prePostHoldObject } from './room-unread.mjs'
@@ -72,9 +75,7 @@ const AGENT_NAME_TOOLS = new Set([
 ])
 
 export function parseDevspecToolName(toolName) {
-  const s = String(toolName || '')
-  const match = /^(?:mcp__(?:plugin_devspec_)?devspec__|mcp_devspec_|devspec__)([a-z0-9_]+)$/.exec(s)
-  return match ? match[1] : null
+  return devspecToolFromName(toolName)
 }
 
 function unquoteString(val) {
@@ -116,7 +117,7 @@ export function unwrapDevspecToolCall(toolName, rawToolInput) {
   const serverName = String(
     unquoteString(rawToolInput.ServerName ?? rawToolInput.server_name ?? ''),
   ).toLowerCase()
-  if (serverName !== 'devspec') {
+  if (!isDevspecServerName(serverName)) {
     return { verb: null, args: null, wrapped: false, argumentsWasString: false, argumentsKey: null }
   }
   const verb = unquoteString(rawToolInput.ToolName ?? rawToolInput.tool_name ?? '')
@@ -203,7 +204,7 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
       next.system_notice_ids = normalizeNoticeIds(next.system_notice_ids)
       noticeReply = true
     } else if (connectionId && postCanTakeTurnNotices(next)) {
-      const turnNotices = currentTurnNoticeIds(connectionId, { dir: connDir, connectionState: connState })
+      const turnNotices = currentTurnStampNoticeIds(connectionId, { dir: connDir, connectionState: connState })
       if (turnNotices) {
         next.system_notice_ids = turnNotices
         noticeReply = true
@@ -274,7 +275,8 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
     next.agent_name = AGENT_NAME
   }
 
-  // 7. Request ref & provenance_ref stamping (or multi-requester denial)
+  // 7. Who asked: request_ref, or provenance_ref on the tools that take no request
+  //    (or multi-requester denial)
   const request = stampRequest(verb, next, connectionId, input.agent_id, {
     home,
     connectionState: connState,
@@ -379,7 +381,11 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
         try {
           const { events, markdown } = extractAntigravityTrailFromTranscript(
             fs.readFileSync(tPath, 'utf8'),
-            { sinceMs: turnMarker?.startedAt ?? null, stopAtReply: true },
+            {
+              sinceMs: turnMarker?.startedAt ?? null,
+              stopAtReply: true,
+              transcriptPath: tPath,
+            },
           )
           if (markdown && events.length > 0) {
             next = { ...next, work_trail: markdown, trail_events: events }

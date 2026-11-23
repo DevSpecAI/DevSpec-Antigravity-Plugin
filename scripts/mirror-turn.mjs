@@ -19,7 +19,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { mcpToolsCall } from './mcp-call.mjs'
-import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { connectionCredential, stateWithCurrentToken } from './resolve-mcp-auth.mjs'
+import { devspecToolFromName, isDevspecServerName } from './devspec-server.mjs'
 import { ensurePrivateDir, writePrivateJson } from './private-state.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import {
@@ -31,17 +32,18 @@ import {
 } from './remote-control-state.mjs'
 import {
   localTurnScope,
-  localTurnToComplete,
   startLocalTurn,
 } from './local-turn.mjs'
 import {
   absentLaunches,
   appendRequestEvent,
   closeRequest,
+  extractBackgroundCommandTaskId,
   notifiedKeys,
   openRequest,
   promptArrival,
   readRequestState,
+  requestForLaunch,
   requestsWithWorkPending,
   rotateRequestLog,
   setCurrentRequest,
@@ -49,15 +51,27 @@ import {
 } from './requests.mjs'
 import {
   isCheckJobOnlyTurn,
+  isRoutineTurn,
   mergeTurnWake,
   postCanTakeTurnNotices,
   turnNoticeIds,
+  turnReplyNoticeIds,
+  turnStampNoticeIds,
   turnWakeFromEntry,
   turnWakeFromText,
 } from './notice-reply.mjs'
 import { recordMirroredLocalPrompt } from './room-unread.mjs'
 import { readConnectionTelemetry } from './statusline.mjs'
 import { parseTurnFailure, turnFailureMessage } from './turn-failure.mjs'
+import { noteUsageRefusalSent, recordTurnOutcome, usageRefusalArgument, usageRefusedUntil } from './usage-refusal.mjs'
+import { turnCompletionIdentities } from './turn-completion.mjs'
+import {
+  postToPerson,
+  speechSourceId,
+  stageHandBack,
+  telemetryModel,
+  tellPersonArguments,
+} from './tell-person.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
 const MODES = new Set(['user_prompt', 'stop', 'background_launch', 'subagent_stop'])
@@ -111,7 +125,8 @@ export function turnMarkerPath(connectionId, dir = CONNECTIONS_DIR) {
   return path.join(dir, `${connectionId}.turn`)
 }
 
-const DEFAULT_MAX_TURN_MS = 10 * 60 * 1000
+export const NO_SIGN_OF_LIFE_MS = 60 * 60 * 1000
+const DEFAULT_MAX_TURN_MS = NO_SIGN_OF_LIFE_MS
 
 export function readTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
   if (!connectionId) return null
@@ -125,11 +140,17 @@ export function readTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
 
 export function isTurnMarkerActive(marker, now = Date.now(), maxTurnMs = DEFAULT_MAX_TURN_MS) {
   if (!marker || typeof marker.startedAt !== 'number') return false
+  if (marker.held === true) return true
   const lastActiveAt = Math.max(
     marker.startedAt,
     typeof marker.lastToolAt === 'number' ? marker.lastToolAt : 0,
   )
   return now - lastActiveAt < maxTurnMs
+}
+
+export function isForegroundTurnRunning(marker, now = Date.now(), maxTurnMs = DEFAULT_MAX_TURN_MS) {
+  if (!marker || marker.held === true) return false
+  return isTurnMarkerActive(marker, now, maxTurnMs)
 }
 
 export function trailStatePath(connectionId, dir = CONNECTIONS_DIR) {
@@ -161,12 +182,24 @@ export function writeTurnMarker(connectionId, extra = {}, dir = CONNECTIONS_DIR)
   return payload
 }
 
+function snapshotHeldParent(marker) {
+  if (!marker) return null
+  if (marker.heldParent && typeof marker.heldParent === 'object') return marker.heldParent
+  return {
+    remoteTurn: Boolean(marker.remoteTurn),
+    localPromptMirrored: Boolean(marker.localPromptMirrored),
+    localTurn: marker.localTurn || null,
+    otherWake: Boolean(marker.otherWake),
+    backgroundContinuation: Boolean(marker.backgroundContinuation),
+  }
+}
+
 /**
  * Mark the turn remote and record what one delivered inbox entry brought into it
  * (notice-reply.mjs): its notice ids, or that something other than a notice woke it.
  * The listener and the wait script call this for each entry they deliver.
  */
-export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR) {
+export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR, now = Date.now()) {
   if (!connectionId) return null
   const wake = turnWakeFromEntry(entry)
   let existing = readTurnMarker(connectionId, dir)
@@ -176,7 +209,7 @@ export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR) {
   // stay stale and every queued check job and notice behind this one would be released
   // at once instead of one per turn (item b68df72d). Only the marker goes; writing the
   // fresh one below clears the old turn's reply and trail state as any new turn does.
-  if (existing && !isTurnMarkerActive(existing)) {
+  if (existing && !isTurnMarkerActive(existing, now)) {
     try {
       fs.rmSync(turnMarkerPath(connectionId, dir), { force: true })
     } catch {
@@ -186,7 +219,55 @@ export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR) {
   }
   // A notice or check job is not a command: one that arrives during a turn typed at
   // the terminal leaves it a local turn, so that turn's answer keeps its local-turn flags.
-  const nonCommandWake = Boolean(wake?.noticeIds || wake?.checkJobWake)
+  const nonCommandWake = Boolean(wake?.noticeIds || wake?.recordNoticeIds || wake?.checkJobWake)
+  if (existing?.held === true) {
+    if (nonCommandWake) {
+      return writeTurnMarker(
+        connectionId,
+        {
+          held: false,
+          heldParent: snapshotHeldParent(existing),
+          remoteTurn: true,
+          localPromptMirrored: false,
+          localTurn: null,
+          otherWake: false,
+          backgroundContinuation: false,
+          noticeIds: wake?.noticeIds ?? [],
+          recordNoticeIds: wake?.recordNoticeIds ?? [],
+          checkJobWake: Boolean(wake?.checkJobWake),
+          tellPerson: false,
+          noticeReplyAt: null,
+          personToldAt: null,
+          preserveExplicitReply: true,
+        },
+        dir,
+      )
+    }
+    return writeTurnMarker(
+      connectionId,
+      {
+        held: false,
+        heldParent: null,
+        remoteTurn: true,
+        ...mergeTurnWake(existing, wake),
+        preserveExplicitReply: true,
+      },
+      dir,
+    )
+  }
+  if (existing?.heldParent && !existing?.otherWake && nonCommandWake) {
+    return writeTurnMarker(
+      connectionId,
+      {
+        held: false,
+        heldParent: existing.heldParent,
+        remoteTurn: true,
+        ...mergeTurnWake(existing, wake),
+        preserveExplicitReply: true,
+      },
+      dir,
+    )
+  }
   const remote = existing && nonCommandWake ? {} : { remoteTurn: true }
   return writeTurnMarker(connectionId, { ...remote, ...mergeTurnWake(existing, wake) }, dir)
 }
@@ -205,6 +286,55 @@ export function currentTurnNoticeIds(
     requestState: readRequestState(connectionId, { dir }),
     connectionState,
   })
+}
+
+/** Of those, the notices that need a person (`turnReplyNoticeIds`). */
+export function currentTurnReplyNoticeIds(
+  connectionId,
+  { dir = CONNECTIONS_DIR, connectionState = null, marker = undefined } = {},
+) {
+  if (!connectionId) return null
+  return turnReplyNoticeIds({
+    marker: marker === undefined ? readTurnMarker(connectionId, dir) : marker,
+    requestState: readRequestState(connectionId, { dir }),
+    connectionState,
+  })
+}
+
+/** The ids PreToolUse puts on a plain post in a notice-only turn (`turnStampNoticeIds`). */
+export function currentTurnStampNoticeIds(
+  connectionId,
+  { dir = CONNECTIONS_DIR, connectionState = null, marker = undefined } = {},
+) {
+  if (!connectionId) return null
+  return turnStampNoticeIds({
+    marker: marker === undefined ? readTurnMarker(connectionId, dir) : marker,
+    requestState: readRequestState(connectionId, { dir }),
+    connectionState,
+  })
+}
+
+/**
+ * True when the current turn is routine (`isRoutineTurn`): woken only by check jobs and
+ * notices DevSpec labelled for the record.
+ */
+export function isCurrentTurnRoutine(
+  connectionId,
+  { dir = CONNECTIONS_DIR, connectionState = null, marker = undefined } = {},
+) {
+  if (!connectionId) return false
+  return isRoutineTurn({
+    marker: marker === undefined ? readTurnMarker(connectionId, dir) : marker,
+    requestState: readRequestState(connectionId, { dir }),
+    connectionState,
+  })
+}
+
+/** Note on the turn marker that a write in it carried DevSpec's `tell_person` mark. */
+export function recordTellPerson(connectionId, dir = CONNECTIONS_DIR) {
+  if (!connectionId || !readTurnMarker(connectionId, dir)) return false
+  writeTurnMarker(connectionId, { tellPerson: true, preserveExplicitReply: true }, dir)
+  return true
 }
 
 /**
@@ -228,6 +358,42 @@ export function recordNoticeReply(connectionId, dir = CONNECTIONS_DIR, now = Dat
   if (!connectionId || !readTurnMarker(connectionId, dir)) return false
   writeTurnMarker(connectionId, { noticeReplyAt: now, preserveExplicitReply: true }, dir)
   return true
+}
+
+/**
+ * Note on the turn marker that the agent told its person itself with
+ * `devspec-tell-person.mjs` (tell-person.mjs), so Stop's backstop posts nothing more.
+ */
+export function recordPersonTold(connectionId, dir = CONNECTIONS_DIR, now = Date.now()) {
+  if (!connectionId || !readTurnMarker(connectionId, dir)) return false
+  writeTurnMarker(connectionId, { personToldAt: now, preserveExplicitReply: true }, dir)
+  return true
+}
+
+/**
+ * Stop's backstop for `tell_person` (`semantics.notice_audience.telling_anyway`): the
+ * agent's last words, posted on DevSpec's speech lane because a turn no room command
+ * started has no turn for an ordinary post to join (tell-person.mjs, item e086163c).
+ * The source id is the turn's and the words', so a Stop that runs again for the same
+ * turn stores them once. A refusal is reported here and handed back to the agent at
+ * its next step (pre-invocation.mjs), never dropped.
+ */
+async function postTellPersonBackstop({ call, mcpUrl, token, state, connectionId, agentName, message, marker, connectionsDir }) {
+  const args = tellPersonArguments({
+    connectionId,
+    message,
+    sourceId: speechSourceId('tell-person-backstop', connectionId, marker?.startedAt, message),
+    agentName,
+    model: telemetryModel(connectionId ? readConnectionTelemetry(connectionId) : null),
+  })
+  const sent = await postToPerson({ call, mcpUrl, token, connectionCapability: state?.connection_capability, args })
+  if (!sent.ok) {
+    stageHandBack(connectionId, { message, refusal: sent.refusal }, connectionsDir)
+    process.stderr.write(
+      `[devspec-remote] the tell_person post did not land; handed back to the agent: ${JSON.stringify(sent.refusal)}\n`,
+    )
+  }
+  return sent
 }
 
 export function ownedWorkPath(connectionId, dir = CONNECTIONS_DIR) {
@@ -320,7 +486,7 @@ export function readOwnedIds(
   connectionId,
   marker,
   dir = CONNECTIONS_DIR,
-  { now = Date.now(), maxAgeMs = 60 * 60 * 1000 } = {},
+  { now = Date.now(), maxAgeMs = null } = {},
 ) {
   const lines = readOwnedLines(connectionId, marker, dir)
   const ended = new Set(
@@ -338,10 +504,29 @@ export function readOwnedIds(
   return ids
 }
 
+function stepMatchesOwnedId(stepContent, id) {
+  if (typeof stepContent !== 'string' || typeof id !== 'string' || !id) return false
+  if (stepContent.includes(id)) return true
+  const slashIdx = id.lastIndexOf('/')
+  if (slashIdx > 0) {
+    const shortId = id.slice(slashIdx + 1)
+    if (
+      shortId &&
+      (stepContent.includes(`"${shortId}"`) ||
+        stepContent.includes(`/${shortId}.log`) ||
+        stepContent.includes(`/${shortId}`))
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
 /**
- * Reconcile completed background tasks and subagents from `<SYSTEM_MESSAGE>` steps in
- * `transcript.jsonl`, whether the completion arrived while the turn was still running
- * (`existingMarker.held === false`) or while Stop was holding the turn open.
+ * Reconcile background task and subagent launches (`GENERIC` steps) and completions
+ * (`<SYSTEM_MESSAGE>` steps) from `transcript.jsonl`, whether the completion arrived
+ * while the turn was still running (`existingMarker.held === false`) or while Stop
+ * was holding the turn open.
  */
 export function reconcileCompletedOwnedWork(
   connectionId,
@@ -350,12 +535,15 @@ export function reconcileCompletedOwnedWork(
   dir = CONNECTIONS_DIR,
 ) {
   if (!connectionId || !transcriptPath) return
-  const ownedIds = marker ? readOwnedIds(connectionId, marker, dir) : []
-  const reqState = readRequestState(connectionId, { dir })
-  const unnotifiedKeys = [...new Set(reqState.launches.values())]
+  let ownedLines = marker ? readOwnedLines(connectionId, marker, dir) : []
+  let ownedIds = marker ? readOwnedIds(connectionId, marker, dir) : []
+  let reqState = readRequestState(connectionId, { dir })
+  let unnotifiedKeys = [...new Set(reqState.launches.values())]
     .filter((launch) => launch.notifies && !launch.notified)
     .map((launch) => launch.key)
-  if (ownedIds.length === 0 && unnotifiedKeys.length === 0) return
+  if (!marker && ownedIds.length === 0 && unnotifiedKeys.length === 0 && reqState.open.size === 0) {
+    return
+  }
 
   let raw = ''
   try {
@@ -374,8 +562,14 @@ export function reconcileCompletedOwnedWork(
     return
   }
 
-  const endedOwned = new Set()
+  const knownOwned = new Set(ownedLines.map((e) => e.id))
+  const endedOwned = new Set(
+    ownedLines.filter((e) => typeof e.ended === 'string').map((e) => e.id),
+  )
   const newlyNotified = new Set()
+  let seenPlannerResponse = false
+  let pendingPlannerTools = []
+
   for (const line of raw.split(/\r?\n/)) {
     const trimmed = line.trim()
     if (!trimmed) continue
@@ -385,25 +579,176 @@ export function reconcileCompletedOwnedWork(
     } catch {
       continue
     }
-    if (step?.type !== 'SYSTEM_MESSAGE' || typeof step.content !== 'string') continue
-    if (typeof marker?.startedAt === 'number' && step.created_at) {
+    if (typeof marker?.startedAt === 'number' && step?.created_at) {
       const stepMs = Date.parse(step.created_at)
       if (Number.isFinite(stepMs) && stepMs < marker.startedAt - 1000) continue
     }
+    if (step?.type === 'PLANNER_RESPONSE') {
+      seenPlannerResponse = true
+      pendingPlannerTools = Array.isArray(step.tool_calls)
+        ? step.tool_calls.map((tc) => ({
+            name: String(tc?.name || '').replace(/^default_api:/, ''),
+            args: tc?.args && typeof tc.args === 'object' ? tc.args : {},
+          }))
+        : []
+      continue
+    }
+    if (step?.type === 'GENERIC' && typeof step.content === 'string') {
+      const currentTool = pendingPlannerTools.shift() || null
+      const canBeRunCommand =
+        (!seenPlannerResponse &&
+          !step.content.includes('Task Description: Timer:') &&
+          !step.content.includes('Task Description: Cron:')) ||
+        currentTool?.name === 'run_command'
+      const canBeSchedule =
+        (!seenPlannerResponse && step.content.includes('Task Description: Timer:')) ||
+        currentTool?.name === 'schedule'
+      const canBeSubagent = !seenPlannerResponse || currentTool?.name === 'invoke_subagent'
+      const runCommandInput = currentTool?.name === 'run_command' ? currentTool.args : null
+      const scheduleInput = currentTool?.name === 'schedule' ? currentTool.args : null
+      const subagentInput = currentTool?.name === 'invoke_subagent' ? currentTool.args : null
+
+      if (currentTool?.name === 'manage_task') {
+        const action = String(currentTool.args?.Action ?? currentTool.args?.action ?? '').toLowerCase()
+        const rawKilledId = String(currentTool.args?.TaskId ?? currentTool.args?.taskId ?? '').trim()
+        if (action === 'kill' && rawKilledId && !/^Error:/m.test(step.content)) {
+          for (const id of ownedIds) {
+            if (!endedOwned.has(id) && (id === rawKilledId || id.endsWith(`/${rawKilledId}`))) {
+              recordOwnedEnd(connectionId, id, { status: 'killed', dir })
+              endedOwned.add(id)
+            }
+          }
+          for (const key of unnotifiedKeys) {
+            if (
+              !newlyNotified.has(key) &&
+              (key === rawKilledId || key.endsWith(`/${rawKilledId}`))
+            ) {
+              appendRequestEvent(connectionId, { op: 'notified', key }, { dir })
+              newlyNotified.add(key)
+            }
+          }
+        }
+        continue
+      }
+
+      const bgId = canBeRunCommand ? extractBackgroundCommandTaskId(step.content) : null
+      if (bgId) {
+        const cmdLine = String(
+          runCommandInput?.CommandLine || runCommandInput?.command || '',
+        )
+        const isDaemon =
+          runCommandInput?.IsDaemon === true || runCommandInput?.IsDaemon === 'true'
+        const isPlumbing =
+          isDaemon ||
+          cmdLine.includes('devspec-remote-wait.mjs') ||
+          cmdLine.includes('devspec-remote-listen.mjs') ||
+          cmdLine.includes('devspec-remote-poll.mjs')
+        if (!isPlumbing) {
+          const id = bgId
+          const label =
+            unquoteTranscriptString(runCommandInput?.toolSummary) ||
+            unquoteTranscriptString(runCommandInput?.CommandLine) ||
+            'background command'
+          if (marker && !knownOwned.has(id)) {
+            if (recordOwnedLaunch(connectionId, { id, kind: 'command', label }, { dir })) {
+              knownOwned.add(id)
+              if (!ownedIds.includes(id)) ownedIds.push(id)
+            }
+          }
+          if (!reqState.launches.has(id)) {
+            const { request, also } = requestForLaunch(reqState)
+            appendRequestEvent(
+              connectionId,
+              { op: 'launch', key: id, kind: 'shell', notifies: true, request, also },
+              { dir },
+            )
+            reqState = readRequestState(connectionId, { dir })
+            if (!unnotifiedKeys.includes(id)) unnotifiedKeys.push(id)
+          }
+        }
+      }
+      const timerId =
+        canBeSchedule && (!scheduleInput || isOneShotScheduleTimer(scheduleInput))
+          ? extractBackgroundCommandTaskId(step.content)
+          : null
+      if (timerId) {
+        const label =
+          unquoteTranscriptString(scheduleInput?.Prompt ?? scheduleInput?.prompt) || 'timer'
+        if (marker && !knownOwned.has(timerId)) {
+          if (recordOwnedLaunch(connectionId, { id: timerId, kind: 'timer', label }, { dir })) {
+            knownOwned.add(timerId)
+            if (!ownedIds.includes(timerId)) ownedIds.push(timerId)
+          }
+        }
+        if (!reqState.launches.has(timerId)) {
+          const { request, also } = requestForLaunch(reqState)
+          appendRequestEvent(
+            connectionId,
+            { op: 'launch', key: timerId, kind: 'timer', notifies: true, request, also },
+            { dir },
+          )
+          reqState = readRequestState(connectionId, { dir })
+          if (!unnotifiedKeys.includes(timerId)) unnotifiedKeys.push(timerId)
+        }
+      }
+      const subMatch = canBeSubagent
+        ? step.content.match(
+            /Created the following subagent:[\s\S]*?"conversationId"\s*:\s*"([^"]+)"/,
+          )
+        : null
+      if (subMatch) {
+        const id = subMatch[1]
+        const label =
+          unquoteTranscriptString(subagentInput?.Role) ||
+          unquoteTranscriptString(subagentInput?.TypeName) ||
+          'subagent'
+        if (marker && !knownOwned.has(id)) {
+          if (recordOwnedLaunch(connectionId, { id, kind: 'subagent', label }, { dir })) {
+            knownOwned.add(id)
+            if (!ownedIds.includes(id)) ownedIds.push(id)
+          }
+        }
+        if (!reqState.launches.has(id)) {
+          const { request, also } = requestForLaunch(reqState)
+          appendRequestEvent(
+            connectionId,
+            { op: 'launch', key: id, kind: 'subagent', notifies: true, request, also },
+            { dir },
+          )
+          reqState = readRequestState(connectionId, { dir })
+          if (!unnotifiedKeys.includes(id)) unnotifiedKeys.push(id)
+        }
+      }
+      continue
+    }
+    if (step?.type !== 'SYSTEM_MESSAGE' || typeof step.content !== 'string') continue
     for (const id of ownedIds) {
-      if (!endedOwned.has(id) && step.content.includes(id)) {
+      if (!endedOwned.has(id) && stepMatchesOwnedId(step.content, id)) {
         recordOwnedEnd(connectionId, id, { dir })
         endedOwned.add(id)
       }
     }
     const keysInStep = notifiedKeys(step.content)
     for (const key of unnotifiedKeys) {
-      if (!newlyNotified.has(key) && (keysInStep.includes(key) || step.content.includes(key))) {
+      if (
+        !newlyNotified.has(key) &&
+        (keysInStep.includes(key) || stepMatchesOwnedId(step.content, key))
+      ) {
         appendRequestEvent(connectionId, { op: 'notified', key }, { dir })
         newlyNotified.add(key)
       }
     }
   }
+}
+
+export function isOneShotScheduleTimer(input) {
+  if (!input || typeof input !== 'object') return false
+  if (input.CronExpression || input.cron_expression) return false
+  if (input.IsDaemon === true || input.IsDaemon === 'true') return false
+  const dur = input.DurationSeconds ?? input.duration_seconds
+  if (dur === undefined || dur === null || dur === '') return false
+  const n = Number(dur)
+  return Number.isFinite(n) && n > 0
 }
 
 /**
@@ -459,14 +804,33 @@ export function launchedAntigravityBackgroundWork(toolName, toolInput, toolRespo
         : typeof resp.raw === 'string'
           ? resp.raw
           : ''
-    const bgMatch =
-      outText.match(/(?:background task ID|with task id)[:\s]+([A-Za-z0-9_.:/-]+)/i) ||
-      outText.match(/TaskId[:\s"]+([A-Za-z0-9_.:/-]+)/i)
-    if (bgMatch) {
+    const bgId = extractBackgroundCommandTaskId(outText)
+    if (bgId) {
       return {
-        id: bgMatch[1],
+        id: bgId,
         kind: 'command',
         label: input.toolSummary || input.CommandLine || 'background command',
+      }
+    }
+    return null
+  }
+
+  // Antigravity: one-shot schedule wait timer (`DurationSeconds` without `CronExpression` / `IsDaemon`).
+  if (name === 'schedule' || name === 'default_api:schedule') {
+    if (!isOneShotScheduleTimer(input)) return null
+    const outText =
+      typeof resp.output === 'string'
+        ? resp.output
+        : typeof resp.raw === 'string'
+          ? resp.raw
+          : ''
+    const bgId =
+      extractBackgroundCommandTaskId(outText) || resp.taskId || resp.task_id || resp.id || null
+    if (bgId) {
+      return {
+        id: String(bgId),
+        kind: 'timer',
+        label: input.Prompt || input.prompt || 'timer',
       }
     }
     return null
@@ -493,24 +857,141 @@ export function launchedAntigravityBackgroundWork(toolName, toolInput, toolRespo
   return null
 }
 
+export function resolveAntigravityToolResponse(
+  input,
+  { transcriptPath = null, conversationId = null } = {},
+) {
+  if (!input || typeof input !== 'object') return undefined
+  const direct = input.tool_response ?? input.toolResponse ?? input.result
+  if (direct !== undefined && direct !== null) return direct
+
+  const stepIdx = typeof input.stepIdx === 'number' ? input.stepIdx : null
+  const convId =
+    conversationId ||
+    (typeof input.conversationId === 'string' && input.conversationId.trim()) ||
+    (typeof input.conversation_id === 'string' && input.conversation_id.trim()) ||
+    null
+  const tPath =
+    normalizeTranscriptPath(transcriptPath) ||
+    normalizeTranscriptPath(input.transcriptPath) ||
+    normalizeTranscriptPath(input.transcript_path) ||
+    null
+  const brainDir =
+    (typeof input.artifactDirectoryPath === 'string' && input.artifactDirectoryPath.trim()) ||
+    (tPath && tPath.includes(`${path.sep}.system_generated${path.sep}`)
+      ? tPath.split(`${path.sep}.system_generated${path.sep}`)[0]
+      : null)
+
+  if (brainDir && stepIdx !== null) {
+    try {
+      const stepOutPath = path.join(
+        brainDir,
+        '.system_generated',
+        'steps',
+        String(stepIdx),
+        'output.txt',
+      )
+      if (fs.existsSync(stepOutPath)) {
+        const text = fs.readFileSync(stepOutPath, 'utf8')
+        if (text.trim()) return { output: text }
+      }
+    } catch {
+      /* ignore */
+    }
+    try {
+      const taskLogPath = path.join(
+        brainDir,
+        '.system_generated',
+        'tasks',
+        `task-${stepIdx}.log`,
+      )
+      if (fs.existsSync(taskLogPath)) {
+        const taskId = convId ? `${convId}/task-${stepIdx}` : `task-${stepIdx}`
+        return { output: `Tool is running as a background task with task id: ${taskId}` }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (tPath && fs.existsSync(tPath)) {
+    try {
+      const stat = fs.statSync(tPath)
+      if (stat.isFile() && stat.size > 0) {
+        const readSize = Math.min(stat.size, 65536)
+        const fd = fs.openSync(tPath, 'r')
+        try {
+          const buf = Buffer.alloc(readSize)
+          fs.readSync(fd, buf, 0, readSize, stat.size - readSize)
+          const lines = buf
+            .toString('utf8')
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .filter(Boolean)
+          for (let i = lines.length - 1; i >= 0; i--) {
+            let step
+            try {
+              step = JSON.parse(lines[i])
+            } catch {
+              continue
+            }
+            if (stepIdx !== null && typeof step?.step_index === 'number' && step.step_index < stepIdx) {
+              break
+            }
+            if (
+              step?.type === 'GENERIC' &&
+              typeof step.content === 'string' &&
+              (Boolean(extractBackgroundCommandTaskId(step.content)) ||
+                step.content.includes('Created the following subagent:'))
+            ) {
+              return { output: step.content }
+            }
+            if (step?.type === 'PLANNER_RESPONSE' && stepIdx === null) {
+              break
+            }
+          }
+        } finally {
+          fs.closeSync(fd)
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  return undefined
+}
+
 export function recordBackgroundLaunch(
   raw,
-  { load = loadState, record = recordOwnedLaunch, dir = CONNECTIONS_DIR } = {},
+  {
+    load = loadState,
+    record = recordOwnedLaunch,
+    dir = CONNECTIONS_DIR,
+    transcriptPath = null,
+    env = process.env,
+  } = {},
 ) {
   let input
   try {
-    input = JSON.parse(raw || '{}')
+    input = typeof raw === 'string' ? JSON.parse(raw || '{}') : raw || {}
   } catch {
     return false
   }
+  const conversationId = resolveHookConversationId(raw, env)
+  const state = load(conversationId)
+  const effectiveTranscriptPath =
+    transcriptPath || parseTranscriptPath(raw) || state?.transcript_path || null
+  const toolResponse = resolveAntigravityToolResponse(input, {
+    transcriptPath: effectiveTranscriptPath,
+    conversationId: conversationId || state?.local_id || null,
+  })
   const found = launchedAntigravityBackgroundWork(
     input?.tool_name ?? input?.toolName ?? input?.toolCall?.name,
     input?.tool_input ?? input?.toolInput ?? input?.toolCall?.args,
-    input?.tool_response ?? input?.toolResponse ?? input?.result,
+    toolResponse,
   )
-  if (!found) return false
-  const state = load(resolveHookConversationId(raw))
-  if (!state?.connection_id) return false
+  if (!found || !state?.connection_id) return false
   const recorded = record(state.connection_id, found, { dir })
   return recorded ? { state, launch: found } : false
 }
@@ -814,6 +1295,10 @@ export function loadState(
     connectionsDir = CONNECTIONS_DIR,
     legacyPath = LEGACY_STATE_PATH,
     ownerPid = resolveOwnerPid({}),
+    // How long to wait for a background renewal of the login (default RENEW_WAIT_MS).
+    // 0 starts the detached renewal and carries on with the token in hand: for a hook
+    // on a short deadline, such as the turn-recall hook (scripts/turn-recall.mjs).
+    renewWaitMs = undefined,
   } = {},
 ) {
   // Gather every candidate (legacy singleton + per-connection files) but NEVER
@@ -842,7 +1327,7 @@ export function loadState(
   } catch {
     /* selection below fails closed when no readable matching state exists */
   }
-  return selectBoundState(candidates, conversationId, AGENT_NAME, { ownerPid })
+  return stateWithCurrentToken(selectBoundState(candidates, conversationId, AGENT_NAME, { ownerPid }), renewWaitMs === undefined ? {} : { waitMs: renewWaitMs })
 }
 
 /**
@@ -962,6 +1447,156 @@ export function isHarnessInjection(text) {
   )
 }
 
+/**
+ * True when a user prompt is the `/devspec-remote` or `/devspec-remote-stop` setup
+ * command itself (`/(?:devspec:)?devspec-remote(?:-stop)?`). That setup turn registers
+ * or detaches the connection and must not mark the connection busy with non-check work.
+ */
+export function isRemoteControlCommandPrompt(text) {
+  if (typeof text !== 'string') return false
+  const extracted = extractUserRequestText(text)
+  const trimmed = String(extracted ?? text).trim()
+  return /^\/(?:devspec:)?devspec-remote(?:-stop)?(?:\s|$)/i.test(trimmed)
+}
+
+/**
+ * True when a prompt or `<SYSTEM_MESSAGE>` step is a background command, subagent,
+ * or timer notification rather than user input or a DevSpec Remote Wake.
+ */
+export function isBackgroundTaskNotification(text) {
+  const t = String(text ?? '')
+  if (!t) return false
+  if (
+    t.includes('<task-notification') ||
+    t.includes('[SYSTEM NOTIFICATION - NOT USER INPUT]') ||
+    t.includes('This is an automated background-task event') ||
+    /\bsender=(?!system\b)[A-Za-z0-9_.:/-]+/.test(t) ||
+    /Background command\s+"[^"]+"\s+\([^)]*\)\s+finished/i.test(t) ||
+    /\bcontent=Task id\s+"[^"]+"\s+finished/i.test(t)
+  ) {
+    return true
+  }
+  if (
+    t.includes('[DevSpec Remote Wake]') ||
+    t.includes('"event":"wake"') ||
+    t.includes('"type":"system_notice"') ||
+    t.includes('"type":"check_job"') ||
+    t.includes('"event":"directives"') ||
+    t.includes('"event":"automation_run"') ||
+    t.includes('"event":"interaction_answer"') ||
+    t.includes('"event":"question_dismissal"')
+  ) {
+    return false
+  }
+  return t.includes('<SYSTEM_MESSAGE>')
+}
+
+/**
+ * Inspect the tail of `transcript.jsonl` to recover the active turn's context
+ * (`remoteTurn`, `localPromptMirrored`, `noticeIds`, `recordNoticeIds`, `checkJobWake`,
+ * `otherWake`, `backgroundContinuation`) when `.turn` was missing or when a background
+ * task / subagent `<SYSTEM_MESSAGE>` continues an earlier turn.
+ */
+export function inferTurnContextFromTranscript(transcriptPath) {
+  const tPath = normalizeTranscriptPath(transcriptPath)
+  if (!tPath) return null
+  let raw = ''
+  try {
+    const stat = fs.statSync(tPath)
+    if (!stat.isFile() || stat.size === 0) return null
+    const readSize = Math.min(stat.size, 262_144)
+    const fd = fs.openSync(tPath, 'r')
+    try {
+      const buf = Buffer.alloc(readSize)
+      fs.readSync(fd, buf, 0, readSize, stat.size - readSize)
+      raw = buf.toString('utf8')
+    } finally {
+      fs.closeSync(fd)
+    }
+  } catch {
+    return null
+  }
+
+  const steps = []
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    try {
+      steps.push(JSON.parse(trimmed))
+    } catch {
+      /* skip partial first line in tail chunk */
+    }
+  }
+
+  let sawBgNotification = false
+  for (let i = steps.length - 1; i >= 0; i--) {
+    const step = steps[i]
+    if (!step || typeof step.content !== 'string') continue
+    if (step.type === 'SYSTEM_MESSAGE') {
+      if (isBackgroundTaskNotification(step.content)) {
+        sawBgNotification = true
+        continue
+      }
+      const wake = turnWakeFromText(step.content)
+      if (
+        sawBgNotification &&
+        wake &&
+        !wake.otherWake &&
+        (wake.checkJobWake || wake.noticeIds?.length || wake.recordNoticeIds?.length)
+      ) {
+        continue
+      }
+      return {
+        remoteTurn: true,
+        localPromptMirrored: false,
+        ...(sawBgNotification ? { backgroundContinuation: true } : {}),
+        ...(wake || {}),
+      }
+    }
+    if (step.type === 'USER_INPUT') {
+      if (step.content.includes('[DevSpec Remote Wake]')) {
+        const wake = turnWakeFromText(step.content)
+        if (
+          sawBgNotification &&
+          wake &&
+          !wake.otherWake &&
+          (wake.checkJobWake || wake.noticeIds?.length || wake.recordNoticeIds?.length)
+        ) {
+          continue
+        }
+        return {
+          remoteTurn: true,
+          localPromptMirrored: false,
+          ...(sawBgNotification ? { backgroundContinuation: true } : {}),
+          ...(wake || {}),
+        }
+      }
+      if (!sawBgNotification && isRemoteControlCommandPrompt(step.content)) {
+        return {
+          remoteTurn: false,
+          localPromptMirrored: false,
+          remoteControlCommand: true,
+        }
+      }
+      return {
+        remoteTurn: false,
+        localPromptMirrored: true,
+        otherWake: true,
+        ...(sawBgNotification ? { backgroundContinuation: true } : {}),
+      }
+    }
+  }
+
+  if (sawBgNotification) {
+    return {
+      remoteTurn: false,
+      localPromptMirrored: false,
+      backgroundContinuation: true,
+    }
+  }
+  return null
+}
+
 function unquoteTranscriptString(val) {
   if (typeof val !== 'string') return val
   const trimmed = val.trim()
@@ -988,11 +1623,46 @@ export function summarizeThinkingText(text, maxLen = 140) {
     : firstParagraph
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const SNAKE_TOOL_NAME_RE = /^[a-z0-9]+(?:_[a-z0-9]+)+$/i
+const GIT_BRANCH_TITLE_RE = /^[a-z0-9._-]+\/[a-z0-9._/-]*…?$/i
+
+function isHumanDomainTitle(value) {
+  if (typeof value !== 'string') return false
+  const trimmed = value.replace(/\s+/g, ' ').trim()
+  if (!trimmed) return false
+  if (UUID_RE.test(trimmed)) return false
+  if (SNAKE_TOOL_NAME_RE.test(trimmed)) return false
+  if (GIT_BRANCH_TITLE_RE.test(trimmed)) return false
+  return true
+}
+
+function salvageTruncatedJsonStringFields(raw) {
+  if (typeof raw !== 'string' || !raw) return {}
+  const normalized = raw.includes('\\"')
+    ? raw.replace(/^\s*"/, '').replace(/\\"/g, '"').replace(/\\\\/g, '\\')
+    : raw
+  const out = {}
+  const fieldRe =
+    /"(title|task_id|id|resource_id|summary|completion_summary|query|agent_branch|phase|turn_kind)"\s*:\s*"((?:\\.|[^"\\])*)"/g
+  let match
+  while ((match = fieldRe.exec(normalized)) !== null) {
+    const key = match[1]
+    if (key in out) continue
+    try {
+      out[key] = JSON.parse(`"${match[2]}"`)
+    } catch {
+      out[key] = match[2]
+    }
+  }
+  return out
+}
+
 function unwrapMcpCallArgs(toolName, args = {}) {
   const name = String(toolName || '').replace(/^default_api:/, '')
   if (name === 'call_mcp_tool' && args && typeof args === 'object') {
     const serverName = String(unquoteTranscriptString(args.ServerName ?? args.server_name ?? '')).toLowerCase()
-    if (serverName === 'devspec') {
+    if (isDevspecServerName(serverName)) {
       const innerTool = String(unquoteTranscriptString(args.ToolName ?? args.tool_name ?? ''))
       let innerArgs = args.Arguments ?? args.arguments ?? {}
       if (typeof innerArgs === 'string') {
@@ -1000,7 +1670,7 @@ function unwrapMcpCallArgs(toolName, args = {}) {
         try {
           innerArgs = typeof unquoted === 'string' ? JSON.parse(unquoted) : unquoted
         } catch {
-          innerArgs = {}
+          innerArgs = typeof unquoted === 'string' ? salvageTruncatedJsonStringFields(unquoted) : {}
         }
       }
       return {
@@ -1076,6 +1746,7 @@ export function isRemotePlumbingToolCall(toolName, args = {}) {
       cmdLine.includes('devspec-remote-connect.mjs') ||
       cmdLine.includes('devspec-remote-stop.mjs') ||
       cmdLine.includes('devspec-question.mjs') ||
+      cmdLine.includes('devspec-tell-person.mjs') ||
       cmdLine.includes('remote-control-state.mjs') ||
       cmdLine.includes('connection-call.mjs') ||
       cmdLine.includes('post_session_message') ||
@@ -1099,24 +1770,27 @@ export function redactSecretsFromText(text) {
     .replace(/(ANTIGRAVITY_CSRF_TOKEN\s*=\s*)[^\s"']+/g, '$1[REDACTED]')
 }
 
-function classifyDevspecDomainTool(toolName, args = {}) {
+function classifyDevspecDomainTool(toolName, args = {}, { titleById = null } = {}) {
   const { effectiveName, effectiveArgs } = unwrapMcpCallArgs(toolName, args)
-  const match = /^(?:mcp__(?:plugin_devspec_)?devspec__|mcp_devspec_|devspec__)([a-z0-9_]+)$/.exec(
-    effectiveName,
-  )
-  if (!match) return null
-  const verb = match[1]
+  const verb = devspecToolFromName(effectiveName)
+  if (!verb) return null
   const id = unquoteTranscriptString(
     effectiveArgs?.task_id || effectiveArgs?.id || effectiveArgs?.resource_id || '',
   )
-  const title = unquoteTranscriptString(
-    effectiveArgs?.title ||
-      effectiveArgs?.summary ||
-      effectiveArgs?.query ||
-      effectiveArgs?.agent_branch ||
-      id ||
-      '',
-  )
+  const candidates = [
+    effectiveArgs?.title,
+    id && titleById ? titleById.get(String(id)) : '',
+    effectiveArgs?.summary,
+    effectiveArgs?.query,
+  ]
+  let title = ''
+  for (const candidate of candidates) {
+    const clean = unquoteTranscriptString(candidate || '')
+    if (isHumanDomainTitle(clean)) {
+      title = clean.replace(/\s+/g, ' ').trim()
+      break
+    }
+  }
 
   const domainMap = {
     create_task: { domain: 'task', action: 'created' },
@@ -1213,6 +1887,73 @@ function normalizeCanonicalToolEvent(toolName, args = {}) {
   }
 }
 
+function extractRecordIdAndTitleFromToolOutput(rawContent) {
+  if (typeof rawContent !== 'string' || !rawContent) return null
+  let text = rawContent
+  const spillMatch = rawContent.match(/saved to:\s*file:\/\/(\/[^\s"'<>]+\/output\.txt)/i)
+  if (spillMatch?.[1] && fs.existsSync(spillMatch[1])) {
+    try {
+      const fd = fs.openSync(spillMatch[1], 'r')
+      try {
+        const buf = Buffer.alloc(4096)
+        const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0)
+        text = buf.slice(0, bytesRead).toString('utf8')
+      } finally {
+        fs.closeSync(fd)
+      }
+    } catch {
+      /* ignore spill read errors */
+    }
+  }
+  const head = text.slice(0, 4096)
+  const idMatch = head.match(
+    /"id"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"/i,
+  )
+  const titleMatch = head.match(/"title"\s*:\s*"((?:\\.|[^"\\])*)"/)
+  if (!idMatch?.[1] || !titleMatch?.[1]) return null
+  let title = titleMatch[1]
+  try {
+    title = JSON.parse(`"${titleMatch[1]}"`)
+  } catch {
+    /* keep raw */
+  }
+  if (!isHumanDomainTitle(title)) return null
+  return {
+    id: idMatch[1],
+    title: title.replace(/\s+/g, ' ').trim(),
+  }
+}
+
+function loadFullTranscriptTruncatedSteps(transcriptPath, fullTranscriptText, neededStepIndices) {
+  const byIndex = new Map()
+  if (!neededStepIndices || neededStepIndices.size === 0) return byIndex
+  let rawFull = typeof fullTranscriptText === 'string' ? fullTranscriptText : null
+  if (!rawFull && typeof transcriptPath === 'string' && /transcript\.jsonl$/.test(transcriptPath)) {
+    const fullPath = transcriptPath.replace(/transcript\.jsonl$/, 'transcript_full.jsonl')
+    if (fs.existsSync(fullPath)) {
+      try {
+        rawFull = fs.readFileSync(fullPath, 'utf8')
+      } catch {
+        rawFull = null
+      }
+    }
+  }
+  if (!rawFull) return byIndex
+  for (const rawLine of rawFull.split(/\r?\n/)) {
+    const trimmed = rawLine.trim()
+    if (!trimmed) continue
+    try {
+      const step = JSON.parse(trimmed)
+      if (step && neededStepIndices.has(step.step_index)) {
+        byIndex.set(step.step_index, step)
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return byIndex
+}
+
 /**
  * Extract structured trail events and cumulative Markdown from an Antigravity
  * `transcript.jsonl` raw string for the active turn (Pi-style `work_trail` and
@@ -1220,7 +1961,13 @@ function normalizeCanonicalToolEvent(toolName, args = {}) {
  */
 export function extractAntigravityTrailFromTranscript(
   rawText,
-  { sinceIso = null, sinceMs = null, stopAtReply = true } = {},
+  {
+    sinceIso = null,
+    sinceMs = null,
+    stopAtReply = true,
+    transcriptPath = null,
+    fullTranscriptText = null,
+  } = {},
 ) {
   const cutoffMs =
     typeof sinceMs === 'number' && Number.isFinite(sinceMs)
@@ -1231,9 +1978,14 @@ export function extractAntigravityTrailFromTranscript(
 
   const events = []
   const bullets = []
+  const domainBulletMeta = new Map()
+  const titleById = new Map()
+  let pendingCreatedDomainEvent = null
   let seq = 0
   let replyPosted = false
 
+  const parsedSteps = []
+  const truncatedStepIndices = new Set()
   for (const rawLine of String(rawText || '').split(/\r?\n/)) {
     const trimmed = rawLine.trim()
     if (!trimmed) continue
@@ -1243,17 +1995,45 @@ export function extractAntigravityTrailFromTranscript(
     } catch {
       continue
     }
-    if (!step || step.type !== 'PLANNER_RESPONSE') continue
+    if (!step) continue
+    if (
+      step.type === 'PLANNER_RESPONSE' &&
+      Array.isArray(step.truncated_fields) &&
+      step.truncated_fields.includes('tool_calls') &&
+      step.step_index !== undefined
+    ) {
+      truncatedStepIndices.add(step.step_index)
+    }
+    parsedSteps.push(step)
+  }
 
-    if (cutoffMs !== null && Number.isFinite(cutoffMs) && step.created_at) {
-      const stepMs = Date.parse(step.created_at)
-      if (Number.isFinite(stepMs) && stepMs < cutoffMs) continue
+  const fullStepsByIndex = loadFullTranscriptTruncatedSteps(
+    transcriptPath,
+    fullTranscriptText,
+    truncatedStepIndices,
+  )
+
+  for (let rawStep of parsedSteps) {
+    const step =
+      rawStep.type === 'PLANNER_RESPONSE' && fullStepsByIndex.has(rawStep.step_index)
+        ? fullStepsByIndex.get(rawStep.step_index)
+        : rawStep
+
+    if (step.type === 'GENERIC') {
+      const extracted = extractRecordIdAndTitleFromToolOutput(step.content)
+      if (extracted) {
+        titleById.set(extracted.id, extracted.title)
+        if (pendingCreatedDomainEvent) {
+          if (!pendingCreatedDomainEvent.id) pendingCreatedDomainEvent.id = extracted.id
+          if (!pendingCreatedDomainEvent.title) pendingCreatedDomainEvent.title = extracted.title
+          pendingCreatedDomainEvent = null
+        }
+      }
+      continue
     }
 
-    const occurredAt =
-      typeof step.created_at === 'string' && Number.isFinite(Date.parse(step.created_at))
-        ? new Date(Date.parse(step.created_at)).toISOString()
-        : undefined
+    if (step.type !== 'PLANNER_RESPONSE') continue
+    pendingCreatedDomainEvent = null
 
     const rawToolCalls = Array.isArray(step.tool_calls) ? step.tool_calls : []
     const parsedToolCalls = rawToolCalls.map((tc) => {
@@ -1268,6 +2048,23 @@ export function extractAntigravityTrailFromTranscript(
       }
       return { toolName, args }
     })
+
+    for (const { toolName, args } of parsedToolCalls) {
+      const info = classifyDevspecDomainTool(toolName, args, { titleById })
+      if (info?.id && info?.title && isHumanDomainTitle(info.title)) {
+        titleById.set(String(info.id), info.title)
+      }
+    }
+
+    if (cutoffMs !== null && Number.isFinite(cutoffMs) && step.created_at) {
+      const stepMs = Date.parse(step.created_at)
+      if (Number.isFinite(stepMs) && stepMs < cutoffMs) continue
+    }
+
+    const occurredAt =
+      typeof step.created_at === 'string' && Number.isFinite(Date.parse(step.created_at))
+        ? new Date(Date.parse(step.created_at)).toISOString()
+        : undefined
 
     if (stopAtReply && parsedToolCalls.some((tc) => isSessionReplyToolCall(tc.toolName, tc.args))) {
       replyPosted = true
@@ -1359,10 +2156,10 @@ export function extractAntigravityTrailFromTranscript(
         toolName
       const summary = (typeof rawSummary === 'string' && rawSummary.trim()) || action
 
-      const domainInfo = classifyDevspecDomainTool(toolName, args)
+      const domainInfo = classifyDevspecDomainTool(toolName, args, { titleById })
       if (domainInfo?.domain) {
         seq++
-        events.push({
+        const domainEvent = {
           seq,
           kind: 'domain',
           domain: domainInfo.domain,
@@ -1374,9 +2171,19 @@ export function extractAntigravityTrailFromTranscript(
           ...(summary ? { result: summary } : {}),
           ...(occurredAt ? { occurredAt } : {}),
           step_index: step.step_index ?? null,
-        })
-        const argBit = domainInfo.title ? ` — \`${domainInfo.title}\`` : ''
+        }
+        events.push(domainEvent)
+        const bulletIdx = bullets.length
+        const argBit = domainEvent.title ? ` — \`${domainEvent.title}\`` : ''
         bullets.push(`✓ \`${domainInfo.verb}\`${argBit} → ${action}`)
+        domainBulletMeta.set(domainEvent, { bulletIdx, verb: domainInfo.verb, action })
+        if (
+          domainInfo.verb === 'create_task' ||
+          domainInfo.verb === 'record_memory' ||
+          domainInfo.verb === 'create_resource'
+        ) {
+          pendingCreatedDomainEvent = domainEvent
+        }
         continue
       }
 
@@ -1399,6 +2206,53 @@ export function extractAntigravityTrailFromTranscript(
       const excerpt = oneLine.length > TRAIL_LINE_ARGS_CHARS ? `${oneLine.slice(0, TRAIL_LINE_ARGS_CHARS - 1)}…` : oneLine
       const shortArgs = excerpt ? ` — \`${excerpt}\`` : ''
       bullets.push(`✓ \`${canonicalName}\`${shortArgs} → ${action}`)
+    }
+  }
+
+  const taskIds = new Set()
+  let createdTaskEvents = []
+  for (const ev of events) {
+    if (ev.kind !== 'domain') continue
+    if (
+      (ev.domain === 'task' || ev.domain === 'implementation' || ev.domain === 'criterion') &&
+      ev.id &&
+      UUID_RE.test(ev.id)
+    ) {
+      taskIds.add(ev.id)
+    }
+    if (ev.name === 'create_task') {
+      createdTaskEvents.push(ev)
+    }
+    if (ev.id && ev.title && isHumanDomainTitle(ev.title)) {
+      titleById.set(ev.id, ev.title)
+    }
+  }
+  const singleTaskId = taskIds.size === 1 ? [...taskIds][0] : null
+  if (singleTaskId && createdTaskEvents.length === 1) {
+    const createdEv = createdTaskEvents[0]
+    if (!createdEv.id) createdEv.id = singleTaskId
+    if (createdEv.title && isHumanDomainTitle(createdEv.title) && !titleById.has(singleTaskId)) {
+      titleById.set(singleTaskId, createdEv.title)
+    }
+  }
+  for (const ev of events) {
+    if (ev.kind !== 'domain') continue
+    if (
+      !ev.id &&
+      singleTaskId &&
+      (ev.name === 'create_task' ||
+        ev.name === 'claim_work_item' ||
+        ev.name === 'record_implementation' ||
+        ev.name === 'record_criterion_verdicts')
+    ) {
+      ev.id = singleTaskId
+    }
+    if (!ev.title && ev.id && titleById.has(ev.id)) {
+      ev.title = titleById.get(ev.id)
+    }
+    const meta = domainBulletMeta.get(ev)
+    if (meta && ev.title) {
+      bullets[meta.bulletIdx] = `✓ \`${meta.verb}\` — \`${ev.title}\` → ${meta.action}`
     }
   }
 
@@ -1448,6 +2302,17 @@ export async function streamTurnTrailIfChanged(
   if (isCurrentTurnCheckJobOnly(connectionId, { dir: connectionsDir, connectionState: state, marker })) {
     return { streamed: false, reason: 'check_job_turn' }
   }
+  const isLocalMirroredTurn = Boolean(
+    !marker.remoteTurn &&
+      (marker.localPromptMirrored || marker.localTurn || state.local_turn),
+  )
+  if (marker.backgroundContinuation && !isLocalMirroredTurn) {
+    const reqState = readRequestState(connectionId, { dir: connectionsDir })
+    const hasOpenCommand = [...reqState.open.values()].some((r) => r.kind === 'command')
+    if (!hasOpenCommand) {
+      return { streamed: false, reason: 'background_continuation_turn' }
+    }
+  }
   const tPath =
     normalizeTranscriptPath(state.transcript_path) ||
     inferAntigravityTranscriptPath(state.local_id)
@@ -1465,6 +2330,7 @@ export async function streamTurnTrailIfChanged(
   const trail = extractAntigravityTrailFromTranscript(rawTranscript, {
     sinceMs: marker.startedAt,
     stopAtReply: true,
+    transcriptPath: tPath,
   })
   if (trail.replyPosted) {
     return { streamed: false, reason: 'reply_posted_in_transcript' }
@@ -1489,20 +2355,10 @@ export async function streamTurnTrailIfChanged(
     }
   }
 
-  let token = state.token
-  let mcpUrl = state.mcp_url
-  if (!token || !mcpUrl) {
-    const auth = resolveDevspecMcpAuth(state.cwd || process.cwd())
-    token = token || auth.token
-    mcpUrl = mcpUrl || auth.mcp_url
-  }
-  if (!token) return { streamed: false, reason: 'no_auth_token' }
-  mcpUrl = mcpUrl || 'https://api.devspec.ai/api/mcp'
+  const credential = connectionCredential(state)
+  if (!credential) return { streamed: false, reason: 'no_auth_token' }
+  const { token, mcpUrl } = credential
 
-  const isLocalMirroredTurn = Boolean(
-    !marker.remoteTurn &&
-      (marker.localPromptMirrored || marker.localTurn || state.local_turn),
-  )
   const telemetry = readConnectionTelemetry(connectionId, { home })
   const postArgs = {
     connection_id: connectionId,
@@ -1557,7 +2413,10 @@ export async function streamTurnTrailIfChanged(
  * for the current turn (after the latest `USER_INPUT` / `SYSTEM_MESSAGE` boundary
  * or since `sinceMs`).
  */
-export function extractLatestAssistantReplyFromTranscript(transcriptPath, { sinceMs = null } = {}) {
+export function extractLatestAssistantReplyFromTranscript(
+  transcriptPath,
+  { sinceMs = null, afterLastSystemMessage = false } = {},
+) {
   if (!transcriptPath) return null
   let raw = ''
   try {
@@ -1589,10 +2448,13 @@ export function extractLatestAssistantReplyFromTranscript(transcriptPath, { sinc
     }
   }
 
-  // Find the last USER_INPUT step index so we only look at the current turn
+  // Find the last USER_INPUT (or SYSTEM_MESSAGE for isolated sub-turns) boundary
   let lastUserBoundary = -1
   for (let i = steps.length - 1; i >= 0; i--) {
-    if (steps[i]?.type === 'USER_INPUT') {
+    if (
+      steps[i]?.type === 'USER_INPUT' ||
+      (afterLastSystemMessage && steps[i]?.type === 'SYSTEM_MESSAGE')
+    ) {
       lastUserBoundary = i
       break
     }
@@ -1709,6 +2571,7 @@ export async function handleMirrorTurn(
     return recordBackgroundLaunch(raw, {
       load: (id) => loadState(id, { connectionsDir, legacyPath }),
       dir: connectionsDir,
+      env,
     })
   }
 
@@ -1733,16 +2596,10 @@ export async function handleMirrorTurn(
   const hookTranscriptPath = parseTranscriptPath(raw)
   syncStateTranscriptPath(state, hookTranscriptPath, conversationId, { connectionsDir, env })
 
-  let token = state.token
-  let mcpUrl = state.mcp_url
-  if (!token || !mcpUrl) {
-    const auth = resolveDevspecMcpAuth(state.cwd || process.cwd())
-    token = token || auth.token
-    mcpUrl = mcpUrl || auth.mcp_url
-  }
-  if (!token) return { ok: true, skipped: 'no_auth_token' }
+  const credential = connectionCredential(state)
+  if (!credential) return { ok: true, skipped: 'no_auth_token' }
+  const { token, mcpUrl } = credential
 
-  mcpUrl = mcpUrl || 'https://api.devspec.ai/api/mcp'
   const agentName = AGENT_NAME
   const connectionId = state.connection_id
   const sessionId = state.session_id || null
@@ -1755,7 +2612,15 @@ export async function handleMirrorTurn(
   const existingMarker = readTurnMarker(connectionId, connectionsDir)
   reconcileCompletedOwnedWork(connectionId, existingMarker, effectiveTranscriptPath, connectionsDir)
   const latestStep = extractLatestTranscriptStep(effectiveTranscriptPath)
+  const latestStepMs = latestStep?.created_at ? Date.parse(latestStep.created_at) : NaN
+  const latestStepIsBeforeMarker =
+    Boolean(
+      existingMarker && !existingMarker.held && typeof existingMarker.startedAt === 'number',
+    ) &&
+    Number.isFinite(latestStepMs) &&
+    latestStepMs < existingMarker.startedAt - 2000
   const isNewUserInputStep =
+    !latestStepIsBeforeMarker &&
     latestStep?.type === 'USER_INPUT' &&
     (typeof latestStep.step_index !== 'number' ||
       existingMarker?.lastStepIndex !== latestStep.step_index)
@@ -1776,33 +2641,67 @@ export async function handleMirrorTurn(
     }
   }
 
-  const text = extractLastText(raw, modeArg)
-  const rawStepContent = typeof latestStep?.content === 'string' ? latestStep.content : ''
+  const text = latestStepIsBeforeMarker
+    ? parsedHookInput?.prompt ||
+      parsedHookInput?.user_prompt ||
+      parsedHookInput?.message ||
+      parsedHookInput?.text ||
+      null
+    : extractLastText(raw, modeArg)
+  const rawStepContent =
+    !latestStepIsBeforeMarker && typeof latestStep?.content === 'string' ? latestStep.content : ''
+  const inferredTranscriptContext =
+    !isNewUserInputStep
+      ? inferTurnContextFromTranscript(effectiveTranscriptPath)
+      : null
+  const isRemoteControlCommand =
+    (isNewUserInputStep && isRemoteControlCommandPrompt(rawStepContent || text)) ||
+    (!isNewUserInputStep && Boolean(inferredTranscriptContext?.remoteControlCommand)) ||
+    (modeArg === 'user_prompt' && isRemoteControlCommandPrompt(text))
+  if (isRemoteControlCommand && !existingMarker) {
+    return { ok: true, skipped: 'remote_control_command' }
+  }
+  const isBgContinuation =
+    modeArg === 'user_prompt' &&
+    !isNewUserInputStep &&
+    (isBackgroundTaskNotification(rawStepContent || text) ||
+      Boolean(inferredTranscriptContext?.backgroundContinuation) ||
+      (Boolean(existingMarker?.held) &&
+        latestStep?.type === 'SYSTEM_MESSAGE' &&
+        !rawStepContent.includes('[DevSpec Remote Wake]')))
+  const bgParentContext = isBgContinuation
+    ? existingMarker?.heldParent || existingMarker || inferredTranscriptContext || {}
+    : null
   const isExplicitUserInputStep =
+    !isBgContinuation &&
     latestStep?.type === 'USER_INPUT' &&
     !rawStepContent.includes('[DevSpec Remote Wake]') &&
     parsedHookInput?.remote_turn !== true
-  const isRemoteWakeInput =
-    !isExplicitUserInputStep &&
-    (Boolean(existingMarker?.remoteTurn) ||
-      parsedHookInput?.remote_turn === true ||
-      (typeof text === 'string' && text.includes('[DevSpec Remote Wake]')) ||
-      rawStepContent.includes('[DevSpec Remote Wake]') ||
-      (latestStep?.type === 'SYSTEM_MESSAGE' &&
-        (rawStepContent.includes('"event":"wake"') ||
-          rawStepContent.includes('"type":"system_notice"') ||
-          rawStepContent.includes('"type":"check_job"') ||
-          rawStepContent.includes('"event":"directives"') ||
-          rawStepContent.includes('"event":"automation_run"') ||
-          rawStepContent.includes('"event":"interaction_answer"') ||
-          rawStepContent.includes('"event":"question_dismissal"'))))
+  const isRemoteWakeInput = isBgContinuation
+    ? Boolean(bgParentContext?.remoteTurn)
+    : !isExplicitUserInputStep &&
+      (Boolean(existingMarker?.remoteTurn) ||
+        parsedHookInput?.remote_turn === true ||
+        (typeof text === 'string' && text.includes('[DevSpec Remote Wake]')) ||
+        rawStepContent.includes('[DevSpec Remote Wake]') ||
+        (latestStep?.type === 'SYSTEM_MESSAGE' &&
+          (rawStepContent.includes('"event":"wake"') ||
+            rawStepContent.includes('"type":"system_notice"') ||
+            rawStepContent.includes('"type":"check_job"') ||
+            rawStepContent.includes('"event":"directives"') ||
+            rawStepContent.includes('"event":"automation_run"') ||
+            rawStepContent.includes('"event":"interaction_answer"') ||
+            rawStepContent.includes('"event":"question_dismissal"'))))
 
   const skipMirror =
     modeArg === 'user_prompt' &&
-    ((!!text && isHarnessInjection(text)) || latestStep?.type === 'SYSTEM_MESSAGE')
+    (isBgContinuation ||
+      (!!text && isHarnessInjection(text)) ||
+      latestStep?.type === 'SYSTEM_MESSAGE')
 
   const fromAPerson =
     modeArg === 'user_prompt' &&
+    !isBgContinuation &&
     !isRemoteWakeInput &&
     !skipMirror &&
     Boolean(text && String(text).trim())
@@ -1820,6 +2719,21 @@ export async function handleMirrorTurn(
         appendRequestEvent(connectionId, event, { dir: connectionsDir })
       }
       if (arrival.typedId) typedRequest = { id: arrival.typedId, midTurn: false }
+    } catch {
+      /* non-fatal */
+    }
+  } else if (isBgContinuation && connectionId) {
+    try {
+      const arrival = promptArrival({
+        fromAPerson: false,
+        origin: 'task-notification',
+        text: rawStepContent || text || '',
+        midTurn: false,
+        state: readRequestState(connectionId, { dir: connectionsDir }),
+      })
+      for (const event of arrival.events) {
+        appendRequestEvent(connectionId, event, { dir: connectionsDir })
+      }
     } catch {
       /* non-fatal */
     }
@@ -1912,20 +2826,58 @@ export async function handleMirrorTurn(
     if (turnActive) {
       // What woke the turn (notice-reply.mjs): the wake's own notice ids, checkJobWake,
       // or that a person or a command did. The listener records the same as it delivers;
-      // both write, so neither ordering of the two loses it.
-      const wake = isRemoteWakeInput
-        ? turnWakeFromText(rawStepContent || text)
-        : fromAPerson
-          ? { otherWake: true }
-          : null
+      // both write, so neither ordering of the two loses it. A background task or
+      // subagent continuation inherits its parent turn's wake context instead of parsing
+      // background stdout as a new wake.
+      const bgParentHasCommandOrPrompt = Boolean(
+        bgParentContext?.otherWake ||
+          bgParentContext?.localPromptMirrored ||
+          bgParentContext?.localTurn ||
+          existingMarker?.heldParent,
+      )
+      const wake = isBgContinuation
+        ? {
+            ...(!bgParentHasCommandOrPrompt &&
+            Array.isArray(bgParentContext?.noticeIds) &&
+            bgParentContext.noticeIds.length > 0
+              ? { noticeIds: bgParentContext.noticeIds }
+              : {}),
+            ...(!bgParentHasCommandOrPrompt &&
+            Array.isArray(bgParentContext?.recordNoticeIds) &&
+            bgParentContext.recordNoticeIds.length > 0
+              ? { recordNoticeIds: bgParentContext.recordNoticeIds }
+              : {}),
+            ...(!bgParentHasCommandOrPrompt && bgParentContext?.checkJobWake
+              ? { checkJobWake: true }
+              : {}),
+            ...(bgParentContext?.otherWake ? { otherWake: true } : {}),
+          }
+        : isRemoteWakeInput
+          ? turnWakeFromText(rawStepContent || text)
+          : fromAPerson
+            ? { otherWake: true }
+            : null
+      const isMidWaitNonCommandWake = Boolean(
+        !isBgContinuation &&
+          isRemoteWakeInput &&
+          (existingMarker?.held === true ||
+            (existingMarker?.heldParent && !existingMarker?.otherWake)) &&
+          wake &&
+          !wake.otherWake &&
+          (wake.checkJobWake || wake.noticeIds?.length || wake.recordNoticeIds?.length),
+      )
       if (
         connectionId &&
         isRemoteWakeInput &&
-        (wake?.checkJobWake || wake?.noticeIds?.length) &&
-        !existingMarker?.otherWake &&
-        !existingMarker?.localPromptMirrored &&
-        !existingMarker?.localTurn &&
-        !state?.local_turn
+        (wake?.checkJobWake || wake?.noticeIds?.length || wake?.recordNoticeIds?.length) &&
+        (isMidWaitNonCommandWake ||
+          (!existingMarker?.otherWake &&
+            !bgParentContext?.otherWake &&
+            !existingMarker?.localPromptMirrored &&
+            !bgParentContext?.localPromptMirrored &&
+            !existingMarker?.localTurn &&
+            !bgParentContext?.localTurn &&
+            !state?.local_turn))
       ) {
         try {
           setCurrentRequest(connectionId, UNSTATED, { dir: connectionsDir })
@@ -1933,25 +2885,134 @@ export async function handleMirrorTurn(
           /* non-fatal */
         }
       }
-      const markerExtra = {
-        held: false,
-        remoteTurn: Boolean(isRemoteWakeInput),
-        localPromptMirrored: Boolean(localPromptMirrored),
-        ...(admittedLocalTurn ? { localTurn: admittedLocalTurn } : {}),
-        ...mergeTurnWake(readTurnMarker(connectionId, connectionsDir), wake),
-      }
+      const preservedLocalMirrored = isMidWaitNonCommandWake
+        ? false
+        : Boolean(
+            localPromptMirrored ||
+              (isBgContinuation &&
+                (bgParentContext?.localPromptMirrored || existingMarker?.localPromptMirrored)),
+          )
+      const preservedLocalTurn = isMidWaitNonCommandWake
+        ? null
+        : admittedLocalTurn ||
+          (isBgContinuation ? bgParentContext?.localTurn || existingMarker?.localTurn || null : null)
+      const currentMarkerForMerge = readTurnMarker(connectionId, connectionsDir)
+      const markerExtra = isMidWaitNonCommandWake
+        ? {
+            held: false,
+            heldParent: snapshotHeldParent(existingMarker),
+            remoteTurn: true,
+            localPromptMirrored: false,
+            localTurn: null,
+            otherWake: false,
+            backgroundContinuation: false,
+            ...mergeTurnWake(
+              currentMarkerForMerge?.held === true ? null : currentMarkerForMerge,
+              wake,
+            ),
+            preserveExplicitReply: true,
+          }
+        : {
+            held: false,
+            heldParent: null,
+            remoteTurn: Boolean(isRemoteWakeInput),
+            localPromptMirrored: preservedLocalMirrored,
+            ...(isBgContinuation
+              ? {
+                  backgroundContinuation: true,
+                  ...(bgParentHasCommandOrPrompt
+                    ? { noticeIds: [], recordNoticeIds: [], checkJobWake: false }
+                    : {}),
+                }
+              : {}),
+            ...(preservedLocalTurn ? { localTurn: preservedLocalTurn } : { localTurn: null }),
+            ...mergeTurnWake(
+              isBgContinuation && bgParentHasCommandOrPrompt
+                ? { otherWake: Boolean(bgParentContext?.otherWake) }
+                : currentMarkerForMerge,
+              wake,
+            ),
+            ...(isBgContinuation ? { preserveExplicitReply: true } : {}),
+          }
       if (typeof latestStep?.step_index === 'number') {
         markerExtra.lastStepIndex = latestStep.step_index
       }
       writeTurnMarker(connectionId, markerExtra, connectionsDir)
     } else {
-      // On Stop: check if this turn launched background work (e.g. subagent or async command)
-      // that has not yet reported back. If so, hold the turn open instead of closing it.
+      // On Stop: check if this turn launched background work (e.g. subagent, async command,
+      // or one-shot timer) that has not yet reported back. If so, hold the turn open instead
+      // of closing it.
       const marker = readTurnMarker(connectionId, connectionsDir)
       reconcileCompletedOwnedWork(connectionId, marker, effectiveTranscriptPath, connectionsDir)
       const outstandingIds = marker ? readOwnedIds(connectionId, marker, connectionsDir) : []
-      if (outstandingIds.length > 0 && !marker?.held) {
-        writeTurnMarker(connectionId, { held: true }, connectionsDir)
+      if (outstandingIds.length > 0) {
+        if (marker?.heldParent) {
+          const midWaitNotices = currentTurnReplyNoticeIds(connectionId, {
+            dir: connectionsDir,
+            connectionState: state,
+            marker,
+          })
+          const midWaitRoutine = isCurrentTurnRoutine(connectionId, {
+            dir: connectionsDir,
+            connectionState: state,
+            marker,
+          })
+          if (
+            (midWaitNotices || midWaitRoutine) &&
+            marker.tellPerson &&
+            !marker.noticeReplyAt &&
+            !marker.personToldAt &&
+            sessionId
+          ) {
+            const tellText =
+              (text ? prepareAgentMirrorText(text) : null) ||
+              extractLatestAssistantReplyFromTranscript(effectiveTranscriptPath, {
+                sinceMs: marker.startedAt ?? null,
+                afterLastSystemMessage: true,
+              })
+            if (tellText) {
+              await postTellPersonBackstop({
+                call, mcpUrl, token, state, connectionId, agentName, message: tellText, marker, connectionsDir,
+              })
+            }
+          }
+          const parent = marker.heldParent
+          writeTurnMarker(
+            connectionId,
+            {
+              held: true,
+              heldParent: null,
+              remoteTurn: Boolean(parent.remoteTurn),
+              localPromptMirrored: Boolean(parent.localPromptMirrored),
+              localTurn: parent.localTurn || null,
+              otherWake: Boolean(parent.otherWake),
+              backgroundContinuation: Boolean(parent.backgroundContinuation),
+              noticeIds: [],
+              recordNoticeIds: [],
+              checkJobWake: false,
+              tellPerson: false,
+              noticeReplyAt: null,
+              personToldAt: null,
+              preserveExplicitReply: true,
+            },
+            connectionsDir,
+          )
+          return { ok: true, held: true, outstanding: outstandingIds }
+        }
+        const parentIsCommandOrPrompt = Boolean(
+          marker?.otherWake || marker?.localPromptMirrored || marker?.localTurn,
+        )
+        writeTurnMarker(
+          connectionId,
+          {
+            held: true,
+            ...(parentIsCommandOrPrompt
+              ? { noticeIds: [], recordNoticeIds: [], checkJobWake: false }
+              : {}),
+            preserveExplicitReply: true,
+          },
+          connectionsDir,
+        )
         return { ok: true, held: true, outstanding: outstandingIds }
       }
 
@@ -1968,18 +3029,30 @@ export async function handleMirrorTurn(
       }
 
       const hadExplicitReply = consumeExplicitReplyMarker(connectionId, connectionsDir)
-      // Read before the marker goes: a turn woken only by DevSpec notices ends with a
-      // reply to those notices, and a turn woken only by check jobs ends silently,
-      // never with an answer filed under an earlier command.
-      const turnNotices = currentTurnNoticeIds(connectionId, {
+      // Read before the marker goes: a turn woken only by DevSpec notices or check jobs
+      // ends silently on Stop when the model did not call post_session_message itself —
+      // never scraping local terminal notes into the room as a notice reply or command
+      // answer (`check_job.room` and `semantics.notice_audience` in the served contract;
+      // item 699517ad, decision 0fdb1237).
+      const effectiveStopMarker =
+        marker ||
+        (inferredTranscriptContext &&
+        !inferredTranscriptContext.otherWake &&
+        !inferredTranscriptContext.localPromptMirrored &&
+        (inferredTranscriptContext.checkJobWake ||
+          inferredTranscriptContext.noticeIds?.length ||
+          inferredTranscriptContext.recordNoticeIds?.length)
+          ? { startedAt: Date.now(), ...inferredTranscriptContext }
+          : null)
+      const turnNotices = currentTurnReplyNoticeIds(connectionId, {
         dir: connectionsDir,
         connectionState: state,
-        marker,
+        marker: effectiveStopMarker,
       })
-      const checkJobOnlyTurn = isCurrentTurnCheckJobOnly(connectionId, {
+      const routineTurn = isCurrentTurnRoutine(connectionId, {
         dir: connectionsDir,
         connectionState: state,
-        marker,
+        marker: effectiveStopMarker,
       })
       clearTurnMarker(connectionId, connectionsDir)
 
@@ -1993,46 +3066,33 @@ export async function handleMirrorTurn(
         !isRemoteTurn &&
           (marker?.localPromptMirrored || marker?.localTurn || state?.local_turn),
       )
+      const isUnboundBgContinuation = Boolean(
+        marker?.backgroundContinuation &&
+          !isLocalMirroredTurn &&
+          !hadStreamedTrail &&
+          ![...readRequestState(connectionId, { dir: connectionsDir }).open.values()].some(
+            (r) => r.kind === 'command',
+          ),
+      )
       const turnFailure = parseTurnFailure(parsedHookInput)
-      if (turnNotices) {
-        // The model's last words on the notices, as a reply to them: bound to no
-        // command turn, so no trail, no complete_turn and no local-turn flags, which
-        // a notice reply refuses (notice-reply.mjs). Skipped when it already replied.
-        const replyText =
-          !hadExplicitReply && !marker?.noticeReplyAt && sessionId
+      if (turnNotices || routineTurn) {
+        // Silent, except when a write in the turn carried `tell_person`
+        // (`semantics.notice_audience.telling_anyway`) and the agent told nobody: then
+        // its last words go to the room on DevSpec's speech lane, bound to no command
+        // turn, so no trail and no complete_turn (postTellPersonBackstop).
+        const tellText =
+          marker?.tellPerson && !hadExplicitReply && !marker?.noticeReplyAt && !marker?.personToldAt && sessionId
             ? (text ? prepareAgentMirrorText(text) : null) ||
               extractLatestAssistantReplyFromTranscript(effectiveTranscriptPath, {
                 sinceMs: marker?.startedAt ?? null,
               })
             : null
-        if (replyText) {
-          const telemetry = connectionId ? readConnectionTelemetry(connectionId) : null
-          try {
-            await call({
-              mcpUrl,
-              token,
-              name: 'post_session_message',
-              arguments: {
-                connection_id: connectionId,
-                agent_name: agentName,
-                message: replyText,
-                system_notice_ids: turnNotices,
-                ...(telemetry ? { agent_stats: telemetry } : {}),
-                ...(telemetry?.model?.id
-                  ? {
-                      model: {
-                        providerID: telemetry.model.provider || 'google',
-                        modelID: telemetry.model.id,
-                      },
-                    }
-                  : {}),
-              },
-            })
-          } catch {
-            /* non-fatal fallback */
-          }
+        if (tellText) {
+          await postTellPersonBackstop({
+            call, mcpUrl, token, state, connectionId, agentName, message: tellText, marker, connectionsDir,
+          })
         }
-      } else if (turnFailure && isRemoteTurn && sessionId) {
+      } else if (turnFailure && isRemoteTurn && sessionId && !isUnboundBgContinuation) {
         // The turn died on an error before the model could answer (item 408ad47b):
         // tell the room in Antigravity's own words instead of mirroring nothing. Posted
         // even after an explicit progress post, because the command still failed. An
@@ -2066,9 +3126,9 @@ export async function handleMirrorTurn(
           /* non-fatal: report_complete below still ends the turn */
         }
       } else if (
-        !checkJobOnlyTurn &&
         !hadExplicitReply &&
         sessionId &&
+        !isUnboundBgContinuation &&
         (isRemoteTurn || isLocalMirroredTurn || hadStreamedTrail)
       ) {
         let trail = { markdown: '', events: [] }
@@ -2076,7 +3136,11 @@ export async function handleMirrorTurn(
           try {
             trail = extractAntigravityTrailFromTranscript(
               fs.readFileSync(effectiveTranscriptPath, 'utf8'),
-              { sinceMs: marker?.startedAt ?? null, stopAtReply: false },
+              {
+                sinceMs: marker?.startedAt ?? null,
+                stopAtReply: false,
+                transcriptPath: effectiveTranscriptPath,
+              },
             )
           } catch {
             /* ignore */
@@ -2142,32 +3206,48 @@ export async function handleMirrorTurn(
       }
 
       if (connectionId) {
+        // A turn ended by the model provider's usage refusal keeps check jobs away from
+        // this agent until it lifts; the next turn that succeeds clears it
+        // (usage-refusal.mjs, `semantics.check_job.usage_refusal`).
+        const endedOn = parseTurnFailure(parsedHookInput)
+        recordTurnOutcome(
+          connectionId,
+          { refusedUntil: endedOn ? usageRefusedUntil(endedOn.text) : null, succeeded: !endedOn },
+          { dir: connectionsDir },
+        )
+        const heartbeatArgs = {
+          connection_id: connectionId,
+          agent_name: agentName,
+          status: 'live',
+          busy: false,
+          ...usageRefusalArgument(connectionId, { dir: connectionsDir }),
+        }
         await call({
           mcpUrl,
           token,
           name: 'heartbeat_connection',
-          arguments: {
-            connection_id: connectionId,
-            agent_name: agentName,
-            status: 'live',
-            busy: false,
-          },
+          arguments: heartbeatArgs,
         })
-        const localAttempt = localTurnToComplete(
-          state.local_turn || marker?.localTurn,
+        noteUsageRefusalSent(connectionId, heartbeatArgs, { dir: connectionsDir })
+        // Name the turn that ended (turn-completion.mjs, item 6ccb8be1), from the
+        // marker read before it was cleared above. By now the next command may already
+        // be delivered, and a completion that names nothing closes whatever is newest on
+        // the connection: that command, before the agent starts on it.
+        for (const identity of turnCompletionIdentities({
+          marker,
+          localTurn: state.local_turn,
           sessionId,
-        )
-        try {
-          await call({
-            mcpUrl,
-            token,
-            name: 'report_complete',
-            arguments: localAttempt
-              ? { connection_id: connectionId, attempt_id: localAttempt, reason: 'turn_end' }
-              : { connection_id: connectionId, reason: 'turn_end' },
-          })
-        } catch {
-          /* non-fatal — the poller's marker-driven backstop still runs */
+        })) {
+          try {
+            await call({
+              mcpUrl,
+              token,
+              name: 'report_complete',
+              arguments: { connection_id: connectionId, ...identity, reason: 'turn_end' },
+            })
+          } catch {
+            /* non-fatal — the poller's marker-driven backstop still runs */
+          }
         }
         if (state.local_turn) {
           patchOwnState(connectionId, { local_turn: null }, connectionsDir)
@@ -2175,9 +3255,14 @@ export async function handleMirrorTurn(
         }
         if (state.connection_capability) {
           try {
+            const hostBackgroundTasks = Array.isArray(parsedHookInput?.background_tasks)
+              ? parsedHookInput.background_tasks
+              : null
             const requests = readRequestState(connectionId, { dir: connectionsDir })
             if (requests.open.size > 0) {
-              const pending = requestsWithWorkPending(requests, { backgroundTasks: [] })
+              const pending = requestsWithWorkPending(requests, {
+                backgroundTasks: hostBackgroundTasks,
+              })
               const finished = [...requests.open.keys()].filter(
                 (id) => requests.started.has(id) && !pending.has(id),
               )
@@ -2192,7 +3277,7 @@ export async function handleMirrorTurn(
                 ),
               )
             }
-            for (const key of absentLaunches(requests, [])) {
+            for (const key of absentLaunches(requests, hostBackgroundTasks)) {
               appendRequestEvent(connectionId, { op: 'absent', key }, { dir: connectionsDir })
             }
             rotateRequestLog(connectionId, { dir: connectionsDir })

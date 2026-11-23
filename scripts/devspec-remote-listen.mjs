@@ -34,8 +34,15 @@ import {
   readHeldInboxRecords,
 } from './devspec-remote-wait.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
-import { isTurnMarkerActive, loadState, readTurnMarker, recordTurnWake } from './mirror-turn.mjs'
-import { noticeReplyInstruction } from './notice-reply.mjs'
+import { clearWakeDelivery, recordWakeDelivery } from './wake-delivery.mjs'
+import {
+  isForegroundTurnRunning,
+  isTurnMarkerActive,
+  loadState,
+  readTurnMarker,
+  recordTurnWake,
+} from './mirror-turn.mjs'
+import { noticeAudience, noticeReplyInstruction } from './notice-reply.mjs'
 import {
   ensurePollerForConnection,
   listenerInfoPath,
@@ -48,6 +55,7 @@ import {
 } from './remote-control-state.mjs'
 import { ensurePrivateDir, writePrivateText } from './private-state.mjs'
 import { recordDeliveredBatchRequests, setCurrentRequest, UNSTATED } from './requests.mjs'
+import { commandPickupIdentity, commandTurnsFromEntry } from './turn-completion.mjs'
 import { autoConnectAtStartup, connectAtStartupEnabled } from './session-start.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
@@ -445,8 +453,10 @@ export function buildWakeDeliveryMessage(entry, opts = {}) {
       const formatted = formatSystemNoticeContent(notice)
       if (formatted) bodyLines.push(formatted)
     }
-    // One reply can answer every notice this wake handed over.
-    if (notices.length > 1) bodyLines.push(noticeReplyInstruction(notices.map((n) => n.notice_id)))
+    // One reply can answer every notice this wake handed over that needs a person;
+    // one DevSpec labelled for the record is never replied to (notice-reply.mjs).
+    const replyIds = notices.filter((n) => noticeAudience(n) === 'needs_person').map((n) => n.notice_id)
+    if (replyIds.length > 1) bodyLines.push(noticeReplyInstruction(replyIds))
     const streamJson = formatInboxEntryForStream(entry, { ...streamOpts, includeContent: false })
     const topics = notices
       .map((n) => (n?.topic && n?.notice_type ? `${n.topic}/${n.notice_type}` : n?.kind || 'notice'))
@@ -835,8 +845,9 @@ function adoptPersistedQueue(queueState, live, { inboxPath, connectionId }) {
  *   to `devspec-remote-wait.mjs --pending` delivers each held record exactly once and
  *   never replays the commands delivered past it (item b68df72d).
  * - Once the active turn finishes, drains queued `check_job` / `canonical_system_notices`
- *   one follow-up turn at a time in arrival order, resetting `current` request to `null`
- *   and skipping `report_pickup` (check jobs and system notices are not server commands).
+ *   one follow-up turn at a time in arrival order, resetting `current` request to `null`.
+ *   None of them is reported as a pickup: only a room command is, by name (item
+ *   71ce988c); the poller's busy goes on being reported while the turn runs.
  */
 export async function processListenerInboxTick(
   queueState,
@@ -859,17 +870,51 @@ export async function processListenerInboxTick(
   adoptPersistedQueue(queueState, live, { inboxPath, connectionId })
 
   const isTurnBusy = () =>
-    isTurnMarkerActive(readTurnMarker(connectionId, connectionsDir), nowFn())
+    isForegroundTurnRunning(readTurnMarker(connectionId, connectionsDir), nowFn())
 
-  const deliverSingleRecord = async (rec, { queuedEntry }) => {
+  const deliverSingleRecord = async (rec, { queuedEntry, heldRecord = false }) => {
     const message = buildWakeDeliveryMessage(rec.entry, {
       connectionId,
       inboxFile: inboxPath,
     })
     if (!message) return { ok: true, skipped: true }
 
+    if (
+      heldRecord &&
+      rec?.entry?.type === CHECK_JOB_RECORD_TYPE &&
+      typeof rec.entry?.dispatch?.check_job_id === 'string' &&
+      rec.entry.dispatch.check_job_id &&
+      live?.token &&
+      live?.mcp_url
+    ) {
+      try {
+        const dispatchRes = await callMcp({
+          mcpUrl: live.mcp_url,
+          token: live.token,
+          ...(live.connection_capability
+            ? { connectionCapability: live.connection_capability }
+            : {}),
+          name: 'get_connection_dispatch',
+          arguments: {
+            connection_id: connectionId,
+            dispatch_id: rec.entry.dispatch.check_job_id,
+          },
+          timeoutMs: 5_000,
+        })
+        if (Array.isArray(dispatchRes?.dispatches) && dispatchRes.dispatches.length === 0) {
+          return { ok: true, skipped: true }
+        }
+      } catch {
+        /* non-fatal: deliver on transient network error */
+      }
+    }
+
     let deliveredVia = 'stdout'
     if (useAgentApi) {
+      // Before the hand-over, never after it: Antigravity starts the turn, and runs
+      // the recall hook, before it writes this message into the transcript the hook
+      // reads (wake-delivery.mjs).
+      recordWakeDelivery(connectionId, { conversationId, message }, connectionsDir, nowFn())
       const res = await deliver({
         conversationId,
         message,
@@ -877,6 +922,7 @@ export async function processListenerInboxTick(
         state: live,
       })
       if (!res?.ok) {
+        clearWakeDelivery(connectionId, connectionsDir)
         const error = String(res?.error || 'agentapi_failed')
         if (error !== queueState.lastDeliveryError) {
           writeStdout(
@@ -904,7 +950,12 @@ export async function processListenerInboxTick(
         )
         queueState.lastDeliveryError = null
       }
-      if (!queuedEntry && live?.token && live?.mcp_url) {
+      // A command names itself, so the pickup starts exactly the command this turn was
+      // given and never one that arrived behind it (commandPickupIdentity). A check job,
+      // notice or automation run starts no command, so it gets no pickup at all: one
+      // naming nothing starts whichever command is newest and waiting (item 71ce988c).
+      const startsCommand = commandPickupIdentity(commandTurnsFromEntry(rec.entry))
+      if (startsCommand.command_turn_id && live?.token && live?.mcp_url) {
         callMcp({
           mcpUrl: live.mcp_url,
           token: live.token,
@@ -912,7 +963,7 @@ export async function processListenerInboxTick(
             ? { connectionCapability: live.connection_capability }
             : {}),
           name: 'report_pickup',
-          arguments: { connection_id: connectionId },
+          arguments: { connection_id: connectionId, ...startsCommand },
           timeoutMs: 5_000,
         }).catch(() => {})
       }
@@ -950,7 +1001,7 @@ export async function processListenerInboxTick(
   let deliveryFailed = false
   while (queueState.heldRecords.length > 0 && !isTurnBusy()) {
     const rec = queueState.heldRecords[0]
-    const outcome = await deliverSingleRecord(rec, { queuedEntry: true })
+    const outcome = await deliverSingleRecord(rec, { queuedEntry: true, heldRecord: true })
     if (!outcome.ok) {
       deliveryFailed = true
       break

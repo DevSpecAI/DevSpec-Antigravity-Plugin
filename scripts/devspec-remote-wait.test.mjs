@@ -691,5 +691,64 @@ describe('canonical_system_notices delivery (server_notice & unlinked_commit_ite
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  it('delivers pr_ready_to_merge server_notice wakes with merge instructions for the cleared commit', () => {
+    const prNoticeId = '71000000-0000-4000-8000-000000000009'
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-pr-ready-notice-'))
+    const file = path.join(dir, `${CONNECTION}.inbox.jsonl`)
+    try {
+      const index = scanPersistedInboxRecords('')
+      const writeRecord = (_cid, rec) => {
+        fs.appendFileSync(file, JSON.stringify(rec) + '\n', { mode: 0o600 })
+        return true
+      }
+      const res = appendCanonicalInbox(CONNECTION, {
+        ...NOTICE_ENVELOPE,
+        envelope_id: '60000000-0000-4000-8000-000000000097',
+        system_notices: [
+          {
+            version: 1,
+            kind: 'server_notice',
+            notice_id: prNoticeId,
+            topic: 'pull_request_merge',
+            notice_type: 'pr_ready_to_merge',
+            audience: 'for_the_record',
+            summary: 'Pull request #42 is cleared to merge at commit abc1234567890',
+            prompt:
+              'DevSpec check and all GitHub checks have passed on pull request #42 (head SHA abc1234567890), and Merge when cleared is enabled, but the GitHub App installation cannot merge directly. Merge this cleared commit now using the owner GitHub credentials (`gh pr merge 42 --merge --match-head-commit abc1234567890`).',
+            contract_uri: 'devspec://product/remote-ingress-contract',
+            records: [
+              {
+                label: 'Pull request',
+                record_type: 'pull_request',
+                record_id: '83000000-0000-4000-8000-000000000001',
+                title: 'PR #42: Universal PR delivery',
+                text: 'DevSpecAI/DevSpec-Antigravity-Plugin#42 (head SHA abc1234567890)',
+                url: 'https://github.com/DevSpecAI/DevSpec-Antigravity-Plugin/pull/42',
+              },
+            ],
+            allowed_outcomes: ['merge_cleared_commit', 'leave_open'],
+            allowed_tools: ['get_pull_request'],
+          },
+        ],
+      }, index, {
+        sessionId: null,
+        channel: 'system_notice',
+        writeRecord,
+      })
+      assert.equal(res.ok, true)
+      assert.equal(res.appended, true)
+      const batches = parseInboxBatches(fs.readFileSync(file, 'utf8').trim().split('\n'), CONNECTION)
+      assert.equal(batches.length, 1)
+      const events = buildCanonicalSystemNoticeEvents(batches[0], { inboxFile: file })
+      assert.equal(events[0].type, 'system_notice')
+      assert.equal(events[0].kind, 'server_notice')
+      assert.equal(events[0].topic, 'pull_request_merge')
+      assert.equal(events[0].notice_type, 'pr_ready_to_merge')
+      assert.match(events[0].content, /gh pr merge 42 --merge --match-head-commit abc1234567890/)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
 })
 

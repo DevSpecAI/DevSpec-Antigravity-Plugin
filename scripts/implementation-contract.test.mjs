@@ -27,23 +27,18 @@ describe('MCP-served implementation contract', () => {
     })
   }
 
-  it('keeps mutation-boundary behavior inside honest Antigravity host-limitation notes', () => {
-    for (const relativePath of [
-      'skills/devspec-remote/SKILL.md',
-    ]) {
-      const source = read(relativePath)
-      const paragraphs = source.split(/\n\s*\n/)
-      const boundaryParagraphs = paragraphs.filter((paragraph) =>
-        paragraph.includes('mutation boundary'),
-      )
-      assert.equal(boundaryParagraphs.length, 1, relativePath)
-      assert.match(
-        source,
-        /(?:Antigravity host limitation|## Host limitation)[\s\S]{0,800}mutation boundary/i,
-      )
-      assert.match(boundaryParagraphs[0], /no verified blocking pre-tool hook/i)
-      assert.match(boundaryParagraphs[0], /explicit/i)
-      assert.match(boundaryParagraphs[0], /runtime authority|authoritative/i)
+  it('says honestly what the plugin enforces about the mutation boundary', () => {
+    const source = read('skills/devspec-remote/SKILL.md')
+    const boundaryParagraphs = source.split(/\n\s*\n/).filter((paragraph) => paragraph.includes('mutation boundary'))
+    assert.equal(boundaryParagraphs.length, 1)
+    assert.match(boundaryParagraphs[0], /explicit/i)
+    assert.match(boundaryParagraphs[0], /runtime authority|authoritative/i)
+    // The plugin registers a PreToolUse hook that can refuse a call, so the skill must
+    // not tell the agent there is none (it did until item cf356677).
+    const preToolUse = JSON.parse(read('hooks.json'))['devspec-remote-control-mirror'].PreToolUse ?? []
+    if (preToolUse.length > 0) {
+      assert.doesNotMatch(boundaryParagraphs[0], /no (?:verified )?(?:blocking )?pre-tool hook/i)
+      assert.match(boundaryParagraphs[0], /PreToolUse/)
     }
   })
 
@@ -93,7 +88,7 @@ describe('MCP-served implementation contract', () => {
       {
         type: 'command',
         command: 'node ./scripts/pre-invocation.mjs',
-        timeout: 10,
+        timeout: 12,
       },
     ])
   })
@@ -117,24 +112,39 @@ describe('MCP-served implementation contract', () => {
 // and skips without one, as the server tool-name check does.
 const CONTRACT_SOURCE = 'packages/core/src/mcp/implementation-contract.ts'
 const NAMING_SURFACES = [
-  'rules/AGENTS.md',
-  'skills/devspec-remote/SKILL.md',
-  'skills/devspec-remote-stop/SKILL.md',
+  ...fs.readdirSync(path.join(ROOT, 'rules')).filter((name) => name.endsWith('.md')).map((name) => `rules/${name}`),
+  ...fs.readdirSync(path.join(ROOT, 'skills')).map((skill) => `skills/${skill}/SKILL.md`),
   'scripts/commit-provenance.mjs',
   'scripts/devspec-remote-wait.mjs',
   'README.md',
 ]
 
-function servedContractNames(root) {
+/** A contract the server serves, read from its source in the devspecv2 checkout at `root`. */
+function servedContract(root, source, name) {
   const tsx = path.join(root, 'node_modules/.bin/tsx')
   assert.ok(fs.existsSync(tsx), `${root} has no node_modules/.bin/tsx; run npm ci there`)
-  const script = `import { IMPLEMENTATION_CONTRACT } from ${JSON.stringify(path.join(root, CONTRACT_SOURCE))}
-process.stdout.write(JSON.stringify(IMPLEMENTATION_CONTRACT))`
-  const contract = JSON.parse(execFileSync(tsx, ['--tsconfig=apps/web/tsconfig.json', '-e', script], {
+  const script = `import { ${name} } from ${JSON.stringify(path.join(root, source))}
+process.stdout.write(JSON.stringify(${name}))`
+  return JSON.parse(execFileSync(tsx, ['--tsconfig=apps/web/tsconfig.json', '-e', script], {
     cwd: root,
     encoding: 'utf8',
     maxBuffer: 16 * 1024 * 1024,
   }))
+}
+
+const INGRESS_SOURCE = 'packages/core/src/mcp/remote-ingress-contract.ts'
+
+/** Every rule, skill, script and the README this plugin ships, tests aside. */
+function shippedFiles() {
+  const under = (dir) =>
+    fs.readdirSync(path.join(ROOT, dir), { recursive: true, withFileTypes: true })
+      .filter((entry) => entry.isFile() && /\.(?:md|mjs|json)$/.test(entry.name) && !/\.test\.mjs$/.test(entry.name))
+      .map((entry) => path.relative(ROOT, path.join(entry.parentPath, entry.name)))
+  return ['README.md', ...under('rules'), ...under('skills'), ...under('scripts')]
+}
+
+function servedContractNames(root) {
+  const contract = servedContract(root, CONTRACT_SOURCE, 'IMPLEMENTATION_CONTRACT')
   const names = new Set()
   const walk = (value) => {
     if (Array.isArray(value)) value.forEach(walk)
@@ -171,5 +181,44 @@ describe('contract parts the plugin names', () => {
     for (const name of ['commit_provenance_contract', 'work_entry_contract']) assert.ok(used.has(name), `the scan did not find ${name}`)
     const missing = [...used].filter(([name]) => !served.has(name)).map(([name, files]) => `${name} (${[...files].join(', ')})`)
     assert.deepEqual(missing, [], `named here, but the served contract has no such part:\n  ${missing.join('\n  ')}`)
+  })
+
+  // The remote-ingress contract is pointed at by path (`semantics.notice_audience`,
+  // `semantics.check_job.helpers`), so the whole path must lead somewhere: the line
+  // that announces a check job sends the agent to read one before it takes the job
+  // (item 509154d4). Every file the plugin ships is read, tests aside.
+  it('and every semantics path it names leads somewhere in the served remote-ingress contract', (t) => {
+    const named = process.env.DEVSPEC_V2_ROOT?.trim()
+    const root = named ? path.resolve(named) : path.resolve(ROOT, '..', 'devspecv2')
+    if (!fs.existsSync(path.join(root, INGRESS_SOURCE))) {
+      if (named) assert.fail(`DEVSPEC_V2_ROOT names ${root}, which has no ${INGRESS_SOURCE}`)
+      t.skip('no devspecv2 checkout beside this repo')
+      return
+    }
+    const contract = servedContract(root, INGRESS_SOURCE, 'REMOTE_INGRESS_CONTRACT')
+    const used = new Map()
+    for (const file of shippedFiles()) {
+      for (const match of read(file).matchAll(/\bsemantics(?:\.[a-z_]+)+/g)) {
+        if (!used.has(match[0])) used.set(match[0], new Set())
+        used.get(match[0]).add(file)
+      }
+    }
+    // The check-job line, the rules and the skill all point here; a scan that misses
+    // any of them is broken, not clean.
+    const helpers = used.get('semantics.check_job.helpers') ?? new Set()
+    for (const file of ['scripts/check-job.mjs', 'rules/AGENTS.md', 'skills/devspec-remote/SKILL.md']) {
+      assert.ok(helpers.has(file), `the scan did not find semantics.check_job.helpers in ${file}`)
+    }
+    assert.ok(used.has('semantics.notice_audience'), 'the scan did not find semantics.notice_audience')
+    const missing = [...used]
+      .filter(([pointer]) => {
+        let node = contract
+        for (const key of pointer.split('.')) {
+          node = node && typeof node === 'object' && Object.hasOwn(node, key) ? node[key] : undefined
+        }
+        return node === undefined
+      })
+      .map(([pointer, files]) => `${pointer} (${[...files].join(', ')})`)
+    assert.deepEqual(missing, [], `named here, but the served remote-ingress contract ${contract.contract_version} has no such path:\n  ${missing.join('\n  ')}`)
   })
 })

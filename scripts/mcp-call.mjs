@@ -14,7 +14,9 @@
  * deliberate abort from a network failure. Omitting them keeps the original behaviour.
  */
 
+import { markLoginEnded } from './auth-store.mjs'
 import { pluginHeaders, versionedConnectionArguments } from './connection-version.mjs'
+import { envToken, refusedCredentialMessage } from './sign-in-messages.mjs'
 
 /** HTTP statuses that describe a transient condition, not a verdict on the request. */
 const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 502, 503, 504])
@@ -41,6 +43,7 @@ export function readServerFailure(status, bodyText) {
   const out = {
     status: Number.isInteger(status) ? status : null,
     serverCode: null,
+    serverMessage: null,
     retryable: null,
     credentialType: null,
   }
@@ -55,11 +58,30 @@ export function readServerFailure(status, bodyText) {
   }
   if (!body || typeof body !== 'object') return out
   if (typeof body.code === 'string') out.serverCode = body.code
+  if (typeof body.error === 'string' && body.error.trim()) out.serverMessage = body.error.trim()
   if (typeof body.retryable === 'boolean') out.retryable = body.retryable
   if (body.credential_type === 'api_token' || body.credential_type === 'connection_capability') {
     out.credentialType = body.credential_type
   }
   return out
+}
+
+/**
+ * DevSpec refused the credential itself. Say so in plain words, with how to sign in
+ * again, instead of a raw HTTP error. When the browser login was refused because the
+ * person disconnected Antigravity on the Agent setup page (`signed_out`), end it in
+ * the login file too, so every later use says so instead of failing quietly.
+ */
+async function refusedCredentialError({ mcpUrl, token, failure, text }) {
+  const source = envToken(process.env) === token ? 'env' : 'login'
+  if (source === 'login' && failure.serverCode === 'signed_out') {
+    await markLoginEnded(mcpUrl, token, 'signed_out').catch(() => false)
+  }
+  const err = new Error(
+    refusedCredentialMessage({ serverCode: failure.serverCode, serverMessage: failure.serverMessage, source }),
+  )
+  Object.assign(err, failure, { body: text, signInRefused: true })
+  return err
 }
 
 /**
@@ -125,8 +147,7 @@ export async function mcpRequest({
       // Every DevSpec request the plugin's own scripts make (poller, wait, listen,
       // connect, mirror-turn, plan/question bridges) goes through here, so this is
       // where they say which plugin they are. Antigravity's own MCP client sends the
-      // same header from the user's mcp_config.json, which host-mcp-header.mjs keeps
-      // current (item 7a01644a).
+      // same header from the plugin's bundled mcp_config.json (item 7a01644a).
       headers: {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
@@ -155,8 +176,12 @@ export async function mcpRequest({
 
   const text = await res.text()
   if (!res.ok) {
+    const failure = readServerFailure(res.status, text)
+    if (res.status === 401 && (failure.serverCode === 'signed_out' || failure.serverCode === 'invalid_api_token')) {
+      throw await refusedCredentialError({ mcpUrl, token, failure, text })
+    }
     const err = new Error(`MCP HTTP ${res.status}: ${bodyExcerpt(text)}`)
-    Object.assign(err, readServerFailure(res.status, text), { body: text })
+    Object.assign(err, failure, { body: text })
     throw err
   }
 

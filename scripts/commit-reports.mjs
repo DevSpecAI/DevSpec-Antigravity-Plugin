@@ -26,7 +26,7 @@ import { findProjectPin, gitRemoteOrigin } from './devspec-scope.mjs'
 import { isRetryableHttpFailure, mcpToolsCall } from './mcp-call.mjs'
 import { ensurePrivateDir, readPrivateJson, writePrivateJson } from './private-state.mjs'
 import { readStateFile } from './remote-control-state.mjs'
-import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { connectionCredential } from './resolve-mcp-auth.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const FULL_SHA = /^[0-9a-f]{40}$/
@@ -223,18 +223,14 @@ function classifyError(error) {
 
 async function sendOne(item, { home, call }) {
   const state = readStateFile(item.connection_id, connectionsDir(home))
-  let token = state?.token
-  let mcpUrl = state?.mcp_url
-  if (!token || !mcpUrl) {
-    try {
-      const auth = resolveDevspecMcpAuth(item.worktree || process.cwd())
-      token = token || auth.token
-      mcpUrl = mcpUrl || auth.mcp_url
-    } catch {
-      /* reported below */
-    }
+  let credential = null
+  try {
+    credential = connectionCredential(state ?? { cwd: item.worktree || process.cwd() })
+  } catch {
+    /* reported below */
   }
-  if (!token || !mcpUrl) return { outcome: 'retry', reason: 'no DevSpec key was available' }
+  if (!credential) return { outcome: 'retry', reason: 'no DevSpec key was available' }
+  const { token, mcpUrl } = credential
   try {
     const result = await call({
       mcpUrl,

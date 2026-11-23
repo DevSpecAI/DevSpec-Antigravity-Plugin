@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
+  isProjectIncidentsProjectionV1,
   normalizeRemoteIngressV1,
   renderAdvisoryContext,
   REMOTE_INGRESS_CONTRACT_VERSION,
@@ -14,7 +15,14 @@ import {
   REMOTE_INGRESS_SYSTEM_NOTICE_CONTRACT_VERSION,
   REMOTE_INGRESS_SYSTEM_NOTICE_POLICY_VERSION,
 } from './remote-ingress-v1.mjs'
-import { pushChannelUrl, remoteIngressNegotiationArguments } from './devspec-remote-poll.mjs'
+import {
+  appendCanonicalInbox,
+  pushChannelUrl,
+  remoteIngressNegotiationArguments,
+  roomChangesSince,
+  writeRoomState,
+} from './devspec-remote-poll.mjs'
+import { buildCanonicalCommandEvents, parseInboxBatches } from './devspec-remote-wait.mjs'
 
 const CONNECTION = '10000000-0000-4000-8000-000000000001'
 const OWNER = '20000000-0000-4000-8000-000000000002'
@@ -712,15 +720,15 @@ describe('strict 1.4 system notices', () => {
     assert.equal(result.envelope.system_notices[0].records.length, 2)
   })
 
-  // The channel version this plugin negotiates on the poll and the stream (2: the one
-  // that carries findings) is not the shape version inside each notice. DevSpec's
-  // version 2 adds kinds and changes none, so a server_notice on a version-2 channel
-  // still says `version: 1` and is read in full, labelled records and all (1fd34942,
-  // item 42a4a5f9).
-  it('reads a version-1 server_notice body delivered over the version-2 channel it asks for', () => {
-    assert.equal(remoteIngressNegotiationArguments().system_notice_version, 2)
-    assert.match(pushChannelUrl('https://devspec.test/api/mcp', CONNECTION), /[?&]system_notice_version=2(&|$)/)
-    const notice = serverNotice()
+  // The channel version this plugin negotiates on the poll and the stream (3: findings,
+  // each labelled) is not the shape version inside each notice. DevSpec's version 2 adds
+  // kinds and version 3 adds `audience` to every kind, so a server_notice on a version-3
+  // channel still says `version: 1` and is read in full, labelled records and all
+  // (1fd34942, items 42a4a5f9, a868f41f).
+  it('reads a version-1 server_notice body delivered over the version-3 channel it asks for', () => {
+    assert.equal(remoteIngressNegotiationArguments().system_notice_version, 3)
+    assert.match(pushChannelUrl('https://devspec.test/api/mcp', CONNECTION), /[?&]system_notice_version=3(&|$)/)
+    const notice = serverNotice({ audience: 'needs_person' })
     assert.equal(notice.version, 1)
     const result = normalizeRemoteIngressV1(noticed({
       commands: [],
@@ -734,11 +742,54 @@ describe('strict 1.4 system notices', () => {
     assert.deepEqual(result.envelope.system_notices[0].records.map((record) => record.label), notice.records.map((record) => record.label))
   })
 
+  it('accepts every notice kind with DevSpec\'s label, and one persisted before labels as before (item a868f41f)', () => {
+    const unlinked = {
+      version: 1,
+      kind: 'unlinked_commit_item_review',
+      notice_id: '73000000-0000-4000-8000-000000000003',
+      commit_sha: 'a'.repeat(40),
+      task_id: '83000000-0000-4000-8000-000000000003',
+      task_title: 'Sign in with a passkey',
+      branch: 'feat/passkeys',
+      contract_uri: 'devspec://product/remote-ingress-contract',
+      allowed_outcomes: ['correct_item', 'link_item', 'resolve_duplicate', 'dismiss_item', 'confirm_item_correct', 'defer_follow_up'],
+      allowed_tools: ['get_task', 'update_task', 'link_tasks', 'supersede_task'],
+    }
+    for (const notice of [
+      serverNotice({ audience: 'needs_person' }),
+      serverNotice({ audience: 'for_the_record' }),
+      serverNotice(),
+      { ...unlinked, audience: 'for_the_record' },
+      unlinked,
+    ]) {
+      const result = normalizeRemoteIngressV1(noticed({
+        commands: [],
+        command_message_ids: [],
+        wake: { kind: 'system_notice', active: true, reason_id: 'exact_connection_system_notice' },
+        system_notices: [notice],
+        window: metadata([], { policy_version: REMOTE_INGRESS_SYSTEM_NOTICE_POLICY_VERSION }),
+      }), CONNECTION)
+      assert.equal(result.ok, true, `${notice.kind}/${notice.audience ?? 'unlabelled'}`)
+      assert.deepEqual(result.envelope.system_notices, [notice])
+    }
+    for (const audience of ['someone', null, '', 'NEEDS_PERSON']) {
+      const result = normalizeRemoteIngressV1(noticed({
+        commands: [],
+        command_message_ids: [],
+        wake: { kind: 'system_notice', active: true, reason_id: 'exact_connection_system_notice' },
+        system_notices: [serverNotice({ audience })],
+        window: metadata([], { policy_version: REMOTE_INGRESS_SYSTEM_NOTICE_POLICY_VERSION }),
+      }), CONNECTION)
+      assert.equal(result.ok, false, `audience ${JSON.stringify(audience)}`)
+    }
+  })
+
   it('rejects malformed server_notice payloads (missing records, extra keys, bad contract_uri)', () => {
     for (const bad of [
       serverNotice({ records: [] }),
       serverNotice({ contract_uri: 'devspec://wrong' }),
       serverNotice({ extra: true }),
+      serverNotice({ audience: 'for_the_record', label: 'For the record' }),
       serverNotice({ records: [{ ...serverNotice().records[0], similarity: 0.91 }] }),
     ]) {
       const env = noticed({
@@ -750,5 +801,91 @@ describe('strict 1.4 system notices', () => {
       })
       assert.equal(normalizeRemoteIngressV1(env, CONNECTION).ok, false)
     }
+  })
+})
+
+describe('passive project_incidents projection (7115301e)', () => {
+  function sampleProjectIncidents() {
+    return {
+      version: 1,
+      authority: 'advisory_read_awareness',
+      recent_resolved_window_minutes: 60,
+      active: [
+        {
+          id: '91000000-0000-4000-8000-000000000001',
+          short_code: '91000000',
+          kind: 'checks_failing',
+          kind_label: 'Checks failing',
+          title: 'CI typecheck failing on staging',
+          summary: 'Shared type error in packages/core',
+          state: 'handled',
+          since: '2026-11-12T01:00:00.000Z',
+          last_seen_at: '2026-11-12T01:15:00.000Z',
+          status_line: 'Being handled by Antigravity · Gentle Urchin',
+          handler: {
+            kind: 'agent_connection',
+            label: 'Antigravity · Gentle Urchin',
+            user_id: null,
+            connection_id: CONNECTION,
+            run_id: null,
+            expires_at: '2026-11-12T01:45:00.000Z',
+          },
+          decision_prompt: null,
+          blocked_pull_request_count: 2,
+          blocked_task_count: 1,
+        },
+      ],
+      recently_resolved: [
+        {
+          id: '92000000-0000-4000-8000-000000000002',
+          short_code: '92000000',
+          kind: 'deploy_failed',
+          kind_label: 'Deployment failed',
+          title: 'Vercel production build failed',
+          state: 'cleared',
+          resolved_at: '2026-11-12T00:50:00.000Z',
+          resolution_kind: 'signal_cleared',
+          resolution_summary: 'Green deployment succeeded',
+        },
+      ],
+      truncated: { active_omitted: 0, resolved_omitted: 0 },
+      note: 'Background awareness only.',
+    }
+  }
+
+  it('validates canonical projections, writes .room.json, and emits passive wake awareness without waking on its own', () => {
+    const projection = sampleProjectIncidents()
+    assert.equal(isProjectIncidentsProjectionV1(projection), true)
+    assert.equal(isProjectIncidentsProjectionV1({ ...projection, active: [], recently_resolved: [] }), false)
+    assert.equal(isProjectIncidentsProjectionV1({ ...projection, authority: 'executable' }), false)
+
+    let writtenDoc = null
+    const pollRes = { session_id: TURN, ingress: envelope(), project_incidents: projection }
+    writeRoomState(CONNECTION, pollRes, {}, { write: (_path, doc) => { writtenDoc = doc } })
+    assert.equal(writtenDoc.sections.project_incidents, 'present')
+    assert.deepEqual(writtenDoc.project_incidents, projection)
+
+    const diff = roomChangesSince(pollRes, null, {})
+    assert.ok(diff.changed.includes('project_incidents'))
+
+    const lines = []
+    const index = { envelopeIds: new Set(), commandMessageIds: new Set(), controlIds: new Set(), systemNoticeIds: new Set() }
+    appendCanonicalInbox(CONNECTION, envelope(), index, {
+      sessionId: TURN,
+      channel: 'command',
+      projectIncidents: projection,
+      writeRecord: (_conn, rec) => {
+        lines.push(JSON.stringify(rec))
+        return true
+      },
+    })
+    const [batch] = parseInboxBatches(lines, CONNECTION)
+    const events = buildCanonicalCommandEvents(batch)
+    const incEvent = events.find((e) => e.type === 'project_incidents')
+    assert.ok(incEvent)
+    assert.equal(incEvent.advisory, true)
+    assert.equal(incEvent.executable, false)
+    assert.equal(incEvent.active[0].short_code, '91000000')
+    assert.equal(incEvent.recently_resolved[0].short_code, '92000000')
   })
 })

@@ -1,0 +1,50 @@
+---
+trigger: model_decision
+description: "Call shapes for DevSpec's memory (decision, convention, insight, risk), requirement, document and infrastructure-inventory tools. Read this before you call any of them: it stands in for their schema files."
+---
+
+# DevSpec tool shapes: knowledge
+
+Call these DevSpec tools directly (`ServerName: "devspec_devspec"` on `call_mcp_tool`) with the shapes below, without reading their `.json` schema files.
+
+- `?` marks an optional parameter. Ids that take a UUID or an 8-character short code say so; the rest need the full UUID.
+- Never pass what `PreToolUse` stamps: `connection_id`, `project_id`, `local_session_id`, `agent_name`, `request_ref` and `provenance_ref`.
+- Most tools also take `git_remote` (your `git remote get-url origin`) and `pinned_project_id` (from `.devspec/project.json`), which say which project when none is stamped. Pass them only when a result asks which project you mean.
+- Writes take `work_claim_ref`: pass the one `claim_work_item` returned on a write about that claimed task when you hold more than one claim.
+- When a result names a parameter these shapes do not show, read that tool's schema file before calling it again.
+- What to put in each field, when a record is worth writing at all, and what to do with an overlap preview: `devspec-records.md`.
+
+## Memories (`id` is a UUID or 8-character short code, never `memory_id`)
+
+- `get_memory`: `{ id, history_before?, history_limit?, evidence_before?, evidence_limit? }` (the `*_before` values are the `next_before` a previous read returned, for older pages)
+- `search_memories`: `{ query, type?: "decision"|"convention"|"insight"|"risk"|"all", include_superseded?: boolean, limit?, offset?, flagged?: boolean, signal_type?: "possibly_stale", requested_by?, request_origin?: "human_requested"|"agent_initiative"|"automatic"|"unattributed"|"nobody_asked"|"unrecorded"|"all" }` (`requested_by` takes `"me"` or a user UUID)
+- `record_memory`: `{ type: "decision"|"convention"|"insight"|"risk", title, body, summary?, ai_instructions?, state?: "in_discussion"|"decided", confidence?, tags?: string[], affected_files?: string[], delivering_task_id?, companion_links?: [{ id, note }], idempotency_key, preview_ack?, home_check_ack? }` (a fresh UUID `idempotency_key` every time; `confidence` is 0 to 1; `preview_ack` only after `preview_required`)
+- `supersede_memory`: `{ id, title, body, summary?, ai_instructions?, state?: "in_discussion"|"decided", confidence?, tags?: string[], affected_files?: string[], delivering_task_id?, companion_links?: [{ id, note }], expected_version?, idempotency_key?, preview_ack?, home_check_ack? }` (`title` and `body` are required even when unchanged; send `expected_version` and a fresh `idempotency_key`)
+- `update_memory`: `{ id, title?, body?, summary?, ai_instructions?, state?: "in_discussion"|"decided", confidence?, tags?: string[], affected_files?: string[], delivering_task_id?, note?, expected_version?, idempotency_key?, preview_ack?, home_check_ack? }` (send `expected_version` and a fresh `idempotency_key`)
+- `retract_memory`: `{ id, reason? }` (a memory that is no longer true and that nothing replaces)
+
+## Requirements (`id` is a UUID or 8-character short code; memory tools never return them)
+
+- `search_requirements`: `{ query?, include_superseded?: boolean, limit?, offset?, flagged?: boolean, signal_type?: "possibly_stale", requested_by?, request_origin?: "human_requested"|"agent_initiative"|"automatic"|"unattributed"|"nobody_asked"|"unrecorded"|"all" }`
+- `get_requirements`: `{ limit?, offset?, flagged?: boolean, signal_type?: "possibly_stale", requested_by?, request_origin?: "human_requested"|"agent_initiative"|"automatic"|"unattributed"|"nobody_asked"|"unrecorded"|"all" }`
+- `get_requirement`: `{ id, history_before?, history_limit?, evidence_before?, evidence_limit? }`
+- `record_requirement`: `{ title, body, summary?, ai_instructions?, confidence?, tags?: string[], affected_files?: string[], delivering_task_id?, companion_links?: [{ id, note }], idempotency_key, preview_ack?, home_check_ack? }` (only after the person agreed: `devspec-records.md`; a fresh UUID `idempotency_key`)
+- `supersede_requirement`: `{ id, title, body, summary?, ai_instructions?, confidence?, tags?: string[], affected_files?: string[], delivering_task_id?, companion_links?: [{ id, note }], expected_version?, idempotency_key?, preview_ack?, home_check_ack? }` (`title` and `body` are required even when unchanged)
+- `update_requirement`: `{ id, title?, summary?, body?, ai_instructions?, confidence?, tags?: string[], affected_files?: string[], delivering_task_id?, note?, expected_version?, idempotency_key?, preview_ack?, home_check_ack? }`
+- `retract_requirement`: `{ id, reason? }`
+
+## Documents (`id` is a UUID or 8-character short code, never `resource_id`; the kind is `resource_type`, never `type`)
+
+- `get_resource`: `{ id, start_line?, end_line?, search?, history_before?, history_limit? }` (`search` returns only matching lines, with context)
+- `search_resources`: `{ query?, scope?: "all"|"project"|"session", source?: "uploaded"|"ai_generated"|"all", limit?, offset?, requested_by?, request_origin?: "human_requested"|"agent_initiative"|"automatic"|"unattributed"|"nobody_asked"|"unrecorded"|"all" }`
+- `create_resource`: `{ title, resource_type: "guide"|"reference"|"runbook", body?, summary?, tags?: string[], delivering_task_id?, idempotency_key, preview_ack?, home_check_ack? }` (search documents first; a fresh UUID `idempotency_key`)
+- `update_resource`: `{ id, title?, summary?, tags?: string[], body_edits?: [{ op: "replace"|"append", find?, content }], body?, delivering_task_id?, expected_version?, idempotency_key?, preview_ack?, home_check_ack? }` (prefer `body_edits`; send `expected_version` and `idempotency_key`; a content edit returns a **new** `id` and retires the old one)
+- `supersede_resource`: `{ id, title, body, summary?, resource_type?: "guide"|"reference"|"runbook", tags?: string[], delivering_task_id?, expected_version?, idempotency_key?, preview_ack?, home_check_ack? }` (a rewritten successor to a standing document)
+
+## Infrastructure inventory (`id` is an entry's version id or 8-character short code)
+
+- `get_inventory`: `{ lifecycle?: "current"|"retired"|"replaced"|"all", environment?: "production"|"staging"|"preview"|"development", resource_type?: "web_app"|"website"|"api"|"mobile_app_listing"|"mobile_test_build"|"package"|"release"|"repository"|"database"|"server"|"hosting"|"dashboard"|"storage"|"observability"|"domain"|"service"|"dependency"|"other", delivered_only?: boolean, dependency_package?, dependency_ecosystem?, judgement?: "held_back"|"advisory_accepted", limit?, offset? }` (`dependency_package` with `lifecycle: "current"` lists the judgements that still stand about one dependency)
+- `get_inventory_entry`: `{ id, versions_limit?, versions_offset? }`
+- `record_inventory_entry`: `{ name, purpose, resource_type: "web_app"|"website"|"api"|"mobile_app_listing"|"mobile_test_build"|"package"|"release"|"repository"|"database"|"server"|"hosting"|"dashboard"|"storage"|"observability"|"domain"|"service"|"dependency"|"other", environments?: ["production"|"staging"|"preview"|"development"], provider?, location_kind?: "url"|"identifier", location?, host_group?, lifecycle?: "current"|"retired"|"replaced", replaced_by?, dependency?: { ecosystem, package, declared_in?, current_version, judgement: "held_back"|"advisory_accepted", held_version?, advisories?: string[], decided_by: "agent"|"person", decided_on?, accepted_until?, conditions: [{ kind: "other_dependency_version"|"newer_release"|"requirement_met"|"dependency_version_changes"|"advisory_severity_changes"|"advisory_range_changes"|"advisory_exploit_known"|"dependency_scope_changes", ecosystem?, package?, version?, than?, requirement?, advisory?, severity?: "low"|"medium"|"high"|"critical"|"unknown", affected_range?, scope?: "build_only"|"shipped", note? }] }, tags?: string[], companion_links?: [{ id, note }], idempotency_key, home_check_ack? }` (`location_kind` is required with `location`; `dependency` only with `resource_type: "dependency"`, and each condition sends the fields its `kind` names; a fresh UUID `idempotency_key`)
+- `revise_inventory_entry`: `{ id, expected_version, name?, purpose?, resource_type?: "web_app"|"website"|"api"|"mobile_app_listing"|"mobile_test_build"|"package"|"release"|"repository"|"database"|"server"|"hosting"|"dashboard"|"storage"|"observability"|"domain"|"service"|"dependency"|"other", environments?: ["production"|"staging"|"preview"|"development"], provider?, location_kind?: "url"|"identifier", location?, host_group?, lifecycle?: "current"|"retired"|"replaced", replaced_by?, dependency?: { ecosystem?, package?, declared_in?, current_version?, judgement?: "held_back"|"advisory_accepted", held_version?, advisories?: string[], decided_by?: "agent"|"person", decided_on?, accepted_until?, conditions?: [{ kind: "other_dependency_version"|"newer_release"|"requirement_met"|"dependency_version_changes"|"advisory_severity_changes"|"advisory_range_changes"|"advisory_exploit_known"|"dependency_scope_changes", ecosystem?, package?, version?, than?, requirement?, advisory?, severity?: "low"|"medium"|"high"|"critical"|"unknown", affected_range?, scope?: "build_only"|"shipped", note? }] }, tags?: string[], companion_links?: [{ id, note }], note?, idempotency_key?, preview_ack?, home_check_ack? }` (read the entry first and pass its version as `expected_version`; send only what changes, and `null` clears an optional field; `conditions` replaces the whole list; `replaced_by` is the replacing entry's stable id)
+- `retract_inventory_entry`: `{ id, expected_version, reason?, idempotency_key?, preview_ack? }` (only for an entry recorded by mistake; retire one that no longer stands with `revise_inventory_entry` instead)

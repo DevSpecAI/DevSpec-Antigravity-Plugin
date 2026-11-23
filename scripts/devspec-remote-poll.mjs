@@ -7,10 +7,10 @@
  *   + durable per-connection JSONL inbox (`.inbox.jsonl`) → `devspec-remote-wait.mjs` / `devspec-remote-listen.mjs`.
  *
  * Negotiates remote-ingress 1.6.0 (`ingress_version: 1`, `delegated_scope_version: 1`,
- * `active_plan_projection_version: 1`, `system_notice_version: 2`, `sender_style_version: 1`,
+ * `active_plan_projection_version: 1`, `system_notice_version: 3`, `sender_style_version: 1`,
  * `room_context_version: 1`, `session_polls_projection_version: 2`), `known_instruction_tiers_hash`,
  * `interaction_event_version: 1`, `question_dismissal_event_version: 1`, `command_offer_version: 1`,
- * and `check_job_version: 1` (check jobs beside automation runs in `dispatches[]`; check-job.mjs).
+ * and `check_job_version: 2` (check jobs beside automation runs in `dispatches[]`; check-job.mjs).
  * Authority: devspec://product/implementation-contract
  *
  * Usage:
@@ -84,6 +84,7 @@ import {
 } from './question-dismissal-events.mjs'
 import {
   isActiveSessionPlansProjectionV1,
+  isProjectIncidentsProjectionV1,
   isRemoteCommandProjectScope,
   isSessionActivityV1,
   isSessionEventsV1,
@@ -94,10 +95,11 @@ import {
   ROOM_CONTEXT_VERSION,
   SESSION_POLL_PROJECTION_VERSION_2,
 } from './remote-ingress-v1.mjs'
+import { mergeTurnWake, turnWakeFromEntry } from './notice-reply.mjs'
 import { openRequest } from './requests.mjs'
 import {
-  hostTokenFromEnv,
   resolveDevspecMcpAuth,
+  stateWithCurrentToken,
 } from './resolve-mcp-auth.mjs'
 import {
   applyIngressToStore,
@@ -118,22 +120,26 @@ import {
 import { readSessionTitle, sessionTitleReadDue } from './session-title.mjs'
 import { readConnectionTelemetry } from './statusline.mjs'
 import { isEntryPoint } from './entry-point.mjs'
+import { commandPickupIdentity, turnCompletionIdentities } from './turn-completion.mjs'
+import { noteUsageRefusalSent, usageRefusalArgument } from './usage-refusal.mjs'
 
 export const REMOTE_INGRESS_VERSION = 1
 export const DELEGATED_SCOPE_VERSION = 1
 export const ACTIVE_PLAN_PROJECTION_VERSION = 1
 /**
  * The notice CHANNEL version this poller negotiates, on `poll_connection` and on the
- * SSE stream: which notice kinds DevSpec may send, not the shape each notice carries.
- * 1 carries `unlinked_commit_item_review`; 2 also carries `server_notice` (confirmed
- * findings and pending-edit outcomes about this agent's own work). DevSpec sends a
- * `server_notice` only to a channel that asked for 2 and records the last version
- * asked for on the connection, so both negotiations ask for the same one, or the
- * Agents page shows "Not receiving findings" (1fd34942, item 42a4a5f9). Version 2
- * adds kinds and changes none: every notice still arrives as a `version: 1` body,
- * read by `isSystemNoticeV1` in remote-ingress-v1.mjs.
+ * SSE stream: which notice kinds DevSpec may send and what rides on each, not the
+ * shape version each notice carries. 1 carries `unlinked_commit_item_review`; 2 also
+ * carries `server_notice` (confirmed findings and pending-edit outcomes about this
+ * agent's own work). DevSpec sends a `server_notice` only to a channel that asked for
+ * 2 or later and records the last version asked for on the connection, so both
+ * negotiations ask for the same one, or the Agents page shows "Not receiving findings"
+ * (1fd34942, item 42a4a5f9). 3 adds `audience` to every notice (item a868f41f):
+ * DevSpec's label for whether it needs a person or is for the record, which decides
+ * whether anything is said in the room (notice-reply.mjs). Every notice still arrives
+ * as a `version: 1` body, read by `isSystemNoticeV1` in remote-ingress-v1.mjs.
  */
-export const SYSTEM_NOTICE_CHANNEL_VERSION = 2
+export const SYSTEM_NOTICE_CHANNEL_VERSION = 3
 export const SENDER_STYLE_VERSION = 1
 
 export { roomStatePath }
@@ -312,7 +318,7 @@ export function countUnconsumedCommands(connectionId, inboxOffset, dir = CONNECT
 const ATTENDED_CADENCE = { waitMs: 25_000, tier: 'attended', checkTier: 'responsive' }
 const IDLE_CADENCE = { waitMs: 30_000, tier: 'idle', checkTier: 'responsive' }
 const POLL_HTTP_GRACE_MS = 15_000
-const MAX_TURN_MS = 10 * 60 * 1000
+const MAX_TURN_MS = 60 * 60 * 1000
 
 function turnMarkerPath(connectionId, dir = CONNECTIONS_DIR) {
   return path.join(dir, `${connectionId}.turn`)
@@ -352,6 +358,7 @@ export function isNoWorkingAttemptRefusal(err) {
 
 export function isTurnMarkerActive(marker, now = Date.now(), maxTurnMs = MAX_TURN_MS) {
   if (!marker || typeof marker.startedAt !== 'number') return false
+  if (marker.held === true) return true
   const lastActiveAt = Math.max(
     marker.startedAt,
     typeof marker.lastToolAt === 'number' ? marker.lastToolAt : 0,
@@ -408,9 +415,10 @@ function readStateResult(connectionId, { dir = CONNECTIONS_DIR, legacyPath = LEG
   return legacy
 }
 
+/** The connection's state, with the current token of the browser login it was made with. */
 function readState(connectionId) {
   const result = readStateResult(connectionId)
-  return result.status === STATE_OK ? result.value : null
+  return result.status === STATE_OK ? stateWithCurrentToken(result.value) : null
 }
 
 export function patchConnectionState(connectionId, patch, paths = {}) {
@@ -654,6 +662,7 @@ export function appendCanonicalInbox(
     instructionContextFile = null,
     channel = 'context',
     questionHandoff = null,
+    projectIncidents = null,
     writeRecord = appendDurableRecord,
   } = {},
 ) {
@@ -714,6 +723,9 @@ export function appendCanonicalInbox(
     executeMessageIds.includes(questionHandoff.source_message_id)
       ? { question_handoff: questionHandoff }
       : {}),
+    ...(channel === 'command' && isProjectIncidentsProjectionV1(projectIncidents)
+      ? { project_incidents: projectIncidents }
+      : {}),
   }
   if (!writeRecord(connectionId, record)) return { ok: false, appended: false }
   index.envelopeIds.add(ingress.envelope_id)
@@ -743,6 +755,7 @@ export function appendWakeDispatches(
   index,
   sessionId,
   writeRecord = appendDurableRecord,
+  { projectIncidents = null } = {},
 ) {
   const validated = []
   for (const offered of Array.isArray(dispatches) ? dispatches : []) {
@@ -750,6 +763,7 @@ export function appendWakeDispatches(
     if (!parsed.ok) return { ok: false, appended: 0, error: parsed.error }
     validated.push(parsed.dispatch)
   }
+  const validIncidents = isProjectIncidentsProjectionV1(projectIncidents) ? projectIncidents : null
   let appended = 0
   const appendedByType = { automation_run: 0, [CHECK_JOB_RECORD_TYPE]: 0 }
   for (const dispatch of validated) {
@@ -762,6 +776,7 @@ export function appendWakeDispatches(
       received_at: new Date().toISOString(),
       dispatch_cursor: dispatchCursor,
       dispatch,
+      ...(type === 'automation_run' && validIncidents ? { project_incidents: validIncidents } : {}),
     }
     if (!writeRecord(connectionId, record)) {
       return { ok: false, appended, appendedByType, error: 'dispatch inbox persistence failed' }
@@ -869,6 +884,9 @@ export function roomChangesSince(res, activity, seen = {}) {
       ? JSON.stringify(res.still_to_discuss)
       : null,
     active_session_plans: isActiveSessionPlansProjectionV1(plans) ? JSON.stringify(plans) : null,
+    project_incidents: isProjectIncidentsProjectionV1(res?.project_incidents)
+      ? JSON.stringify(res.project_incidents)
+      : null,
     session_activity: activity
       ? JSON.stringify({ items: activity.items, events: activity.events.length })
       : null,
@@ -916,6 +934,19 @@ export function formatRoomStateJson(doc) {
           },
         }
       : {}),
+    ...(doc.project_incidents && typeof doc.project_incidents === 'object'
+      ? {
+          project_incidents: {
+            ...doc.project_incidents,
+            ...(Array.isArray(doc.project_incidents.active)
+              ? { active: markArray(doc.project_incidents.active) }
+              : {}),
+            ...(Array.isArray(doc.project_incidents.recently_resolved)
+              ? { recently_resolved: markArray(doc.project_incidents.recently_resolved) }
+              : {}),
+          },
+        }
+      : {}),
     ...(doc.session_activity && typeof doc.session_activity === 'object'
       ? {
           session_activity: {
@@ -957,6 +988,9 @@ export function writeRoomState(
   const plans = isActiveSessionPlansProjectionV1(ingress?.active_session_plans)
     ? ingress.active_session_plans
     : null
+  const incidents = isProjectIncidentsProjectionV1(res?.project_incidents)
+    ? res.project_incidents
+    : null
   const notices = Array.isArray(ingress?.system_notices) ? ingress.system_notices : null
   const body = {
     advisory: true,
@@ -969,6 +1003,7 @@ export function writeRoomState(
     session_polls: polls,
     still_to_discuss: discuss,
     active_session_plans: plans,
+    project_incidents: incidents,
     system_notices: notices ?? [],
     session_activity: activity,
     transcript,
@@ -976,6 +1011,7 @@ export function writeRoomState(
       session_polls: polls ? 'present' : 'none_or_unavailable',
       still_to_discuss: discuss ? 'present' : 'none_or_unavailable',
       active_session_plans: plans ? 'present' : ingress ? 'none' : 'not_sent',
+      project_incidents: incidents ? 'present' : 'none_or_unavailable',
       system_notices: notices === null ? 'not_sent' : notices.length > 0 ? 'present' : 'none',
       session_activity: activity ? (activity.list_readable ? 'present' : 'unavailable') : 'not_sent',
       transcript: transcript ? transcript.status : 'not_sent',
@@ -1064,6 +1100,191 @@ const ACTIVITY_VERB_TOOL = {
   complete: 'report_complete',
 }
 
+/**
+ * What the poller reports for the turn marker it sees now, given the turn it saw last
+ * (item 6ccb8be1). `seen` is the poller's memory of that turn: the marker's `startedAt`,
+ * which tells one turn from the next, and what its end closes
+ * (`turnCompletionIdentities`), read while the marker was still there.
+ *
+ * The end of a turn is reported with that remembered identity, never with what is on
+ * the connection by then: a long poll can return the next command before this loop
+ * looks at the marker again, and a completion that names nothing closes that command.
+ * When the marker on disk already belongs to a newer turn (the old one ended and the
+ * next began between two looks), the old turn is completed by its own identity and
+ * the new one is a pickup, never a keepalive of the old.
+ *
+ * Only a turn a room command started is picked up, and its pickup names that command
+ * (item cf356677); `keepsAlive` says this poller keeps that work alive until the turn
+ * ends. A turn no command started (a check job, an automation run, a notice, a prompt
+ * typed at the terminal) gets no pickup from here, because `report_pickup` naming
+ * nothing starts whichever command is newest and waiting (item 71ce988c), and no
+ * keepalive of the connection's own (createTurnActivityReporter). What busy and each
+ * activity call do is in their own tool descriptions and the served remote-ingress
+ * contract; the poll's busy goes on being reported for every turn, and a typed turn's
+ * exact pickup is the prompt hook's (local-turn.mjs).
+ *
+ * @param {{ startedAt: number, identities: object[], keepsAlive?: boolean, outlivedCommand?: boolean } | null} seen
+ * @param {object | null} marker the ACTIVE marker, or null when no turn is running
+ */
+export function planTurnActivity(seen, marker, { localTurn = null, sessionId = null } = {}) {
+  const sameTurn = Boolean(seen && marker && seen.startedAt === marker.startedAt)
+  // The command the turn was given, when one started it; empty otherwise.
+  const startedBy = commandPickupIdentity(marker?.commandTurns)
+  const current = marker
+    ? {
+        startedAt: marker.startedAt,
+        identities: turnCompletionIdentities({ marker, localTurn, sessionId }),
+        keepsAlive: sameTurn ? seen.keepsAlive === true : Boolean(startedBy.command_turn_id),
+        outlivedCommand: sameTurn && seen.outlivedCommand === true,
+      }
+    : null
+  const ended = () => {
+    // `outlivedCommand`: the turn's command was answered while the agent went on
+    // working (createTurnActivityReporter). Whatever activity carried that work has no
+    // source command, and naming only the command would leave it showing Working until
+    // its lease ran out.
+    const identities =
+      seen.outlivedCommand && !seen.identities.some((identity) => identity.command_turn_unbound)
+        ? [...seen.identities, { command_turn_unbound: true }]
+        : seen.identities
+    return { verb: 'complete', identities }
+  }
+  const steps = []
+  const begin = () => {
+    if (current.keepsAlive) steps.push({ verb: 'pickup', identity: startedBy })
+  }
+  if (seen && current && !sameTurn) {
+    steps.push(ended())
+    begin()
+  } else {
+    const verb = verbForTurnTransition(Boolean(seen), Boolean(current))
+    if (verb === 'complete') steps.push(ended())
+    else if (verb === 'pickup') begin()
+    else if (verb) steps.push({ verb })
+  }
+  return { steps, seen: current }
+}
+
+/**
+ * The poller's activity reports (`report_pickup` / `report_keepalive` /
+ * `report_complete`), driven by the turn marker. `observe` is called once per loop
+ * with the active marker (or null); it sends what `planTurnActivity` plans and keeps
+ * the memory of the turn between calls.
+ *
+ * While a directed-question continuation is held, its own exact reports stand in for
+ * these (interactionActivityPlan): a keepalive renews the continuation and the other
+ * two are not sent.
+ *
+ * Every pickup sent here names the command it starts (`command_turn_id` and
+ * `command_message_id`, items cf356677 and 71ce988c), once: a pickup that names
+ * nothing starts whichever command is newest and waiting, which can be one the agent
+ * has not been given. Only the work such a pickup started is kept alive from here
+ * (`keepsAlive`). A turn can outlive its command when the command's own answer closed
+ * it and the agent kept working, seen two ways: the server refuses a keepalive because
+ * nothing is working, or the marker is cleared here for that reason and written again
+ * by the next tool call for the same command. Either way nothing is picked up again
+ * and no further keepalive is sent for that turn; it is marked `outlivedCommand`, so
+ * its end also closes activity no command started (planTurnActivity).
+ *
+ * @param {object} deps
+ * @param {(request: { name: string, arguments: object }) => Promise<unknown>} deps.callTool
+ * @param {() => object | null} deps.readMarker the marker on disk, read fresh
+ * @param {() => void} deps.clearMarker
+ */
+export function createTurnActivityReporter({
+  connectionId,
+  callTool,
+  readMarker,
+  clearMarker,
+  getContinuation = () => null,
+  keepaliveContinuation = async () => {},
+  log = (line) => process.stderr.write(line),
+  now = () => Date.now(),
+}) {
+  let seen = null
+  // The commands of the turn this poller last reported a pickup for.
+  let pickedUp = []
+
+  const commandKey = (identity) =>
+    identity?.command_turn_id ? `${identity.command_turn_id}:${identity.command_message_id}` : null
+
+  function notePickup() {
+    if (seen) pickedUp = seen.identities.map(commandKey).filter(Boolean)
+  }
+
+  /** The turn goes on after its command was closed: nothing of its own is kept alive any more. */
+  function outliveCommand() {
+    if (!seen) return
+    seen.keepsAlive = false
+    seen.outlivedCommand = true
+  }
+
+  /** Whether the turn on disk is still running although nothing is working on the server. */
+  function turnStillRunning() {
+    const currentMarker = readMarker()
+    return (
+      hasPostReplyToolActivity(currentMarker, now()) ||
+      currentMarker?.held === true ||
+      currentMarker?.checkJobWake === true ||
+      (Array.isArray(currentMarker?.noticeIds) && currentMarker.noticeIds.length > 0) ||
+      (Array.isArray(currentMarker?.recordNoticeIds) && currentMarker.recordNoticeIds.length > 0) ||
+      (typeof currentMarker?.startedAt === 'number' && now() - currentMarker.startedAt <= 60_000)
+    )
+  }
+
+  async function send(verb, identity = {}) {
+    const name = ACTIVITY_VERB_TOOL[verb]
+    try {
+      await callTool({
+        name,
+        arguments: {
+          connection_id: connectionId,
+          ...identity,
+          ...(verb === 'complete' ? { reason: 'turn_marker_cleared' } : {}),
+        },
+      })
+      if (verb === 'pickup') notePickup()
+    } catch (e) {
+      log(`devspec-remote-poll: activity verb ${verb} (${name}) failed: ${e.message}\n`)
+      if (!isNoWorkingAttemptRefusal(e)) return
+      if (verb === 'keepalive' && turnStillRunning()) {
+        // The agent is still working, the command it was given is not. Nothing is
+        // picked up again: a pickup naming no command could start one that is waiting.
+        outliveCommand()
+        log('devspec-remote-poll: turn outlived its command — keeping the turn marker, no further keepalives\n')
+        return
+      }
+      clearMarker()
+      seen = null
+      log('devspec-remote-poll: server reports no working attempt — clearing the stale turn marker\n')
+    }
+  }
+
+  return {
+    async observe(marker, context = {}) {
+      const plan = planTurnActivity(seen, marker, context)
+      seen = plan.seen
+      for (const step of plan.steps) {
+        const exact = interactionActivityPlan({ verb: step.verb, continuation: getContinuation() })
+        if (exact.kind === 'suppress') continue
+        if (exact.kind === 'exact_keepalive') {
+          await keepaliveContinuation()
+          continue
+        }
+        if (step.verb === 'complete') {
+          for (const identity of step.identities) await send('complete', identity)
+        } else if (step.verb === 'pickup') {
+          // The same command again: its answer closed it, and its turn was written anew.
+          if (pickedUp.includes(commandKey(step.identity))) outliveCommand()
+          else await send('pickup', step.identity)
+        } else if (seen?.keepsAlive) {
+          await send(step.verb)
+        }
+      }
+    },
+  }
+}
+
 export function resolveServerAttachment(currentSessionId, hb) {
   if (!hb || typeof hb !== 'object' || hb.status === 'not_found') {
     return { sessionId: currentSessionId, changed: false }
@@ -1147,6 +1368,82 @@ export function buildPollConnectionArguments({
 
 export const PUSH_RECONNECT_BACKOFF_MS = [1_000, 4_000, 10_000]
 export const PUSH_HEALTHY_MS = 30_000
+export const PUSH_SAFETY_MS = 45_000
+export const PUSH_LOCAL_CHECK_MS = 1_000
+
+export function createPushGate({
+  safetyMs = PUSH_SAFETY_MS,
+  localCheckMs = PUSH_LOCAL_CHECK_MS,
+} = {}) {
+  let connected = false
+  let wakePending = false
+  let wakeWaiter = null
+
+  const notify = () => {
+    if (wakeWaiter) {
+      const fn = wakeWaiter
+      wakeWaiter = null
+      fn()
+    }
+  }
+
+  return {
+    isConnected: () => connected,
+    hasWakePending: () => wakePending,
+    onEvent(evt) {
+      if (!evt) return
+      if (evt.kind === 'hello') {
+        connected = true
+        return
+      }
+      if (
+        evt.kind === 'wake' ||
+        evt.kind === 'ended' ||
+        evt.kind === 'system_notice' ||
+        evt.kind === 'interaction_event' ||
+        evt.kind === 'question_dismissal_event'
+      ) {
+        wakePending = true
+        notify()
+      }
+    },
+    onDisconnect() {
+      connected = false
+      notify()
+    },
+    consumePollWaitMs(fallbackWaitMs) {
+      const waitMs = wakePending || connected ? 0 : fallbackWaitMs
+      wakePending = false
+      return waitMs
+    },
+    async waitIfIdle({ shouldWakeImmediately } = {}) {
+      if (!connected || wakePending) return
+      if (typeof shouldWakeImmediately === 'function' && shouldWakeImmediately()) return
+      await new Promise((resolve) => {
+        let settled = false
+        const finish = () => {
+          if (settled) return
+          settled = true
+          clearTimeout(safetyTimer)
+          clearInterval(localTimer)
+          if (wakeWaiter === finish) wakeWaiter = null
+          resolve()
+        }
+        wakeWaiter = finish
+        const safetyTimer = setTimeout(finish, safetyMs)
+        const localTimer = setInterval(() => {
+          if (!connected || wakePending) {
+            finish()
+            return
+          }
+          if (typeof shouldWakeImmediately === 'function' && shouldWakeImmediately()) {
+            finish()
+          }
+        }, localCheckMs)
+      })
+    },
+  }
+}
 
 export function nextPushReconnectDelayMs({ attempt, openedAtMs, nowMs = Date.now() }) {
   const effectiveAttempt =
@@ -1239,12 +1536,17 @@ export function parseSseFrame(block) {
   return null
 }
 
+/**
+ * `token` may be a function returning the current token: a reconnect after a browser
+ * login renewed then sends the renewed one.
+ */
 export function openPushChannel({
   mcpUrl,
   token,
   connectionId,
   connectionCapability = null,
   onEvent,
+  onDisconnect,
   onFallback,
   fetchImpl = fetch,
 }) {
@@ -1267,6 +1569,7 @@ export function openPushChannel({
 
   const scheduleReconnect = (openedAtMs, reason) => {
     if (closed) return
+    onDisconnect?.(reason)
     const { delayMs, nextAttempt } = nextPushReconnectDelayMs({ attempt, openedAtMs })
     attempt = nextAttempt
     if (delayMs === null) {
@@ -1287,7 +1590,7 @@ export function openPushChannel({
       const res = await fetchImpl(pushChannelUrl(mcpUrl, connectionId), {
         method: 'GET',
         headers: {
-          Authorization: `Bearer ${token}`,
+          Authorization: `Bearer ${typeof token === 'function' ? token() : token}`,
           Accept: 'text/event-stream',
           ...pluginHeaders(),
           ...(connectionCapability ? { 'x-devspec-connection-capability': connectionCapability } : {}),
@@ -1296,6 +1599,7 @@ export function openPushChannel({
       })
       const contentType = res.headers?.get?.('content-type') || ''
       if (!res.ok || !contentType.includes('text/event-stream') || !res.body) {
+        onDisconnect?.(`push_http_${res.status}`)
         onFallback?.(`push_http_${res.status}`)
         return
       }
@@ -1429,18 +1733,21 @@ async function main() {
     process.exit(1)
   }
 
+  // The token is re-read from the state at the top of every loop (readState gives
+  // the browser login's current one), so a login renewed while this poller runs is
+  // picked up, never a different identity.
   let token = state?.token || null
   let mcpUrl = state?.mcp_url || null
   if (!token) {
-    const auth = resolveDevspecMcpAuth(state?.cwd || process.cwd(), {
-      hostToken: hostTokenFromEnv(process.env),
-    })
-    token = auth.token
-    mcpUrl = mcpUrl || auth.mcp_url
+    const auth = resolveDevspecMcpAuth(state?.cwd || process.cwd())
+    if (auth.ok && (!mcpUrl || auth.mcp_url === mcpUrl)) {
+      token = auth.token
+      mcpUrl = auth.mcp_url
+    }
   }
   if (!token) {
     process.stderr.write(
-      'devspec-remote-poll: no token. Run remote-control-state.mjs write after connect, or set DEVSPEC_MCP_TOKEN.\n',
+      'devspec-remote-poll: no token. Run /devspec-remote again, or /devspec-login to sign in.\n',
     )
     process.exit(1)
   }
@@ -1479,7 +1786,9 @@ async function main() {
     agentStats = undefined,
   }) {
     const telemetry = agentStats !== undefined ? agentStats : readConnectionTelemetry(connectionId)
-    return mcpToolsCall({
+    // A usage refusal rides every live status update while it stands (usage-refusal.mjs).
+    const usageRefusal = status === 'live' ? usageRefusalArgument(connectionId, { dir: CONNECTIONS_DIR }) : {}
+    const result = await mcpToolsCall({
       mcpUrl,
       token,
       name: 'heartbeat_connection',
@@ -1491,9 +1800,12 @@ async function main() {
         ...(busy !== null ? { busy } : {}),
         ...(status === 'offline' && endReason ? { end_reason: endReason } : {}),
         ...(telemetry ? { agent_stats: telemetry } : {}),
+        ...usageRefusal,
       },
       timeoutMs: 5_000,
     })
+    noteUsageRefusalSent(connectionId, usageRefusal, { dir: CONNECTIONS_DIR })
+    return result
   }
 
   let interactionContinuation = null
@@ -1551,60 +1863,16 @@ async function main() {
     }
   }
 
-  let prevTurnActive = false
-
-  async function emitActivityVerb(verb) {
-    if (!verb) return
-    const plan = interactionActivityPlan({ verb, continuation: interactionContinuation })
-    if (plan.kind === 'suppress') return
-    if (plan.kind === 'exact_keepalive') {
-      await keepaliveInteractionContinuation()
-      return
-    }
-    const name = ACTIVITY_VERB_TOOL[verb]
-    if (!name) return
-    try {
-      await mcpToolsCall({
-        mcpUrl,
-        token,
-        name,
-        arguments: {
-          connection_id: connectionId,
-          ...(verb === 'complete' ? { reason: 'turn_marker_cleared' } : {}),
-        },
-        timeoutMs: 10_000,
-      })
-    } catch (e) {
-      process.stderr.write(`devspec-remote-poll: activity verb ${verb} (${name}) failed: ${e.message}\n`)
-      if (isNoWorkingAttemptRefusal(e)) {
-        const currentMarker = readTurnMarker(connectionId)
-        if (verb === 'keepalive' && hasPostReplyToolActivity(currentMarker)) {
-          try {
-            await mcpToolsCall({
-              mcpUrl,
-              token,
-              name: 'report_pickup',
-              arguments: { connection_id: connectionId },
-              timeoutMs: 10_000,
-            })
-            process.stderr.write(
-              'devspec-remote-poll: post-reply tool activity detected — re-opened working attempt via report_pickup\n',
-            )
-            return
-          } catch (pickupErr) {
-            process.stderr.write(
-              `devspec-remote-poll: continuation report_pickup failed: ${pickupErr.message}\n`,
-            )
-          }
-        }
-        clearTurnMarker(connectionId)
-        prevTurnActive = false
-        process.stderr.write(
-          'devspec-remote-poll: server reports no working attempt — clearing the stale turn marker\n',
-        )
-      }
-    }
-  }
+  const turnActivity = createTurnActivityReporter({
+    connectionId,
+    // `mcpUrl` and `token` are read at call time: the loop below refreshes the token.
+    callTool: ({ name, arguments: toolArguments }) =>
+      mcpToolsCall({ mcpUrl, token, name, arguments: toolArguments, timeoutMs: 10_000 }),
+    readMarker: () => readTurnMarker(connectionId),
+    clearMarker: () => clearTurnMarker(connectionId),
+    getContinuation: () => interactionContinuation,
+    keepaliveContinuation: keepaliveInteractionContinuation,
+  })
 
   let shuttingDown = false
   async function offlineAndExit(reason, code) {
@@ -1953,6 +2221,7 @@ async function main() {
         `devspec-remote-poll: ${nowStamp()} handing the question's turn to message ${handoff.source_message_id}\n`,
       )
     }
+    const usageRefusal = usageRefusalArgument(connectionId, { dir: CONNECTIONS_DIR })
     const response = await mcpToolsCall({
       mcpUrl,
       token,
@@ -1978,10 +2247,12 @@ async function main() {
         ...(listenerArmed !== null ? { listener_armed: listenerArmed } : {}),
         unread_commands: unreadCommands,
         ...(telemetry ? { agent_stats: telemetry } : {}),
+        ...usageRefusal,
       },
       timeoutMs: waitMs + POLL_HTTP_GRACE_MS,
       isAlive: () => !ownerAnchor || ownerAlive(ownerAnchor),
     })
+    noteUsageRefusalSent(connectionId, usageRefusal, { dir: CONNECTIONS_DIR })
     if (ack && pendingInteractionAck === ack) pendingInteractionAck = null
     if (controlAck && pendingControlAck === controlAck) pendingControlAck = null
     if (handoff && pendingCommandHandoff === handoff) pendingCommandHandoff = null
@@ -2144,6 +2415,9 @@ async function main() {
             source_message_id: sentCommandHandoff.ready.source_message_id,
           }
         : null,
+      projectIncidents: isProjectIncidentsProjectionV1(res?.project_incidents)
+        ? res.project_incidents
+        : null,
     })
     if (!persisted.ok) return { ok: false, delivered: false }
 
@@ -2186,7 +2460,19 @@ async function main() {
         }) + '\n',
       )
       if (shouldAssertTurnOnPollerInboxWrite(connectionId, readState(connectionId))) {
-        writeTurnMarker(connectionId, { remoteTurn: true, otherWake: true })
+        // With the command's own turn and message, so this turn's end can name what
+        // it closes (turn-completion.mjs, item 6ccb8be1).
+        writeTurnMarker(connectionId, {
+          remoteTurn: true,
+          ...mergeTurnWake(
+            readTurnMarker(connectionId),
+            turnWakeFromEntry({
+              type: 'canonical_commands',
+              ingress,
+              execute_message_ids: persisted.executeMessageIds,
+            }),
+          ),
+        })
       }
       patchState({ last_owner_wake_at: new Date().toISOString() })
       if (persisted.handedOff) {
@@ -2234,6 +2520,12 @@ async function main() {
       nextDispatchCursor,
       persistedInbox,
       sessionId,
+      appendDurableRecord,
+      {
+        projectIncidents: isProjectIncidentsProjectionV1(res?.project_incidents)
+          ? res.project_incidents
+          : null,
+      },
     )
     if (!persisted.ok) {
       process.stderr.write(`devspec-remote-poll: rejected dispatch batch (${persisted.error})\n`)
@@ -2293,24 +2585,26 @@ async function main() {
     process.exit(1)
   }
 
-  let sseWakePending = false
+  const pushGate = createPushGate()
   if (process.env.DEVSPEC_DISABLE_SSE !== '1') {
     openPushChannel({
       mcpUrl,
-      token,
+      token: () => token,
       connectionId,
       connectionCapability,
       onEvent: (evt) => {
-        if (evt.kind === 'wake') {
-          sseWakePending = true
-        } else if (evt.kind === 'ended') {
-          sseWakePending = true
+        pushGate.onEvent(evt)
+        if (evt.kind === 'ended') {
           if (evt.endReason && PERMANENT_END_REASONS.includes(evt.endReason)) {
             handlePermanentEnd(evt.endReason)
           }
         }
       },
+      onDisconnect: () => {
+        pushGate.onDisconnect()
+      },
       onFallback: (reason) => {
+        pushGate.onDisconnect()
         process.stderr.write(
           `devspec-remote-poll: SSE push unavailable (${reason}) — using poll_connection\n`,
         )
@@ -2321,10 +2615,33 @@ async function main() {
   let consecutiveEmpty = 0
   let consecutiveErrors = 0
   let consecutiveRecoverableEnds = 0
+  let lastLocalTurnKey = null
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
+    if (!needsSeed && !catchUpCursor && !pendingInteractionAck) {
+      await pushGate.waitIfIdle({
+        shouldWakeImmediately: () => {
+          const s = readState(connectionId)
+          if (s && s.enabled === false) return true
+          if (ownerAnchor && !ownerAlive(ownerAnchor)) return true
+          const m = readTurnMarker(connectionId)
+          if (isTurnMarkerActive(m) !== (lastBusySent === true)) return true
+          const localTurnKey = s?.local_turn ? JSON.stringify(s.local_turn) : null
+          if (localTurnKey !== lastLocalTurnKey) return true
+          const nextCont = activeContinuation(s?.interaction_continuation, {
+            connectionId,
+            sessionId,
+          })
+          if (Boolean(nextCont) !== Boolean(interactionContinuation)) return true
+          return false
+        },
+      })
+    }
+
     const liveState = readState(connectionId)
+    lastLocalTurnKey = liveState?.local_turn ? JSON.stringify(liveState.local_turn) : null
+    if (liveState?.token && liveState.mcp_url === mcpUrl) token = liveState.token
     if (liveState && liveState.enabled === false) {
       process.stderr.write('devspec-remote-poll: disabled — exiting\n')
       process.exit(1)
@@ -2373,9 +2690,10 @@ async function main() {
     if (turnActive) busyArg = true
     else if (lastBusySent === true) busyArg = false
 
-    const turnTransitionVerb = verbForTurnTransition(prevTurnActive, turnActive)
-    prevTurnActive = turnActive
-    await emitActivityVerb(turnTransitionVerb)
+    await turnActivity.observe(turnActive ? marker : null, {
+      localTurn: liveState?.local_turn ?? null,
+      sessionId,
+    })
 
     const tier = cadenceFor({ attached: !!sessionId, turnActive })
     if (tier.tier !== lastTier) {
@@ -2390,8 +2708,7 @@ async function main() {
 
     let res = null
     try {
-      const effectiveWaitMs = sseWakePending ? 0 : tier.waitMs
-      sseWakePending = false
+      const effectiveWaitMs = pushGate.consumePollWaitMs(tier.waitMs)
       res = await pollOnce({
         waitMs: effectiveWaitMs,
         busy: busyArg,

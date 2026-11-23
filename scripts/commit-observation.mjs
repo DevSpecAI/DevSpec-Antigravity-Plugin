@@ -25,6 +25,7 @@ import {
 } from './commit-provenance.mjs'
 import { findProjectPin, gitRemoteOrigin } from './devspec-scope.mjs'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
+import { credentialIdentity } from './resolve-mcp-auth.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
@@ -110,7 +111,8 @@ function connectionBinding(state) {
   return digest([
     state.connection_id,
     state.mcp_url,
-    state.token,
+    // A browser login's token changes about daily; the login it belongs to does not.
+    credentialIdentity(state),
     state.project_id ?? null,
     state.connection_capability ?? null,
   ])

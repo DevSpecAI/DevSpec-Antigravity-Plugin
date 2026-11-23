@@ -30,6 +30,8 @@ import {
   unansweredCommands,
   splitRoomWindow,
   PUSH_HEALTHY_MS,
+  PUSH_SAFETY_MS,
+  createPushGate,
   nextPushReconnectDelayMs,
   pushChannelUrl,
   parseSseFrame,
@@ -628,7 +630,7 @@ describe('SSE push channel (parseSseFrame, pushChannelUrl, nextPushReconnectDela
     const url = pushChannelUrl('https://api.devspec.ai/api/mcp/', ME)
     assert.equal(
       url,
-      'https://api.devspec.ai/api/mcp/connection-stream?connection_id=conn-mine-1111&system_notice_version=2&interaction_event_version=1&question_dismissal_event_version=1&check_job_version=1',
+      'https://api.devspec.ai/api/mcp/connection-stream?connection_id=conn-mine-1111&system_notice_version=3&interaction_event_version=1&question_dismissal_event_version=1&check_job_version=2',
     )
   })
 
@@ -684,6 +686,58 @@ describe('SSE push channel (parseSseFrame, pushChannelUrl, nextPushReconnectDela
     await new Promise((r) => setTimeout(r, 20))
     handle.close()
     assert.equal(fallbackReason, 'push_http_404')
+  })
+
+  it('sleeps locally on the open SSE push channel, wakes immediately on SSE frames or local turn changes, and falls back to held waitMs on disconnect (59afbe7e)', async () => {
+    assert.equal(PUSH_SAFETY_MS, 45_000)
+    const gate = createPushGate({ safetyMs: 80, localCheckMs: 10 })
+
+    // Before hello: not connected, waitIfIdle returns immediately, and poll uses fallback waitMs
+    assert.equal(gate.isConnected(), false)
+    assert.equal(gate.consumePollWaitMs(25_000), 25_000)
+
+    // After hello: connected, poll uses wait_ms: 0, and waitIfIdle sleeps up to safetyMs
+    gate.onEvent({ kind: 'hello' })
+    assert.equal(gate.isConnected(), true)
+    assert.equal(gate.consumePollWaitMs(25_000), 0)
+
+    const startSafety = Date.now()
+    await gate.waitIfIdle()
+    assert.ok(Date.now() - startSafety >= 55, 'waitIfIdle sleeps until safetyMs when quiet')
+    assert.equal(gate.consumePollWaitMs(25_000), 0)
+
+    // SSE wake/notice/interaction frames wake waitIfIdle immediately
+    for (const kind of ['wake', 'system_notice', 'interaction_event', 'question_dismissal_event']) {
+      const gateFrame = createPushGate({ safetyMs: 5_000, localCheckMs: 500 })
+      gateFrame.onEvent({ kind: 'hello' })
+      setTimeout(() => gateFrame.onEvent({ kind }), 15)
+      const t0 = Date.now()
+      await gateFrame.waitIfIdle()
+      assert.ok(Date.now() - t0 < 500, `SSE ${kind} frame wakes waitIfIdle immediately`)
+      assert.equal(gateFrame.consumePollWaitMs(25_000), 0)
+    }
+
+    // Local turn marker / state change wakes waitIfIdle on the localCheckMs tick
+    let localTurnChanged = false
+    const gateLocal = createPushGate({ safetyMs: 5_000, localCheckMs: 10 })
+    gateLocal.onEvent({ kind: 'hello' })
+    setTimeout(() => {
+      localTurnChanged = true
+    }, 15)
+    const tLocal = Date.now()
+    await gateLocal.waitIfIdle({ shouldWakeImmediately: () => localTurnChanged })
+    assert.ok(Date.now() - tLocal < 500, 'local state change wakes waitIfIdle immediately')
+    assert.equal(gateLocal.consumePollWaitMs(25_000), 0)
+
+    // Disconnect wakes waitIfIdle immediately and restores the held poll waitMs fallback
+    const gateDrop = createPushGate({ safetyMs: 5_000, localCheckMs: 500 })
+    gateDrop.onEvent({ kind: 'hello' })
+    setTimeout(() => gateDrop.onDisconnect(), 15)
+    const tDrop = Date.now()
+    await gateDrop.waitIfIdle()
+    assert.ok(Date.now() - tDrop < 500, 'disconnect wakes waitIfIdle immediately')
+    assert.equal(gateDrop.isConnected(), false)
+    assert.equal(gateDrop.consumePollWaitMs(25_000), 25_000)
   })
 })
 
@@ -964,11 +1018,11 @@ describe('Parity 3: room transcript, 4-tier instruction files, repository contex
         ingress_version: 1,
         delegated_scope_version: 1,
         active_plan_projection_version: 1,
-        system_notice_version: 2,
+        system_notice_version: 3,
         sender_style_version: 1,
         room_context_version: 1,
         session_polls_projection_version: 2,
-        check_job_version: 1,
+        check_job_version: 2,
       })
 
       const tiersPayload = {
@@ -1137,16 +1191,21 @@ describe('Parity 3: room transcript, 4-tier instruction files, repository contex
     assert.equal(res.session_id, '7069bedd-878d-4c5a-b52c-b5cfc1bcd544')
   })
 
-  it('keeps >10m turns active via lastToolAt and re-asserts .turn after an opening post_session_message acknowledgment', async () => {
+  it('keeps held turns active indefinitely without a clock cutoff, expires unheld dead-air turns at 60m, and keeps >10m turns active via lastToolAt', async () => {
     const now = 1_700_000_000_000
+    const fourHoursAgo = now - 4 * 60 * 60 * 1000
+    const ninetyMinsAgo = now - 90 * 60 * 1000
     const thirtyMinsAgo = now - 30 * 60 * 1000
     const fiveSecsAgo = now - 5_000
 
-    // Without lastToolAt, a 30-minute-old turn marker expires at MAX_TURN_MS (10m)
-    assert.equal(isTurnMarkerActive({ startedAt: thirtyMinsAgo }, now), false)
-    // With recent lastToolAt, the turn remains active even 30 minutes into the turn
+    // A held turn waiting on background work or a wait timer never expires on a clock
+    assert.equal(isTurnMarkerActive({ startedAt: fourHoursAgo, held: true }, now), true)
+    // Without lastToolAt, an unheld 90-minute-old turn marker expires at MAX_TURN_MS (60m)
+    assert.equal(isTurnMarkerActive({ startedAt: ninetyMinsAgo }, now), false)
+    // Within 60m or with recent lastToolAt, an unheld turn remains active
+    assert.equal(isTurnMarkerActive({ startedAt: thirtyMinsAgo }, now), true)
     assert.equal(
-      isTurnMarkerActive({ startedAt: thirtyMinsAgo, lastToolAt: fiveSecsAgo }, now),
+      isTurnMarkerActive({ startedAt: ninetyMinsAgo, lastToolAt: fiveSecsAgo }, now),
       true,
     )
 

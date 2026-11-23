@@ -287,8 +287,19 @@ function carriedBy(entry, state) {
 
 function senderKeys(text) {
   const out = []
-  for (const match of String(text || '').matchAll(/\bsender=([A-Za-z0-9_.:/-]{1,128})/g)) {
-    if (KEY.test(match[1]) && !out.includes(match[1])) out.push(match[1])
+  const s = String(text || '')
+  const push = (val) => {
+    if (val && KEY.test(val) && !out.includes(val)) out.push(val)
+  }
+  for (const match of s.matchAll(/\bsender=([A-Za-z0-9_.:/-]{1,128})/g)) {
+    push(match[1])
+  }
+  for (const match of s.matchAll(/\/brain\/([0-9a-f-]{36})\/\.system_generated\/tasks\/(task-\d+)\.log/gi)) {
+    push(`${match[1]}/${match[2]}`)
+    push(match[2])
+  }
+  for (const match of s.matchAll(/\b(?:Background command|Task id)\s+"([A-Za-z0-9_.:/-]{1,128})"/gi)) {
+    push(match[1])
   }
   return out
 }
@@ -590,8 +601,29 @@ export function startsBackgroundWork(toolName, toolInput) {
   }
 }
 
+export function extractBackgroundCommandTaskId(text) {
+  if (typeof text !== 'string' || !text) return null
+  if (/^Completed At:\s/m.test(text)) return null
+  const match =
+    text.match(/(?:background task ID|with task id)[:\s]+([A-Za-z0-9_.:/-]+)/i) ||
+    text.match(/(?:^|[\r\n\s"{,])TaskId[:\s"]+([A-Za-z0-9_.:/-]+)/)
+  return match?.[1] ?? null
+}
+
 export function launchForRequest(toolName, toolInput, toolResponse, toolUseId = null) {
-  const res = toolResponse && typeof toolResponse === 'object' ? toolResponse : null
+  const res =
+    typeof toolResponse === 'string'
+      ? (() => {
+          try {
+            const parsed = JSON.parse(toolResponse)
+            return parsed && typeof parsed === 'object' ? parsed : { raw: toolResponse }
+          } catch {
+            return { raw: toolResponse }
+          }
+        })()
+      : toolResponse && typeof toolResponse === 'object'
+        ? toolResponse
+        : null
   const input = toolInput && typeof toolInput === 'object' ? toolInput : {}
   const id = (value) => (typeof value === 'string' && KEY.test(value) ? value : null)
   const alias = id(toolUseId)
@@ -600,21 +632,51 @@ export function launchForRequest(toolName, toolInput, toolResponse, toolUseId = 
   switch (name) {
     case 'invoke_subagent': {
       const sub = Array.isArray(res.subagents) ? res.subagents[0] : res
-      const key = id(sub?.conversationId ?? sub?.conversation_id ?? res.agentId ?? res.taskId ?? toolUseId)
+      const outText =
+        typeof res.output === 'string'
+          ? res.output
+          : typeof res.raw === 'string'
+            ? res.raw
+            : JSON.stringify(res)
+      const convMatch = outText.match(/"conversationId"\s*:\s*"([^"]+)"/)
+      const key = id(
+        sub?.conversationId ??
+          sub?.conversation_id ??
+          res.agentId ??
+          res.taskId ??
+          convMatch?.[1] ??
+          toolUseId,
+      )
       return key ? { key, alias, kind: 'subagent', notifies: true } : null
     }
     case 'run_command': {
       if (isDevSpecListener(input)) return null
       const outText = typeof res.output === 'string' ? res.output : typeof res.raw === 'string' ? res.raw : ''
-      const textMatch =
-        outText.match(/(?:background task ID|with task id)[:\s]+([A-Za-z0-9_.:/-]+)/i) ||
-        outText.match(/TaskId[:\s"]+([A-Za-z0-9_.:/-]+)/i)
-      const key = id(res.taskId ?? res.task_id ?? res.backgroundTaskId ?? textMatch?.[1])
+      const extractedId = extractBackgroundCommandTaskId(outText)
+      const key = id(res.taskId ?? res.task_id ?? res.backgroundTaskId ?? extractedId)
       return key ? { key, alias, kind: 'shell', notifies: true } : null
     }
     case 'schedule': {
+      const dur = input.DurationSeconds ?? input.duration_seconds
+      const isOneShotTimer =
+        dur !== undefined &&
+        dur !== null &&
+        dur !== '' &&
+        Number.isFinite(Number(dur)) &&
+        Number(dur) > 0 &&
+        !input.CronExpression &&
+        !input.cron_expression &&
+        input.IsDaemon !== true &&
+        input.IsDaemon !== 'true'
+      const outText =
+        typeof res.output === 'string' ? res.output : typeof res.raw === 'string' ? res.raw : ''
+      const extractedId = extractBackgroundCommandTaskId(outText)
+      const key = id(res.taskId ?? res.task_id ?? res.backgroundTaskId ?? res.id ?? extractedId)
+      if (isOneShotTimer && key) {
+        return { key, alias, kind: 'timer', notifies: true }
+      }
       const prompt = String(input.Prompt ?? input.prompt ?? '').trim()
-      return prompt ? { schedule: true, prompt, id: id(res.taskId ?? res.id) } : null
+      return prompt ? { schedule: true, prompt, id: key } : null
     }
     case 'Bash': {
       const key = id(res.backgroundTaskId)

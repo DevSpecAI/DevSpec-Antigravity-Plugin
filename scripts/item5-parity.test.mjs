@@ -556,9 +556,8 @@ describe('Item 5 Parity: statusline.mjs rendering and telemetry', () => {
     assert.ok(recordStatuslineTelemetry(stdinPayload, { home, connectionId: CONN_ID }))
   })
 
-  it('auto-configures statusLine in settings.json and surfaces missing-auth notice in statusline and SessionStart', async () => {
+  it('auto-configures statusLine in settings.json and surfaces the background sign-in in statusline and SessionStart', async () => {
     const {
-      cleanupLegacyPluginMcpConfig,
       connectAtStartupEnabled,
       ensureStatusLineConfigured,
       runSessionStart,
@@ -566,21 +565,6 @@ describe('Item 5 Parity: statusline.mjs rendering and telemetry', () => {
     } = await import('./session-start.mjs')
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-agy-setup-'))
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-agy-cwd-'))
-
-    // 0. cleanupLegacyPluginMcpConfig removes leftover placeholder mcp_config.json
-    const fakePluginRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-agy-plugin-'))
-    const legacyMcp = path.join(fakePluginRoot, 'mcp_config.json')
-    fs.writeFileSync(
-      legacyMcp,
-      JSON.stringify({
-        mcpServers: {
-          devspec: { headers: { Authorization: 'Bearer dvs_YOUR_DEVSPEC_MCP_TOKEN' } },
-        },
-      }),
-    )
-    const cleaned = cleanupLegacyPluginMcpConfig({ pluginRoot: fakePluginRoot })
-    assert.equal(cleaned.removed, true)
-    assert.equal(fs.existsSync(legacyMcp), false)
 
     // 1. ensureStatusLineConfigured writes statusLine with stack_with_default: true when missing and preserves existing keys
     const settingsPath = path.join(home, '.gemini', 'antigravity-cli', 'settings.json')
@@ -620,17 +604,15 @@ describe('Item 5 Parity: statusline.mjs rendering and telemetry', () => {
       false,
     )
 
-    // 3. renderStatusLine shows not-configured notice when no dvs_ token exists
+    // 3. With no browser sign-in for the background features, the status bar says so and how to fix it
     const unconfiguredLine = renderStatusLine(
       JSON.stringify({ conversation_id: 'conv-missing-auth', cwd }),
       { home, env: {} },
     )
-    assert.equal(
-      unconfiguredLine,
-      'DevSpec: not configured — add dvs_ token to ~/.gemini/config/mcp_config.json',
-    )
+    assert.equal(unconfiguredLine, 'DevSpec: remote control not signed in (/devspec-login)')
 
-    // 4. runSessionStart returns deterministic missing-auth remediation context when unconfigured, and toProtoSessionStartResult strips hookSpecificOutput
+    // 4. SessionStart opens the one browser approval (as Antigravity) and has the person told, with the link
+    const opened = []
     const startOut = await runSessionStart(
       JSON.stringify({ conversation_id: 'conv-missing-auth', cwd }),
       {
@@ -639,17 +621,18 @@ describe('Item 5 Parity: statusline.mjs rendering and telemetry', () => {
         env: {},
         loadStateFn: () => null,
         reapPollersFn: () => [],
+        startSignInFn: (request) => {
+          opened.push(request)
+          return { status: 'started', url: 'https://clerk.example/oauth/authorize?client_id=Gmbtf7QgaoSw7WJ0' }
+        },
       },
     )
+    assert.equal(opened.length, 1)
+    assert.equal(opened[0].mcpUrl, 'https://api.devspec.ai/api/mcp')
     assert.ok(startOut?.hookSpecificOutput?.additionalContext)
-    assert.match(
-      startOut.hookSpecificOutput.additionalContext,
-      /DevSpec is not configured properly: .*~\/\.gemini\/config\/mcp_config\.json/,
-    )
-    assert.match(
-      startOut.hookSpecificOutput.additionalContext,
-      /report this message verbatim and do not guess or search for tokens/,
-    )
+    assert.match(startOut.hookSpecificOutput.additionalContext, /approve Antigravity on DevSpec's page in the browser tab that just opened/)
+    assert.match(startOut.hookSpecificOutput.additionalContext, /https:\/\/clerk\.example\/oauth\/authorize/)
+    assert.match(startOut.hookSpecificOutput.additionalContext, /never look for DevSpec tokens in files/)
     const protoStart = toProtoSessionStartResult(startOut)
     assert.deepEqual(Object.keys(protoStart), ['injectSteps'])
     assert.equal(protoStart.hookSpecificOutput, undefined)

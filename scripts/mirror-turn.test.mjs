@@ -28,6 +28,7 @@ import {
   launchedAntigravityBackgroundWork,
   handleMirrorTurn,
   recordOwnedLaunch,
+  recordTurnWake,
   writeTurnMarker,
   readTurnMarker,
   extractAntigravityTrailFromTranscript,
@@ -1016,6 +1017,533 @@ describe('Antigravity native hook payload & transcript handling', () => {
       writeTurnMarker(connId, { startedAt: startedAt + 50, remoteTurn: false, held: false }, connectionsDir)
       await runPostToolDispatch(hookPayload, { env: {}, home: tmpHome, call: mockCall })
       assert.equal(calls.filter((c) => c.name === 'post_session_message').length, 0)
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves notice, check-job, and background-task continuation turn context across tool calls without sending unbound room-command trails', async () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-nonchat-context-'))
+    try {
+      const connectionsDir = path.join(tmpHome, '.devspec', 'remote-control', 'connections')
+      const legacyPath = path.join(tmpHome, '.devspec', 'remote-control.json')
+      fs.mkdirSync(connectionsDir, { recursive: true })
+
+      const connId = '4b2db8bc-e182-4514-9087-442ced71f324'
+      const sessionId = '8a0e6bc5-dc53-49c8-a502-90fd02b7f764'
+      const convId = 'conv-nonchat-context'
+      const noticeId = 'c3c8c000-0000-4000-8000-000000000099'
+      const transcriptPath = path.join(
+        tmpHome,
+        '.gemini',
+        'antigravity-cli',
+        'brain',
+        convId,
+        '.system_generated',
+        'logs',
+        'transcript.jsonl',
+      )
+      fs.mkdirSync(path.dirname(transcriptPath), { recursive: true })
+
+      fs.writeFileSync(
+        path.join(connectionsDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          session_id: sessionId,
+          local_id: convId,
+          transcript_path: transcriptPath,
+          token: 'dvs_test_tok_fake1234',
+          mcp_url: 'https://api.devspec.ai/api/mcp',
+        }),
+      )
+
+      const t0 = Date.now()
+      fs.writeFileSync(
+        transcriptPath,
+        [
+          JSON.stringify({
+            step_index: 1,
+            type: 'USER_INPUT',
+            created_at: new Date(t0).toISOString(),
+            content: `<USER_REQUEST>\n[DevSpec Remote Wake]\n[DevSpec System Notice: ci_failure]\nTell the person with post_session_message and system_notice_ids: ["${noticeId}"]\n</USER_REQUEST>`,
+          }),
+          JSON.stringify({
+            step_index: 2,
+            type: 'PLANNER_RESPONSE',
+            created_at: new Date(t0 + 1000).toISOString(),
+            thinking: 'Inspecting broken PR checks.',
+            tool_calls: [
+              {
+                name: 'default_api:run_command',
+                args: { CommandLine: 'gh pr checks 1235', toolSummary: 'Check PR 1235 status' },
+              },
+            ],
+          }),
+          JSON.stringify({
+            step_index: 3,
+            type: 'GENERIC',
+            created_at: new Date(t0 + 1500).toISOString(),
+            content: `Tool is running as a background task with task id: ${convId}/task-2`,
+          }),
+        ].join('\n') + '\n',
+      )
+
+      const calls = []
+      const mockCall = async (req) => {
+        calls.push(req)
+        return { ok: true }
+      }
+
+      // 1. Even if .turn was missing when PostToolUse ran, inferTurnContextFromTranscript recovers noticeIds
+      //    and suppresses unbound trail streaming.
+      await runPostToolDispatch(
+        JSON.stringify({
+          conversationId: convId,
+          transcriptPath,
+          stepIdx: 2,
+          toolCall: {
+            name: 'run_command',
+            args: { CommandLine: 'gh pr checks 1235', WaitMsBeforeAsync: 500, toolSummary: 'Check PR 1235 status' },
+          },
+        }),
+        { env: {}, home: tmpHome, call: mockCall },
+      )
+      const markerAfterTool = readTurnMarker(connId, connectionsDir)
+      assert.deepEqual(markerAfterTool?.noticeIds, [noticeId])
+      assert.equal(
+        calls.filter((c) => c.name === 'post_session_message' && c.arguments?.phase === 'trail').length,
+        0,
+        'notice turn tool call must never stream an unbound room-command trail',
+      )
+
+      // 2. Stop holds .turn open because background task `${convId}/task-2` is in flight!
+      const stopHeld = await handleMirrorTurn(
+        'stop',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        { env: {}, connectionsDir, legacyPath, call: mockCall },
+      )
+      assert.equal(stopHeld.held, true)
+      assert.deepEqual(stopHeld.outstanding, [`${convId}/task-2`])
+      assert.equal(readTurnMarker(connId, connectionsDir)?.held, true)
+      assert.equal(
+        calls.filter((c) => c.name === 'report_complete').length,
+        0,
+        'Stop must not call report_complete while background task is still running',
+      )
+
+      // 3. Background task completes via <SYSTEM_MESSAGE> (even if its stdout mentions "type":"owner_message").
+      fs.appendFileSync(
+        transcriptPath,
+        [
+          JSON.stringify({
+            step_index: 4,
+            type: 'SYSTEM_MESSAGE',
+            created_at: new Date(t0 + 5000).toISOString(),
+            content: `<SYSTEM_MESSAGE>\n[SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated background-task event, not a message from the user.\nBackground command "task-2" (Check PR 1235 status) finished with exit code 0.\nOutput path: ${path.join(path.dirname(path.dirname(transcriptPath)), 'tasks', 'task-2.log')}\nFinal output:\n{"type":"owner_message","message_id":"00000000-0000-4000-8000-000000000001"}\n</SYSTEM_MESSAGE>`,
+          }),
+          JSON.stringify({
+            step_index: 5,
+            type: 'PLANNER_RESPONSE',
+            created_at: new Date(t0 + 6000).toISOString(),
+            thinking: 'Applying fix after background task finished.',
+            content: 'Fixed PR #1235 and verified CI passes.',
+            tool_calls: [
+              {
+                name: 'default_api:run_command',
+                args: { CommandLine: 'git status', toolSummary: 'Check git status' },
+              },
+            ],
+          }),
+        ].join('\n') + '\n',
+      )
+
+      await handleMirrorTurn(
+        'user_prompt',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        { env: {}, connectionsDir, legacyPath, call: mockCall },
+      )
+      const markerAfterWake = readTurnMarker(connId, connectionsDir)
+      assert.equal(markerAfterWake?.held, false)
+      assert.equal(markerAfterWake?.backgroundContinuation, true)
+      assert.deepEqual(markerAfterWake?.noticeIds, [noticeId])
+      assert.equal(
+        markerAfterWake?.otherWake,
+        undefined,
+        'background task stdout containing owner_message JSON must not set otherWake on a notice turn',
+      )
+
+      // 4. Tool call during the background-task continuation turn still preserves noticeIds and sends no trail
+      await runPostToolDispatch(
+        JSON.stringify({
+          conversationId: convId,
+          transcriptPath,
+          stepIdx: 5,
+          toolCall: {
+            name: 'run_command',
+            args: { CommandLine: 'git status', WaitMsBeforeAsync: 5000, toolSummary: 'Check git status' },
+          },
+        }),
+        { env: {}, home: tmpHome, call: mockCall },
+      )
+      assert.equal(
+        calls.filter((c) => c.name === 'post_session_message' && c.arguments?.phase === 'trail').length,
+        0,
+        'background continuation of notice turn must not stream an unbound room-command trail',
+      )
+
+      // 5. Final Stop reconciles the finished background task, ends the notice turn quietly without scraping terminal text, and completes the turn!
+      const stopFinal = await handleMirrorTurn(
+        'stop',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        { env: {}, connectionsDir, legacyPath, call: mockCall },
+      )
+      assert.equal(stopFinal.held, undefined)
+      assert.equal(stopFinal.busy, false)
+      assert.equal(readTurnMarker(connId, connectionsDir), null)
+      const postCalls = calls.filter((c) => c.name === 'post_session_message')
+      assert.equal(postCalls.length, 0, 'notice turn that finished without calling post_session_message must not scrape terminal text on Stop')
+      assert.equal(calls.filter((c) => c.name === 'report_complete').length, 1)
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
+    }
+  })
+
+  it('resolves human task titles for truncated create_task, claim_work_item, and record_implementation calls without falling back to branch names or UUIDs', () => {
+    const taskId = '5773f417-11d6-4665-a79b-df4137982d5d'
+    const taskTitle =
+      'Unify pending memory version view with one-click accept and connected conflict rulings'
+    const lines = [
+      JSON.stringify({
+        step_index: 10,
+        type: 'PLANNER_RESPONSE',
+        created_at: '2026-11-10T14:13:46Z',
+        truncated_fields: ['tool_calls'],
+        tool_calls: [
+          {
+            name: 'default_api:call_mcp_tool',
+            args: {
+              ServerName: '"devspec_devspec"',
+              ToolName: '"create_task"',
+              Arguments: '"{\\"description\\":\\"Long spec... [truncated]',
+            },
+          },
+        ],
+      }),
+      JSON.stringify({
+        step_index: 11,
+        type: 'GENERIC',
+        created_at: '2026-11-10T14:13:47Z',
+        content: JSON.stringify({
+          outcome: 'committed',
+          id: taskId,
+          title: taskTitle,
+        }),
+      }),
+      JSON.stringify({
+        step_index: 12,
+        type: 'PLANNER_RESPONSE',
+        created_at: '2026-11-10T14:20:13Z',
+        tool_calls: [
+          {
+            name: 'default_api:call_mcp_tool',
+            args: {
+              ServerName: '"devspec_devspec"',
+              ToolName: '"claim_work_item"',
+              Arguments: JSON.stringify(
+                JSON.stringify({
+                  agent_branch: 'feat/unify-pending-memory-view-5773f417',
+                  task_id: taskId,
+                }),
+              ),
+            },
+          },
+        ],
+      }),
+      JSON.stringify({
+        step_index: 13,
+        type: 'PLANNER_RESPONSE',
+        created_at: '2026-11-10T14:43:06Z',
+        truncated_fields: ['tool_calls'],
+        tool_calls: [
+          {
+            name: 'default_api:call_mcp_tool',
+            args: {
+              ServerName: '"devspec_devspec"',
+              ToolName: '"record_implementation"',
+              Arguments: `"{\\"task_id\\":\\"${taskId}\\",\\"completion_note\\":\\"Long note... [truncated]`,
+            },
+          },
+        ],
+      }),
+    ].join('\n')
+
+    const { events, markdown } = extractAntigravityTrailFromTranscript(lines, {
+      stopAtReply: false,
+    })
+    assert.equal(events.length, 3)
+    assert.deepEqual(
+      events.map((e) => ({ domain: e.domain, action: e.action, id: e.id, title: e.title })),
+      [
+        { domain: 'task', action: 'created', id: taskId, title: taskTitle },
+        { domain: 'task', action: 'claimed', id: taskId, title: taskTitle },
+        { domain: 'implementation', action: 'recorded', id: taskId, title: taskTitle },
+      ],
+    )
+    assert.ok(!markdown.includes('feat/unify-pending-memory-view-5773f417'))
+    assert.ok(markdown.includes(`\`create_task\` — \`${taskTitle}\``))
+    assert.ok(markdown.includes(`\`claim_work_item\` — \`${taskTitle}\``))
+    assert.ok(markdown.includes(`\`record_implementation\` — \`${taskTitle}\``))
+  })
+
+  it('does not mistake read_file outputs containing "parentTaskId" after an earlier run_command step for a background command launch', async () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-parent-task-id-'))
+    try {
+      const rcDir = path.join(tmpHome, '.devspec', 'remote-control')
+      const connectionsDir = path.join(rcDir, 'connections')
+      const legacyPath = path.join(rcDir, 'state.json')
+      fs.mkdirSync(connectionsDir, { recursive: true })
+
+      const connId = '11111111-2222-4333-8444-555555555555'
+      const convId = 'b9b9b9b9-b9b9-4b9b-8b9b-b9b9b9b9b9b9'
+      const msgId = 'd9d9d9d9-d9d9-4d9d-8d9d-d9d9d9d9d9d9'
+      const transcriptPath = path.join(
+        tmpHome,
+        '.gemini',
+        'antigravity-cli',
+        'brain',
+        convId,
+        '.system_generated',
+        'logs',
+        'transcript.jsonl',
+      )
+      fs.mkdirSync(path.dirname(transcriptPath), { recursive: true })
+
+      fs.writeFileSync(
+        path.join(connectionsDir, `${connId}.json`),
+        JSON.stringify({
+          connection_id: connId,
+          session_id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+          project_id: '24c4abaa-2cb9-496a-8492-cf1f1aa1090b',
+          local_id: convId,
+          agent_name: 'Antigravity',
+          enabled: true,
+          token: 'dvs_tok',
+          mcp_url: 'https://fixture.invalid/api/mcp',
+          connection_capability: 'cap_1',
+          transcript_path: transcriptPath,
+        }),
+      )
+      fs.writeFileSync(
+        path.join(rcDir, 'local-bonds.json'),
+        JSON.stringify({ bonds: { [`Antigravity:${convId}`]: { connection_id: connId } } }),
+      )
+
+      const t0 = Date.now()
+      recordTurnWake(
+        connId,
+        { type: 'canonical_commands', execute_message_ids: [msgId] },
+        connectionsDir,
+      )
+
+      // 1. Earlier PLANNER_RESPONSE ran a normal synchronous run_command, followed by a
+      //    PLANNER_RESPONSE that called read_file on a subagent log containing `"parentTaskId": "task-662"`.
+      fs.writeFileSync(
+        transcriptPath,
+        [
+          JSON.stringify({
+            step_index: 1,
+            type: 'USER_INPUT',
+            created_at: new Date(t0).toISOString(),
+            content: '<USER_REQUEST>Inspect the transcript</USER_REQUEST>',
+          }),
+          JSON.stringify({
+            step_index: 2,
+            type: 'PLANNER_RESPONSE',
+            created_at: new Date(t0 + 1000).toISOString(),
+            tool_calls: [
+              {
+                name: 'default_api:run_command',
+                args: { CommandLine: 'git status --short', toolSummary: 'Git status check' },
+              },
+            ],
+          }),
+          JSON.stringify({
+            step_index: 3,
+            type: 'GENERIC',
+            created_at: new Date(t0 + 1500).toISOString(),
+            content:
+              'Created At: 2026-11-11T10:00:00Z\nCompleted At: 2026-11-11T10:00:01Z\nCommand exited with code 0.',
+          }),
+          JSON.stringify({
+            step_index: 4,
+            type: 'PLANNER_RESPONSE',
+            created_at: new Date(t0 + 2000).toISOString(),
+            tool_calls: [
+              {
+                name: 'default_api:read_file',
+                args: { Path: '/tmp/subagent-transcript.jsonl' },
+              },
+            ],
+          }),
+          JSON.stringify({
+            step_index: 5,
+            type: 'GENERIC',
+            created_at: new Date(t0 + 2500).toISOString(),
+            content:
+              'Showing lines 1-5 of 5\n1: {"step_index":1,"parentTaskId":"task-662","TaskId":"should-not-match-on-read-file"}',
+          }),
+        ].join('\n') + '\n',
+      )
+
+      assert.equal(
+        launchedAntigravityBackgroundWork(
+          'run_command',
+          { CommandLine: 'cat file' },
+          { output: '{"parentTaskId":"task-662"}' },
+        ),
+        null,
+      )
+
+      const calls = []
+      const stopRes = await handleMirrorTurn(
+        'stop',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        {
+          env: {},
+          connectionsDir,
+          legacyPath,
+          call: async (req) => {
+            calls.push(req)
+            return { ok: true }
+          },
+        },
+      )
+
+      assert.notEqual(stopRes.held, true, 'Stop must not hold the turn open on read_file output')
+      assert.equal(readTurnMarker(connId, connectionsDir), null, '.turn marker must be cleared on Stop')
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
+    }
+  })
+
+  it('does not mark the connection busy during the /devspec:devspec-remote setup turn, then marks busy on a real prompt', async () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-remote-connect-spare-'))
+    try {
+      const connectionsDir = path.join(tmpHome, '.devspec', 'remote-control', 'connections')
+      const legacyPath = path.join(tmpHome, '.devspec', 'remote-control.json')
+      fs.mkdirSync(connectionsDir, { recursive: true })
+      const connId = '63752d51-2af6-46a5-8436-5181a5718571'
+      const convId = 'a7702ea3-eccc-471a-abb0-ff4268edeb41'
+      const transcriptPath = path.join(tmpHome, 'transcript.jsonl')
+
+      // Step 0: user invokes /devspec:devspec-remote; Step 1: model runs devspec-remote-connect.mjs;
+      // Step 2: run_command output after connection state is registered.
+      const steps = [
+        {
+          step_index: 0,
+          source: 'USER_EXPLICIT',
+          type: 'USER_INPUT',
+          status: 'DONE',
+          created_at: new Date(Date.now() - 5000).toISOString(),
+          content: '<USER_REQUEST>\n/devspec:devspec-remote\n</USER_REQUEST>\n<ADDITIONAL_METADATA>...</ADDITIONAL_METADATA>',
+        },
+        {
+          step_index: 1,
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: new Date(Date.now() - 4000).toISOString(),
+          tool_calls: [{ name: 'run_command', args: { CommandLine: 'node devspec-remote-connect.mjs --owner-pid $PPID' } }],
+        },
+        {
+          step_index: 2,
+          source: 'SYSTEM',
+          type: 'GENERIC',
+          status: 'DONE',
+          created_at: new Date(Date.now() - 1000).toISOString(),
+          content: '━━━ DevSpec Remote Control ━━━\nStatus: registered\nwake: ALREADY ARMED',
+        },
+      ]
+      fs.writeFileSync(transcriptPath, steps.map((s) => JSON.stringify(s)).join('\n') + '\n')
+
+      // State file written during Step 2 (sessionless spare connection)
+      fs.writeFileSync(
+        path.join(connectionsDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          session_id: null,
+          agent_name: 'Antigravity',
+          local_id: convId,
+          transcript_path: transcriptPath,
+          mcp_url: 'https://example.invalid/api/mcp',
+          token: 'test-token',
+          connection_capability: 'dvsc_test',
+        }),
+      )
+
+      const calls = []
+      const preStep3 = await handleMirrorTurn(
+        'user_prompt',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        {
+          env: {},
+          connectionsDir,
+          legacyPath,
+          call: async (req) => {
+            calls.push(req)
+            return { ok: true }
+          },
+        },
+      )
+      assert.equal(preStep3.skipped, 'remote_control_command')
+      assert.equal(readTurnMarker(connId, connectionsDir), null)
+      assert.equal(calls.length, 0)
+
+      const stopStep3 = await handleMirrorTurn(
+        'stop',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        {
+          env: {},
+          connectionsDir,
+          legacyPath,
+          call: async (req) => {
+            calls.push(req)
+            return { ok: true }
+          },
+        },
+      )
+      assert.equal(stopStep3.skipped, 'remote_control_command')
+      assert.equal(calls.length, 0)
+
+      // Now the user types a real prompt in Step 4: it must mark the connection busy.
+      steps.push({
+        step_index: 4,
+        source: 'USER_EXPLICIT',
+        type: 'USER_INPUT',
+        status: 'DONE',
+        created_at: new Date().toISOString(),
+        content: '<USER_REQUEST>\nHello from terminal\n</USER_REQUEST>',
+      })
+      fs.writeFileSync(transcriptPath, steps.map((s) => JSON.stringify(s)).join('\n') + '\n')
+
+      const preStep4 = await handleMirrorTurn(
+        'user_prompt',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        {
+          env: {},
+          connectionsDir,
+          legacyPath,
+          call: async (req) => {
+            calls.push(req)
+            return { ok: true }
+          },
+        },
+      )
+      assert.equal(preStep4.busy, true)
+      assert.notEqual(readTurnMarker(connId, connectionsDir), null)
+      assert.equal(calls.some((c) => c.name === 'heartbeat_connection' && c.arguments.busy === true), true)
     } finally {
       fs.rmSync(tmpHome, { recursive: true, force: true })
     }

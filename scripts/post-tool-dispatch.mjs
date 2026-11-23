@@ -3,7 +3,9 @@
  * Antigravity PostToolUse dispatcher (`scripts/post-tool-dispatch.mjs`).
  *
  * Routes PostToolUse events by `tool_name` in-process:
- * 1. `mcp_devspec_post_session_message` → marks explicit reply (`explicitReplyMarkerPath`)
+ * 1. `mcp_devspec_post_session_message` → marks explicit reply (`explicitReplyMarkerPath`);
+ *    any other DevSpec tool whose result carries DevSpec's `tell_person` mark → notes it
+ *    on the turn (`recordTellPerson`), so a routine turn still tells the person.
  * 2. `invoke_subagent`, `run_command`, `schedule` → records background work launches
  *    against both the open turn (`recordBackgroundLaunch` in `mirror-turn.mjs`) and
  *    the request chain (`<connectionId>.requests.jsonl` via `requests.mjs`).
@@ -17,18 +19,24 @@ import path from 'node:path'
 import { handleBashPost } from './commit-observation.mjs'
 import { handlePost, stagePendingNudge } from './commit-provenance.mjs'
 import { reportObservedCommits } from './commit-reports.mjs'
+import { unwrapDevspecToolCall } from './devspec-tool-input.mjs'
 import { withoutObserverPrefix } from './git-observer.mjs'
 import { resolveOwnConnectionId } from './launch-guard.mjs'
 import {
-  currentTurnNoticeIds,
+  currentTurnStampNoticeIds,
   explicitReplyMarkerPath,
+  inferTurnContextFromTranscript,
   isNoticeReplyToolCall,
   isRemotePlumbingToolCall,
   isSessionReplyToolCall,
   loadState,
   parseTranscriptPath,
+  readOwnedLines,
   readTurnMarker,
   recordBackgroundLaunch,
+  recordOwnedEnd,
+  recordTellPerson,
+  resolveAntigravityToolResponse,
   resolveHookConversationId,
   streamTurnTrailIfChanged,
   syncStateTranscriptPath,
@@ -41,7 +49,10 @@ import {
   launchForRequest,
   readRequestState,
   requestForLaunch,
+  setCurrentRequest,
+  UNSTATED,
 } from './requests.mjs'
+import { resultCarriesTellPerson } from './notice-reply.mjs'
 import { postToolNotice } from './room-unread.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
@@ -118,8 +129,22 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
   const noticeReply =
     connectionId &&
     isNoticeReplyToolCall(toolName, toolInput, {
-      turnNotices: currentTurnNoticeIds(connectionId, { dir: connectionsDir, connectionState: state }),
+      turnNotices: currentTurnStampNoticeIds(connectionId, { dir: connectionsDir, connectionState: state }),
     })
+  // A DevSpec write that changed someone else's record says so on its result
+  // (`tell_person`, item a868f41f). Noted on the turn, so Stop's silence for a routine
+  // turn gives way and PreToolUse leaves the model's own post to the person unstamped.
+  if (
+    connectionId &&
+    unwrapDevspecToolCall(toolName, toolInput).verb &&
+    resultCarriesTellPerson(toolResponse)
+  ) {
+    try {
+      recordTellPerson(connectionId, connectionsDir)
+    } catch {
+      /* non-fatal */
+    }
+  }
   if (connectionId && !noticeReply && isSessionReplyToolCall(toolName, toolInput)) {
     try {
       const p = explicitReplyMarkerPath(connectionId, connectionsDir)
@@ -138,15 +163,39 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
   } else if (connectionId && !isRemotePlumbingToolCall(toolName, toolInput)) {
     try {
       const existingMarker = readTurnMarker(connectionId, connectionsDir)
-      writeTurnMarker(
-        connectionId,
-        {
-          ...(existingMarker ? {} : { remoteTurn: Boolean(state?.session_id) }),
-          lastToolAt: now,
-          preserveExplicitReply: true,
-        },
-        connectionsDir,
-      )
+      const effectiveTranscriptPath = parseTranscriptPath(raw) || state?.transcript_path || null
+      const inferred = existingMarker
+        ? null
+        : inferTurnContextFromTranscript(effectiveTranscriptPath)
+      if (!existingMarker && inferred?.remoteControlCommand) {
+        // Never open a .turn marker inside the /devspec-remote setup turn itself.
+      } else {
+        if (
+          !existingMarker &&
+          inferred &&
+          (inferred.checkJobWake ||
+            inferred.noticeIds?.length ||
+            inferred.recordNoticeIds?.length) &&
+          !inferred.otherWake &&
+          !inferred.localPromptMirrored &&
+          !state?.local_turn
+        ) {
+          try {
+            setCurrentRequest(connectionId, UNSTATED, { dir: connectionsDir })
+          } catch {
+            /* non-fatal */
+          }
+        }
+        writeTurnMarker(
+          connectionId,
+          {
+            ...(existingMarker ? {} : inferred || { remoteTurn: Boolean(state?.session_id) }),
+            lastToolAt: now,
+            preserveExplicitReply: true,
+          },
+          connectionsDir,
+        )
+      }
     } catch {
       /* ignore */
     }
@@ -185,6 +234,42 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
     }
   }
 
+  if (bareToolName === 'manage_task' && connectionId) {
+    const action = String(toolInput?.Action ?? toolInput?.action ?? '').toLowerCase()
+    const rawKilledId = String(toolInput?.TaskId ?? toolInput?.taskId ?? '').trim()
+    if (action === 'kill' && rawKilledId) {
+      try {
+        const marker = readTurnMarker(connectionId, connectionsDir)
+        if (marker) {
+          for (const entry of readOwnedLines(connectionId, marker, connectionsDir)) {
+            if (
+              typeof entry.ended !== 'string' &&
+              (entry.id === rawKilledId || entry.id.endsWith(`/${rawKilledId}`))
+            ) {
+              recordOwnedEnd(connectionId, entry.id, { status: 'killed', dir: connectionsDir })
+            }
+          }
+        }
+        const reqState = readRequestState(connectionId, { dir: connectionsDir })
+        for (const launch of new Set(reqState.launches.values())) {
+          if (
+            launch.notifies &&
+            !launch.notified &&
+            (launch.key === rawKilledId || launch.key.endsWith(`/${rawKilledId}`))
+          ) {
+            appendRequestEvent(
+              connectionId,
+              { op: 'notified', key: launch.key },
+              { dir: connectionsDir },
+            )
+          }
+        }
+      } catch {
+        /* non-fatal */
+      }
+    }
+  }
+
   if (
     bareToolName === 'invoke_subagent' ||
     bareToolName === 'run_command' ||
@@ -192,8 +277,24 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
     bareToolName === 'Bash' ||
     bareToolName === 'Agent'
   ) {
+    const effectiveTranscriptPath = parseTranscriptPath(raw) || state?.transcript_path || null
+    const effectiveToolResponse =
+      toolResponse ??
+      resolveAntigravityToolResponse(payload, {
+        transcriptPath: effectiveTranscriptPath,
+        conversationId: conversationId || state?.local_id || null,
+      })
     try {
-      recordBackgroundLaunch(typeof raw === 'string' ? raw : JSON.stringify(payload))
+      recordBackgroundLaunch(typeof raw === 'string' ? raw : JSON.stringify(payload), {
+        load: (id) =>
+          loadState(id, {
+            connectionsDir,
+            legacyPath: path.join(home, '.devspec', 'remote-control.json'),
+          }),
+        dir: connectionsDir,
+        transcriptPath: effectiveTranscriptPath,
+        env,
+      })
     } catch {
       /* non-fatal */
     }
@@ -204,7 +305,7 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
         const launch = launchForRequest(
           bareToolName,
           toolInput,
-          toolResponse,
+          effectiveToolResponse,
           payload.tool_use_id ?? payload.toolUseId
         )
         if (launch) {

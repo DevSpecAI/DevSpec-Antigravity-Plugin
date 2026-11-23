@@ -10,7 +10,8 @@
  *   notice, turns a string-shaped `system_notice_ids` into an array, and never
  *   gives a notice reply a trail or local-turn flags;
  * - a notice reply never counts as the reply to a command, so Stop still answers it;
- * - Stop ends a notice-only turn with a notice reply, and streams no trail during it.
+ * - Stop ends a notice-only turn quietly when the model did not post (never scraping
+ *   local terminal notes into the room), and streams no trail during it.
  */
 
 import assert from 'node:assert/strict'
@@ -26,8 +27,10 @@ import {
   explicitReplyMarkerPath,
   handleMirrorTurn,
   readTurnMarker,
+  recordOwnedLaunch,
   recordTurnWake,
   streamTurnTrailIfChanged,
+  writeTurnMarker,
 } from './mirror-turn.mjs'
 import { normalizeNoticeIds } from './notice-reply.mjs'
 import { runPostToolDispatch } from './post-tool-dispatch.mjs'
@@ -212,7 +215,7 @@ describe('a turn woken only by notices', () => {
     }
   })
 
-  it('ends with a notice reply at Stop when the model posted nothing, and with nothing when it replied', async () => {
+  it('ends quietly at Stop without scraping terminal text when the model posted nothing, and posts nothing extra when it replied', async () => {
     const fx = fixture()
     try {
       const stop = async () => {
@@ -230,18 +233,83 @@ describe('a turn woken only by notices', () => {
       }
       fs.appendFileSync(
         fx.transcriptPath,
-        `${JSON.stringify({ step_index: 4, type: 'PLANNER_RESPONSE', created_at: new Date(Date.now() + 2000).toISOString(), content: 'Merged; the work is on staging.' })}\n`,
+        `${JSON.stringify({ step_index: 4, type: 'PLANNER_RESPONSE', created_at: new Date(Date.now() + 2000).toISOString(), content: 'Settled quietly in place; finishing quietly per notice handling rules.' })}\n`,
       )
       recordTurnWake(CONN_ID, noticeEntry(NOTICE_A, NOTICE_B), fx.connDir)
-      const [post] = await stop()
-      assert.ok(post, 'Stop posts the final words')
-      assert.deepEqual(post.arguments.system_notice_ids, [NOTICE_A, NOTICE_B])
-      assert.equal(post.arguments.message, 'Merged; the work is on staging.')
-      for (const key of [...TURN_ONLY, 'complete_turn', 'session_id']) assert.equal(post.arguments[key], undefined, key)
+      assert.deepEqual(await stop(), [], 'Stop never scrapes local terminal notes into the room on a notice turn')
+
+      // Even if .turn was missing at Stop on a zero-tool-call notice wake, transcript inference keeps Stop quiet.
+      const wake = buildWakeDeliveryMessage(noticeEntry(NOTICE_A), { connectionId: CONN_ID })
+      fs.appendFileSync(
+        fx.transcriptPath,
+        [
+          JSON.stringify({ step_index: 5, type: 'SYSTEM_MESSAGE', created_at: new Date(Date.now() + 3000).toISOString(), content: `<SYSTEM_MESSAGE>\n${wake}\n</SYSTEM_MESSAGE>` }),
+          JSON.stringify({ step_index: 6, type: 'PLANNER_RESPONSE', created_at: new Date(Date.now() + 4000).toISOString(), content: 'Read the wake payload quietly; nothing needs a person.' }),
+        ].join('\n') + '\n',
+      )
+      assert.deepEqual(await stop(), [], 'zero-tool notice turn without .turn marker still ends quietly without command fallback')
 
       recordTurnWake(CONN_ID, noticeEntry(NOTICE_A), fx.connDir)
       prePost(fx, { message: 'Merged.' })
       assert.deepEqual(await stop(), [], 'no second post after the model replied to the notice')
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('restores a held parent turn at Stop without scraping terminal text when a mid-wait notice turn stays quiet', async () => {
+    const fx = fixture()
+    try {
+      const parentStartedAt = Date.now() - 10_000
+      openCommand(fx)
+      writeTurnMarker(
+        CONN_ID,
+        { startedAt: parentStartedAt, held: true, remoteTurn: true, otherWake: true },
+        fx.connDir,
+      )
+      recordOwnedLaunch(
+        CONN_ID,
+        { id: `${CONV_ID}/task-99`, kind: 'command' },
+        { dir: fx.connDir, now: parentStartedAt },
+      )
+
+      // A notice wakes the agent while the parent command turn is held on background work.
+      recordTurnWake(CONN_ID, noticeEntry(NOTICE_A), fx.connDir)
+      const midMarker = readTurnMarker(CONN_ID, fx.connDir)
+      assert.equal(midMarker.held, false)
+      assert.equal(midMarker.heldParent?.otherWake, true)
+      assert.deepEqual(midMarker.noticeIds, [NOTICE_A])
+
+      fs.appendFileSync(
+        fx.transcriptPath,
+        `${JSON.stringify({ step_index: 4, type: 'PLANNER_RESPONSE', created_at: new Date(Date.now() + 2000).toISOString(), content: 'Settled during held parent wait; finishing quietly.' })}\n`,
+      )
+      const calls = []
+      const stopRes = await handleMirrorTurn(
+        'stop',
+        JSON.stringify({ conversationId: CONV_ID, transcriptPath: fx.transcriptPath }),
+        {
+          env: {},
+          connectionsDir: fx.connDir,
+          legacyPath: path.join(fx.home, 'legacy.json'),
+          call: async (c) => {
+            calls.push(c)
+            return { ok: true }
+          },
+        },
+      )
+      assert.equal(stopRes.held, true)
+      assert.deepEqual(stopRes.outstanding, [`${CONV_ID}/task-99`])
+      assert.deepEqual(
+        calls.filter((c) => c.name === 'post_session_message'),
+        [],
+        'mid-wait notice turn must not scrape terminal text into the room on Stop',
+      )
+      const restored = readTurnMarker(CONN_ID, fx.connDir)
+      assert.equal(restored.held, true)
+      assert.equal(restored.heldParent, null)
+      assert.equal(restored.otherWake, true)
+      assert.deepEqual(restored.noticeIds, [])
     } finally {
       fx.cleanup()
     }
@@ -337,5 +405,258 @@ describe('normalizeNoticeIds changes shape only', () => {
     assert.equal(normalizeNoticeIds('the last one'), 'the last one')
     assert.deepEqual(normalizeNoticeIds([NOTICE_A]), [NOTICE_A])
     assert.equal(normalizeNoticeIds(7), 7)
+  })
+})
+
+// Item a868f41f: DevSpec labels every notice (system notice version 3), and the label,
+// never this plugin, decides whether anything reaches the room.
+function labelled(audience, ...ids) {
+  const entry = noticeEntry(...ids)
+  entry.ingress.system_notices = entry.ingress.system_notices.map((notice) => ({ ...notice, audience }))
+  return entry
+}
+
+function mixedEntry(needsId, recordId) {
+  const entry = noticeEntry(needsId, recordId)
+  const [needs, record] = entry.ingress.system_notices
+  entry.ingress.system_notices = [{ ...needs, audience: 'needs_person' }, { ...record, audience: 'for_the_record' }]
+  return entry
+}
+
+async function stopCalls(fx, hookInput = {}) {
+  const calls = []
+  await handleMirrorTurn('stop', JSON.stringify({ conversationId: CONV_ID, transcriptPath: fx.transcriptPath, ...hookInput }), {
+    env: {},
+    connectionsDir: fx.connDir,
+    legacyPath: path.join(fx.home, 'legacy.json'),
+    call: async (c) => {
+      calls.push(c)
+      return { ok: true }
+    },
+  })
+  return calls.filter((c) => c.name === 'post_session_message')
+}
+
+function lastWords(fx, content) {
+  fs.appendFileSync(
+    fx.transcriptPath,
+    `${JSON.stringify({ step_index: 4, type: 'PLANNER_RESPONSE', created_at: new Date(Date.now() + 2000).toISOString(), content })}\n`,
+  )
+}
+
+const TELL_PERSON_RESULT = {
+  content: [
+    { type: 'text', text: JSON.stringify({ outcome: 'committed', task: { id: NOTICE_B } }) },
+    {
+      type: 'text',
+      text: JSON.stringify({
+        tell_person: {
+          why: 'changed_someone_elses_record',
+          record: { type: 'task', id: NOTICE_B },
+          owner: 'someone_else',
+          instruction: 'This changed a record that is not the requester\'s own, so tell the person you are working for what you changed.',
+        },
+      }),
+    },
+  ],
+}
+
+async function postTool(fx, toolName, args, toolResponse) {
+  await runPostToolDispatch(
+    JSON.stringify({
+      conversationId: CONV_ID,
+      tool_name: 'call_mcp_tool',
+      tool_input: { ServerName: '"devspec"', ToolName: `"${toolName}"`, Arguments: JSON.stringify(args) },
+      tool_response: toolResponse,
+    }),
+    { env: {}, home: fx.home, call: async () => ({ ok: true }) },
+  )
+}
+
+describe('DevSpec labels each notice, and only one that needs a person is answered (item a868f41f)', () => {
+  it('hands the model the reply call only under a notice that needs a person', () => {
+    const record = buildWakeDeliveryMessage(labelled('for_the_record', NOTICE_A), { connectionId: CONN_ID })
+    assert.doesNotMatch(record, /post_session_message\(/)
+    assert.match(record, /labels this notice for the record \(semantics\.notice_audience in devspec:\/\/product\/remote-ingress-contract\)/)
+    assert.match(record, /This plugin posts no reply to it/)
+
+    const needs = buildWakeDeliveryMessage(labelled('needs_person', NOTICE_A), { connectionId: CONN_ID })
+    assert.ok(needs.includes(`system_notice_ids: ["${NOTICE_A}"]`))
+
+    // A batch's one reply names only the notices that need a person.
+    const mixed = buildWakeDeliveryMessage(mixedEntry(NOTICE_A, NOTICE_B), { connectionId: CONN_ID })
+    assert.doesNotMatch(mixed, new RegExp(`post_session_message\\(\\{ message, system_notice_ids: \\[[^\\]]*${NOTICE_B}`), 'no reply call names the for-the-record notice')
+    assert.ok(mixed.includes(`system_notice_ids: ["${NOTICE_A}"]`))
+
+    // The wait script carries the label on each notice event, which PreInvocation reads.
+    const [event] = buildCanonicalSystemNoticeEvents(labelled('for_the_record', NOTICE_A), { inboxFile: 'inbox' })
+    assert.equal(event.audience, 'for_the_record')
+    assert.doesNotMatch(event.content, /post_session_message\(/)
+  })
+
+  it('reads the label from the wake step itself at PreInvocation', async () => {
+    const fx = fixture()
+    try {
+      const wake = buildWakeDeliveryMessage(mixedEntry(NOTICE_A, NOTICE_B), { connectionId: CONN_ID })
+      fs.appendFileSync(
+        fx.transcriptPath,
+        `${JSON.stringify({ step_index: 3, type: 'SYSTEM_MESSAGE', created_at: new Date().toISOString(), content: `<SYSTEM_MESSAGE>\n${wake}\n</SYSTEM_MESSAGE>` })}\n`,
+      )
+      await handleMirrorTurn('user_prompt', JSON.stringify({ conversationId: CONV_ID, transcriptPath: fx.transcriptPath }), {
+        env: {},
+        connectionsDir: fx.connDir,
+        legacyPath: path.join(fx.home, 'legacy.json'),
+        call: async () => ({ ok: true }),
+      })
+      const marker = readTurnMarker(CONN_ID, fx.connDir)
+      assert.deepEqual(marker.noticeIds, [NOTICE_A])
+      assert.deepEqual(marker.recordNoticeIds, [NOTICE_B])
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('ends a turn woken only by for-the-record notices with nothing in the room, and no trail during it', async () => {
+    const fx = fixture()
+    try {
+      recordTurnWake(CONN_ID, labelled('for_the_record', NOTICE_A, NOTICE_B), fx.connDir)
+      assert.deepEqual(currentTurnNoticeIds(CONN_ID, { dir: fx.connDir }), [NOTICE_A, NOTICE_B])
+      const state = JSON.parse(fs.readFileSync(path.join(fx.connDir, `${CONN_ID}.json`), 'utf8'))
+      const trailCalls = []
+      const trail = await streamTurnTrailIfChanged(state, { connectionsDir: fx.connDir, home: fx.home, call: async (c) => trailCalls.push(c) })
+      assert.equal(trail.reason, 'notice_turn')
+      assert.equal(trailCalls.length, 0)
+
+      lastWords(fx, 'Linked the commit to the task.')
+      assert.deepEqual(await stopCalls(fx), [], 'no reply, no answer')
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('posts no error message for a routine turn that died on an error', async () => {
+    const fx = fixture()
+    try {
+      recordTurnWake(CONN_ID, labelled('for_the_record', NOTICE_A), fx.connDir)
+      assert.deepEqual(await stopCalls(fx, { terminationReason: 'ERROR', error: 'request failed: Forbidden' }), [])
+      recordTurnWake(CONN_ID, { type: 'check_job', connection_id: CONN_ID }, fx.connDir)
+      assert.deepEqual(await stopCalls(fx, { terminationReason: 'ERROR', error: 'request failed: Forbidden' }), [])
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('stamps only the notices that need a person on an explicit post in a mixed batch, and stays quiet at Stop when the model does not post', async () => {
+    const fx = fixture()
+    try {
+      recordTurnWake(CONN_ID, mixedEntry(NOTICE_A, NOTICE_B), fx.connDir)
+      lastWords(fx, 'Settled the reversal in place; finishing quietly.')
+      assert.deepEqual(await stopCalls(fx), [], 'Stop posts nothing when the model stayed quiet')
+
+      recordTurnWake(CONN_ID, mixedEntry(NOTICE_A, NOTICE_B), fx.connDir)
+      const sent = prePost(fx, { message: 'Your change clashes with the retry decision: keep it or change the decision?' })
+      assert.deepEqual(sent.system_notice_ids, [NOTICE_A])
+      for (const key of TURN_ONLY) assert.equal(sent[key], undefined, key)
+      assert.deepEqual(await stopCalls(fx), [])
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('stamps a stray post in a for-the-record turn so DevSpec refuses it, and treats the refusal as quiet', async () => {
+    const fx = fixture()
+    try {
+      recordTurnWake(CONN_ID, labelled('for_the_record', NOTICE_A), fx.connDir)
+      const sent = prePost(fx, { message: 'Noted the commit review.' })
+      assert.deepEqual(sent.system_notice_ids, [NOTICE_A])
+      // DevSpec refuses it (delivery.reason for_the_record): not the turn's reply, not
+      // an error to surface, and nothing at Stop posts it another way.
+      await postTool(fx, 'post_session_message', sent, {
+        content: [{ type: 'text', text: JSON.stringify({ delivery: { status: 'rejected', reason: 'for_the_record', retryable: false }, error: 'Nothing was posted, and nothing needs to be.' }) }],
+        isError: true,
+      })
+      assert.equal(fs.existsSync(explicitReplyMarkerPath(CONN_ID, fx.connDir)), false)
+      lastWords(fx, 'Noted the commit review.')
+      assert.deepEqual(await stopCalls(fx), [])
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('tells the person when a write in a routine or notice turn changed someone else\'s record (tell_person)', async () => {
+    const fx = fixture()
+    try {
+      // The post goes on DevSpec's speech lane, which needs the connection's capability
+      // (tell-person.mjs, item e086163c).
+      const statePath = path.join(fx.connDir, `${CONN_ID}.json`)
+      writeStateFile({ ...JSON.parse(fs.readFileSync(statePath, 'utf8')), connection_capability: 'dvsc_notice_reply_test' }, fx.connDir)
+      recordTurnWake(CONN_ID, labelled('for_the_record', NOTICE_A), fx.connDir)
+      await postTool(fx, 'update_task', { task_id: NOTICE_B, lifecycle: 'dismissed' }, TELL_PERSON_RESULT)
+      assert.equal(readTurnMarker(CONN_ID, fx.connDir).tellPerson, true)
+      // The model did not post: Stop posts its last words, as an ordinary message.
+      lastWords(fx, 'I closed Brandon\'s duplicate task, which repeated mine.')
+      const [post, ...rest] = await stopCalls(fx)
+      assert.equal(rest.length, 0)
+      assert.equal(post.arguments.message, 'I closed Brandon\'s duplicate task, which repeated mine.')
+      assert.equal(post.arguments.connection_id, CONN_ID)
+      assert.equal(post.arguments.ingest_version, 2)
+      assert.equal(typeof post.arguments.assistant_source_id, 'string')
+      assert.equal(post.connectionCapability, 'dvsc_notice_reply_test')
+      for (const key of [...TURN_ONLY, 'system_notice_ids', 'complete_turn']) assert.equal(post.arguments[key], undefined, key)
+
+      // Same when the turn woke on a needs_person notice and a write carried tell_person.
+      recordTurnWake(CONN_ID, labelled('needs_person', NOTICE_A), fx.connDir)
+      await postTool(fx, 'update_task', { task_id: NOTICE_B, lifecycle: 'dismissed' }, TELL_PERSON_RESULT)
+      const [noticePost, ...noticeRest] = await stopCalls(fx)
+      assert.equal(noticeRest.length, 0)
+      assert.equal(noticePost.arguments.message, 'I closed Brandon\'s duplicate task, which repeated mine.')
+      for (const key of [...TURN_ONLY, 'system_notice_ids', 'complete_turn']) assert.equal(noticePost.arguments[key], undefined, key)
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('leaves the model\'s own post to the person unstamped after tell_person, and adds nothing at Stop', async () => {
+    const fx = fixture()
+    try {
+      recordTurnWake(CONN_ID, labelled('for_the_record', NOTICE_A), fx.connDir)
+      await postTool(fx, 'update_task', { task_id: NOTICE_B, lifecycle: 'dismissed' }, TELL_PERSON_RESULT)
+      const sent = prePost(fx, { message: 'I closed your duplicate task.' })
+      assert.equal(sent.system_notice_ids, undefined, 'the ordinary message DevSpec asks for')
+      await postTool(fx, 'post_session_message', sent, { content: [{ type: 'text', text: '{"delivery":{"status":"stored"}}' }] })
+      lastWords(fx, 'I closed your duplicate task.')
+      assert.deepEqual(await stopCalls(fx), [], 'told once, by the model')
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('does not take a mention of tell_person in record text for the mark', async () => {
+    const fx = fixture()
+    try {
+      recordTurnWake(CONN_ID, labelled('for_the_record', NOTICE_A), fx.connDir)
+      await postTool(fx, 'get_task', { task_id: NOTICE_B }, {
+        content: [{ type: 'text', text: JSON.stringify({ description: 'A write result may carry a "tell_person" block.' }) }],
+      })
+      assert.equal(readTurnMarker(CONN_ID, fx.connDir).tellPerson, undefined)
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('reads a notice persisted before labels as needing a person, stamping an explicit post and staying quiet at Stop when the model does not post', async () => {
+    const fx = fixture()
+    try {
+      recordTurnWake(CONN_ID, noticeEntry(NOTICE_A), fx.connDir)
+      lastWords(fx, 'Merged.')
+      assert.deepEqual(await stopCalls(fx), [])
+
+      recordTurnWake(CONN_ID, noticeEntry(NOTICE_A), fx.connDir)
+      const sent = prePost(fx, { message: 'Merged.' })
+      assert.deepEqual(sent.system_notice_ids, [NOTICE_A])
+      assert.deepEqual(await stopCalls(fx), [])
+    } finally {
+      fx.cleanup()
+    }
   })
 })

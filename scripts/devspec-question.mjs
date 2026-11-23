@@ -24,6 +24,7 @@ import path from 'node:path'
 import { mcpToolsCall, mcpToolsList } from './mcp-call.mjs'
 import { clearTurnMarker, writeExplicitReplyMarker } from './mirror-turn.mjs'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
+import { stateWithCurrentToken } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import {
   activeContinuation,
@@ -180,7 +181,7 @@ export function readQuestionConnectionState(connectionId, dir = CONNECTIONS_DIR)
   if (typeof connectionId !== 'string' || !UUID.test(connectionId)) {
     throw new Error('missing or invalid --connection-id')
   }
-  const state = readPrivateJson(path.join(dir, `${connectionId}.json`))
+  const state = stateWithCurrentToken(readPrivateJson(path.join(dir, `${connectionId}.json`)))
   if (!state) throw new Error('connection state is unavailable or unreadable')
   if (state.connection_id !== connectionId || state.enabled === false) {
     throw new Error('connection state is unavailable or disabled')

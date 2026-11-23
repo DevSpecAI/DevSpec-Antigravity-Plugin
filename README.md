@@ -8,16 +8,16 @@ Connect [Google Antigravity CLI](https://antigravity.google/product/antigravity-
 
 ## Why DevSpec + Antigravity CLI?
 
-- **Shared team memory with automatic staleness screening** — Antigravity recalls the architectural decisions, conventions, risks, and reference docs that apply to the code it's touching. When you record a new decision or land changes, DevSpec screens your project's records for conflicts, duplicates, and **Possibly outdated** guidance so your team's shared memory stays accurate.
-- **Steer `agy` live from your phone or the web** — Run `/devspec-remote` to register your terminal on your project's **Agents** page outside any session room, or pass `--new` or `--session <id>` (or attach from [devspec.ai](https://devspec.ai)) to collaborate in a shared session room, answer structured agent questions and polls, and track multi-phase execution plans in real time. Sitting idle on the **Agents** page uses no tokens — `agy` runs only when you or an authorized teammate asks it to do something, when your project routes a check on a change for it to rule, or when an automation you opted into runs.
-- **Tasks, observed verification, and automatic commit provenance** — Claim tasks with full project context. When a single task is claimed in a linked project repository (including Git worktrees) or a `.devspec/project.json`-pinned folder, the plugin tags your commits (`[devspec:<id>]`) automatically, links pull requests, and records observed verification evidence from checks `agy` actually ran against each acceptance criterion.
-- **Protected intent and GitHub pull-request holds** — DevSpec screens changes against your team's recorded decisions, requirements, and open tasks, holds reversals of someone else's decision and unagreed experiments on their own branch until approved, and publishes its pull-request check on GitHub to reflect pending checks and holds.
+- **Shared team memory, recalled on every turn** — Before Antigravity answers a request, whether you typed it or a teammate sent it from DevSpec, it checks your project for the requirements, documents, decisions, open and rejected plans, and past work that bear on it, and adds the ones that apply to the end of the conversation. Nothing is added when nothing applies, each record appears once per conversation until it changes, and a slow or unreachable DevSpec never holds up your prompt. When you record a new decision or land changes, DevSpec screens your project's records for conflicts, duplicates, and **Possibly outdated** guidance so your team's shared memory stays accurate.
+- **Steer `agy` live from your phone or the web** — Run `/devspec-remote` to register your terminal on your project's **Agents** page outside any session room, or pass `--new` or `--session <id>` (or attach from [devspec.ai](https://devspec.ai)) to collaborate in a shared session room, answer structured agent questions and polls, and track multi-phase execution plans in real time. Sitting idle on the **Agents** page uses no tokens — `agy` runs only when you or an authorized teammate asks it to do something, when your project routes a check on a change for it to rule, or when an automation you opted into runs. DevSpec decides which of your project's agents rules each check; when Antigravity's AI provider stops it for a usage limit, the plugin tells DevSpec, so checks go to another agent until the limit resets.
+- **Tasks, observed verification, and automatic commit provenance** — Claim tasks with full project context. When a single task is claimed in a linked project repository (including Git worktrees) or a `.devspec/project.json`-pinned folder, the plugin tags your commits (`[devspec:<id>]`) automatically, links pull requests, and records observed verification evidence from checks `agy` actually ran against each acceptance criterion. A commit made with no task claimed still goes through, untagged, so work that needs no task is never held up.
+- **Protected intent, pull-request checks, and Merge when cleared** — Every change is delivered on its own branch through a pull request into the repository's tracking branch, wherever pull requests are supported. When the agent switches on DevSpec's **Merge when cleared**, DevSpec merges the pull request once its own check and every required GitHub check and approval have passed; if DevSpec's GitHub App cannot merge in your repository, DevSpec wakes the agent to merge that exact commit with your GitHub credentials instead. DevSpec screens changes against your team's recorded decisions, requirements, and open tasks, and publishes its check on the pull request. Work that would undo someone else's decision, and experiments not yet agreed, stay on their own branch until approved; a requirement break or an unintended conflict that the agent fixes on the branch clears when DevSpec checks the fixed work again. A Dependabot or Renovate update that changes only dependency files needs no task: the agent reviews it and records what it found on the pull request.
 
 ## Requirements
 
 - **[Antigravity CLI](https://antigravity.google/download#antigravity-cli)** (`agy`)
 - **Node.js 18 or later** (`node --version` — install from [nodejs.org](https://nodejs.org/en/download) if needed) and **`git`** on your `PATH`
-- A **[DevSpec](https://devspec.ai)** access token (`dvs_…`) with **Read & write** access from your [Agent setup](https://app.devspec.ai/settings/agents) page
+- A **[DevSpec](https://devspec.ai)** account. You approve Antigravity in your browser.
 
 Full commit tracking — every commit reported to DevSpec and tagged with its task automatically — needs macOS, Linux, or Windows through WSL. On native Windows, Antigravity falls back to the simpler check that reads the command, which catches single-line commits only, in the project's repositories (an `origin` the project tracks, or a `.devspec/project.json` pin).
 
@@ -39,41 +39,15 @@ curl -fsSL https://antigravity.google/cli/install.sh | bash
 irm https://antigravity.google/cli/install.ps1 | iex
 ```
 
-### 2. Add your DevSpec token to `mcp_config.json`
-
-Open `~/.gemini/config/mcp_config.json` (`%USERPROFILE%\.gemini\config\mcp_config.json` on Windows) in a text editor and merge in the `devspec` entry with your `dvs_…` token from [Agent setup](https://app.devspec.ai/settings/agents):
-
-```json
-{
-  "mcpServers": {
-    "devspec": {
-      "type": "http",
-      "serverUrl": "https://api.devspec.ai/api/mcp",
-      "headers": {
-        "Authorization": "Bearer dvs_YOUR_DEVSPEC_MCP_TOKEN"
-      }
-    }
-  }
-}
-```
-
-On macOS and Linux, make the folder and file readable only by you:
-
-```bash
-chmod 700 ~/.gemini/config && chmod 600 ~/.gemini/config/mcp_config.json
-```
-
-> Do not use `agy mcp add --header "Authorization: Bearer …"` — passing your token on a command line exposes it to other accounts on the machine and records it in shell history.
-
-### 3. Install the DevSpec plugin
-
-**Installing the plugin is required alongside the MCP server.** It supplies `rules/AGENTS.md`, the `/devspec-remote`, `/devspec-remote-stop`, and `/devspec-project` skills, the status bar (`DevSpec: local (/devspec-remote to connect) · <Project>`), and the connection hooks that let you steer `agy` from DevSpec.
+### 2. Install the DevSpec plugin
 
 In your terminal (macOS, Linux, or Windows), run:
 
 ```bash
 agy plugin install https://github.com/DevSpecAI/DevSpec-Antigravity-Plugin
 ```
+
+The plugin brings everything: DevSpec's tools (it connects Antigravity to `https://api.devspec.ai/api/mcp` itself, so there is no settings file to edit), its agent rules (in `rules/`), the `/devspec-remote`, `/devspec-remote-stop`, `/devspec-project` and `/devspec-login` skills, the status bar (`DevSpec: local (/devspec-remote to connect) · <Project>`), and the hooks that let you steer `agy` from DevSpec.
 
 <details>
 <summary>Prefer cloning straight with Git?</summary>
@@ -95,6 +69,18 @@ git clone https://github.com/DevSpecAI/DevSpec-Antigravity-Plugin.git "$HOME\.ge
 
 </details>
 
+### 3. Approve Antigravity in your browser
+
+Start `agy` and run `/devspec-login` (or approve the DevSpec browser tab that opens automatically at startup):
+
+```text
+/devspec-login
+```
+
+Click **Allow** on DevSpec's approval page naming **Antigravity**, then restart `agy` so DevSpec's tools, your status bar, and your agent connection load cleanly. Over SSH, or on any machine your browser cannot reach, run `/devspec-login --code` and paste back the code DevSpec's page shows.
+
+One approval covers everything in Antigravity — DevSpec's tools, remote control, commit tracking, and the session hooks — and appears as one **Antigravity** entry on DevSpec's [Agent setup](https://app.devspec.ai/settings/agents) page. You stay signed in across all open Antigravity windows until you sign out or disconnect Antigravity on Agent setup. If your sign-in stops working, the status bar and DevSpec's tools say so plainly and tell you to run `/devspec-login`.
+
 ### 4. Optional — recommended for phone and voice control: skip permission prompts
 
 By default, Antigravity CLI pauses in the terminal and waits for your approval before editing files or running commands. When you are driving `agy` remotely from your phone or by voice, starting it with `--dangerously-skip-permissions` keeps work from stalling at your computer while built-in AI safety protections remain in place:
@@ -113,7 +99,7 @@ You can also run plain `agy` when working at your desk.
 
 ## Commands
 
-Everything in DevSpec can be asked in plain words ("Work on DevSpec task 4f2a", "Work these DevSpec tasks in order: 4f2a, 9c1b", "Create a task for the login redirect bug", "What did we decide about caching?"). The plugin also adds three slash commands in `agy`:
+Everything in DevSpec can be asked in plain words ("Work on DevSpec task 4f2a", "Work these DevSpec tasks in order: 4f2a, 9c1b", "Create a task for the login redirect bug", "What did we decide about caching?"). The plugin also adds these slash commands in `agy`:
 
 | Command | What it does |
 |---|---|
@@ -124,6 +110,7 @@ Everything in DevSpec can be asked in plain words ("Work on DevSpec task 4f2a", 
 | `/devspec-remote --name "Night Owl"` | Connects using a custom agent codename. |
 | `/devspec-remote-stop` | Disconnects this conversation from DevSpec while leaving other `agy` terminals running. |
 | `/devspec-project` | Shows the current project and folder default, or lets you `choose`, `remember`, or `forget` a project. |
+| `/devspec-login` | Signs Antigravity in to DevSpec through your browser (`--code` on a machine your browser cannot reach, `--status` to check, `--logout` to sign out). |
 
 ## Choosing and remembering a project
 

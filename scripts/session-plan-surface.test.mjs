@@ -8,9 +8,9 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const read = (file) => fs.readFileSync(path.join(ROOT, file), 'utf8')
 
 describe('bounded Antigravity plan discovery and prompts', () => {
-  it('keeps only the connection and project skills and discovers plan mechanics on demand', () => {
+  it('keeps only the connection, project and sign-in skills and discovers plan mechanics on demand', () => {
     const skills = fs.readdirSync(path.join(ROOT, 'skills')).sort()
-    assert.deepEqual(skills, ['devspec-project', 'devspec-remote', 'devspec-remote-stop'])
+    assert.deepEqual(skills, ['devspec-login', 'devspec-project', 'devspec-remote', 'devspec-remote-stop'])
     const remote = read('skills/devspec-remote/SKILL.md')
     assert.match(remote, /devspec-plan\.mjs" --schema/)
     assert.match(remote, /do not keep a local plan skill or broad static MCP allowlist hot/i)
@@ -38,7 +38,7 @@ describe('bounded Antigravity plan discovery and prompts', () => {
   it('does not inject plan prompts before connection and provides revisioned resume/end/adoption after connection', () => {
     const hooks = JSON.parse(read('hooks.json'))
     assert.deepEqual(hooks['devspec-remote-control-mirror'].PreInvocation, [{
-      type: 'command', command: 'node ./scripts/pre-invocation.mjs', timeout: 10,
+      type: 'command', command: 'node ./scripts/pre-invocation.mjs', timeout: 12,
     }])
     const remote = read('skills/devspec-remote/SKILL.md')
     for (const phrase of ['On reconnect', 'expected_revision', 'explicit `plan_id`', 'Another owner\'s plan is read-only', 'Closing a plan does not end remote control']) {

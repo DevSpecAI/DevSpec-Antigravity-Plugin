@@ -152,16 +152,64 @@ describe('the tools PreToolUse stamps with the request a write serves', () => {
   })
 })
 
-// rules/AGENTS.md tells the agent to call DevSpec tools from the shapes it gives,
-// without reading their schema files (Antigravity loads MCP schemas lazily, so each
-// read is a step). That makes those shapes the agent's schema, so they must match
-// the server's: no parameter the tool lacks, every required one present and not
-// marked optional, and only values the server allows. Nested object shapes, and
-// arrays of them, are checked the same way (item 1df99dd4).
-const RULES_FILE = 'rules/AGENTS.md'
+// The DevSpec tool references in rules/ tell the agent to call DevSpec tools from the
+// shapes they give, without reading their schema files (Antigravity loads MCP schemas
+// lazily, so each read is a step). That makes those shapes the agent's schema, so they
+// must match the server's: no parameter the tool lacks, every required one present and
+// not marked optional, only values the server allows, and every parameter the agent
+// may need, so a parameter the server adds is never invisible to the agent. Nested
+// object shapes, and arrays of them, are checked the same way (items 1df99dd4, cf356677).
+const RULES_DIR = 'rules'
 const SHAPE_ENTRY = /`([a-z][a-z0-9]*(?:_[a-z0-9]+)+)`: `(\{[^`]*\})`/g
 // A scan that finds none of these is broken, not clean.
-const MUST_SHAPE = ['create_task', 'record_criterion_verdicts', 'manage_protected_intent', 'update_memory']
+const MUST_SHAPE = ['create_task', 'record_criterion_verdicts', 'manage_protected_intent', 'update_memory', 'record_inventory_entry', 'record_dependency_review']
+// Parameters the references describe once, in each file's opening notes, rather than
+// on every shape: what PreToolUse stamps, the project hints, and the claim reference.
+const DESCRIBED_ONCE = new Set([
+  'connection_id', 'project_id', 'local_session_id', 'agent_name', 'request_ref', 'provenance_ref',
+  'git_remote', 'pinned_project_id', 'work_claim_ref',
+])
+// Parameters the plugin or DevSpec fills in on a tool, which its shape tells the agent
+// never to pass.
+const FILLED_IN_FOR_THE_AGENT = new Map([
+  // The turn a reply answers, its trail, telemetry and local-turn flags (PreToolUse,
+  // mirror-turn.mjs); the room is the connection's.
+  ['post_session_message', new Set(['session_id', 'command_turn_id', 'command_message_id', 'command_turn_unbound', 'local_turn', 'turn_kind', 'phase', 'needs_input', 'work_trail', 'trail_events', 'agent_stats', 'model'])],
+  // PreToolUse stamps provider: antigravity.
+  ['claim_work_item', new Set(['provider'])],
+])
+
+/** A schema's object form: itself, or the object alternative of a nullable union. */
+function objectSchema(schema) {
+  if (!schema || typeof schema !== 'object') return schema
+  if (schema.properties) return schema
+  for (const alternative of schema.anyOf ?? schema.oneOf ?? []) {
+    if (alternative?.properties) return alternative
+  }
+  return schema
+}
+
+/** The values a schema allows, through a nullable union, or null when it is not an enum. */
+function enumValues(schema) {
+  if (!schema || typeof schema !== 'object') return null
+  if (Array.isArray(schema.enum)) return schema.enum
+  if (schema.const !== undefined) return [schema.const]
+  const alternatives = schema.anyOf ?? schema.oneOf
+  if (!alternatives) return null
+  const values = alternatives.flatMap((alternative) => enumValues(alternative) ?? [])
+  return values.length > 0 ? values : null
+}
+
+/** The item schema of an array schema, through a nullable union. */
+function itemsOf(schema) {
+  if (schema?.items) return schema.items
+  for (const alternative of schema?.anyOf ?? schema?.oneOf ?? []) {
+    if (alternative?.items) return alternative.items
+  }
+  return null
+}
+
+const hostOnly = (schema) => JSON.stringify(schema ?? {}).includes('x-devspec-host-only')
 
 function splitTopLevel(body) {
   const parts = []
@@ -185,8 +233,9 @@ function quotedValues(type) {
   return [...type.matchAll(/"([^"]+)"/g)].map((match) => match[1])
 }
 
-function shapeProblems(shape, schema, where) {
+function shapeProblems(shape, rawSchema, where, { complete = false, omitted = new Set() } = {}) {
   const problems = []
+  const schema = objectSchema(rawSchema)
   const properties = schema?.properties ?? {}
   const body = shape.trim().replace(/^\{/, '').replace(/\}$/, '').trim()
   const given = new Map()
@@ -203,10 +252,10 @@ function shapeProblems(shape, schema, where) {
       problems.push(`${where}.${name}: the server has no such parameter`)
       continue
     }
-    if (type.startsWith('{')) problems.push(...shapeProblems(type, property, `${where}.${name}`))
-    else if (type.startsWith('[{')) problems.push(...shapeProblems(type.slice(1, -1), property.items, `${where}.${name}[]`))
+    if (type.startsWith('{')) problems.push(...shapeProblems(type, property, `${where}.${name}`, { complete }))
+    else if (type.startsWith('[{')) problems.push(...shapeProblems(type.slice(1, -1), itemsOf(property), `${where}.${name}[]`, { complete }))
     else if (type.startsWith('"') || type.startsWith('["')) {
-      const allowed = type.startsWith('[') ? property.items?.enum : property.enum
+      const allowed = type.startsWith('[') ? enumValues(itemsOf(property)) : enumValues(property)
       for (const value of quotedValues(type)) {
         if (!allowed?.includes(value)) problems.push(`${where}.${name}: the server does not allow "${value}"`)
       }
@@ -216,22 +265,62 @@ function shapeProblems(shape, schema, where) {
     if (!given.has(name)) problems.push(`${where}.${name}: required by the server but missing`)
     else if (given.get(name).optional) problems.push(`${where}.${name}: required by the server but marked optional`)
   }
+  if (complete) {
+    for (const [name, property] of Object.entries(properties)) {
+      if (given.has(name) || hostOnly(property) || DESCRIBED_ONCE.has(name) || omitted.has(name)) continue
+      problems.push(`${where}.${name}: the server takes it, and the shape does not show it`)
+    }
+  }
   return problems
 }
 
-describe('the call shapes rules/AGENTS.md gives', () => {
+function shapeEntries() {
+  const entries = []
+  for (const name of fs.readdirSync(path.join(ROOT, RULES_DIR)).filter((file) => file.endsWith('.md'))) {
+    const file = `${RULES_DIR}/${name}`
+    for (const [, tool, shape] of fs.readFileSync(path.join(ROOT, file), 'utf8').matchAll(SHAPE_ENTRY)) {
+      entries.push({ file, tool, shape })
+    }
+  }
+  return entries
+}
+
+describe('the call shapes the DevSpec tool references in rules/ give', () => {
   it('match the server input schemas', (t) => {
     const schemas = pairedServer(t, serverToolSchemas)
     if (!schemas) return
-    const rules = fs.readFileSync(path.join(ROOT, RULES_FILE), 'utf8')
-    const entries = [...rules.matchAll(SHAPE_ENTRY)]
-    const named = new Set(entries.map(([, tool]) => tool))
+    const entries = shapeEntries()
+    const named = new Set(entries.map(({ tool }) => tool))
     for (const tool of MUST_SHAPE) assert.ok(named.has(tool), `found no shape for ${tool}: the scan is broken, not clean`)
     const problems = []
-    for (const [, tool, shape] of entries) {
-      if (!schemas.has(tool)) problems.push(`${tool}: the server has no such tool`)
-      else problems.push(...shapeProblems(shape, schemas.get(tool), tool))
+    for (const { file, tool, shape } of entries) {
+      if (!schemas.has(tool)) problems.push(`${file}: ${tool}: the server has no such tool`)
+      else problems.push(...shapeProblems(shape, schemas.get(tool), `${file}: ${tool}`))
     }
-    assert.deepEqual(problems, [], `${RULES_FILE} gives call shapes the server would refuse:\n  ${problems.join('\n  ')}`)
+    assert.deepEqual(problems, [], `the rules give call shapes the server would refuse:\n  ${problems.join('\n  ')}`)
+  })
+
+  it('show every parameter the agent may pass, at every level', (t) => {
+    const schemas = pairedServer(t, serverToolSchemas)
+    if (!schemas) return
+    const problems = []
+    for (const { file, tool, shape } of shapeEntries()) {
+      if (!schemas.has(tool)) continue
+      problems.push(...shapeProblems(shape, schemas.get(tool), `${file}: ${tool}`, {
+        complete: true,
+        omitted: FILLED_IN_FOR_THE_AGENT.get(tool),
+      }))
+    }
+    assert.deepEqual(problems, [], `the server takes parameters the rules never show the agent:\n  ${problems.join('\n  ')}`)
+  })
+
+  it('give each tool one shape', () => {
+    const seen = new Map()
+    const twice = []
+    for (const { file, tool } of shapeEntries()) {
+      if (seen.has(tool)) twice.push(`${tool} (${seen.get(tool)}, ${file})`)
+      else seen.set(tool, file)
+    }
+    assert.deepEqual(twice, [], `one tool, two shapes that can drift apart:\n  ${twice.join('\n  ')}`)
   })
 })

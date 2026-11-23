@@ -40,8 +40,8 @@ it('carries a connection capability header and can return hidden MCP result meta
 
 /**
  * x-devspec-plugin on the wire (item 7a01644a). The plugin's scripts reach DevSpec
- * through three requests: mcpToolsCall (every tool call, register and poll), the
- * token check before auth is pinned, and the poller's push channel. A real socket
+ * through two requests: mcpToolsCall (every tool call, register, poll, and the check
+ * of a new browser sign-in) and the poller's push channel. A real socket
  * receiving each is the closest check short of the server recording the header
  * (DevSpec item 2295e089 builds that).
  */
@@ -50,7 +50,6 @@ it('names this plugin and its running version on every DevSpec request the scrip
   const fs = await import('node:fs')
   const os = await import('node:os')
   const path = await import('node:path')
-  const { verifyAndPinDevspecAuth } = await import('./resolve-mcp-auth.mjs')
   const { openPushChannel } = await import('./devspec-remote-poll.mjs')
   const version = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
   const seen = []
@@ -74,10 +73,6 @@ it('names this plugin and its running version on every DevSpec request the scrip
     await mcpToolsCall({ mcpUrl, token: 'dvs_fixture', name: 'get_task', arguments: {} })
     await mcpToolsCall({ mcpUrl, token: 'dvs_fixture', name: 'register_connection', arguments: {} })
     await mcpToolsCall({ mcpUrl, token: 'dvs_fixture', name: 'poll_connection', arguments: { connection_id: 'c' }, connectionCapability: 'dvsc_fixture', timeoutMs: 5_000 })
-    // The token check reads its candidates from the Antigravity config under home.
-    fs.mkdirSync(path.join(home, '.gemini', 'config'), { recursive: true })
-    fs.writeFileSync(path.join(home, '.gemini', 'config', 'mcp_config.json'), JSON.stringify({ mcpServers: { devspec: { serverUrl: mcpUrl, headers: { Authorization: 'Bearer dvs_fixture_token' } } } }))
-    await verifyAndPinDevspecAuth(home, { env: {}, home, platform: 'linux' })
     const channel = openPushChannel({ mcpUrl, token: 'dvs_fixture', connectionId: 'c', connectionCapability: 'dvsc_fixture', onEvent: () => {}, onFallback: () => {} })
     for (let i = 0; i < 100 && !seen.some((entry) => entry.tool.startsWith('GET ')); i++) {
       await new Promise((resolve) => setTimeout(resolve, 20))
@@ -89,11 +84,61 @@ it('names this plugin and its running version on every DevSpec request the scrip
     fs.rmSync(home, { recursive: true, force: true })
   }
   const expected = `antigravity/${version}`
-  assert.deepEqual(seen.slice(0, 4), [
+  assert.deepEqual(seen.slice(0, 3), [
     { tool: 'get_task', plugin: expected, capability: null },
     { tool: 'register_connection', plugin: expected, capability: null },
     { tool: 'poll_connection', plugin: expected, capability: 'dvsc_fixture' },
-    { tool: 'verify_agent_connection', plugin: expected, capability: null },
   ])
   assert.ok(seen.some((entry) => entry.tool === 'GET /api/mcp/connection-stream' && entry.plugin === expected && entry.capability === 'dvsc_fixture'), JSON.stringify(seen))
+})
+
+/**
+ * DevSpec refuses a credential (item 7f862114): the person hears it in plain words
+ * with how to sign in again, never a raw HTTP error, and a browser login refused
+ * because Antigravity was disconnected ends, so the next use says so too.
+ */
+it('a refused sign-in is said plainly, and a disconnected browser login ends', async () => {
+  const fs = await import('node:fs')
+  const os = await import('node:os')
+  const path = await import('node:path')
+  const { saveLogin, loginState } = await import('./auth-store.mjs')
+  const { startSignInServer } = await import('./sign-in-test-fixtures.mjs')
+  const fake = await startSignInServer()
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-refused-'))
+  const savedHome = process.env.HOME
+  const savedToken = process.env.DEVSPEC_MCP_TOKEN
+  process.env.HOME = home
+  delete process.env.DEVSPEC_MCP_TOKEN
+  try {
+    const now = Date.now()
+    await saveLogin(
+      {
+        endpoint: fake.mcpUrl,
+        tokens: { accessToken: 'oat_disconnected', refreshToken: 'rt_x', issuedAt: now, expiresAt: now + 86_400_000 },
+        issuer: fake.base,
+        tokenEndpoint: `${fake.base}/oauth/token`,
+        clientId: 'TucS1MNZZlWpOUc7',
+        resource: fake.mcpUrl,
+      },
+      { home },
+    )
+    const said = 'This tool was disconnected from your DevSpec account. You can reconnect it from Agent setup in your DevSpec settings.'
+    fake.refuse('oat_disconnected', 401, { error: said, code: 'signed_out', retryable: false })
+    const refused = await mcpToolsCall({ mcpUrl: fake.mcpUrl, token: 'oat_disconnected', name: 'get_task', arguments: {} }).catch((e) => e)
+    assert.equal(refused.message, `${said} Then run /devspec-login to sign in again.`)
+    assert.equal(refused.status, 401)
+    assert.equal(refused.serverCode, 'signed_out')
+    assert.equal(loginState(fake.mcpUrl, { home }).kind, 'ended')
+
+    process.env.DEVSPEC_MCP_TOKEN = 'dvs_ci_token_123456'
+    fake.refuse('dvs_ci_token_123456', 401, { error: 'Invalid or revoked API token', code: 'invalid_api_token', retryable: false })
+    const envRefused = await mcpToolsCall({ mcpUrl: fake.mcpUrl, token: 'dvs_ci_token_123456', name: 'get_task', arguments: {} }).catch((e) => e)
+    assert.match(envRefused.message, /DevSpec did not accept the token in DEVSPEC_MCP_TOKEN/)
+  } finally {
+    process.env.HOME = savedHome
+    if (savedToken === undefined) delete process.env.DEVSPEC_MCP_TOKEN
+    else process.env.DEVSPEC_MCP_TOKEN = savedToken
+    fs.rmSync(home, { recursive: true, force: true })
+    await fake.close()
+  }
 })

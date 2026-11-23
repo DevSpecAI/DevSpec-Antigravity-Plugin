@@ -1,5 +1,152 @@
 # Changelog
 
+## 0.29.4
+
+- **When your agent changes someone else's record while ruling a check or handling a notice, you now hear about it.** DevSpec asks the agent to tell you about some changes, such as one to a record that is not yours, even on a turn no room message started. Until now, if the agent did not say so itself, the plugin posted the agent's last words to the room in a way DevSpec turned down on such a turn, or filed as a reply to another message, and a turn down was dropped without anyone knowing. The plugin now posts those words the way DevSpec takes them on such a turn, as the agent's own message rather than as the answer to another one.
+- **A message that still does not get through comes back to your agent.** If DevSpec turns it down, the plugin gives your agent DevSpec's reason and the words that were not delivered at its next step, once, so it can tell you another way.
+- **Your agent has its own way to tell you on such a turn.** The rules now point your agent at DevSpec's rule for telling you, never at the plugin, and give it a command that posts to your room on a turn no room message started. When it uses it, the plugin adds nothing at the end of the turn.
+- Update the plugin and start a new `agy` session to pick this up.
+
+## 0.29.3
+
+- **A check job, automation run or notice no longer marks a waiting room message as started.** When DevSpec woke your Antigravity agent for something other than a room message (ruling a check, running an automation, or handling a notice about its own work), the plugin told DevSpec the agent had started work without saying on what. DevSpec then started whichever room message was newest and waiting, so a message you had just sent could show as started while the agent was only ruling a check. The plugin now tells DevSpec it has started something only when a room message starts the turn, and always names that message. While the agent rules a check or runs an automation, the plugin still reports that it is busy, which never starts a message.
+- **Work that carries on after the agent answered a message no longer picks up the next one.** If the agent kept working after its answer closed your message, the plugin used to report a fresh start, which could start a newer message waiting behind it. It now leaves that message waiting until the agent is given it.
+- Update the plugin and start a new `agy` session to pick this up.
+
+## 0.29.2
+
+- **Going ahead on a decision conflict follows what DevSpec accepts.** The plugin rules no longer claim that a bare **Go ahead** or **Keep** on work that conflicts with a decision, convention or requirement is refused until the record is edited first. When you let the work go ahead, DevSpec accepts the answer and marks the overruled record as needing an update.
+- Update the plugin and start a new `agy` session to pick this up.
+
+## 0.29.1
+
+- **Your agent now suggests turning a recurring problem into a requirement when one comes up.** Before, the rules told your agent to ask before recording a requirement without saying what a candidate requirement looks like during an ordinary conversation, so it waited for you to use the word "requirement" yourself. Now, when you point out a mistake that keeps creeping back in across tasks, or state a non-negotiable project-wide "always" or "never" rule that can be checked against what future work actually delivers, your agent explains what a requirement is and asks whether you want to record one — while still never saving a requirement without your yes.
+- Update the plugin and start a new `agy` session to pick this up.
+
+## 0.29.0
+
+- **A commit is never refused because no task is claimed.** With no task claimed, your Antigravity agent's commit now goes through as written, with a note saying it carries no task reference and that claiming the task first gets the reference added. Work that needs no task, such as a dependency update or an automation run, is no longer held up. With one task claimed, commits are still tagged for you; with several, the agent is still asked which one a commit belongs to.
+- **Usage limits move checks to another agent.** When Antigravity's AI provider stops your agent for a usage limit (a quota reached, a rate limit), the plugin tells DevSpec until when, so the checks DevSpec would have offered your agent go to another agent instead. It clears that as soon as a turn succeeds again.
+- **Each room command starts exactly the command your agent was given.** When a command reaches your agent, the plugin now tells DevSpec which command the agent started. Before, it only said the agent had started something, and DevSpec started whichever command was newest, which could be one that arrived behind it.
+- **Inventory and dependency reviews record whose request they serve.** Recording, revising or retracting an infrastructure inventory entry, and reviewing a dependency update, now say whose request the change serves, like every other change your agent makes.
+- **Instructions brought in line with what DevSpec does now:**
+  - A hold from a requirement your work breaks, or from a conflict it did not mean to cause, clears once the agent fixes the work on its branch and hands it in again; only work that undoes someone's decision waits for an OK.
+  - How work that undoes a decision, convention or requirement is answered or kept follows DevSpec's served rules rather than a copy in the plugin.
+  - DevSpec may offer a check on your agent's own change to another agent first, so the agent no longer expects every one of its checks to come back to it, and rules the ones still waiting for it when it hands work in.
+  - The agent switches on Merge when cleared when it hands in work or records a dependency review, and recognises DevSpec's request to merge a cleared pull request by the name DevSpec actually sends.
+  - A new requirement takes effect once its own checks are ruled, not the moment it is recorded.
+  - The agent knows how to link a task to the ticket, GitHub issue or error report it resolves, how to name the pull request carrying an incident's fix, how to answer DevSpec's duplicate notice, and how to review a Dependabot or Renovate update that needs no task.
+- **Agent rules split into more files.** The rules Antigravity loads from the plugin are now an always-on core plus four files the agent reads when it needs them: one on writing DevSpec records and three with the exact call shapes of DevSpec's tools, which now show every parameter the agent may pass. Antigravity cuts off any single rule file past 24,000 bytes, and the old single file had reached that limit.
+- **Sign-in is browser approval only.** The README and the sign-in command describe approving Antigravity in your browser and nothing else.
+- Update the plugin and start a new `agy` session to pick this up.
+
+## 0.28.0
+
+- **A connected Antigravity agent that is waiting for work now listens instead of asking.** The plugin already kept a connection open to DevSpec so DevSpec could tell it the moment something arrived, but it went on asking DevSpec every 25 to 30 seconds as well. While that connection is open and nothing is happening, it now only listens, and checks in once every 45 seconds so DevSpec can keep showing it as connected. This cuts the work DevSpec does for every agent that sits connected and idle.
+- **Messages still arrive straight away.** When DevSpec pushes something, the plugin fetches it at once. When you start working in the terminal, or a turn ends, the plugin tells DevSpec within about a second, as before.
+- **Nothing is missed if the open connection drops.** The plugin reconnects. If it cannot, it goes back to asking DevSpec every 25 to 30 seconds, the way earlier versions did.
+- Update the plugin and start a new `agy` session to pick this up. A session that is already connected keeps the earlier behaviour until it is restarted.
+
+## 0.27.3
+
+- **Notice turns that finish quietly in the terminal no longer post internal notes to the room.** When DevSpec wakes your Antigravity agent with a notice and the agent either settles the finding in place from what you already agreed in the room or sees nothing that needs your decision right now, the agent finishes its turn in the terminal without sending a room message. Until now, the plugin's turn-end hook saw that no room message had been sent during the notice turn, scraped whatever sign-off note the agent printed in its terminal (including internal IDs and lines like "Finishing quietly per notice handling rules"), and posted it into the room as a reply to the notice.
+- When a turn is woken only by DevSpec notices and the agent does not send a room message itself, the turn now ends quietly without scraping terminal output into the room, whether the notice turn ran on its own or while another turn was waiting for background work.
+- Unchanged: when the agent sends a room message on a notice turn because a choice, hold, rejection, or block still needs you, the plugin still labels it as a reply to that notice; when a change during a notice or check turn updates another person's record and DevSpec asks the agent to tell you, the plugin still posts the agent's explanation if the agent did not send one itself; and ordinary room commands and terminal prompts still post their answers as before.
+
+## 0.27.2
+
+- **An Antigravity agent connected outside a room now counts as a spare agent straight away.** When you run `/devspec-remote` in an Antigravity terminal without joining a room, the connection is registered in the middle of that setup turn. When the connect script finished and Antigravity ran one final step to print the status block, the plugin saw the newly created connection and reported the agent as busy with a turn. DevSpec took that as non-check work done after connecting, which disqualified every newly connected Antigravity agent from ever counting as a spare agent for ruling checks.
+- The plugin now treats `/devspec-remote` and `/devspec-remote-stop` turns as remote-control setup from start to finish, so connecting an Antigravity agent outside a room leaves it eligible as a spare agent until you give it real work.
+- Unchanged: typing a normal prompt in the terminal or working on a room command still marks the agent as busy and records that it has done non-check work.
+
+## 0.27.1
+
+- **A change is no longer refused because its command had already been closed.** When your Antigravity agent makes a change that records who asked (creating or updating a task, recording a memory, handing in work and so on), the plugin tells DevSpec which request the change serves. It used to add, beside that, the command the request came from. DevSpec read the command first and refused the change with "DevSpec could not confirm who asked for this change" whenever that command had been closed, even by a timing accident, although the request beside it said exactly who asked.
+- The plugin now sends only the request on those changes. A request answers for its work after its command has closed, and the access of the person who asked is still checked at the moment of each change.
+- When the plugin knows of no request, it sends nothing about who asked and DevSpec works it out from the connection. It no longer falls back to a command it remembered from earlier.
+- Unchanged: a command or a claim the agent names itself is passed through as written; reserving and claiming a task, asking a directed question and previewing a replacement still carry the command, because DevSpec takes no request on those; and a change is still held when one turn carries two people's requests, until the agent says which it serves. There is nothing to set.
+
+## 0.27.0
+
+- **A check now sends the agent to DevSpec's instruction for ruling it.** When DevSpec sends your Antigravity agent a check to rule, the message announcing it tells the agent to read DevSpec's instruction for ruling a check before it takes one. That instruction has the agent hand the check to a helper agent wherever it can start one, so the check's entries stay out of your main conversation. Until now the message told the agent to take the check and rule every entry itself.
+- On Antigravity the helper is a subagent. The plugin follows it as background work, as it does any subagent the agent starts: the check's turn stays open until the helper reports back, and nothing is posted in the room.
+- When no helper can be started, the agent rules the check itself, as before.
+- The plugin points to DevSpec's instruction and keeps no copy of it, so a later change to how checks are ruled reaches the agent without a plugin update.
+- Unchanged: when and how checks are delivered, the order they run in, and how commands and notices are handled. There is nothing to set.
+
+## 0.26.3
+
+- **A command sent just as the agent finishes something else is no longer lost.** If you sent a command from a DevSpec room at the moment your Antigravity agent was finishing its previous turn (often a background check it had been asked to rule on), the command could be marked finished before the agent had started it. The agent then woke, read the command and began the work, but DevSpec refused its first change because it could no longer tell who had asked, and the agent could only ask you to send the command again.
+- When a turn ends, the plugin now tells DevSpec exactly which turn ended: the command it was given, the prompt typed at the terminal, or background work that no command started. Ending one turn can no longer close a different command. Before, it only said that the agent had finished, and DevSpec applied that to whatever was newest, which could be the command that had just arrived.
+- Unchanged: how commands, checks and notices are delivered, the order they run in, and when the room shows the agent as working. There is nothing to set.
+
+## 0.26.2
+
+- **A command sent from a room now gets its project recall.** A command sent to an Antigravity agent from a DevSpec room, on the web or a phone, woke the agent and it answered, but DevSpec's recall cards (the project's relevant decisions, requirements, tasks and documents) never reached that turn, although the same question typed at the terminal got them. The plugin now notes each command as it hands it to Antigravity, so the cards arrive before the model starts on it, even when the command's reply and steps already follow it in the conversation.
+- Unchanged: each command is recalled once, each card is shown once per conversation, a short reply or a slash command asks nothing, a failed lookup adds nothing, and typed prompts behave as before.
+
+## 0.26.1
+
+- **Project recall waits up to 5 seconds instead of 3.** After a quiet spell, the first lookup on a message can take over 2.5 seconds, and at the old limit that message went ahead with no recall cards. The plugin now waits up to 5 seconds, and DevSpec's own limit moved with it, so it always answers or gives up first. An answer that is ready sooner is used at once; signed out, no project in sight, an error or a timeout still adds nothing and never holds up your prompt.
+
+## 0.26.0
+
+- **The agent asks before it records a decision or a requirement.** Your Antigravity agent now asks whether a choice was deliberate, and why, before recording it as a decision, and records nothing on a "no" or no answer. Requirements are rare: the agent explains what one is and asks first, then records it once you agree. A task's intent is your own reason, in plain words, never one the agent invents.
+- **Work is checked against your requirements.** The agent holds its work to the requirements a task comes with, reads every document they link in full, and before handing work in checks what it delivered against them, recording each one it saw met as evidence.
+- **Fewer near-duplicate records.** When DevSpec answers that a new task or memory overlaps existing ones, the agent prefers updating or extending the existing record, talks a previously rejected idea through with you before reviving it, and creates a separate record only when one is genuinely intended. It searches existing documents before writing a new guide or runbook.
+- **Records that recall can find.** Summaries say when to reach for a record and what it covers, related records (such as a runbook and the decision it carries out) are linked, and a requirement recorded at someone's request says whose request it was.
+
+## 0.25.0
+
+- **Project recall on every turn.** When a turn starts, whether you typed the prompt or a command or automation arrived from DevSpec, the plugin asks DevSpec which of your project's records bear on it and adds them to the end of the conversation, so Antigravity starts with the decisions, requirements, tasks and documents that apply. Steps in the middle of a turn, checks, notices, slash commands and short replies ask nothing, and kinds of record DevSpec adds later appear with no plugin update.
+- **Each record once per conversation.** A record already shown is not shown again until it changes. What has been shown is kept in a file only you can read, and forgotten after 30 days unused.
+- **Never in the way.** Recall gives up after 3 seconds, and when you are signed out, no project is in sight, or the lookup fails or times out, it adds nothing. Your sign-in never goes on a command line or into the file recall keeps.
+
+## 0.24.4
+
+- **Project incidents.** When something shared is broken (failing checks, a failed deploy), DevSpec now tells your Antigravity agent about it as background awareness, without waking an idle agent, so it does not start a fix someone is already on. The agent can look incidents up, claim one, report a new one and update it, and each such change records whose request it serves.
+- **Unlinked commits.** The agent's instructions now match how DevSpec follows up a commit that reached the project with no task: a heads-up to the agent that made it, never a task created for it.
+- The incident tool shapes the agent uses match DevSpec's: a reported incident is the only kind an agent opens by hand, and one handler holds an incident at a time, a claim lapsing after 15 minutes without a heartbeat.
+
+## 0.24.3
+
+- **Settled notices stay quiet.** When a DevSpec notice is settled by what was already agreed in the room, your Antigravity agent settles it in place without posting an acknowledgment. It replies in the room only when a choice, hold, rejection or block still needs a person, or when a change it made touched someone else's record.
+
+## 0.24.2
+
+- **A turn waiting on background work keeps showing as working.** When your Antigravity agent starts a background command, a subagent or a one-off timer and waits for it, the room now shows it working for as long as that work runs, with no ten-minute cutoff; a turn waiting on nothing still times out after an hour of silence. A check or notice that arrives during the wait is handled without losing the waiting turn, the command it answers or its reply.
+
+## 0.24.1
+
+- **Fewer turns held open by mistake.** The plugin is more exact about which commands it treats as still running in the background, so text in a file the agent read no longer keeps a turn open.
+- **Settled checks are not delivered.** A check that was settled while it waited behind another turn is now dropped quietly instead of being handed to the agent.
+
+## 0.24.0
+
+- **One browser sign-in for all of Antigravity.** DevSpec's tools now share the plugin's own browser sign-in with remote control, commit tracking and the hooks, so setting up takes a single `/devspec-login` approval with no code to copy, and keeping several Antigravity windows open no longer signs you out after a day.
+- **Every change goes through a pull request, and merges itself once cleared.** Your agent builds each change on its own branch and opens a pull request into the repository's tracking branch with your GitHub credentials wherever pull requests are supported, small changes included, never pushing straight to the tracking branch. It marks the pull request ready and switches on DevSpec's Merge when cleared, so the pull request merges once DevSpec's check and the required GitHub checks pass, and the agent does not sit polling GitHub meanwhile. If DevSpec's GitHub App cannot merge in your repository, DevSpec wakes the agent to merge that exact commit with your credentials.
+- **The room shows the agent working on checks and notices too,** and a turn that hands work to the background keeps the command it is answering open until that work reports back.
+- **Readable task names in the activity trail.** The room's live activity shows the titles of the tasks the agent works with, even when DevSpec answered with only an id or a shortened result.
+
+## 0.23.1
+
+- **Browser sign-in polish.** The local browser callback page now renders with the DevSpec logo and adapts cleanly to light and dark mode, `/devspec-login` places the browser link on its own line with a clearer remote-machine `--code` hint, sign-in confirmation prompts you to restart Antigravity to finish connecting, and the Quick Start copy no longer mentions the retired token setup to new users.
+
+## 0.23.0
+
+- Signing in no longer involves a token. The plugin now brings its own DevSpec connection, naming Antigravity's own DevSpec sign-in app, so a fresh install needs no settings file edited: Antigravity asks you to approve it in your browser on DevSpec's page, and keeps and renews that sign-in itself.
+- Remote control, commit tracking and the plugin's hooks run outside Antigravity's sign-in, so they get one approval of their own, also on DevSpec's page and also naming Antigravity. The first time they need DevSpec the plugin opens it in your browser (once, however many windows ask), and `/devspec-login` does the same whenever you want it. On a machine your browser cannot reach, `/devspec-login --code` gives you a link and takes back the code DevSpec's page shows. The approval always comes back through your own browser.
+- Antigravity appears once on DevSpec's Agent setup page, and disconnecting it there signs out both. When the background sign-in stops working, the status bar and the next session say so in plain words and tell you to run `/devspec-login`. `/devspec-login --status` and `--logout` check it and sign out of it.
+- The background sign-in is kept in the plugin's own file, `~/.devspec/antigravity/auth.json` (readable only by you), one per DevSpec server, and is only ever sent to the server it was approved for. It is renewed in time without asking you again. The plugin no longer reads another tool's login or a token from Antigravity's settings, and a server address in the environment no longer redirects a saved sign-in.
+
+## 0.22.0
+
+- DevSpec now asks the project's agents to check whether open tasks are out of date when a discussion point is settled, when a Goal or one of its outcomes changes, and when someone runs the out-of-date scan over the whole backlog from the Tasks page. Antigravity now receives those checks: the wake says which one it is ("an out-of-date check on the settled discussion point …", "… on the Goal …", "the whole-backlog out-of-date scan …"), and your agent rules them like any other check. The plugin asks for the new version of check jobs, and no longer reads the high-risk count, which that version does not send.
+- DevSpec now labels every notice it sends your agent as either needing you or only for the record, and the plugin follows that label instead of replying to everything. A notice that needs you is answered in the room as before. One that is only for the record (an edit going live, a duplicate of your own task folded in, a commit linked to your own task) is handled quietly: nothing is posted, and if your agent tries, DevSpec declines it without anything else being tried.
+- A turn your agent spends only on checks and for-the-record notices now leaves nothing in the room, including when it ends on an error. If something your agent does in such a turn changes someone else's record, DevSpec says so, and your agent tells you what it changed.
+- The remote skill and the rules point at DevSpec's own rules for this (which notices are replied to, and never posting about ruling a check) instead of restating them.
+- When a check finds that a task your agent wrote duplicates another, the agent resolves it there and then as DevSpec's own rule says, instead of following a copy of that rule kept in the plugin.
+
 ## 0.21.15
 
 - Updated `README.md` with an overview of shared team memory and staleness screening, sessionless **Agents** page availability versus session room attachment, `/devspec-remote --name "<codename>"`, check-ruling and automation wake behavior, single-claim commit tagging across linked repositories (including Git worktrees) and `.devspec/project.json`-pinned folders, observed criterion verification, Protected intent holds, and GitHub pull-request checks.

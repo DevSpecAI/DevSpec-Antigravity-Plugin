@@ -23,6 +23,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { mcpToolsCall, mcpToolsList } from './mcp-call.mjs'
 import { readPrivateJson } from './private-state.mjs'
+import { stateWithCurrentToken } from './resolve-mcp-auth.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
@@ -157,7 +158,7 @@ export function readPollConnectionState(connectionId, dir = CONNECTIONS_DIR) {
     throw new Error('missing or invalid --connection-id')
   }
   const statePath = path.join(dir, `${connectionId}.json`)
-  const state = readPrivateJson(statePath)
+  const state = stateWithCurrentToken(readPrivateJson(statePath))
   if (!state) throw new Error('connection state is unavailable or unreadable')
   if (state.connection_id !== connectionId || state.enabled === false) {
     throw new Error('connection state is unavailable or disabled')
