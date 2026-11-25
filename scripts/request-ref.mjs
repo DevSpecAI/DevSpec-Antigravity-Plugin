@@ -44,6 +44,7 @@ export const REQUEST_REF_TOOLS = new Set([
   'link_tasks',
   'manage_goals',
   'manage_incident',
+  'manage_inventory_connections',
   'manage_knowledge_links',
   'manage_protected_intent',
   'record_completed_work',
