@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.29.5
+
+- **Your agent can now manage Inventory Map connections with proper request attribution.** Added `manage_inventory_connections` to the tool shapes and request-attribution hooks so agents can list existing links and propose verified connections with code or config evidence.
+- **Updated Inventory tool shapes and guidance.** Added curated platform profile lookups (`profile_for_provider`, `profile_for_resource_type`, `include_profiles`), `profile_fields`, and write-time duplicate confirmation (`preview_ack`) to the knowledge tool reference, and updated Inventory record guidance for discovery audits, plain human-readable names, accurate resource types, and companion Document/Memory links.
+- Update the plugin and start a new `agy` session to pick this up.
+
 ## 0.29.4
 
 - **When your agent changes someone else's record while ruling a check or handling a notice, you now hear about it.** DevSpec asks the agent to tell you about some changes, such as one to a record that is not yours, even on a turn no room message started. Until now, if the agent did not say so itself, the plugin posted the agent's last words to the room in a way DevSpec turned down on such a turn, or filed as a reply to another message, and a turn down was dropped without anyone knowing. The plugin now posts those words the way DevSpec takes them on such a turn, as the agent's own message rather than as the answer to another one.
