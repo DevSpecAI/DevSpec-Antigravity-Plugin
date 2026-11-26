@@ -32,6 +32,7 @@ import {
   PUSH_HEALTHY_MS,
   PUSH_SAFETY_MS,
   createPushGate,
+  pollCheckedNothing,
   pollCoversNudges,
   nextPushReconnectDelayMs,
   pushChannelUrl,
@@ -842,6 +843,47 @@ describe('SSE push channel (parseSseFrame, pushChannelUrl, nextPushReconnectDela
       gate.pollSucceeded(roomRead)
     }
     assert.equal(gate.hasWakePending(), false, 'the room read that followed handles it')
+  })
+
+  it('a no-change answer whose room lookups failed keeps the nudge and owes a retry; ok or an older server without the field acknowledges (eca7af12)', async () => {
+    // unavailable: checked nothing
+    assert.equal(pollCheckedNothing({ changed: false, markerRead: 'unavailable' }), true)
+    assert.equal(pollCoversNudges({ live: true, changed: false, markerRead: 'unavailable' }), false)
+    // ok, or absent (an older server): a real "no change"
+    assert.equal(pollCheckedNothing({ changed: false, markerRead: 'ok' }), false)
+    assert.equal(pollCheckedNothing({ changed: false }), false)
+    assert.equal(pollCoversNudges({ live: true, changed: false, markerRead: 'ok' }), true)
+    assert.equal(pollCoversNudges({ live: true, changed: false }), true)
+    // a changed reply is never "checked nothing"
+    assert.equal(pollCheckedNothing({ changed: true, markerRead: 'unavailable' }), false)
+
+    // Wired through the gate the way the loop wires it.
+    const runLap = (gate, markerRead) => {
+      const poll = gate.beginPoll(25_000, { live: true })
+      if (pollCheckedNothing({ changed: false, markerRead })) {
+        gate.pollFailed()
+        return
+      }
+      if (pollCoversNudges({ live: poll.live, changed: false, markerRead })) gate.pollSucceeded(poll)
+    }
+
+    const failed = createPushGate({ safetyMs: 400, localCheckMs: 10 })
+    failed.onEvent({ kind: 'hello' })
+    failed.onEvent({ kind: 'wake' })
+    runLap(failed, 'unavailable')
+    assert.equal(failed.hasWakePending(), true, 'the nudge is still pending')
+    assert.equal(failed.isPollOwed(), true, 'a retry is owed')
+    assert.ok((await quickWait(failed)) < 100, 'the retry is not held for the safety timer')
+
+    for (const markerRead of ['ok', undefined]) {
+      const gate = createPushGate({ safetyMs: 400, localCheckMs: 10 })
+      gate.onEvent({ kind: 'hello' })
+      gate.onEvent({ kind: 'wake' })
+      runLap(gate, markerRead)
+      assert.equal(gate.hasWakePending(), false, `marker_read ${markerRead ?? 'absent'} acknowledges`)
+      assert.equal(gate.isPollOwed(), false)
+      assert.ok((await quickWait(gate)) >= 300, `marker_read ${markerRead ?? 'absent'} does not re-poll (no hot loop)`)
+    }
   })
 
   it('an idle gate with no nudges makes no extra check-ins (eca7af12)', async () => {

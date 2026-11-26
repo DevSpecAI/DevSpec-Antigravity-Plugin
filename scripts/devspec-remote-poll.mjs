@@ -1497,7 +1497,14 @@ export function createPushGate({
  *   - an event-only reply (directed-question interaction or question dismissal)
  *     carries no room ingress at all, and its handler may apply nothing;
  *   - a rejected room ingress or dispatch batch was not applied.
- * A clean live poll that reports no change confirms nothing is waiting.
+ * A clean live poll that reports no change confirms nothing is waiting, unless
+ * DevSpec says none of its room lookups answered (`marker_read: 'unavailable'`,
+ * DevSpecV2 #1681): that "no change" checked nothing.
+ *
+ * An ABSENT `marker_read` (an older server, e.g. production until #1681 is
+ * released) still counts as a real "no change". Treating absence as a failure
+ * would make every no-change answer from an older server re-poll immediately
+ * while the stream is open: a hot loop.
  */
 export function pollCoversNudges({
   live,
@@ -1505,11 +1512,21 @@ export function pollCoversNudges({
   interactionLane = false,
   canonicalApplied = false,
   dispatchesApplied = false,
+  markerRead,
 } = {}) {
   if (!live) return false
-  if (!changed) return true
+  if (!changed) return !pollCheckedNothing({ changed, markerRead })
   if (interactionLane) return false
   return Boolean(canonicalApplied && dispatchesApplied)
+}
+
+/**
+ * A no-change answer whose room lookups all failed (DevSpecV2 #1681). It is a
+ * failed check-in in all but name: owe a retry and count it toward the error
+ * back-off. Absent means an older server that cannot say, which is not a failure.
+ */
+export function pollCheckedNothing({ changed, markerRead } = {}) {
+  return changed !== true && markerRead === 'unavailable'
 }
 
 export function nextPushReconnectDelayMs({ attempt, openedAtMs, nowMs = Date.now() }) {
@@ -2784,7 +2801,11 @@ async function main() {
         checkTier: tier.checkTier,
         catchUp: needsSeed,
       })
-      consecutiveErrors = 0
+      // A "no change" that checked nothing is a failure for the back-off too, so
+      // repeated ones slow down exactly like thrown polls (handled below).
+      if (!pollCheckedNothing({ changed: res?.changed, markerRead: res?.marker_read })) {
+        consecutiveErrors = 0
+      }
       if (busyArg !== null) lastBusySent = busyArg
     } catch (e) {
       if (e?.code === 'owner_gone') {
@@ -2960,6 +2981,21 @@ async function main() {
       continue
     }
 
+    if (pollCheckedNothing({ changed: res.changed, markerRead: res.marker_read })) {
+      // DevSpec answered "no change" but none of its room lookups answered, so
+      // nothing was checked: keep any nudge pending, owe a retry, and back off as
+      // for a failed poll. Nothing about the room is learnt, so no cursor moves and
+      // a seed is not marked complete.
+      consecutiveErrors++
+      pushGate.pollFailed()
+      const backoff = errorBackoffMs(consecutiveErrors)
+      process.stderr.write(
+        `devspec-remote-poll: room check did not answer (${consecutiveErrors}) — retrying in ${backoff}ms\n`,
+      )
+      await sleep(backoff)
+      continue
+    }
+
     if (!catchUpCursor && typeof res.cursor_v2 === 'string' && res.cursor_v2) {
       liveCursorV2 = res.cursor_v2
     }
@@ -2975,7 +3011,9 @@ async function main() {
     }
     needsSeed = false
     consecutiveEmpty = 0
-    if (pollCoversNudges({ live: poll.live, changed: false })) pushGate.pollSucceeded(poll)
+    if (pollCoversNudges({ live: poll.live, changed: false, markerRead: res.marker_read })) {
+      pushGate.pollSucceeded(poll)
+    }
   }
 }
 
