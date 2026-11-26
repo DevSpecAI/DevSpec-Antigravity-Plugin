@@ -694,17 +694,17 @@ describe('SSE push channel (parseSseFrame, pushChannelUrl, nextPushReconnectDela
 
     // Before hello: not connected, waitIfIdle returns immediately, and poll uses fallback waitMs
     assert.equal(gate.isConnected(), false)
-    assert.equal(gate.consumePollWaitMs(25_000), 25_000)
+    assert.equal(gate.beginPoll(25_000).waitMs, 25_000)
 
     // After hello: connected, poll uses wait_ms: 0, and waitIfIdle sleeps up to safetyMs
     gate.onEvent({ kind: 'hello' })
     assert.equal(gate.isConnected(), true)
-    assert.equal(gate.consumePollWaitMs(25_000), 0)
+    assert.equal(gate.beginPoll(25_000).waitMs, 0)
 
     const startSafety = Date.now()
     await gate.waitIfIdle()
     assert.ok(Date.now() - startSafety >= 55, 'waitIfIdle sleeps until safetyMs when quiet')
-    assert.equal(gate.consumePollWaitMs(25_000), 0)
+    assert.equal(gate.beginPoll(25_000).waitMs, 0)
 
     // SSE wake/notice/interaction frames wake waitIfIdle immediately
     for (const kind of ['wake', 'system_notice', 'interaction_event', 'question_dismissal_event']) {
@@ -714,7 +714,7 @@ describe('SSE push channel (parseSseFrame, pushChannelUrl, nextPushReconnectDela
       const t0 = Date.now()
       await gateFrame.waitIfIdle()
       assert.ok(Date.now() - t0 < 500, `SSE ${kind} frame wakes waitIfIdle immediately`)
-      assert.equal(gateFrame.consumePollWaitMs(25_000), 0)
+      assert.equal(gateFrame.beginPoll(25_000).waitMs, 0)
     }
 
     // Local turn marker / state change wakes waitIfIdle on the localCheckMs tick
@@ -727,7 +727,7 @@ describe('SSE push channel (parseSseFrame, pushChannelUrl, nextPushReconnectDela
     const tLocal = Date.now()
     await gateLocal.waitIfIdle({ shouldWakeImmediately: () => localTurnChanged })
     assert.ok(Date.now() - tLocal < 500, 'local state change wakes waitIfIdle immediately')
-    assert.equal(gateLocal.consumePollWaitMs(25_000), 0)
+    assert.equal(gateLocal.beginPoll(25_000).waitMs, 0)
 
     // Disconnect wakes waitIfIdle immediately and restores the held poll waitMs fallback
     const gateDrop = createPushGate({ safetyMs: 5_000, localCheckMs: 500 })
@@ -737,7 +737,92 @@ describe('SSE push channel (parseSseFrame, pushChannelUrl, nextPushReconnectDela
     await gateDrop.waitIfIdle()
     assert.ok(Date.now() - tDrop < 500, 'disconnect wakes waitIfIdle immediately')
     assert.equal(gateDrop.isConnected(), false)
-    assert.equal(gateDrop.consumePollWaitMs(25_000), 25_000)
+    assert.equal(gateDrop.beginPoll(25_000).waitMs, 25_000)
+  })
+
+  // Item eca7af12: a nudge is only handled by a successful check-in of the live end.
+  const quickWait = async (gate) => {
+    const t0 = Date.now()
+    await gate.waitIfIdle()
+    return Date.now() - t0
+  }
+
+  it('keeps a nudge that lands while older room history is being paged, so the poller checks straight after the catch-up (eca7af12)', async () => {
+    const gate = createPushGate({ safetyMs: 400, localCheckMs: 10 })
+    gate.onEvent({ kind: 'hello' })
+    // Seed check-in of the live end succeeds; the room has more history to page.
+    const seed = gate.beginPoll(25_000, { live: true })
+    gate.pollSucceeded(seed)
+    assert.equal(gate.hasWakePending(), false)
+    // First history page in flight; the person's message arrives and DevSpec nudges.
+    const page1 = gate.beginPoll(25_000, { live: false })
+    gate.onEvent({ kind: 'wake' })
+    gate.pollSucceeded(page1)
+    // Next history page starts and finishes: it reads only older messages.
+    const page2 = gate.beginPoll(25_000, { live: false })
+    assert.equal(page2.waitMs, 0)
+    gate.pollSucceeded(page2)
+    assert.equal(gate.hasWakePending(), true, 'history pages never acknowledge a nudge')
+    // Catch-up done: the poller must not sleep until the safety timer.
+    assert.ok((await quickWait(gate)) < 100, 'waitIfIdle returns at once after the catch-up')
+    const live = gate.beginPoll(25_000, { live: true })
+    gate.pollSucceeded(live)
+    assert.equal(gate.hasWakePending(), false, 'the live check-in after catch-up handles it')
+  })
+
+  it('owes a retry after a failed or timed-out check-in instead of sleeping until the next nudge (eca7af12)', async () => {
+    const gate = createPushGate({ safetyMs: 400, localCheckMs: 10 })
+    gate.onEvent({ kind: 'hello' })
+    // A nudge starts a check-in that then times out.
+    gate.onEvent({ kind: 'wake' })
+    gate.beginPoll(25_000, { live: true })
+    gate.pollFailed()
+    assert.equal(gate.hasWakePending(), true, 'the failed check-in did not handle the nudge')
+    assert.ok((await quickWait(gate)) < 100, 'the retry goes straight after the back-off')
+    // A safety-timer check-in (no nudge) that fails also owes a retry.
+    const quiet = createPushGate({ safetyMs: 400, localCheckMs: 10 })
+    quiet.onEvent({ kind: 'hello' })
+    quiet.beginPoll(25_000, { live: true })
+    quiet.pollFailed()
+    assert.equal(quiet.isPollOwed(), true)
+    assert.ok((await quickWait(quiet)) < 100, 'a failed quiet check-in is retried at once')
+    // Starting the retry clears what was owed; its success leaves nothing pending.
+    const retry = quiet.beginPoll(25_000, { live: true })
+    assert.equal(quiet.isPollOwed(), false)
+    quiet.pollSucceeded(retry)
+    assert.ok((await quickWait(quiet)) >= 300, 'with nothing owed it sleeps until the safety timer again')
+  })
+
+  it('a nudge during a live check-in causes exactly one more check-in (eca7af12)', async () => {
+    const gate = createPushGate({ safetyMs: 300, localCheckMs: 10 })
+    gate.onEvent({ kind: 'hello' })
+    let checkIns = 0
+    // First lap: the safety timer fires (no nudge) and a check-in starts...
+    const first = gate.beginPoll(25_000, { live: true })
+    checkIns++
+    gate.onEvent({ kind: 'wake' }) // ...and a message lands while it is in flight.
+    gate.pollSucceeded(first)
+    // Loop: poll whenever waitIfIdle returns quickly.
+    for (let lap = 0; lap < 3; lap++) {
+      if ((await quickWait(gate)) >= 250) break
+      const next = gate.beginPoll(25_000, { live: true })
+      checkIns++
+      gate.pollSucceeded(next)
+    }
+    assert.equal(checkIns, 2, 'exactly one extra check-in for the nudge that arrived mid-flight')
+  })
+
+  it('an idle gate with no nudges makes no extra check-ins (eca7af12)', async () => {
+    const gate = createPushGate({ safetyMs: 150, localCheckMs: 10 })
+    gate.onEvent({ kind: 'hello' })
+    const poll = gate.beginPoll(25_000, { live: true })
+    gate.pollSucceeded(poll)
+    assert.equal(gate.hasWakePending(), false)
+    assert.equal(gate.isPollOwed(), false)
+    assert.ok((await quickWait(gate)) >= 120, 'idle waits for the safety timer')
+    // In long-poll fallback (stream down) the held wait is unchanged.
+    gate.onDisconnect()
+    assert.equal(gate.beginPoll(25_000, { live: true }).waitMs, 25_000)
   })
 })
 
