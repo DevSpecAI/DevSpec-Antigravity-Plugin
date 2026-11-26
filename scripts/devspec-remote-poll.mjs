@@ -1489,6 +1489,29 @@ export function createPushGate({
   }
 }
 
+/**
+ * Does a finished check-in cover the nudges that arrived before it began?
+ * (item eca7af12; requirement 3ea2b201: handled state advances only for work
+ * actually completed.) Only a live read of the room counts:
+ *   - a backward history page (catch_up_cursor) reads older messages only;
+ *   - an event-only reply (directed-question interaction or question dismissal)
+ *     carries no room ingress at all, and its handler may apply nothing;
+ *   - a rejected room ingress or dispatch batch was not applied.
+ * A clean live poll that reports no change confirms nothing is waiting.
+ */
+export function pollCoversNudges({
+  live,
+  changed,
+  interactionLane = false,
+  canonicalApplied = false,
+  dispatchesApplied = false,
+} = {}) {
+  if (!live) return false
+  if (!changed) return true
+  if (interactionLane) return false
+  return Boolean(canonicalApplied && dispatchesApplied)
+}
+
 export function nextPushReconnectDelayMs({ attempt, openedAtMs, nowMs = Date.now() }) {
   const effectiveAttempt =
     openedAtMs !== null && openedAtMs !== undefined && nowMs - openedAtMs >= PUSH_HEALTHY_MS
@@ -2892,7 +2915,8 @@ async function main() {
     if (res.changed === true) {
       const interaction = await consumeInteractionEvents(res)
       if (interaction.lane) {
-        pushGate.pollSucceeded(poll)
+        // An event-only reply never read the room, so any nudge stays pending
+        // and the next lap reads the room straight away (pollCoversNudges).
         if (interaction.delivered) {
           consecutiveEmpty = 0
           continue
@@ -2907,9 +2931,18 @@ async function main() {
         needsSeed = redrainRequested
         redrainRequested = false
       }
-      // Only a result that was actually applied covers the nudges before it; a
-      // rejected one leaves them pending so the room is read again.
-      if (canonical.ok && dispatched.ok) pushGate.pollSucceeded(poll)
+      // Only a room ingress that was actually applied covers the nudges before
+      // it; a rejected one leaves them pending so the room is read again.
+      if (
+        pollCoversNudges({
+          live: poll.live,
+          changed: true,
+          canonicalApplied: canonical.ok,
+          dispatchesApplied: dispatched.ok,
+        })
+      ) {
+        pushGate.pollSucceeded(poll)
+      }
       const handOverNow = considerCommandOffer(res)
       if (dispatched.delivered || canonical.delivered) {
         consecutiveEmpty = 0
@@ -2942,7 +2975,7 @@ async function main() {
     }
     needsSeed = false
     consecutiveEmpty = 0
-    pushGate.pollSucceeded(poll)
+    if (pollCoversNudges({ live: poll.live, changed: false })) pushGate.pollSucceeded(poll)
   }
 }
 

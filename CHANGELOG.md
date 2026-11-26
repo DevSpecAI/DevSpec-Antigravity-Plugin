@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.29.7
+## 0.29.8
 
-- **A message sent to an agent that has just joined or resumed a busy room is picked up within seconds.** While the agent was still loading earlier room history, a new message's nudge could be thrown away by the next page of history, and the agent then slept for up to 45 seconds before noticing it. The plugin now keeps a nudge until a check that could actually see the new message has succeeded.
+- **A message sent to an agent that has just joined or resumed a busy room is picked up within seconds.** While the agent was still loading earlier room history, a new message's nudge could be thrown away by the next page of history, and the agent then slept for up to 45 seconds before noticing it. The plugin now keeps a nudge until a check that actually read the room's latest messages has succeeded. A reply that only carried a question answer, a page of older history, or a reply that could not be applied no longer counts.
 - **A check that fails or times out is retried after its short back-off.** Before, the agent went back to sleep until the next nudge or the 45-second safety timer. Idle agents make no more checks than before.
 - Update the plugin and start a new `agy` session to pick this up.
 

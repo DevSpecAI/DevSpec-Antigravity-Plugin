@@ -32,6 +32,7 @@ import {
   PUSH_HEALTHY_MS,
   PUSH_SAFETY_MS,
   createPushGate,
+  pollCoversNudges,
   nextPushReconnectDelayMs,
   pushChannelUrl,
   parseSseFrame,
@@ -810,6 +811,37 @@ describe('SSE push channel (parseSseFrame, pushChannelUrl, nextPushReconnectDela
       gate.pollSucceeded(next)
     }
     assert.equal(checkIns, 2, 'exactly one extra check-in for the nudge that arrived mid-flight')
+  })
+
+  it('an event-only (interaction or dismissal) reply never covers a nudge, so the next lap reads the room at once (eca7af12)', async () => {
+    // The decision the main loop makes after each kind of reply.
+    assert.equal(pollCoversNudges({ live: true, changed: true, interactionLane: true }), false)
+    assert.equal(
+      pollCoversNudges({ live: true, changed: true, interactionLane: true, canonicalApplied: true, dispatchesApplied: true }),
+      false,
+      'the interaction lane never reads the room, whatever else is set',
+    )
+    assert.equal(pollCoversNudges({ live: false, changed: true, canonicalApplied: true, dispatchesApplied: true }), false)
+    assert.equal(pollCoversNudges({ live: false, changed: false }), false, 'a history page that saw nothing still read no live end')
+    assert.equal(pollCoversNudges({ live: true, changed: true, canonicalApplied: false, dispatchesApplied: true }), false)
+    assert.equal(pollCoversNudges({ live: true, changed: true, canonicalApplied: true, dispatchesApplied: false }), false)
+    assert.equal(pollCoversNudges({ live: true, changed: true, canonicalApplied: true, dispatchesApplied: true }), true)
+    assert.equal(pollCoversNudges({ live: true, changed: false }), true, 'a clean live poll confirms nothing waits')
+
+    // Wired through the gate the way the loop wires it.
+    const gate = createPushGate({ safetyMs: 400, localCheckMs: 10 })
+    gate.onEvent({ kind: 'hello' })
+    gate.onEvent({ kind: 'wake' }) // a room message is waiting
+    const poll = gate.beginPoll(25_000, { live: true })
+    // The reply is interaction-only (a question answer), delivered or not.
+    if (pollCoversNudges({ live: poll.live, changed: true, interactionLane: true })) gate.pollSucceeded(poll)
+    assert.equal(gate.hasWakePending(), true, 'the room nudge is still pending')
+    assert.ok((await quickWait(gate)) < 100, 'the next lap polls at once instead of sleeping')
+    const roomRead = gate.beginPoll(25_000, { live: true })
+    if (pollCoversNudges({ live: roomRead.live, changed: true, canonicalApplied: true, dispatchesApplied: true })) {
+      gate.pollSucceeded(roomRead)
+    }
+    assert.equal(gate.hasWakePending(), false, 'the room read that followed handles it')
   })
 
   it('an idle gate with no nudges makes no extra check-ins (eca7af12)', async () => {
