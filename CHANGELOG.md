@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.29.6
+
+- **Inventory Map connections are now recorded directly as live editable links.** Updated the `manage_inventory_connections` tool shape and Inventory guidance to use `action: "record"` (with `evidence` required) so verified connections appear directly on the Inventory Map without a separate confirmation step, while keeping legacy `propose` and `confirm` actions compatible.
+- Update the plugin and start a new `agy` session to pick this up.
+
 ## 0.29.5
 
 - **Your agent can now manage Inventory Map connections with proper request attribution.** Added `manage_inventory_connections` to the tool shapes and request-attribution hooks so agents can list existing links and propose verified connections with code or config evidence.
