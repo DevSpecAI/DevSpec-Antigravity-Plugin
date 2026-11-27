@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.29.9
+
+- **A message sent to an agent that has just joined or resumed a busy room is picked up within seconds.** While the agent was still loading earlier room history, a new message's nudge could be thrown away by the next page of history, and the agent then slept for up to 45 seconds before noticing it. The plugin now keeps a nudge until a check that actually read the room's latest messages has succeeded. A reply that only carried a question answer, a page of older history, or a reply that could not be applied no longer counts.
+- **A check that fails or times out is retried after its short back-off.** Before, the agent went back to sleep until the next nudge or the 45-second safety timer. The same now applies when DevSpec answers “nothing new” but says it could not actually look at the room (DevSpec reports this from its next release; older servers are treated as before). Idle agents make no more checks than before.
+- Update the plugin and start a new `agy` session to pick this up.
+
 ## 0.29.6
 
 - **Inventory Map connections are now recorded directly as live editable links.** Updated the `manage_inventory_connections` tool shape and Inventory guidance to use `action: "record"` (with `evidence` required) so verified connections appear directly on the Inventory Map without a separate confirmation step, while keeping legacy `propose` and `confirm` actions compatible.

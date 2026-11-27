@@ -1371,13 +1371,41 @@ export const PUSH_HEALTHY_MS = 30_000
 export const PUSH_SAFETY_MS = 45_000
 export const PUSH_LOCAL_CHECK_MS = 1_000
 
+/**
+ * The local half of push mode: sleep until the SSE stream says something moved,
+ * with a safety timer underneath, and decide how long each check-in may hold.
+ *
+ * Nudges are COUNTED, not held in one flag (item eca7af12). A single flag cleared
+ * at the start of every check-in threw a nudge away whenever the check-in that
+ * cleared it could not see the new message:
+ *   - a backward history page (catch_up_cursor) read while joining or resuming a
+ *     busy room only reads older messages, so a message that arrived mid catch-up
+ *     waited for the 45 s safety timer once the catch-up ended (Cosmic Hawk, 66 s
+ *     and 69 s on 2026-11-26);
+ *   - a check-in that failed or timed out read nothing at all, so the retry went
+ *     back to sleep instead of going straight away (Wild Pika).
+ * So a check-in takes a ticket when it starts (`beginPoll`), and only a check-in
+ * that SUCCEEDED and read the live end of the room acknowledges the nudges that
+ * had arrived before it started (`pollSucceeded`). A nudge that lands during a
+ * check-in stays pending and causes exactly one more. A failed check-in leaves a
+ * retry owed (`pollFailed`), so the next lap polls after the error back-off rather
+ * than waiting for another nudge. With no nudges nothing changes: idle stays quiet.
+ */
 export function createPushGate({
   safetyMs = PUSH_SAFETY_MS,
   localCheckMs = PUSH_LOCAL_CHECK_MS,
 } = {}) {
   let connected = false
-  let wakePending = false
+  /** Nudges seen on the stream (wake, ended, notices, interaction events). */
+  let produced = 0
+  /** Nudges covered by a successful check-in of the live end of the room. */
+  let acknowledged = 0
+  /** A check-in failed, so one is owed even though no new nudge has arrived. */
+  let pollOwed = false
   let wakeWaiter = null
+
+  const wakePending = () => produced > acknowledged
+  const shouldPollNow = () => wakePending() || pollOwed
 
   const notify = () => {
     if (wakeWaiter) {
@@ -1389,7 +1417,8 @@ export function createPushGate({
 
   return {
     isConnected: () => connected,
-    hasWakePending: () => wakePending,
+    hasWakePending: () => wakePending(),
+    isPollOwed: () => pollOwed,
     onEvent(evt) {
       if (!evt) return
       if (evt.kind === 'hello') {
@@ -1403,7 +1432,7 @@ export function createPushGate({
         evt.kind === 'interaction_event' ||
         evt.kind === 'question_dismissal_event'
       ) {
-        wakePending = true
+        produced += 1
         notify()
       }
     },
@@ -1411,13 +1440,28 @@ export function createPushGate({
       connected = false
       notify()
     },
-    consumePollWaitMs(fallbackWaitMs) {
-      const waitMs = wakePending || connected ? 0 : fallbackWaitMs
-      wakePending = false
-      return waitMs
+    /**
+     * Start a check-in. `live` is false for a backward history page (one sent with
+     * a catch_up_cursor): it can never see a message newer than the room's live
+     * end, so it must not acknowledge a nudge. The hold is unchanged from before:
+     * none while a nudge is pending or the stream is open, else the fallback hold.
+     */
+    beginPoll(fallbackWaitMs, { live = true } = {}) {
+      const waitMs = wakePending() || connected ? 0 : fallbackWaitMs
+      pollOwed = false
+      return { waitMs, ticket: produced, live: Boolean(live) }
+    },
+    /** The check-in succeeded and its result was applied. */
+    pollSucceeded(poll) {
+      if (!poll || !poll.live) return
+      if (poll.ticket > acknowledged) acknowledged = poll.ticket
+    },
+    /** The check-in failed or timed out: nothing was read, so retry rather than sleep. */
+    pollFailed() {
+      pollOwed = true
     },
     async waitIfIdle({ shouldWakeImmediately } = {}) {
-      if (!connected || wakePending) return
+      if (!connected || shouldPollNow()) return
       if (typeof shouldWakeImmediately === 'function' && shouldWakeImmediately()) return
       await new Promise((resolve) => {
         let settled = false
@@ -1432,7 +1476,7 @@ export function createPushGate({
         wakeWaiter = finish
         const safetyTimer = setTimeout(finish, safetyMs)
         const localTimer = setInterval(() => {
-          if (!connected || wakePending) {
+          if (!connected || shouldPollNow()) {
             finish()
             return
           }
@@ -1443,6 +1487,46 @@ export function createPushGate({
       })
     },
   }
+}
+
+/**
+ * Does a finished check-in cover the nudges that arrived before it began?
+ * (item eca7af12; requirement 3ea2b201: handled state advances only for work
+ * actually completed.) Only a live read of the room counts:
+ *   - a backward history page (catch_up_cursor) reads older messages only;
+ *   - an event-only reply (directed-question interaction or question dismissal)
+ *     carries no room ingress at all, and its handler may apply nothing;
+ *   - a rejected room ingress or dispatch batch was not applied.
+ * A clean live poll that reports no change confirms nothing is waiting, unless
+ * DevSpec says none of its room lookups answered (`marker_read: 'unavailable'`,
+ * DevSpecV2 #1681): that "no change" checked nothing.
+ *
+ * An ABSENT `marker_read` (an older server, e.g. production until #1681 is
+ * released) still counts as a real "no change". Treating absence as a failure
+ * would make every no-change answer from an older server re-poll immediately
+ * while the stream is open: a hot loop.
+ */
+export function pollCoversNudges({
+  live,
+  changed,
+  interactionLane = false,
+  canonicalApplied = false,
+  dispatchesApplied = false,
+  markerRead,
+} = {}) {
+  if (!live) return false
+  if (!changed) return !pollCheckedNothing({ changed, markerRead })
+  if (interactionLane) return false
+  return Boolean(canonicalApplied && dispatchesApplied)
+}
+
+/**
+ * A no-change answer whose room lookups all failed (DevSpecV2 #1681). It is a
+ * failed check-in in all but name: owe a retry and count it toward the error
+ * back-off. Absent means an older server that cannot say, which is not a failure.
+ */
+export function pollCheckedNothing({ changed, markerRead } = {}) {
+  return changed !== true && markerRead === 'unavailable'
 }
 
 export function nextPushReconnectDelayMs({ attempt, openedAtMs, nowMs = Date.now() }) {
@@ -2707,15 +2791,21 @@ async function main() {
     }
 
     let res = null
+    // A backward history page (catch_up_cursor) reads only older messages, so it
+    // must not count as having seen a nudge's new message (item eca7af12).
+    const poll = pushGate.beginPoll(tier.waitMs, { live: !catchUpCursor })
     try {
-      const effectiveWaitMs = pushGate.consumePollWaitMs(tier.waitMs)
       res = await pollOnce({
-        waitMs: effectiveWaitMs,
+        waitMs: poll.waitMs,
         busy: busyArg,
         checkTier: tier.checkTier,
         catchUp: needsSeed,
       })
-      consecutiveErrors = 0
+      // A "no change" that checked nothing is a failure for the back-off too, so
+      // repeated ones slow down exactly like thrown polls (handled below).
+      if (!pollCheckedNothing({ changed: res?.changed, markerRead: res?.marker_read })) {
+        consecutiveErrors = 0
+      }
       if (busyArg !== null) lastBusySent = busyArg
     } catch (e) {
       if (e?.code === 'owner_gone') {
@@ -2740,6 +2830,9 @@ async function main() {
         continue
       }
       consecutiveErrors++
+      // Nothing was read: retry after the back-off instead of sleeping until the
+      // next nudge or the safety timer (Wild Pika, item eca7af12).
+      pushGate.pollFailed()
       const rateLimited = /rate limit/i.test(e?.message || '')
       const backoff = errorBackoffMs(consecutiveErrors, { rateLimited })
       process.stderr.write(
@@ -2754,6 +2847,8 @@ async function main() {
       consecutiveRecoverableEnds++
       const label = terminal.reason ? `${terminal.status} (${terminal.reason})` : terminal.status
       if (consecutiveRecoverableEnds < RECOVERABLE_TERMINAL_MAX) {
+        // The server could not see the connection, so this check-in read nothing.
+        pushGate.pollFailed()
         const backoff = errorBackoffMs(consecutiveRecoverableEnds)
         process.stderr.write(
           `devspec-remote-poll: ${label} — recoverable, not a UI end; ` +
@@ -2841,6 +2936,8 @@ async function main() {
     if (res.changed === true) {
       const interaction = await consumeInteractionEvents(res)
       if (interaction.lane) {
+        // An event-only reply never read the room, so any nudge stays pending
+        // and the next lap reads the room straight away (pollCoversNudges).
         if (interaction.delivered) {
           consecutiveEmpty = 0
           continue
@@ -2854,6 +2951,18 @@ async function main() {
       if (canonical.ok) {
         needsSeed = redrainRequested
         redrainRequested = false
+      }
+      // Only a room ingress that was actually applied covers the nudges before
+      // it; a rejected one leaves them pending so the room is read again.
+      if (
+        pollCoversNudges({
+          live: poll.live,
+          changed: true,
+          canonicalApplied: canonical.ok,
+          dispatchesApplied: dispatched.ok,
+        })
+      ) {
+        pushGate.pollSucceeded(poll)
       }
       const handOverNow = considerCommandOffer(res)
       if (dispatched.delivered || canonical.delivered) {
@@ -2872,6 +2981,21 @@ async function main() {
       continue
     }
 
+    if (pollCheckedNothing({ changed: res.changed, markerRead: res.marker_read })) {
+      // DevSpec answered "no change" but none of its room lookups answered, so
+      // nothing was checked: keep any nudge pending, owe a retry, and back off as
+      // for a failed poll. Nothing about the room is learnt, so no cursor moves and
+      // a seed is not marked complete.
+      consecutiveErrors++
+      pushGate.pollFailed()
+      const backoff = errorBackoffMs(consecutiveErrors)
+      process.stderr.write(
+        `devspec-remote-poll: room check did not answer (${consecutiveErrors}) — retrying in ${backoff}ms\n`,
+      )
+      await sleep(backoff)
+      continue
+    }
+
     if (!catchUpCursor && typeof res.cursor_v2 === 'string' && res.cursor_v2) {
       liveCursorV2 = res.cursor_v2
     }
@@ -2887,6 +3011,9 @@ async function main() {
     }
     needsSeed = false
     consecutiveEmpty = 0
+    if (pollCoversNudges({ live: poll.live, changed: false, markerRead: res.marker_read })) {
+      pushGate.pollSucceeded(poll)
+    }
   }
 }
 
