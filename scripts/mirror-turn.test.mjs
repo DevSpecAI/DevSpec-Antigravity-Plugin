@@ -2856,5 +2856,196 @@ describe('Antigravity native hook payload & transcript handling', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true })
     }
   })
+
+  it('does not treat a reply to notice 1 as covering a later needs_person notice 2 in the same pause (02f4ce2b)', async () => {
+    const { appendRequestEvent, setCurrentRequest, UNSTATED } = await import('./requests.mjs')
+    const {
+      currentTurnReplyNoticeIds,
+      recordNoticeReply,
+      recordOwnedEnd,
+      recordOwnedLaunch,
+      recordTurnWake,
+      restoreHeldParentIfResumed,
+    } = await import('./mirror-turn.mjs')
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-second-notice-'))
+    try {
+      const connId = '972c8895-0000-4000-8000-000000000121'
+      const reqId = '972c8895-0000-4000-8000-000000000122'
+      const notice1 = '972c8895-0000-4000-8000-000000000123'
+      const notice2 = '972c8895-0000-4000-8000-000000000124'
+      const taskId = 'conv-second-notice/task-1'
+      const t0 = Date.now() - 10_000
+
+      appendRequestEvent(connId, { op: 'open', id: reqId, kind: 'command' }, { dir: tmpDir })
+      setCurrentRequest(connId, reqId, { dir: tmpDir })
+      appendRequestEvent(connId, { op: 'launch', key: taskId, kind: 'shell', notifies: true, request: reqId, also: [] }, { dir: tmpDir })
+      writeTurnMarker(connId, { startedAt: t0, remoteTurn: true, otherWake: true, held: true }, tmpDir)
+      recordOwnedLaunch(connId, { id: taskId, kind: 'command', label: 'Build' }, { dir: tmpDir, now: t0 + 100 })
+
+      // Notice 1 arrives and is replied to.
+      recordTurnWake(
+        connId,
+        {
+          type: 'canonical_system_notices',
+          execute_notice_ids: [notice1],
+          ingress: { system_notices: [{ notice_id: notice1, audience: 'needs_person' }] },
+        },
+        tmpDir,
+        t0 + 1000,
+      )
+      setCurrentRequest(connId, UNSTATED, { dir: tmpDir })
+      recordNoticeReply(connId, tmpDir, t0 + 1500, { noticeIds: [notice1] })
+
+      // Notice 2 arrives in the same pause; parent task ends — MUST NOT restore until notice 2 is answered!
+      recordTurnWake(
+        connId,
+        {
+          type: 'canonical_system_notices',
+          execute_notice_ids: [notice2],
+          ingress: { system_notices: [{ notice_id: notice2, audience: 'needs_person' }] },
+        },
+        tmpDir,
+        t0 + 2000,
+      )
+      recordOwnedEnd(connId, taskId, { dir: tmpDir, now: t0 + 2500 })
+
+      const beforeSecondReply = restoreHeldParentIfResumed(connId, readTurnMarker(connId, tmpDir), {
+        dir: tmpDir,
+        now: t0 + 3000,
+      })
+      assert.equal(beforeSecondReply.restored, false)
+      assert.deepEqual(currentTurnReplyNoticeIds(connId, { dir: tmpDir }), [notice1, notice2])
+
+      // Once notice 2 is also replied to, restoration succeeds!
+      recordNoticeReply(connId, tmpDir, t0 + 3500, { noticeIds: [notice2] })
+      const afterSecondReply = restoreHeldParentIfResumed(connId, readTurnMarker(connId, tmpDir), {
+        dir: tmpDir,
+        now: t0 + 4000,
+      })
+      assert.equal(afterSecondReply.restored, true)
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('merges a second check job arriving while Stop holds a parked pause for a helper instead of replacing checkJobIds (a2d9f38f)', async () => {
+    const { appendRequestEvent, setCurrentRequest, UNSTATED } = await import('./requests.mjs')
+    const {
+      recordCheckJobRuled,
+      recordOwnedEnd,
+      recordOwnedLaunch,
+      recordTurnWake,
+      restoreHeldParentIfResumed,
+    } = await import('./mirror-turn.mjs')
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-held-second-check-'))
+    try {
+      const connId = '972c8895-0000-4000-8000-000000000131'
+      const reqId = '972c8895-0000-4000-8000-000000000132'
+      const job1 = '972c8895-0000-4000-8000-000000000133'
+      const job2 = '972c8895-0000-4000-8000-000000000134'
+      const parentTaskId = 'conv-second-check/task-1'
+      const helperId = 'subagent-helper-1'
+      const t0 = Date.now() - 10_000
+
+      appendRequestEvent(connId, { op: 'open', id: reqId, kind: 'command' }, { dir: tmpDir })
+      setCurrentRequest(connId, reqId, { dir: tmpDir })
+      appendRequestEvent(connId, { op: 'launch', key: parentTaskId, kind: 'shell', notifies: true, request: reqId, also: [] }, { dir: tmpDir })
+      writeTurnMarker(connId, { startedAt: t0, remoteTurn: true, otherWake: true, held: true }, tmpDir)
+      recordOwnedLaunch(connId, { id: parentTaskId, kind: 'command', label: 'Build' }, { dir: tmpDir, now: t0 + 100 })
+
+      // Check 1 arrives, spawns helper, and Stop sets held: true while preserving heldParent.
+      recordTurnWake(connId, { type: 'check_job', check_job_id: job1 }, tmpDir, t0 + 1000)
+      setCurrentRequest(connId, UNSTATED, { dir: tmpDir })
+      recordOwnedLaunch(connId, { id: helperId, kind: 'subagent', label: 'Helper' }, { dir: tmpDir, now: t0 + 1200 })
+      writeTurnMarker(connId, { held: true, preserveExplicitReply: true }, tmpDir)
+
+      // Check 2 wakes the agent while held: true — MUST merge into [job1, job2]!
+      recordTurnWake(connId, { type: 'check_job', check_job_id: job2 }, tmpDir, t0 + 2000)
+      assert.deepEqual(readTurnMarker(connId, tmpDir)?.checkJobIds, [job1, job2])
+
+      recordOwnedEnd(connId, parentTaskId, { dir: tmpDir, now: t0 + 2500 })
+      recordOwnedEnd(connId, helperId, { dir: tmpDir, now: t0 + 2800 })
+
+      // Settling ONLY job2 MUST NOT restore while job1 is still unresolved!
+      recordCheckJobRuled(connId, tmpDir, { jobId: job2, now: t0 + 3000 })
+      const afterOnlyJob2 = restoreHeldParentIfResumed(connId, readTurnMarker(connId, tmpDir), {
+        dir: tmpDir,
+        now: t0 + 3100,
+      })
+      assert.equal(afterOnlyJob2.restored, false)
+
+      // Once job1 also settles, restoration succeeds!
+      recordCheckJobRuled(connId, tmpDir, { jobId: job1, now: t0 + 3500 })
+      const afterBoth = restoreHeldParentIfResumed(connId, readTurnMarker(connId, tmpDir), {
+        dir: tmpDir,
+        now: t0 + 3600,
+      })
+      assert.equal(afterBoth.restored, true)
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('restores the known requester when a single completion notification names both full and short task IDs (ce71a72b)', async () => {
+    const {
+      appendRequestEvent,
+      readRequestState,
+      requestRefForWrite,
+      setCurrentRequest,
+      UNSTATED,
+    } = await import('./requests.mjs')
+    const {
+      recordOwnedEnd,
+      recordOwnedLaunch,
+      recordTurnWake,
+      restoreHeldParentIfResumed,
+    } = await import('./mirror-turn.mjs')
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-short-alias-'))
+    try {
+      const connId = '972c8895-0000-4000-8000-000000000141'
+      const reqId = '972c8895-0000-4000-8000-000000000142'
+      const noticeId = '972c8895-0000-4000-8000-000000000143'
+      const convUuid = '972c8895-0000-4000-8000-000000000144'
+      const fullTaskId = `${convUuid}/task-415`
+      const t0 = Date.now() - 10_000
+
+      appendRequestEvent(connId, { op: 'open', id: reqId, kind: 'command' }, { dir: tmpDir })
+      setCurrentRequest(connId, reqId, { dir: tmpDir })
+      appendRequestEvent(connId, { op: 'launch', key: fullTaskId, kind: 'shell', notifies: true, request: reqId, also: [] }, { dir: tmpDir })
+      writeTurnMarker(connId, { startedAt: t0, remoteTurn: true, otherWake: true, held: true }, tmpDir)
+      recordOwnedLaunch(connId, { id: fullTaskId, kind: 'command', label: 'Build' }, { dir: tmpDir, now: t0 + 100 })
+
+      recordTurnWake(
+        connId,
+        {
+          type: 'canonical_system_notices',
+          execute_notice_ids: [noticeId],
+          ingress: { system_notices: [{ notice_id: noticeId, audience: 'for_the_record' }] },
+        },
+        tmpDir,
+        t0 + 1000,
+      )
+      setCurrentRequest(connId, UNSTATED, { dir: tmpDir })
+      recordOwnedEnd(connId, fullTaskId, { dir: tmpDir, now: t0 + 2000 })
+
+      // Notification mentions the log path (which produces BOTH `${convUuid}/task-415` AND short alias `task-415`)!
+      const res = restoreHeldParentIfResumed(connId, readTurnMarker(connId, tmpDir), {
+        dir: tmpDir,
+        latestStep: {
+          type: 'SYSTEM_MESSAGE',
+          created_at: new Date(t0 + 2000).toISOString(),
+          content: `[Message] Background command "task-415" completed. Output saved to /tmp/brain/${convUuid}/.system_generated/tasks/task-415.log`,
+        },
+        now: t0 + 2500,
+      })
+      assert.equal(res.restored, true)
+      assert.equal(requestRefForWrite(readRequestState(connId, { dir: tmpDir })), reqId)
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
 })
 

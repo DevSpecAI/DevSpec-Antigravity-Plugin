@@ -406,11 +406,21 @@ export function restoreHeldParentIfResumed(
   }
 
   // Never clear an active needs_person notice or undelivered tell_person pause
-  // mid-turn before its notice reply / tell-person message has gone out, or
-  // notice work and findings could leak into the command trail / final answer
-  // (decisions 02f4ce2b & a2d9f38f).
+  // mid-turn before EVERY needs_person notice in the pause has been replied to
+  // (or tell-person delivered), or notice work and findings could leak into the
+  // command trail / final answer (decisions 02f4ce2b & a2d9f38f).
+  const repliedNoticeSet = new Set(
+    (Array.isArray(marker.repliedNoticeIds) ? marker.repliedNoticeIds : [])
+      .map((id) => String(id).toLowerCase())
+      .filter(Boolean),
+  )
+  const pendingNeedsPersonIds = (Array.isArray(marker.noticeIds) ? marker.noticeIds : [])
+    .map((id) => String(id).toLowerCase())
+    .filter((id) => id && !repliedNoticeSet.has(id))
   const hasPendingNeedsPersonNotice =
-    Array.isArray(marker.noticeIds) && marker.noticeIds.length > 0 && !marker.noticeReplyAt
+    Array.isArray(marker.noticeIds) &&
+    marker.noticeIds.length > 0 &&
+    (pendingNeedsPersonIds.length > 0 || !marker.noticeReplyAt)
   if (hasPendingNeedsPersonNotice) {
     return { restored: false, marker }
   }
@@ -561,6 +571,7 @@ export function restoreHeldParentIfResumed(
       excludedRanges: nextExcludedRanges,
       tellPerson: false,
       noticeReplyAt: null,
+      repliedNoticeIds: [],
       personToldAt: null,
       preserveExplicitReply: true,
     },
@@ -571,21 +582,40 @@ export function restoreHeldParentIfResumed(
     const reqState = readRequestState(connectionId, { dir })
     const endedRealIds = endedParentIds.filter((id) => id !== '__parent_bg__')
     const notifiedEndedKeys = notificationText ? notifiedKeys(notificationText) : []
-    const endedKeys = [...endedRealIds]
-    for (const key of notifiedEndedKeys) {
-      if (!endedKeys.includes(key)) endedKeys.push(key)
-    }
     const endedTrackedLaunches = []
     const seenEndedLaunches = new Set()
     let anyEndedUntracked = false
-    for (const key of endedKeys) {
-      const launch = reqState.launches.get(key)
+
+    // Check each distinct ended launch ID from the owned log / reconciliation.
+    for (const id of endedRealIds) {
+      const launch = reqState.launches.get(id)
       if (launch) {
         if (!seenEndedLaunches.has(launch)) {
           seenEndedLaunches.add(launch)
           endedTrackedLaunches.push(launch)
         }
       } else {
+        anyEndedUntracked = true
+      }
+    }
+
+    // `notifiedKeys(notificationText)` extracts candidate aliases for the SAME
+    // completion message (e.g. both `<convId>/task-415` and its short alias
+    // `task-415`). Match ANY alias to its launch just as `requestForWake` does,
+    // without treating a short alias as a second untracked launch (ce71a72b).
+    if (notifiedEndedKeys.length > 0) {
+      let matchedNotificationLaunch = false
+      for (const key of notifiedEndedKeys) {
+        const launch = reqState.launches.get(key)
+        if (launch) {
+          matchedNotificationLaunch = true
+          if (!seenEndedLaunches.has(launch)) {
+            seenEndedLaunches.add(launch)
+            endedTrackedLaunches.push(launch)
+          }
+        }
+      }
+      if (!matchedNotificationLaunch) {
         anyEndedUntracked = true
       }
     }
@@ -701,6 +731,46 @@ export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR, now =
   // A notice or check job is not a command: one that arrives during a turn typed at
   // the terminal leaves it a local turn, so that turn's answer keeps its local-turn flags.
   const nonCommandWake = Boolean(wake?.noticeIds || wake?.recordNoticeIds || wake?.checkJobWake)
+  // Check `existing?.heldParent` BEFORE `existing?.held === true`: if Stop held
+  // an already-parked pause open while waiting on a helper subagent and a second
+  // check job or notice wakes the agent, merge into the existing pause instead of
+  // replacing its checkJobIds / noticeIds / settledCheckJobIds (decision a2d9f38f).
+  if (existing?.heldParent && !existing?.otherWake && nonCommandWake) {
+    const merged = mergeTurnWake(existing, wake)
+    const settled = Array.isArray(existing.settledCheckJobIds)
+      ? existing.settledCheckJobIds.map((id) => String(id).toLowerCase())
+      : []
+    const mergedJobs = Array.isArray(merged.checkJobIds)
+      ? merged.checkJobIds.map((id) => String(id).toLowerCase())
+      : []
+    const resetRuled =
+      Boolean(wake?.checkJobWake) &&
+      (mergedJobs.length === 0 || mergedJobs.some((id) => !settled.includes(id)))
+    const replied = Array.isArray(existing.repliedNoticeIds)
+      ? existing.repliedNoticeIds.map((id) => String(id).toLowerCase())
+      : []
+    const mergedNotices = Array.isArray(merged.noticeIds)
+      ? merged.noticeIds.map((id) => String(id).toLowerCase())
+      : []
+    const hasUnrepliedNotice = mergedNotices.some((id) => !replied.includes(id))
+    return writeTurnMarker(
+      connectionId,
+      {
+        held: false,
+        heldParent: existing.heldParent,
+        remoteTurn: true,
+        ...merged,
+        ...(resetRuled ? { checkJobRuled: false, checkJobRuledAt: null } : {}),
+        ...(hasUnrepliedNotice ? { noticeReplyAt: null } : {}),
+        lastPauseActivityAt: Math.max(
+          typeof existing.lastPauseActivityAt === 'number' ? existing.lastPauseActivityAt : 0,
+          now,
+        ),
+        preserveExplicitReply: true,
+      },
+      dir,
+    )
+  }
   if (existing?.held === true) {
     if (nonCommandWake) {
       return writeTurnMarker(
@@ -725,6 +795,7 @@ export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR, now =
           excludedRanges: normalizeExcludedRanges(existing.excludedRanges),
           tellPerson: false,
           noticeReplyAt: null,
+          repliedNoticeIds: [],
           personToldAt: null,
           preserveExplicitReply: true,
         },
@@ -738,34 +809,6 @@ export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR, now =
         heldParent: null,
         remoteTurn: true,
         ...mergeTurnWake(existing, wake),
-        preserveExplicitReply: true,
-      },
-      dir,
-    )
-  }
-  if (existing?.heldParent && !existing?.otherWake && nonCommandWake) {
-    const merged = mergeTurnWake(existing, wake)
-    const settled = Array.isArray(existing.settledCheckJobIds)
-      ? existing.settledCheckJobIds.map((id) => String(id).toLowerCase())
-      : []
-    const mergedJobs = Array.isArray(merged.checkJobIds)
-      ? merged.checkJobIds.map((id) => String(id).toLowerCase())
-      : []
-    const resetRuled =
-      Boolean(wake?.checkJobWake) &&
-      (mergedJobs.length === 0 || mergedJobs.some((id) => !settled.includes(id)))
-    return writeTurnMarker(
-      connectionId,
-      {
-        held: false,
-        heldParent: existing.heldParent,
-        remoteTurn: true,
-        ...merged,
-        ...(resetRuled ? { checkJobRuled: false, checkJobRuledAt: null } : {}),
-        lastPauseActivityAt: Math.max(
-          typeof existing.lastPauseActivityAt === 'number' ? existing.lastPauseActivityAt : 0,
-          now,
-        ),
         preserveExplicitReply: true,
       },
       dir,
@@ -856,10 +899,34 @@ export function isCurrentTurnCheckJobOnly(
   })
 }
 
-/** Note on the turn marker that a reply to its notices went out (for the Stop fallback). */
-export function recordNoticeReply(connectionId, dir = CONNECTIONS_DIR, now = Date.now()) {
-  if (!connectionId || !readTurnMarker(connectionId, dir)) return false
-  writeTurnMarker(connectionId, { noticeReplyAt: now, preserveExplicitReply: true }, dir)
+/**
+ * Note on the turn marker that a reply to its notices went out (for the Stop fallback
+ * and mid-wait pause completion tracking). Tracks the exact notice ids answered so a
+ * later needs-a-person notice arriving in the same pause is never treated as already
+ * answered (decision 02f4ce2b).
+ */
+export function recordNoticeReply(
+  connectionId,
+  dir = CONNECTIONS_DIR,
+  now = Date.now(),
+  { noticeIds = null } = {},
+) {
+  const existing = connectionId ? readTurnMarker(connectionId, dir) : null
+  if (!existing) return false
+  const prevReplied = Array.isArray(existing.repliedNoticeIds)
+    ? existing.repliedNoticeIds.map((id) => String(id).toLowerCase()).filter(Boolean)
+    : []
+  const newlyReplied = Array.isArray(noticeIds) && noticeIds.length > 0
+    ? noticeIds.map((id) => String(id).toLowerCase()).filter(Boolean)
+    : (Array.isArray(existing.noticeIds) ? existing.noticeIds : [])
+        .map((id) => String(id).toLowerCase())
+        .filter(Boolean)
+  const repliedNoticeIds = [...new Set([...prevReplied, ...newlyReplied])]
+  writeTurnMarker(
+    connectionId,
+    { noticeReplyAt: now, repliedNoticeIds, preserveExplicitReply: true },
+    dir,
+  )
   return true
 }
 
@@ -3442,6 +3509,38 @@ export async function handleMirrorTurn(
         Number.isFinite(latestStepMs) && latestStepMs <= Date.now()
           ? latestStepMs
           : Date.now()
+      const mergedMidWait = isMidWaitNonCommandWake
+        ? mergeTurnWake(
+            currentMarkerForMerge?.heldParent
+              ? currentMarkerForMerge
+              : currentMarkerForMerge?.held === true
+                ? null
+                : currentMarkerForMerge,
+            wake,
+          )
+        : null
+      const midWaitSettled = Array.isArray(existingMarker?.settledCheckJobIds)
+        ? existingMarker.settledCheckJobIds.map((id) => String(id).toLowerCase())
+        : []
+      const midWaitMergedJobs = Array.isArray(mergedMidWait?.checkJobIds)
+        ? mergedMidWait.checkJobIds.map((id) => String(id).toLowerCase())
+        : []
+      const midWaitKeepRuled =
+        Boolean(existingMarker?.heldParent && existingMarker?.checkJobRuled) &&
+        !(
+          Boolean(wake?.checkJobWake) &&
+          (midWaitMergedJobs.length === 0 ||
+            midWaitMergedJobs.some((id) => !midWaitSettled.includes(id)))
+        )
+      const midWaitReplied = Array.isArray(existingMarker?.repliedNoticeIds)
+        ? existingMarker.repliedNoticeIds.map((id) => String(id).toLowerCase())
+        : []
+      const midWaitMergedNotices = Array.isArray(mergedMidWait?.noticeIds)
+        ? mergedMidWait.noticeIds.map((id) => String(id).toLowerCase())
+        : []
+      const midWaitHasUnrepliedNotice = midWaitMergedNotices.some(
+        (id) => !midWaitReplied.includes(id),
+      )
       const markerExtra = isMidWaitNonCommandWake
         ? {
             held: false,
@@ -3451,21 +3550,18 @@ export async function handleMirrorTurn(
             localTurn: null,
             otherWake: false,
             backgroundContinuation: false,
-            settledCheckJobIds: Array.isArray(existingMarker?.settledCheckJobIds)
-              ? existingMarker.settledCheckJobIds
-              : [],
-            checkJobRuled: false,
-            checkJobRuledAt: null,
+            settledCheckJobIds: midWaitSettled,
+            repliedNoticeIds: midWaitReplied,
+            checkJobRuled: midWaitKeepRuled,
+            checkJobRuledAt: midWaitKeepRuled ? existingMarker?.checkJobRuledAt ?? null : null,
+            ...(midWaitHasUnrepliedNotice ? { noticeReplyAt: null } : {}),
             lastPauseActivityAt: Date.now(),
             pauseStartedAt:
               typeof existingMarker?.pauseStartedAt === 'number'
                 ? existingMarker.pauseStartedAt
                 : pauseStartFromStep,
             excludedRanges: normalizeExcludedRanges(existingMarker?.excludedRanges),
-            ...mergeTurnWake(
-              currentMarkerForMerge?.held === true ? null : currentMarkerForMerge,
-              wake,
-            ),
+            ...mergedMidWait,
             preserveExplicitReply: true,
           }
         : isBgContinuation && pauseStillParked
