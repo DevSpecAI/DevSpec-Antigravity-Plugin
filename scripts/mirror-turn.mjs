@@ -615,26 +615,16 @@ export function restoreHeldParentIfResumed(
 
       if (anyEndedUnstated || anyEndedUntracked || endedRefs.length === 0) {
         setCurrentRequest(connectionId, UNSTATED, { dir })
-      } else if (notificationText) {
-        const arrival = promptArrival({
-          fromAPerson: false,
-          origin: 'task-notification',
-          text: notificationText,
-          midTurn: false,
-          state: reqState,
-        })
-        const hasCurrent = arrival.events.some((ev) => ev.op === 'current' && ev.ref !== null)
-        if (hasCurrent) {
-          for (const event of arrival.events) {
-            appendRequestEvent(connectionId, event, { dir })
-          }
-        } else {
-          setCurrentRequest(connectionId, endedRefs.at(-1), { dir })
-          for (const extra of endedRefs.slice(0, -1)) {
-            appendRequestEvent(connectionId, { op: 'joined', id: extra }, { dir })
+      } else {
+        // Record any notified keys from notificationText, then ALWAYS restore the
+        // full set of ended requesters (including `joined` when two launches for
+        // different people finished in the same pause, even if `notificationText`
+        // only names one of them — decision ce71a72b).
+        if (notificationText) {
+          for (const key of notifiedKeys(notificationText)) {
+            appendRequestEvent(connectionId, { op: 'notified', key }, { dir })
           }
         }
-      } else {
         setCurrentRequest(connectionId, endedRefs.at(-1), { dir })
         for (const extra of endedRefs.slice(0, -1)) {
           appendRequestEvent(connectionId, { op: 'joined', id: extra }, { dir })
@@ -3278,6 +3268,11 @@ export async function handleMirrorTurn(
         state: readRequestState(connectionId, { dir: connectionsDir }),
       })
       for (const event of arrival.events) {
+        // When the mid-wait check/notice pause is still parked (e.g. parent work
+        // finished while an unsettled check is waiting on its helper), NEVER make
+        // the parent's request current yet — only record `notified` so the entire
+        // check/notice pause stays separate from the person's command (decision a2d9f38f).
+        if (pauseStillParked && event.op !== 'notified') continue
         appendRequestEvent(connectionId, event, { dir: connectionsDir })
       }
     } catch {

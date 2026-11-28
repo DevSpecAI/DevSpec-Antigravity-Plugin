@@ -202,11 +202,12 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
       if (existingMarker?.heldParent && !existingMarker?.otherWake) {
         // Only restore from PostToolUse when the pause has an explicit mechanical
         // completion signal (settled check job, sent notice reply, or delivered
-        // tell_person) AND this non-check tool started after that completion.
-        // Never treat "parent background finished + an ordinary tool call" as the
-        // end of an active notice pause, or the notice's own tools can restore the
-        // parent turn prematurely, clear notice/tellPerson flags, and leak into
-        // the command trail or final answer (decisions 02f4ce2b & a2d9f38f).
+        // tell_person), has NO for-the-record notice in the same pause (whose
+        // handling has no mechanical end-of-notice signal and must never leak into
+        // the room's progress trail), AND this non-check tool started after that
+        // completion (decisions 02f4ce2b & a2d9f38f).
+        const hasForTheRecordNotice =
+          Array.isArray(existingMarker.recordNoticeIds) && existingMarker.recordNoticeIds.length > 0
         const pauseCompletedAt = [
           existingMarker.checkJobWake && existingMarker.checkJobRuled
             ? existingMarker.checkJobRuledAt
@@ -214,7 +215,7 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
           existingMarker.noticeReplyAt ?? null,
           existingMarker.personToldAt ?? null,
         ].filter((v) => typeof v === 'number' && Number.isFinite(v))
-        const hasExplicitPauseCompletion = pauseCompletedAt.length > 0
+        const hasExplicitPauseCompletion = !hasForTheRecordNotice && pauseCompletedAt.length > 0
         if (isCheckJobVerb || !effectiveTranscriptPath || !hasExplicitPauseCompletion) {
           recordPauseActivity(connectionId, connectionsDir, now)
         } else {
