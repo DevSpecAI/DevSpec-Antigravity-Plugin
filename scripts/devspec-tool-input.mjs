@@ -32,22 +32,20 @@ import { launchGuard, resolveOwnConnectionId } from './launch-guard.mjs'
 import {
   currentTurnStampNoticeIds,
   extractAntigravityTrailFromTranscript,
-  findLatestToolCallStepMs,
-  hasPendingTellPersonObligation,
   isRemotePlumbingToolCall,
+  parkedParentWriteAmbiguity,
   parseTranscriptPath,
   readTurnMarker,
   reconcileCompletedOwnedWork,
   recordNoticeReply,
   resolveHookConversationId,
-  restoreHeldParentIfResumed,
   writeExplicitReplyMarker,
 } from './mirror-turn.mjs'
 import { normalizeNoticeIds, postCanTakeTurnNotices } from './notice-reply.mjs'
 import { inferAntigravityTranscriptPath, readStateFile } from './remote-control-state.mjs'
 import { devspecToolFromName, isDevspecServerName } from './devspec-server.mjs'
 import { PROVENANCE_REF_TOOLS, REQUEST_REF_TOOLS, stampRequest } from './request-ref.mjs'
-import { readRequestState } from './requests.mjs'
+import { readRequestState, startsBackgroundWork } from './requests.mjs'
 import { prePostHoldObject } from './room-unread.mjs'
 import { readConnectionTelemetry } from './statusline.mjs'
 import { isEntryPoint } from './entry-point.mjs'
@@ -160,6 +158,68 @@ function readProjectPin(cwd) {
   }
 }
 
+function checkParkedParentAmbiguity(
+  input,
+  rawToolName,
+  rawToolInput,
+  verb,
+  toolInput,
+  { env, home },
+) {
+  if (isRemotePlumbingToolCall(rawToolName, rawToolInput)) return null
+  const isBackgroundLaunch = startsBackgroundWork(rawToolName, rawToolInput)
+  const isTrackedDevspecWrite =
+    Boolean(verb) &&
+    (REQUEST_REF_TOOLS.has(verb) || PROVENANCE_REF_TOOLS.has(verb)) &&
+    verb !== 'claim_check_job' &&
+    verb !== 'record_check_rulings' &&
+    verb !== 'release_check_job' &&
+    !(verb === 'post_session_message' && toolInput?.system_notice_ids !== undefined) &&
+    !toolInput?.request_ref &&
+    !toolInput?.provenance_ref &&
+    !toolInput?.work_claim_ref
+  if (!isBackgroundLaunch && !isTrackedDevspecWrite) return null
+
+  const conversationId = resolveHookConversationId(input, env)
+  const connectionId = resolveOwnConnectionId(conversationId, { home })
+  if (!connectionId) return null
+  const connDir = path.join(home, '.devspec', 'remote-control', 'connections')
+  const marker = readTurnMarker(connectionId, connDir)
+  if (!marker?.heldParent || marker.otherWake) return null
+  // While a check job is still unsettled, helper subagents launched for the check
+  // must never be blocked by a completed parent launch.
+  if (isBackgroundLaunch && !isTrackedDevspecWrite && marker.checkJobWake && !marker.checkJobRuled) {
+    return null
+  }
+  const connState = readStateFile(connectionId, connDir)
+  const effectiveConvId = conversationId || connState?.local_id || null
+  const transcriptPath =
+    parseTranscriptPath(JSON.stringify(input)) ||
+    connState?.transcript_path ||
+    inferAntigravityTranscriptPath(effectiveConvId) ||
+    null
+  const reconciled = transcriptPath
+    ? reconcileCompletedOwnedWork(connectionId, marker, transcriptPath, connDir, {
+        conversationId: effectiveConvId,
+      })
+    : null
+  const ambiguity = parkedParentWriteAmbiguity(connectionId, marker, {
+    dir: connDir,
+    reconciled,
+    conversationId: effectiveConvId,
+  })
+  if (!ambiguity) return null
+  return {
+    decision: 'deny',
+    reason: ambiguity.reason,
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'deny',
+      permissionDecisionReason: ambiguity.reason,
+    },
+  }
+}
+
 export function prepareDevspecToolInput(input, { env = process.env, home = os.homedir(), now = Date.now() } = {}) {
   if (!input || typeof input !== 'object') return {}
 
@@ -172,6 +232,22 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
     argumentsWasString,
     argumentsKey,
   } = unwrapDevspecToolCall(rawToolName, rawToolInput)
+
+  // 0. If a mid-wait pause is still parked AND a parent background launch with
+  //    a known open request has already completed, deny ambiguous DevSpec writes
+  //    and background launches until the agent either resumes the parked room
+  //    task (`resume`) or explicitly confirms pause follow-up (`serve --unstated`)
+  //    — never dropping the parent requester and never mis-stamping check/notice
+  //    follow-up writes (decision ce71a72b).
+  const parkedDeny = checkParkedParentAmbiguity(
+    input,
+    rawToolName,
+    rawToolInput,
+    verb,
+    toolInput,
+    { env, home },
+  )
+  if (parkedDeny) return parkedDeny
 
   // 1. Background launch guard during multi-requester turns
   const guard = launchGuard(input, { home, env })

@@ -3549,9 +3549,11 @@ describe('Antigravity native hook payload & transcript handling', () => {
       )
       assert.ok(readTurnMarker(connId, connectionsDir).heldParent)
 
-      // A DevSpec write still following up on the check BEFORE explicit resume MUST NOT
-      // auto-restore heldParent or stamp the parked room requester's identity!
-      const followUpWrite = prepareDevspecToolInput(
+      // A DevSpec write BEFORE explicit resume or `serve --unstated` is ambiguous between
+      // check follow-up and resumed parent work: PreToolUse MUST DENY it (never silently
+      // stamping the parked room requester AND never letting resumed parent work write
+      // with an unset requester!).
+      const ambiguousWrite = prepareDevspecToolInput(
         {
           conversationId: convId,
           transcriptPath,
@@ -3567,9 +3569,38 @@ describe('Antigravity native hook payload & transcript handling', () => {
         },
         { home: tmpHome, env: {}, now: Date.now() + 1000 },
       )
-      const followUpStamped = followUpWrite?.hookSpecificOutput?.updatedInput?.Arguments
-      assert.equal(followUpStamped?.request_ref, undefined, 'check follow-up write must NOT be stamped with parked room requester')
+      assert.equal(ambiguousWrite?.decision, 'deny', 'ambiguous write before resume/serve must be denied')
+      assert.ok(ambiguousWrite?.reason?.includes(`resume --connection-id ${connId}`))
+      assert.ok(ambiguousWrite?.reason?.includes(`serve --connection-id ${connId} --unstated`))
       assert.ok(readTurnMarker(connId, connectionsDir).heldParent, 'heldParent must stay parked until explicit resume')
+
+      // If the agent confirms this write is pause follow-up via `serve --unstated`,
+      // PreToolUse allows it WITHOUT stamping the parked room requester and keeps heldParent parked!
+      const { serveMain } = await import('./devspec-serve-request.mjs')
+      const servedUnstated = serveMain(['serve', '--connection-id', connId, '--unstated'], {
+        dir: connectionsDir,
+      })
+      assert.equal(servedUnstated.ok, true)
+      const followUpWrite = prepareDevspecToolInput(
+        {
+          conversationId: convId,
+          transcriptPath,
+          tool_name: 'call_mcp_tool',
+          tool_input: {
+            ServerName: 'devspec_devspec',
+            ToolName: 'update_task',
+            Arguments: {
+              task_id: '972c8895-0000-4000-8000-000000000189',
+              status: 'in_progress',
+            },
+          },
+        },
+        { home: tmpHome, env: {}, now: Date.now() + 1500 },
+      )
+      assert.equal(followUpWrite?.decision, 'allow')
+      const followUpStamped = followUpWrite?.hookSpecificOutput?.updatedInput?.Arguments
+      assert.equal(followUpStamped?.request_ref, undefined, 'confirmed check follow-up write must NOT be stamped with parked room requester')
+      assert.ok(readTurnMarker(connId, connectionsDir).heldParent, 'heldParent stays parked while serving pause follow-up')
 
       // PreInvocation hint points to `devspec-serve-request.mjs resume --connection-id <id>`.
       const hint = pendingParentResumeHint(connId, readTurnMarker(connId, connectionsDir), {
@@ -4606,6 +4637,110 @@ describe('Antigravity native hook payload & transcript handling', () => {
       assert.ok(afterSingleStop.heldParent, 'heldParent must stay parked when single batched ruling still has remaining entries')
       assert.equal(afterSingleStop.checkJobWake, true)
       assert.equal(afterSingleStop.checkJobRemainingEntries, true)
+
+      // Even if the parent's LAST launch finishes first (`outstandingIds` is empty!),
+      // Stop MUST still preserve the pause marker while batched check entries remain!
+      const { recordOwnedEnd } = await import('./mirror-turn.mjs')
+      recordOwnedEnd(connId2, taskId2, { dir: connectionsDir, now: t0 + 1800 })
+      const stopAfterParentFinished = await handleMirrorTurn(
+        'stop',
+        JSON.stringify({ conversationId: convId2 }),
+        { env: {}, connectionsDir, legacyPath, call: async () => ({ ok: true }) },
+      )
+      assert.equal(stopAfterParentFinished.held, true)
+      const markerStillHeld = readTurnMarker(connId2, connectionsDir)
+      assert.ok(markerStillHeld?.heldParent, 'Stop must preserve pause marker even when parent last launch finished first')
+      assert.equal(markerStillHeld.checkJobWake, true)
+      assert.equal(markerStillHeld.checkJobRemainingEntries, true)
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
+    }
+  })
+
+  it('denies a DevSpec write after a quiet notice + exact parent completion until resume restores the known parent requester (ce71a72b)', async () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-quiet-notice-write-deny-'))
+    const rcDir = path.join(tmpHome, '.devspec', 'remote-control')
+    const connectionsDir = path.join(rcDir, 'connections')
+    fs.mkdirSync(connectionsDir, { recursive: true })
+    const { recordOwnedEnd, recordOwnedLaunch, recordTurnWake, writeTurnMarker } =
+      await import('./mirror-turn.mjs')
+    const { prepareDevspecToolInput } = await import('./devspec-tool-input.mjs')
+    const { resumeParentMain } = await import('./devspec-serve-request.mjs')
+    const { appendRequestEvent, setCurrentRequest, UNSTATED } = await import('./requests.mjs')
+    const { writeLocalBond } = await import('./remote-control-state.mjs')
+
+    try {
+      const connId = '11111111-1111-4111-8111-111111111981'
+      const projId = '22222222-2222-4222-8222-222222222981'
+      const reqId = '44444444-4444-4444-8444-444444444981'
+      const noticeId = '55555555-5555-4555-8555-555555555981'
+      const convId = 'conv-quiet-notice-deny'
+      const taskId = `${convId}/task-9`
+      const t0 = Date.now() - 10_000
+
+      writeLocalBond(convId, { connection_id: connId }, rcDir)
+      fs.writeFileSync(
+        path.join(connectionsDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          project_id: projId,
+          local_id: convId,
+          agent_name: 'Antigravity',
+        }),
+      )
+
+      appendRequestEvent(connId, { op: 'open', id: reqId, kind: 'command', requested_by: 'u-alice' }, { dir: connectionsDir })
+      setCurrentRequest(connId, reqId, { dir: connectionsDir })
+      appendRequestEvent(connId, { op: 'launch', key: taskId, kind: 'shell', notifies: true, request: reqId, also: [] }, { dir: connectionsDir })
+      writeTurnMarker(connId, { startedAt: t0, remoteTurn: true, otherWake: true, held: true }, connectionsDir)
+      recordOwnedLaunch(connId, { id: taskId, kind: 'command', label: 'Build' }, { dir: connectionsDir, now: t0 + 100 })
+      recordTurnWake(
+        connId,
+        {
+          type: 'canonical_system_notices',
+          execute_notice_ids: [noticeId],
+          ingress: { system_notices: [{ notice_id: noticeId, audience: 'for_the_record', topic: 'deploy_failed' }] },
+        },
+        connectionsDir,
+        t0 + 1000,
+      )
+      setCurrentRequest(connId, UNSTATED, { dir: connectionsDir })
+      recordOwnedEnd(connId, taskId, { dir: connectionsDir, now: t0 + 1500 })
+
+      // Without running `resume`, PreToolUse MUST NOT let a DevSpec write proceed with an unset requester!
+      const denied = prepareDevspecToolInput(
+        {
+          conversationId: convId,
+          tool_name: 'call_mcp_tool',
+          tool_input: {
+            ServerName: 'devspec_devspec',
+            ToolName: 'create_task',
+            Arguments: { title: 'Follow-up', intent: 'test', description: 'test', idempotency_key: 'k1' },
+          },
+        },
+        { home: tmpHome, env: {}, now: t0 + 2000 },
+      )
+      assert.equal(denied?.decision, 'deny')
+      assert.ok(denied?.reason?.includes(`resume --connection-id ${connId}`))
+
+      // Once resumed, the exact same write succeeds carrying the known parent request_ref!
+      const resumed = resumeParentMain(['resume', '--connection-id', connId], { dir: connectionsDir, now: t0 + 2100 })
+      assert.equal(resumed.ok, true)
+      const allowed = prepareDevspecToolInput(
+        {
+          conversationId: convId,
+          tool_name: 'call_mcp_tool',
+          tool_input: {
+            ServerName: 'devspec_devspec',
+            ToolName: 'create_task',
+            Arguments: { title: 'Follow-up', intent: 'test', description: 'test', idempotency_key: 'k1' },
+          },
+        },
+        { home: tmpHome, env: {}, now: t0 + 2200 },
+      )
+      assert.equal(allowed?.decision, 'allow')
+      assert.equal(allowed?.hookSpecificOutput?.updatedInput?.Arguments?.request_ref, reqId)
     } finally {
       fs.rmSync(tmpHome, { recursive: true, force: true })
     }

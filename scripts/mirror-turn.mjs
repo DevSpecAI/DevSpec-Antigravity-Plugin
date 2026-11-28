@@ -766,6 +766,132 @@ export function restoreHeldParentIfResumed(
 }
 
 /**
+ * Inspect whether a parked mid-wait pause (`marker.heldParent`) already has at
+ * least one completed parent-owned launch whose open request has NOT yet been
+ * disambiguated (`!reqState.chosen`). Used by `PreToolUse` (`devspec-tool-input.mjs`)
+ * so an ambiguous DevSpec write or background launch neither silently drops the
+ * known parent requester (`ce71a72b`) nor silently stamps the parked room
+ * requester onto check/notice follow-up work.
+ *
+ * When ambiguous, joins the completed parent launch's open request(s) onto the
+ * connection's request log so `devspec-serve-request.mjs serve --unstated` works
+ * cleanly if the call is still pause follow-up, while `devspec-serve-request.mjs
+ * resume` restores `heldParent` and the known parent requester if resuming.
+ */
+export function parkedParentWriteAmbiguity(
+  connectionId,
+  marker,
+  {
+    dir = CONNECTIONS_DIR,
+    reconciled = null,
+    conversationId = null,
+    scriptPath = SERVE_REQUEST_SCRIPT,
+  } = {},
+) {
+  if (!connectionId || !marker?.heldParent || marker.otherWake) return null
+  const reqState = readRequestState(connectionId, { dir })
+  if (reqState.chosen) return null
+
+  const parent = marker.heldParent
+  const parentOwnedIds = Array.isArray(parent.ownedIds)
+    ? parent.ownedIds.filter((id) => typeof id === 'string' && id)
+    : []
+  const endedParentIds = []
+  const noteEnded = (id) => {
+    if (typeof id === 'string' && id && !endedParentIds.includes(id)) {
+      endedParentIds.push(id)
+    }
+  }
+  if (Array.isArray(reconciled?.endedOwnedDetails)) {
+    for (const detail of reconciled.endedOwnedDetails) {
+      if (parentOwnedIds.length === 0 || parentOwnedIds.includes(detail.id)) {
+        noteEnded(detail.id)
+      }
+    }
+  } else if (Array.isArray(reconciled?.endedOwnedIds)) {
+    for (const id of reconciled.endedOwnedIds) {
+      if (parentOwnedIds.length === 0 || parentOwnedIds.includes(id)) {
+        noteEnded(id)
+      }
+    }
+  }
+  for (const entry of readOwnedLines(connectionId, marker, dir)) {
+    if (typeof entry.ended !== 'string') continue
+    if (parentOwnedIds.length > 0 && parentOwnedIds.includes(entry.id)) {
+      noteEnded(entry.id)
+    }
+  }
+  if (endedParentIds.length === 0) return null
+
+  const candidateReqs = []
+  for (const id of endedParentIds) {
+    const launch = reqState.launches.get(id)
+    if (!launch) continue
+    if (reqState.open.has(launch.request) || launch.request === 'none') {
+      if (!candidateReqs.includes(launch.request)) candidateReqs.push(launch.request)
+    }
+    for (const extra of launch.also ?? []) {
+      if (reqState.open.has(extra) && !candidateReqs.includes(extra)) {
+        candidateReqs.push(extra)
+      }
+    }
+  }
+  if (candidateReqs.length === 0) return null
+
+  // Join the completed parent request(s) onto the request state so `serve --unstated`
+  // or `serve --message-id <id>` is valid when the agent disambiguates.
+  for (const ref of candidateReqs) {
+    if (ref !== reqState.current && !reqState.joined.has(ref)) {
+      appendRequestEvent(connectionId, { op: 'joined', id: ref }, { dir })
+    }
+  }
+
+  const allOutstanding = readOwnedIds(connectionId, marker, dir)
+  const pauseHelperRunning = allOutstanding.some((id) => !parentOwnedIds.includes(id))
+  const unsettledCheck = Boolean(marker.checkJobWake && !marker.checkJobRuled)
+  const repliedNoticeSet = new Set(
+    (Array.isArray(marker.repliedNoticeIds) ? marker.repliedNoticeIds : [])
+      .map((id) => String(id).toLowerCase())
+      .filter(Boolean),
+  )
+  const pendingNeedsPerson =
+    Array.isArray(marker.noticeIds) &&
+    marker.noticeIds.length > 0 &&
+    (marker.noticeIds.some((id) => !repliedNoticeSet.has(String(id).toLowerCase())) ||
+      !marker.acceptedNoticeReplyAt)
+  const canResumeNow =
+    !pauseHelperRunning &&
+    !unsettledCheck &&
+    !pendingNeedsPerson &&
+    !hasPendingTellPersonObligation(marker)
+
+  const lines = [
+    'A parked room task has completed background work with a known requester while this DevSpec notice/check pause is still active.',
+    'DevSpec cannot tell whether this call is resuming the parked room task or still following up on the pause.',
+  ]
+  if (canResumeNow) {
+    lines.push(
+      'If you are resuming the parked room task (which restores its requester and live progress), run:',
+      `  node ${JSON.stringify(scriptPath)} resume --connection-id ${connectionId}`,
+    )
+  } else {
+    lines.push(
+      'Finish settling the active check job / notice first before resuming the parked room task.',
+    )
+  }
+  lines.push(
+    'If this call is still follow-up work for the pause itself (not the parked room task), run:',
+    `  node ${JSON.stringify(scriptPath)} serve --connection-id ${connectionId} --unstated`,
+    'Then make the call again.',
+  )
+  return {
+    reason: lines.join('\n'),
+    candidateReqs,
+    canResumeNow,
+  }
+}
+
+/**
  * When a parent background launch has already completed during a quiet notice pause
  * (for-the-record notice or self-fixable needs_person notice with no reply needed)
  * and all check jobs / pause helpers / tell_person obligations are clear, return an
@@ -3956,8 +4082,31 @@ export async function handleMirrorTurn(
         marker,
         effectiveTranscriptPath,
         connectionsDir,
+        { conversationId: effectiveConvId },
       )
       const outstandingIds = marker ? readOwnedIds(connectionId, marker, connectionsDir) : []
+      // Keep all waiting check work in one pause until handled — even if the
+      // parent's last background launch already finished first (`outstandingIds`
+      // is empty) while a batched check ruling still has entries remaining
+      // (decision a2d9f38f).
+      const pauseHasUnsettledCheckJob = Boolean(
+        marker?.heldParent &&
+          marker.checkJobWake &&
+          !marker.checkJobRuled &&
+          (marker.checkJobRemainingEntries === true ||
+            (Array.isArray(marker.checkJobIds) && marker.checkJobIds.length > 1)),
+      )
+      if (pauseHasUnsettledCheckJob) {
+        writeTurnMarker(
+          connectionId,
+          {
+            held: true,
+            preserveExplicitReply: true,
+          },
+          connectionsDir,
+        )
+        return { ok: true, held: true, outstanding: outstandingIds }
+      }
       if (outstandingIds.length > 0) {
         if (marker?.heldParent) {
           const parent = marker.heldParent
@@ -3965,13 +4114,7 @@ export async function handleMirrorTurn(
             ? parent.ownedIds.filter((id) => typeof id === 'string' && id)
             : []
           const pauseOutstandingIds = outstandingIds.filter((id) => !parentOwnedIds.includes(id))
-          const pauseHasUnsettledCheckJob = Boolean(
-            marker.checkJobWake &&
-              !marker.checkJobRuled &&
-              (marker.checkJobRemainingEntries === true ||
-                (Array.isArray(marker.checkJobIds) && marker.checkJobIds.length > 1)),
-          )
-          if (pauseOutstandingIds.length > 0 || pauseHasUnsettledCheckJob) {
+          if (pauseOutstandingIds.length > 0) {
             // A launch started during the mid-wait pause (such as a fresh check-ruling
             // helper subagent) is still running, OR a batched check job still has
             // unsettled entries remaining: keep the pause context intact until all
