@@ -265,7 +265,11 @@ function splitByAudience(ids, audienceOf) {
 export function turnWakeFromEntry(entry) {
   if (!entry || typeof entry !== 'object') return null
   if (entry.type === 'canonical_control') return null
-  if (entry.type === 'check_job') return { checkJobWake: true }
+  if (entry.type === 'check_job') {
+    const rawJobId = entry.dispatch?.check_job_id || entry.dispatch?.id || entry.check_job_id || entry.id || null
+    const checkJobIds = typeof rawJobId === 'string' && UUID.test(rawJobId) ? [rawJobId.toLowerCase()] : []
+    return { checkJobWake: true, ...(checkJobIds.length > 0 ? { checkJobIds } : {}) }
+  }
   if (entry.type === 'canonical_system_notices') {
     const notices = Array.isArray(entry.ingress?.system_notices) ? entry.ingress.system_notices : []
     const ids = Array.isArray(entry.execute_notice_ids)
@@ -287,6 +291,7 @@ export function turnWakeFromText(text) {
   const noticeIds = []
   const audiences = new Map()
   const commands = []
+  const checkJobIds = []
   let checkJobWake = false
   let otherWake = false
   for (const line of String(text || '').split('\n')) {
@@ -304,6 +309,8 @@ export function turnWakeFromText(text) {
       audiences.set(event.notice_id, noticeAudience(event))
     } else if (event.type === 'check_job') {
       checkJobWake = true
+      const rawJobId = event.check_job_id || event.id
+      if (typeof rawJobId === 'string' && UUID.test(rawJobId)) checkJobIds.push(rawJobId.toLowerCase())
     } else if (event.type === 'wake') {
       if (event.reason === 'exact_connection_system_notice') {
         if (Array.isArray(event.system_notice_ids)) noticeIds.push(...event.system_notice_ids)
@@ -332,10 +339,12 @@ export function turnWakeFromText(text) {
     checkJobWake = true
   }
   const split = splitByAudience(noticeIds, (id) => audiences.get(id))
+  const uniqueCheckJobIds = uniqueIds(checkJobIds)
   if (split.noticeIds || split.recordNoticeIds || checkJobWake) {
     return {
       ...split,
       ...(checkJobWake ? { checkJobWake: true } : {}),
+      ...(uniqueCheckJobIds.length > 0 ? { checkJobIds: uniqueCheckJobIds } : {}),
     }
   }
   return null
@@ -359,13 +368,167 @@ export function mergeTurnWake(marker, wake) {
   }
   const held = Array.isArray(marker?.noticeIds) ? marker.noticeIds : []
   const heldRecord = Array.isArray(marker?.recordNoticeIds) ? marker.recordNoticeIds : []
+  const heldJobs = validIds(marker?.checkJobIds)
   const recordNoticeIds = [...new Set([...heldRecord, ...(wake.recordNoticeIds ?? [])])]
+  const checkJobIds = uniqueIds([...heldJobs, ...validIds(wake.checkJobIds)])
   const checkJobWake = Boolean(marker?.checkJobWake || wake.checkJobWake)
   return {
     noticeIds: [...new Set([...held, ...(wake.noticeIds ?? [])])],
     ...(recordNoticeIds.length > 0 ? { recordNoticeIds } : {}),
     ...(checkJobWake ? { checkJobWake: true } : {}),
+    ...(checkJobIds.length > 0 ? { checkJobIds } : {}),
   }
+}
+
+/**
+ * Whether a check-job ruling tool response actually settled or handed back the job,
+ * rather than recording an intermediate batch with remaining entries (decision a2d9f38f).
+ */
+export function isCheckJobRulingSettled(verb, result) {
+  if (verb !== 'record_check_rulings' && verb !== 'release_check_job') return false
+  if (result === null || result === undefined) return false
+
+  const evalObj = (value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+    if (value.isError === true || typeof value.error === 'string') return false
+    if (verb === 'record_check_rulings') {
+      if (value.settled === true || value.handed_back === true) return true
+      if (value.settled === false || (typeof value.remaining === 'number' && value.remaining > 0)) {
+        return false
+      }
+      return null
+    }
+    if (value.released === true || value.ok === true || value.status === 'released') return true
+    if (value.released === false || value.ok === false) return false
+    return null
+  }
+
+  const fromText = (text) => {
+    if (typeof text !== 'string') return null
+    const trimmed = text.trim()
+    if (!trimmed) return null
+    for (const candidate of [trimmed, ...trimmed.split('\n')]) {
+      const part = candidate.trim()
+      if (!part.startsWith('{')) continue
+      try {
+        const parsed = JSON.parse(part)
+        const direct = evalObj(parsed)
+        if (direct !== null) return direct
+        if (Array.isArray(parsed?.content)) {
+          for (const block of parsed.content) {
+            const inner = fromText(block?.text)
+            if (inner !== null) return inner
+          }
+        }
+      } catch {
+        /* try next line */
+      }
+    }
+    return null
+  }
+
+  const visit = (value, depth) => {
+    if (depth > 4 || value === null || value === undefined) return null
+    if (typeof value === 'string') return fromText(value)
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const found = visit(item, depth + 1)
+        if (found !== null) return found
+      }
+      return null
+    }
+    if (typeof value !== 'object') return null
+    const direct = evalObj(value)
+    if (direct !== null) return direct
+    for (const nested of Object.values(value)) {
+      const found = visit(nested, depth + 1)
+      if (found !== null) return found
+    }
+    return null
+  }
+
+  return visit(result, 0) === true
+}
+
+/**
+ * Whether a `post_session_message` notice-reply tool result was accepted by DevSpec
+ * rather than refused or errored (decision 02f4ce2b).
+ */
+export function isNoticeReplyAccepted(result) {
+  if (result === null || result === undefined) return false
+
+  const evalObj = (value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+    if (
+      value.isError === true ||
+      value.ok === false ||
+      typeof value.error === 'string' ||
+      value.refused === true ||
+      typeof value.refusal === 'string' ||
+      (value.refusal && typeof value.refusal === 'object')
+    ) {
+      return false
+    }
+    if (
+      value.ok === true ||
+      typeof value.id === 'string' ||
+      typeof value.message_id === 'string' ||
+      value.status === 'posted' ||
+      value.status === 'ok' ||
+      value.outcome === 'posted' ||
+      value.outcome === 'committed'
+    ) {
+      return true
+    }
+    return null
+  }
+
+  const fromText = (text) => {
+    if (typeof text !== 'string') return null
+    const trimmed = text.trim()
+    if (!trimmed) return null
+    if (/^(?:error|refused)\b/i.test(trimmed)) return false
+    for (const candidate of [trimmed, ...trimmed.split('\n')]) {
+      const part = candidate.trim()
+      if (!part.startsWith('{')) continue
+      try {
+        const parsed = JSON.parse(part)
+        const direct = evalObj(parsed)
+        if (direct !== null) return direct
+        if (Array.isArray(parsed?.content)) {
+          for (const block of parsed.content) {
+            const inner = fromText(block?.text)
+            if (inner !== null) return inner
+          }
+        }
+      } catch {
+        /* try next line */
+      }
+    }
+    return null
+  }
+
+  const visit = (value, depth) => {
+    if (depth > 4 || value === null || value === undefined) return null
+    if (typeof value === 'string') return fromText(value)
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const found = visit(item, depth + 1)
+        if (found !== null) return found
+      }
+      return null
+    }
+    if (typeof value !== 'object') return null
+    const direct = evalObj(value)
+    if (direct !== null) return direct
+    for (const nested of Object.values(value)) {
+      const found = visit(nested, depth + 1)
+      if (found !== null) return found
+    }
+    return null
+  }
+
+  return visit(result, 0) === true
 }
 
 /**

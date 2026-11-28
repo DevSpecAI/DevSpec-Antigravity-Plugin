@@ -25,6 +25,7 @@ import { resolveOwnConnectionId } from './launch-guard.mjs'
 import {
   currentTurnStampNoticeIds,
   explicitReplyMarkerPath,
+  findLatestToolCallStepMs,
   inferTurnContextFromTranscript,
   isNoticeReplyToolCall,
   isRemotePlumbingToolCall,
@@ -33,11 +34,17 @@ import {
   parseTranscriptPath,
   readOwnedLines,
   readTurnMarker,
+  reconcileCompletedOwnedWork,
   recordBackgroundLaunch,
+  recordCheckJobRemainingEntries,
+  recordCheckJobRuled,
+  recordNoticeReplyAccepted,
   recordOwnedEnd,
+  recordPauseActivity,
   recordTellPerson,
   resolveAntigravityToolResponse,
   resolveHookConversationId,
+  restoreHeldParentIfResumed,
   streamTurnTrailIfChanged,
   syncStateTranscriptPath,
   writeTurnMarker,
@@ -52,7 +59,12 @@ import {
   setCurrentRequest,
   UNSTATED,
 } from './requests.mjs'
-import { resultCarriesTellPerson } from './notice-reply.mjs'
+import {
+  isCheckJobRulingSettled,
+  isNoticeReplyAccepted,
+  normalizeNoticeIds,
+  resultCarriesTellPerson,
+} from './notice-reply.mjs'
 import { postToolNotice } from './room-unread.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
@@ -134,13 +146,74 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
   // A DevSpec write that changed someone else's record says so on its result
   // (`tell_person`, item a868f41f). Noted on the turn, so Stop's silence for a routine
   // turn gives way and PreToolUse leaves the model's own post to the person unstamped.
+  // Always unwrap DevSpec calls even when the caller is a helper subagent running
+  // in its own unbonded conversation that explicitly names the parent's connection_id
+  // (decision a2d9f38f).
+  const unwrappedDevspec = unwrapDevspecToolCall(toolName, toolInput)
+  const devspecVerb = unwrappedDevspec.verb
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+  const explicitTargetConnId =
+    typeof unwrappedDevspec.args?.connection_id === 'string' && UUID_RE.test(unwrappedDevspec.args.connection_id)
+      ? unwrappedDevspec.args.connection_id
+      : typeof toolInput?.connection_id === 'string' && UUID_RE.test(toolInput.connection_id)
+        ? toolInput.connection_id
+        : null
+  const devspecTargetConnId = connectionId || explicitTargetConnId
+  const effectiveTranscriptPathForCheck = parseTranscriptPath(raw) || state?.transcript_path || null
+  if (connectionId && devspecVerb === 'post_session_message' && noticeReply) {
+    try {
+      const replyResponse =
+        toolResponse ??
+        resolveAntigravityToolResponse(payload, {
+          transcriptPath: effectiveTranscriptPathForCheck,
+          conversationId: conversationId || state?.local_id || null,
+        })
+      if (isNoticeReplyAccepted(replyResponse)) {
+        const rawIds =
+          unwrappedDevspec.args?.system_notice_ids ?? toolInput?.system_notice_ids ?? null
+        const normalized = normalizeNoticeIds(rawIds)
+        recordNoticeReplyAccepted(connectionId, connectionsDir, now, {
+          noticeIds: Array.isArray(normalized) ? normalized : null,
+        })
+      } else {
+        recordPauseActivity(connectionId, connectionsDir, now)
+      }
+    } catch {
+      /* non-fatal */
+    }
+  }
+  if (devspecTargetConnId && devspecVerb && (devspecVerb === 'record_check_rulings' || devspecVerb === 'release_check_job')) {
+    try {
+      const checkResponse =
+        toolResponse ??
+        resolveAntigravityToolResponse(payload, {
+          transcriptPath: effectiveTranscriptPathForCheck,
+          conversationId: conversationId || state?.local_id || null,
+        })
+      if (isCheckJobRulingSettled(devspecVerb, checkResponse)) {
+        const jobId =
+          unwrappedDevspec.args?.check_job_id ||
+          unwrappedDevspec.args?.job_id ||
+          toolInput?.check_job_id ||
+          toolInput?.job_id ||
+          null
+        recordCheckJobRuled(devspecTargetConnId, connectionsDir, { jobId, now })
+      } else if (devspecVerb === 'record_check_rulings') {
+        recordCheckJobRemainingEntries(devspecTargetConnId, connectionsDir, { now })
+      } else {
+        recordPauseActivity(devspecTargetConnId, connectionsDir, now)
+      }
+    } catch {
+      /* non-fatal */
+    }
+  }
   if (
-    connectionId &&
-    unwrapDevspecToolCall(toolName, toolInput).verb &&
+    devspecTargetConnId &&
+    devspecVerb &&
     resultCarriesTellPerson(toolResponse)
   ) {
     try {
-      recordTellPerson(connectionId, connectionsDir)
+      recordTellPerson(devspecTargetConnId, connectionsDir, now)
     } catch {
       /* non-fatal */
     }
@@ -151,9 +224,22 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
       fs.writeFileSync(p, JSON.stringify({ at: now }), { mode: 0o600 })
       const existingMarker = readTurnMarker(connectionId, connectionsDir)
       if (existingMarker) {
+        const replyAccepted =
+          existingMarker.tellPerson &&
+          isNoticeReplyAccepted(
+            toolResponse ??
+              resolveAntigravityToolResponse(payload, {
+                transcriptPath: effectiveTranscriptPathForCheck,
+                conversationId: conversationId || state?.local_id || null,
+              }),
+          )
         writeTurnMarker(
           connectionId,
-          { lastReplyAt: now, preserveExplicitReply: true },
+          {
+            lastReplyAt: now,
+            ...(replyAccepted ? { personToldAt: now } : {}),
+            preserveExplicitReply: true,
+          },
           connectionsDir,
         )
       }
@@ -162,8 +248,16 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
     }
   } else if (connectionId && !isRemotePlumbingToolCall(toolName, toolInput)) {
     try {
-      const existingMarker = readTurnMarker(connectionId, connectionsDir)
-      const effectiveTranscriptPath = parseTranscriptPath(raw) || state?.transcript_path || null
+      let existingMarker = readTurnMarker(connectionId, connectionsDir)
+      const effectiveTranscriptPath = effectiveTranscriptPathForCheck
+      if (existingMarker?.heldParent && !existingMarker?.otherWake) {
+        // Keep pause activity in the exclusion window while heldParent is parked.
+        // Never infer from an arbitrary tool call in PostToolUse that the agent has
+        // switched from check/notice follow-up back to the parked parent task: the
+        // agent restores parent context cleanly via PreInvocation (when the parent's
+        // completion step arrives) or `devspec-serve-request.mjs resume` (ce71a72b).
+        recordPauseActivity(connectionId, connectionsDir, now)
+      }
       const inferred = existingMarker
         ? null
         : inferTurnContextFromTranscript(effectiveTranscriptPath)

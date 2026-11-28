@@ -39,13 +39,18 @@ import {
   appendRequestEvent,
   closeRequest,
   extractBackgroundCommandTaskId,
+  isRemotePlumbingBackgroundCommand,
+  isRemotePlumbingShellCommand,
+  NO_REQUEST,
   notifiedKeys,
   openRequest,
   promptArrival,
   readRequestState,
   requestForLaunch,
+  requestRefForWrite,
   requestsWithWorkPending,
   rotateRequestLog,
+  SERVE_REQUEST_SCRIPT,
   setCurrentRequest,
   UNSTATED,
 } from './requests.mjs'
@@ -182,15 +187,914 @@ export function writeTurnMarker(connectionId, extra = {}, dir = CONNECTIONS_DIR)
   return payload
 }
 
-function snapshotHeldParent(marker) {
+function snapshotHeldParent(marker, { connectionId = null, dir = CONNECTIONS_DIR } = {}) {
   if (!marker) return null
   if (marker.heldParent && typeof marker.heldParent === 'object') return marker.heldParent
+  const ownedIds = connectionId ? readOwnedIds(connectionId, marker, dir) : []
   return {
     remoteTurn: Boolean(marker.remoteTurn),
     localPromptMirrored: Boolean(marker.localPromptMirrored),
     localTurn: marker.localTurn || null,
     otherWake: Boolean(marker.otherWake),
     backgroundContinuation: Boolean(marker.backgroundContinuation),
+    ...(ownedIds.length > 0 ? { ownedIds } : {}),
+  }
+}
+
+function normalizeExcludedRanges(ranges) {
+  if (!Array.isArray(ranges)) return []
+  return ranges.filter(
+    (r) =>
+      r &&
+      typeof r.startMs === 'number' &&
+      Number.isFinite(r.startMs) &&
+      typeof r.endMs === 'number' &&
+      Number.isFinite(r.endMs) &&
+      r.endMs >= r.startMs,
+  )
+}
+
+function appendExcludedRange(existing, startMs, endMs) {
+  const ranges = normalizeExcludedRanges(existing)
+  if (typeof startMs === 'number' && Number.isFinite(startMs) && typeof endMs === 'number' && Number.isFinite(endMs)) {
+    ranges.push({ startMs: Math.min(startMs, endMs), endMs })
+  }
+  return ranges
+}
+
+function isTimestampInExcludedRanges(stepMs, excludedRanges) {
+  if (!Number.isFinite(stepMs) || !Array.isArray(excludedRanges) || excludedRanges.length === 0) {
+    return false
+  }
+  return excludedRanges.some(
+    (r) =>
+      typeof r?.startMs === 'number' &&
+      typeof r?.endMs === 'number' &&
+      stepMs >= r.startMs &&
+      stepMs <= r.endMs,
+  )
+}
+
+/**
+ * Record that pause-phase activity happened at `now` while `heldParent` is parked so
+ * the pause exclusion window covers the full pause interval (never ending early at
+ * the parent background task's completion timestamp; decisions 02f4ce2b, a2d9f38f, c1791ffa).
+ */
+export function recordPauseActivity(connectionId, dir = CONNECTIONS_DIR, now = Date.now()) {
+  const existing = connectionId ? readTurnMarker(connectionId, dir) : null
+  if (!existing?.heldParent || existing.otherWake) return false
+  const prev =
+    typeof existing.lastPauseActivityAt === 'number' && Number.isFinite(existing.lastPauseActivityAt)
+      ? existing.lastPauseActivityAt
+      : 0
+  writeTurnMarker(
+    connectionId,
+    { lastPauseActivityAt: Math.max(prev, now), preserveExplicitReply: true },
+    dir,
+  )
+  return true
+}
+
+/**
+ * Mark that a check-job ruling settled (all entries ruled or handed back) during the
+ * current mid-wait pause so subsequent parent-task work can safely restore `heldParent`
+ * without mixing in-flight check ruling steps into the command trail (decisions
+ * a2d9f38f & c1791ffa). When multiple check jobs are batched in one pause, `checkJobRuled`
+ * only becomes true once every tracked job has settled.
+ */
+export function recordCheckJobRuled(
+  connectionId,
+  dir = CONNECTIONS_DIR,
+  { jobId = null, now = Date.now() } = {},
+) {
+  const existing = connectionId ? readTurnMarker(connectionId, dir) : null
+  if (!existing) return false
+  const prevPauseAt =
+    typeof existing.lastPauseActivityAt === 'number' && Number.isFinite(existing.lastPauseActivityAt)
+      ? existing.lastPauseActivityAt
+      : 0
+  const nextPauseAt = Math.max(prevPauseAt, now)
+  const trackedJobs = Array.isArray(existing.checkJobIds)
+    ? existing.checkJobIds.map((id) => String(id).toLowerCase()).filter(Boolean)
+    : []
+  const settledJobs = Array.isArray(existing.settledCheckJobIds)
+    ? [...new Set(existing.settledCheckJobIds.map((id) => String(id).toLowerCase()).filter(Boolean))]
+    : []
+  const normalizedJobId = typeof jobId === 'string' && jobId.trim() ? jobId.trim().toLowerCase() : null
+  if (normalizedJobId && !settledJobs.includes(normalizedJobId)) {
+    settledJobs.push(normalizedJobId)
+  }
+  const allSettled =
+    trackedJobs.length === 0 ||
+    !normalizedJobId ||
+    trackedJobs.every((id) => settledJobs.includes(id))
+  writeTurnMarker(
+    connectionId,
+    {
+      settledCheckJobIds: settledJobs,
+      checkJobRuled: allSettled,
+      checkJobRemainingEntries: false,
+      ...(allSettled ? { checkJobRuledAt: now } : {}),
+      lastPauseActivityAt: nextPauseAt,
+      preserveExplicitReply: true,
+    },
+    dir,
+  )
+  return allSettled
+}
+
+/**
+ * Record that a batched `record_check_rulings` call still has entries remaining
+ * (`settled: false` / `remaining > 0`) so Stop while the parent task is still
+ * waiting will NEVER clear the parked check state prematurely (decision a2d9f38f).
+ */
+export function recordCheckJobRemainingEntries(
+  connectionId,
+  dir = CONNECTIONS_DIR,
+  { now = Date.now() } = {},
+) {
+  const existing = connectionId ? readTurnMarker(connectionId, dir) : null
+  if (!existing) return false
+  const prevPauseAt =
+    typeof existing.lastPauseActivityAt === 'number' && Number.isFinite(existing.lastPauseActivityAt)
+      ? existing.lastPauseActivityAt
+      : 0
+  writeTurnMarker(
+    connectionId,
+    {
+      checkJobRuled: false,
+      checkJobRemainingEntries: true,
+      lastPauseActivityAt: Math.max(prevPauseAt, now),
+      preserveExplicitReply: true,
+    },
+    dir,
+  )
+  return true
+}
+
+/**
+ * Find the `created_at` timestamp (ms) of the latest `PLANNER_RESPONSE` step in
+ * `transcriptPath` that invoked `toolName` after `afterMs`, so `PostToolUse` can bound
+ * the pause exclusion window strictly before the resumed parent tool step itself.
+ */
+export function findLatestToolCallStepMs(transcriptPath, toolName, { afterMs = null } = {}) {
+  if (!transcriptPath || !toolName) return null
+  const bareTarget = String(toolName).replace(/^default_api:/, '')
+  let raw = ''
+  try {
+    const stat = fs.statSync(transcriptPath)
+    if (!stat.isFile() || stat.size === 0) return null
+    const readSize = Math.min(stat.size, 262_144)
+    const fd = fs.openSync(transcriptPath, 'r')
+    try {
+      const buf = Buffer.alloc(readSize)
+      fs.readSync(fd, buf, 0, readSize, stat.size - readSize)
+      raw = buf.toString('utf8')
+    } finally {
+      fs.closeSync(fd)
+    }
+  } catch {
+    return null
+  }
+  const lines = raw.split(/\r?\n/)
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const trimmed = lines[i].trim()
+    if (!trimmed) continue
+    let step
+    try {
+      step = JSON.parse(trimmed)
+    } catch {
+      continue
+    }
+    if (step?.type !== 'PLANNER_RESPONSE' || !Array.isArray(step.tool_calls)) continue
+    const matches = step.tool_calls.some(
+      (tc) => String(tc?.name || '').replace(/^default_api:/, '') === bareTarget,
+    )
+    if (!matches) continue
+    const stepMs = step.created_at ? Date.parse(step.created_at) : NaN
+    if (!Number.isFinite(stepMs)) return null
+    if (typeof afterMs === 'number' && Number.isFinite(afterMs) && stepMs < afterMs) return null
+    return stepMs
+  }
+  return null
+}
+
+/**
+ * Restore a parked parent room task (`marker.heldParent`) and its active request
+ * when a parent-owned background task completes mid-turn AND the mid-wait pause
+ * is no longer in flight:
+ * - Never restores while any pause-owned launch (e.g. a check-job helper subagent
+ *   not in `parent.ownedIds`) is still running.
+ * - Never clears an active `checkJobWake` pause until every tracked check job is
+ *   settled (`checkJobRuled`).
+ * - Ends the `[pauseStartedAt, resumedAt]` exclusion window at the full pause end
+ *   (covering helper completions, check rulings, and pause tool activity — never
+ *   cutting it short at an earlier parent-launch completion timestamp) so neither
+ *   trail extraction nor Stop fallback can leak check/notice steps or routine
+ *   check-only responses into the person's command (decisions 02f4ce2b, a2d9f38f, c1791ffa).
+ * - Restores request attribution strictly from the launch(es) that actually ended,
+ *   retaining unknown attribution whenever an ended launch is unstated or cannot be
+ *   tied to the parent request while another launch is parked (decision ce71a72b).
+ */
+/**
+ * True when the pause carries a `tell_person` obligation that has NOT yet been
+ * satisfied by actually telling the person AFTER it was recorded. An earlier
+ * accepted notice reply to a separate notice never satisfies a later
+ * `tell_person` obligation (decision 02f4ce2b).
+ */
+export function hasPendingTellPersonObligation(marker) {
+  if (!marker?.tellPerson) return false
+  const tellAt =
+    typeof marker.tellPersonAt === 'number' && Number.isFinite(marker.tellPersonAt)
+      ? marker.tellPersonAt
+      : null
+  const toldAt =
+    typeof marker.personToldAt === 'number' && Number.isFinite(marker.personToldAt)
+      ? marker.personToldAt
+      : null
+  if (toldAt !== null && (tellAt === null || toldAt >= tellAt)) {
+    return false
+  }
+  return true
+}
+
+export function restoreHeldParentIfResumed(
+  connectionId,
+  marker,
+  {
+    dir = CONNECTIONS_DIR,
+    reconciled = null,
+    latestStep = null,
+    conversationId = null,
+    now = Date.now(),
+    excludeUpToMs = null,
+    requireParentNotificationStep = false,
+    allowQuietNoticeResume = false,
+    settledQuietly = false,
+  } = {},
+) {
+  if (!connectionId || !marker?.heldParent || marker.otherWake) {
+    return { restored: false, marker }
+  }
+  const resolvedConversationId =
+    conversationId || readConnectionLocalId(connectionId, dir) || null
+  const parent = marker.heldParent
+  const parentOwnedIds = Array.isArray(parent.ownedIds)
+    ? parent.ownedIds.filter((id) => typeof id === 'string' && id)
+    : []
+
+  // Never restore while any launch created during the mid-wait pause (such as a
+  // check-job helper subagent) is still running.
+  const allOutstanding = readOwnedIds(connectionId, marker, dir)
+  if (allOutstanding.some((id) => !parentOwnedIds.includes(id))) {
+    return { restored: false, marker }
+  }
+
+  // Never clear an in-flight check-job pause until its ruling settled.
+  if (marker.checkJobWake && !marker.checkJobRuled) {
+    return { restored: false, marker }
+  }
+
+  // Never clear an active for-the-record notice pause automatically just because a
+  // parent background task finished asynchronously (decisions 02f4ce2b & a2d9f38f):
+  // the agent may still be investigating/handling the quiet notice (alone or after
+  // a check job in the same pause settled). Only restore a quiet-notice pause
+  // mid-turn when the agent explicitly hands back control after finishing the
+  // notice (`allowQuietNoticeResume: true`, via `devspec-serve-request.mjs resume`).
+  const hasForTheRecordNotice =
+    Array.isArray(marker.recordNoticeIds) && marker.recordNoticeIds.length > 0
+  if (hasForTheRecordNotice && !allowQuietNoticeResume) {
+    return { restored: false, marker }
+  }
+
+  // Never clear an active needs_person notice or undelivered tell_person pause
+  // automatically, and never clear a pause after a notice reply was attempted
+  // and refused by the server (decision 02f4ce2b). When the agent settled a
+  // needs_person notice quietly in place with nobody still needing to decide,
+  // explicit `devspec-serve-request.mjs resume --settled-quietly` confirms that
+  // settlement and restores the parent task without forcing a room reply
+  // (decisions 02f4ce2b & a2d9f38f).
+  const noticeReplyUnaccepted = Boolean(
+    typeof marker.noticeReplyAt === 'number' &&
+      Number.isFinite(marker.noticeReplyAt) &&
+      !(
+        typeof marker.acceptedNoticeReplyAt === 'number' &&
+        Number.isFinite(marker.acceptedNoticeReplyAt) &&
+        marker.acceptedNoticeReplyAt >= marker.noticeReplyAt
+      ),
+  )
+  if (noticeReplyUnaccepted) {
+    return { restored: false, marker }
+  }
+  const repliedNoticeSet = new Set(
+    (Array.isArray(marker.repliedNoticeIds) ? marker.repliedNoticeIds : [])
+      .map((id) => String(id).toLowerCase())
+      .filter(Boolean),
+  )
+  const pendingNeedsPersonIds = (Array.isArray(marker.noticeIds) ? marker.noticeIds : [])
+    .map((id) => String(id).toLowerCase())
+    .filter((id) => id && !repliedNoticeSet.has(id))
+  const hasPendingNeedsPersonNotice =
+    Array.isArray(marker.noticeIds) &&
+    marker.noticeIds.length > 0 &&
+    (pendingNeedsPersonIds.length > 0 || !marker.acceptedNoticeReplyAt)
+  if (hasPendingNeedsPersonNotice && !(allowQuietNoticeResume && settledQuietly)) {
+    return { restored: false, marker }
+  }
+  if (hasPendingTellPersonObligation(marker)) {
+    return { restored: false, marker }
+  }
+
+  // Identify ONLY the parent-owned launch(es) that actually completed and their
+  // completion timestamp, PLUS the latest completion timestamp of any pause-owned
+  // launch (such as a check-ruling helper subagent) so the exclusion window covers
+  // the entire pause interval.
+  const endedParentIds = []
+  let completedAtMs = null
+  let endedPauseLaunchAtMs = null
+  let notificationText = ''
+  let latestStepIsParentCompletion = false
+
+  const noteEnded = (id, atMs = null, text = '') => {
+    if (typeof id === 'string' && id && !endedParentIds.includes(id)) {
+      endedParentIds.push(id)
+    }
+    if (typeof atMs === 'number' && Number.isFinite(atMs)) {
+      completedAtMs = completedAtMs === null ? atMs : Math.max(completedAtMs, atMs)
+    }
+    if (text && !notificationText) {
+      notificationText = text
+    }
+  }
+
+  const notePauseEnded = (atMs) => {
+    if (typeof atMs === 'number' && Number.isFinite(atMs)) {
+      endedPauseLaunchAtMs =
+        endedPauseLaunchAtMs === null ? atMs : Math.max(endedPauseLaunchAtMs, atMs)
+    }
+  }
+
+  if (Array.isArray(reconciled?.endedOwnedDetails)) {
+    for (const detail of reconciled.endedOwnedDetails) {
+      if (parentOwnedIds.length === 0 || parentOwnedIds.includes(detail.id)) {
+        noteEnded(detail.id, detail.atMs ?? null, detail.content || '')
+      } else {
+        notePauseEnded(detail.atMs ?? null)
+      }
+    }
+  } else if (Array.isArray(reconciled?.endedOwnedIds)) {
+    for (const id of reconciled.endedOwnedIds) {
+      if (parentOwnedIds.length === 0 || parentOwnedIds.includes(id)) {
+        noteEnded(id, null, '')
+      }
+    }
+  }
+
+  const ownedLines = readOwnedLines(connectionId, marker, dir)
+  for (const entry of ownedLines) {
+    if (typeof entry.ended !== 'string') continue
+    const endedMs = Date.parse(entry.ended)
+    const validEndedMs = Number.isFinite(endedMs) ? endedMs : null
+    if (parentOwnedIds.length > 0 && parentOwnedIds.includes(entry.id)) {
+      noteEnded(entry.id, validEndedMs, '')
+    } else if (parentOwnedIds.length > 0 && !parentOwnedIds.includes(entry.id)) {
+      notePauseEnded(validEndedMs)
+    }
+  }
+
+  if (
+    latestStep?.type === 'SYSTEM_MESSAGE' &&
+    typeof latestStep.content === 'string' &&
+    !latestStep.content.includes('[DevSpec Remote Wake]') &&
+    isBackgroundTaskNotification(latestStep.content)
+  ) {
+    const stepMs = latestStep.created_at ? Date.parse(latestStep.created_at) : NaN
+    const matchedIds = parentOwnedIds.filter((id) =>
+      stepMatchesOwnedId(latestStep.content, id, { conversationId: resolvedConversationId }),
+    )
+    if (matchedIds.length > 0) {
+      latestStepIsParentCompletion = true
+      for (const id of matchedIds) {
+        noteEnded(id, Number.isFinite(stepMs) ? stepMs : null, latestStep.content)
+      }
+    } else if (parentOwnedIds.length === 0) {
+      latestStepIsParentCompletion = true
+      noteEnded('__parent_bg__', Number.isFinite(stepMs) ? stepMs : null, latestStep.content)
+    }
+  }
+
+  if (requireParentNotificationStep && !latestStepIsParentCompletion) {
+    return { restored: false, marker }
+  }
+
+  if (endedParentIds.length === 0) {
+    return { restored: false, marker }
+  }
+
+  if (!notificationText && Array.isArray(reconciled?.matchedSystemMessages) && reconciled.matchedSystemMessages.length > 0) {
+    const matchingMsg = reconciled.matchedSystemMessages.find((msg) =>
+      endedParentIds.some(
+        (id) =>
+          id !== '__parent_bg__' &&
+          stepMatchesOwnedId(msg, id, { conversationId: resolvedConversationId }),
+      ),
+    )
+    if (matchingMsg) notificationText = matchingMsg
+  }
+
+  const pauseStartMs = typeof marker.pauseStartedAt === 'number' && Number.isFinite(marker.pauseStartedAt)
+    ? marker.pauseStartedAt
+    : null
+  const pauseFloorCandidates = [
+    completedAtMs,
+    endedPauseLaunchAtMs,
+    typeof marker.checkJobRuledAt === 'number' && Number.isFinite(marker.checkJobRuledAt)
+      ? marker.checkJobRuledAt
+      : null,
+    typeof marker.lastPauseActivityAt === 'number' && Number.isFinite(marker.lastPauseActivityAt)
+      ? marker.lastPauseActivityAt
+      : null,
+  ].filter((v) => typeof v === 'number' && Number.isFinite(v))
+  const pauseFloorMs = pauseFloorCandidates.length > 0 ? Math.max(...pauseFloorCandidates) : null
+  const resumedAtMs =
+    typeof excludeUpToMs === 'number' && Number.isFinite(excludeUpToMs)
+      ? pauseFloorMs !== null
+        ? Math.max(pauseFloorMs, excludeUpToMs)
+        : excludeUpToMs
+      : pauseFloorMs !== null
+        ? Math.max(now, pauseFloorMs)
+        : now
+  const nextExcludedRanges =
+    pauseStartMs !== null
+      ? appendExcludedRange(marker.excludedRanges, pauseStartMs, resumedAtMs)
+      : normalizeExcludedRanges(marker.excludedRanges)
+
+  const restoredMarker = writeTurnMarker(
+    connectionId,
+    {
+      held: false,
+      heldParent: null,
+      remoteTurn: Boolean(parent.remoteTurn),
+      localPromptMirrored: Boolean(parent.localPromptMirrored),
+      localTurn: parent.localTurn || null,
+      otherWake: Boolean(parent.otherWake),
+      backgroundContinuation: true,
+      noticeIds: [],
+      recordNoticeIds: [],
+      checkJobWake: false,
+      checkJobIds: [],
+      settledCheckJobIds: [],
+      checkJobRuled: false,
+      checkJobRemainingEntries: false,
+      checkJobRuledAt: null,
+      lastPauseActivityAt: null,
+      pauseStartedAt: null,
+      resumedFromPauseAt: resumedAtMs,
+      excludedRanges: nextExcludedRanges,
+      tellPerson: false,
+      tellPersonAt: null,
+      noticeReplyAt: null,
+      acceptedNoticeReplyAt: null,
+      repliedNoticeIds: [],
+      personToldAt: null,
+      preserveExplicitReply: true,
+    },
+    dir,
+  )
+
+  try {
+    const reqState = readRequestState(connectionId, { dir })
+    const endedRealIds = endedParentIds.filter((id) => id !== '__parent_bg__')
+    const notifiedEndedKeys = notificationText ? notifiedKeys(notificationText) : []
+    const endedTrackedLaunches = []
+    const seenEndedLaunches = new Set()
+    let anyEndedUntracked = false
+
+    // Check each distinct ended launch ID from the owned log / reconciliation.
+    for (const id of endedRealIds) {
+      const launch = reqState.launches.get(id)
+      if (launch) {
+        if (!seenEndedLaunches.has(launch)) {
+          seenEndedLaunches.add(launch)
+          endedTrackedLaunches.push(launch)
+        }
+      } else {
+        anyEndedUntracked = true
+      }
+    }
+
+    // `notifiedKeys(notificationText)` extracts candidate aliases for the SAME
+    // completion message (e.g. both `<convId>/task-415` and its short alias
+    // `task-415`). Match ANY alias to its launch just as `requestForWake` does,
+    // without treating a short alias as a second untracked launch (ce71a72b).
+    if (notifiedEndedKeys.length > 0) {
+      let matchedNotificationLaunch = false
+      for (const key of notifiedEndedKeys) {
+        const launch = reqState.launches.get(key)
+        if (launch) {
+          matchedNotificationLaunch = true
+          if (!seenEndedLaunches.has(launch)) {
+            seenEndedLaunches.add(launch)
+            endedTrackedLaunches.push(launch)
+          }
+        }
+      }
+      if (!matchedNotificationLaunch) {
+        anyEndedUntracked = true
+      }
+    }
+
+    if (endedTrackedLaunches.length > 0) {
+      // Match normal wake resolution (`carriedBy` + `promptArrival` in requests.mjs):
+      // each finished launch's primary requester is `launch.request` ONLY if it is
+      // still open (or `'none'`), else `UNSTATED`; any still-open co-carried
+      // `launch.also` requests join alongside it rather than silently replacing a
+      // closed or unstated primary requester (decision ce71a72b).
+      const endedPrimaries = []
+      const endedJoined = []
+      let anyEndedUnknown = anyEndedUntracked
+      for (const launch of endedTrackedLaunches) {
+        const primary =
+          reqState.open.has(launch.request) || launch.request === 'none'
+            ? launch.request
+            : UNSTATED
+        if (primary === UNSTATED) {
+          anyEndedUnknown = true
+        } else if (!endedPrimaries.includes(primary)) {
+          endedPrimaries.push(primary)
+        }
+        for (const extra of launch.also ?? []) {
+          if (reqState.open.has(extra) && extra !== launch.request && !endedJoined.includes(extra)) {
+            endedJoined.push(extra)
+          }
+        }
+      }
+
+      if (notificationText) {
+        for (const key of notifiedKeys(notificationText)) {
+          appendRequestEvent(connectionId, { op: 'notified', key }, { dir })
+        }
+      }
+
+      if (anyEndedUnknown || endedPrimaries.length === 0) {
+        setCurrentRequest(connectionId, UNSTATED, { dir })
+        for (const extra of [...endedPrimaries, ...endedJoined]) {
+          appendRequestEvent(connectionId, { op: 'joined', id: extra }, { dir })
+        }
+      } else {
+        const currentRef = endedPrimaries.at(-1)
+        setCurrentRequest(connectionId, currentRef, { dir })
+        for (const extra of [...endedPrimaries.slice(0, -1), ...endedJoined]) {
+          if (extra !== currentRef) {
+            appendRequestEvent(connectionId, { op: 'joined', id: extra }, { dir })
+          }
+        }
+      }
+    } else {
+      let restoredFromNotification = false
+      if (notificationText) {
+        const arrival = promptArrival({
+          fromAPerson: false,
+          origin: 'task-notification',
+          text: notificationText,
+          midTurn: false,
+          state: reqState,
+        })
+        const hasCurrent = arrival.events.some((ev) => ev.op === 'current' && ev.ref !== null)
+        if (hasCurrent) {
+          for (const event of arrival.events) {
+            appendRequestEvent(connectionId, event, { dir })
+          }
+          restoredFromNotification = true
+        }
+      }
+      if (!restoredFromNotification) {
+        // Never infer requester attribution from whichever request was current
+        // when the pause began: an untracked launch without a request record
+        // must leave attribution unknown (decision ce71a72b).
+        setCurrentRequest(connectionId, UNSTATED, { dir })
+      }
+    }
+  } catch {
+    /* non-fatal */
+  }
+
+  return { restored: true, marker: restoredMarker }
+}
+
+/**
+ * Inspect whether a parked mid-wait pause (`marker.heldParent`) already has at
+ * least one completed parent-owned launch whose open request has NOT yet been
+ * disambiguated (`!reqState.chosen`). Used by `PreToolUse` (`devspec-tool-input.mjs`)
+ * so an ambiguous DevSpec write or background launch neither silently drops the
+ * known parent requester (`ce71a72b`) nor silently stamps the parked room
+ * requester onto check/notice follow-up work.
+ *
+ * When ambiguous, joins the completed parent launch's open request(s) onto the
+ * connection's request log so `devspec-serve-request.mjs serve --unstated` works
+ * cleanly if the call is still pause follow-up, while `devspec-serve-request.mjs
+ * resume` restores `heldParent` and the known parent requester if resuming.
+ */
+export function parkedParentWriteAmbiguity(
+  connectionId,
+  marker,
+  {
+    dir = CONNECTIONS_DIR,
+    reconciled = null,
+    conversationId = null,
+    scriptPath = SERVE_REQUEST_SCRIPT,
+  } = {},
+) {
+  if (!connectionId || !marker?.heldParent || marker.otherWake) return null
+  const reqState = readRequestState(connectionId, { dir })
+  if (reqState.chosen) return null
+
+  const parent = marker.heldParent
+  const parentOwnedIds = Array.isArray(parent.ownedIds)
+    ? parent.ownedIds.filter((id) => typeof id === 'string' && id)
+    : []
+  const endedParentIds = []
+  const noteEnded = (id) => {
+    if (typeof id === 'string' && id && !endedParentIds.includes(id)) {
+      endedParentIds.push(id)
+    }
+  }
+  if (Array.isArray(reconciled?.endedOwnedDetails)) {
+    for (const detail of reconciled.endedOwnedDetails) {
+      if (parentOwnedIds.length === 0 || parentOwnedIds.includes(detail.id)) {
+        noteEnded(detail.id)
+      }
+    }
+  } else if (Array.isArray(reconciled?.endedOwnedIds)) {
+    for (const id of reconciled.endedOwnedIds) {
+      if (parentOwnedIds.length === 0 || parentOwnedIds.includes(id)) {
+        noteEnded(id)
+      }
+    }
+  }
+  for (const entry of readOwnedLines(connectionId, marker, dir)) {
+    if (typeof entry.ended !== 'string') continue
+    if (parentOwnedIds.length > 0 && parentOwnedIds.includes(entry.id)) {
+      noteEnded(entry.id)
+    }
+  }
+  if (endedParentIds.length === 0) return null
+
+  const candidateReqs = []
+  for (const id of endedParentIds) {
+    const launch = reqState.launches.get(id)
+    if (!launch) continue
+    if (reqState.open.has(launch.request) || launch.request === 'none') {
+      if (!candidateReqs.includes(launch.request)) candidateReqs.push(launch.request)
+    }
+    for (const extra of launch.also ?? []) {
+      if (reqState.open.has(extra) && !candidateReqs.includes(extra)) {
+        candidateReqs.push(extra)
+      }
+    }
+  }
+  if (candidateReqs.length === 0) return null
+
+  // Decision ce71a72b: "When DevSpec can't tell who asked, a change is never
+  // refused for it, and nothing is held just for that... when one turn carries
+  // two people's requests, the agent says which." Only deny when 2+ distinct
+  // known (non-unknown) attributions are in play (e.g. two different people's
+  // requests, or room + terminal). When there is at most one possible human
+  // requester alongside an unstated notice/check pause, let the write proceed
+  // with unknown requester attribution without mutating `reqState`.
+  const knownAttributions = new Set()
+  const addKnownAttribution = (ref) => {
+    if (ref === NO_REQUEST) {
+      knownAttributions.add('nobody')
+    } else if (ref && ref !== UNSTATED && reqState.open.has(ref)) {
+      const info = reqState.open.get(ref)
+      knownAttributions.add(
+        `${info.requested_by ?? 'unknown'}:${info.kind === 'typed_prompt' ? 'terminal' : 'room'}`,
+      )
+    }
+  }
+  for (const ref of candidateReqs) addKnownAttribution(ref)
+  addKnownAttribution(reqState.current)
+  for (const ref of reqState.joined) addKnownAttribution(ref)
+  if (knownAttributions.size < 2) return null
+
+  // Join the completed parent request(s) onto the request state so `serve --unstated`
+  // or `serve --message-id <id>` is valid when the agent disambiguates.
+  for (const ref of candidateReqs) {
+    if (ref !== reqState.current && !reqState.joined.has(ref)) {
+      appendRequestEvent(connectionId, { op: 'joined', id: ref }, { dir })
+    }
+  }
+
+  const allOutstanding = readOwnedIds(connectionId, marker, dir)
+  const pauseHelperRunning = allOutstanding.some((id) => !parentOwnedIds.includes(id))
+  const unsettledCheck = Boolean(marker.checkJobWake && !marker.checkJobRuled)
+  const noticeReplyUnaccepted = Boolean(
+    typeof marker.noticeReplyAt === 'number' &&
+      Number.isFinite(marker.noticeReplyAt) &&
+      !(
+        typeof marker.acceptedNoticeReplyAt === 'number' &&
+        Number.isFinite(marker.acceptedNoticeReplyAt) &&
+        marker.acceptedNoticeReplyAt >= marker.noticeReplyAt
+      ),
+  )
+  const repliedNoticeSet = new Set(
+    (Array.isArray(marker.repliedNoticeIds) ? marker.repliedNoticeIds : [])
+      .map((id) => String(id).toLowerCase())
+      .filter(Boolean),
+  )
+  const pendingNeedsPerson =
+    Array.isArray(marker.noticeIds) &&
+    marker.noticeIds.length > 0 &&
+    (marker.noticeIds.some((id) => !repliedNoticeSet.has(String(id).toLowerCase())) ||
+      !marker.acceptedNoticeReplyAt)
+  const canResumeNow =
+    !pauseHelperRunning &&
+    !unsettledCheck &&
+    !noticeReplyUnaccepted &&
+    !hasPendingTellPersonObligation(marker)
+
+  const lines = [
+    'A parked room task has completed background work carrying multiple distinct requests while this DevSpec notice/check pause is still active.',
+    'Say which request this call serves before retrying.',
+  ]
+  if (canResumeNow) {
+    if (pendingNeedsPerson) {
+      lines.push(
+        'If you already settled the notice quietly and are resuming the parked room task, run:',
+        `  node ${JSON.stringify(scriptPath)} resume --connection-id ${connectionId} --settled-quietly`,
+        'If the notice still needs a person, reply with post_session_message (including system_notice_ids) first, then run:',
+        `  node ${JSON.stringify(scriptPath)} resume --connection-id ${connectionId}`,
+      )
+    } else {
+      lines.push(
+        'If you are resuming the parked room task (which restores its requester and live progress), run:',
+        `  node ${JSON.stringify(scriptPath)} resume --connection-id ${connectionId}`,
+      )
+    }
+  } else {
+    lines.push(
+      'Finish settling the active check job / notice first before resuming the parked room task.',
+    )
+  }
+  lines.push(
+    'If this call is still follow-up work for the pause itself (not the parked room task), run:',
+    `  node ${JSON.stringify(scriptPath)} serve --connection-id ${connectionId} --unstated`,
+    'Then make the call again.',
+  )
+  return {
+    reason: lines.join('\n'),
+    candidateReqs,
+    canResumeNow,
+  }
+}
+
+/**
+ * When a parent background launch has already completed during a quiet notice pause
+ * (for-the-record notice or self-fixable needs_person notice with no reply needed)
+ * and all check jobs / pause helpers / tell_person obligations are clear, return an
+ * ephemeral PreInvocation hint telling the agent the exact command to hand back
+ * to its parked room task once it finishes handling the notice (decisions 02f4ce2b,
+ * a2d9f38f; item 972c8895).
+ */
+export function pendingParentResumeHint(
+  connectionId,
+  marker,
+  {
+    dir = CONNECTIONS_DIR,
+    reconciled = null,
+    latestStep = null,
+    conversationId = null,
+    scriptPath = SERVE_REQUEST_SCRIPT,
+  } = {},
+) {
+  if (!connectionId || !marker?.heldParent || marker.otherWake) return null
+  const resolvedConversationId =
+    conversationId || readConnectionLocalId(connectionId, dir) || null
+  const parent = marker.heldParent
+  const parentOwnedIds = Array.isArray(parent.ownedIds)
+    ? parent.ownedIds.filter((id) => typeof id === 'string' && id)
+    : []
+  const allOutstanding = readOwnedIds(connectionId, marker, dir)
+  if (allOutstanding.some((id) => !parentOwnedIds.includes(id))) return null
+  if (marker.checkJobWake && !marker.checkJobRuled) return null
+  if (hasPendingTellPersonObligation(marker)) return null
+
+  const noticeReplyUnaccepted = Boolean(
+    typeof marker.noticeReplyAt === 'number' &&
+      Number.isFinite(marker.noticeReplyAt) &&
+      !(
+        typeof marker.acceptedNoticeReplyAt === 'number' &&
+        Number.isFinite(marker.acceptedNoticeReplyAt) &&
+        marker.acceptedNoticeReplyAt >= marker.noticeReplyAt
+      ),
+  )
+  if (noticeReplyUnaccepted) return null
+
+  const repliedNoticeSet = new Set(
+    (Array.isArray(marker.repliedNoticeIds) ? marker.repliedNoticeIds : [])
+      .map((id) => String(id).toLowerCase())
+      .filter(Boolean),
+  )
+  const pendingNeedsPersonIds = (Array.isArray(marker.noticeIds) ? marker.noticeIds : [])
+    .map((id) => String(id).toLowerCase())
+    .filter((id) => id && !repliedNoticeSet.has(id))
+  const hasPendingNeedsPersonNotice =
+    Array.isArray(marker.noticeIds) &&
+    marker.noticeIds.length > 0 &&
+    (pendingNeedsPersonIds.length > 0 || !marker.acceptedNoticeReplyAt)
+
+  let hasEndedParent = false
+  if (Array.isArray(reconciled?.endedOwnedDetails)) {
+    hasEndedParent = reconciled.endedOwnedDetails.some(
+      (d) => parentOwnedIds.length === 0 || parentOwnedIds.includes(d.id),
+    )
+  } else if (Array.isArray(reconciled?.endedOwnedIds)) {
+    hasEndedParent = reconciled.endedOwnedIds.some(
+      (id) => parentOwnedIds.length === 0 || parentOwnedIds.includes(id),
+    )
+  }
+  if (!hasEndedParent) {
+    const ownedLines = readOwnedLines(connectionId, marker, dir)
+    hasEndedParent = ownedLines.some(
+      (entry) =>
+        typeof entry.ended === 'string' &&
+        parentOwnedIds.length > 0 &&
+        parentOwnedIds.includes(entry.id),
+    )
+  }
+  if (
+    !hasEndedParent &&
+    latestStep?.type === 'SYSTEM_MESSAGE' &&
+    typeof latestStep.content === 'string' &&
+    !latestStep.content.includes('[DevSpec Remote Wake]') &&
+    isBackgroundTaskNotification(latestStep.content)
+  ) {
+    hasEndedParent =
+      parentOwnedIds.length === 0 ||
+      parentOwnedIds.some((id) =>
+        stepMatchesOwnedId(latestStep.content, id, { conversationId: resolvedConversationId }),
+      )
+  }
+  if (!hasEndedParent) return null
+
+  if (hasPendingNeedsPersonNotice) {
+    return {
+      ephemeralMessage: [
+        'Your parked room task has background work that finished while this DevSpec notice pause is open.',
+        'Finish handling the notice first — all notice work stays out of the room while the pause is active.',
+        'If an unresolved choice, hold, rejection, or block still needs the person, post a notice reply (post_session_message with system_notice_ids) and then run:',
+        `  node ${JSON.stringify(scriptPath)} resume --connection-id ${connectionId}`,
+        'If you already settled the notice quietly and no room reply is needed, resume mid-turn with:',
+        `  node ${JSON.stringify(scriptPath)} resume --connection-id ${connectionId} --settled-quietly`,
+        '(Or end your turn quietly if nothing more is needed.)',
+      ].join('\n'),
+    }
+  }
+
+  return {
+    ephemeralMessage: [
+      'Your parked room task has background work that finished while this DevSpec notice pause is open.',
+      'Finish handling the notice first — all notice work stays out of the room while the pause is active.',
+      'When you are done with the notice and ready to resume the parked room task mid-turn, run:',
+      `  node ${JSON.stringify(scriptPath)} resume --connection-id ${connectionId}`,
+      '(Or end your turn if nothing more is needed.)',
+    ].join('\n'),
+  }
+}
+
+/** PreInvocation helper: returns `{ ephemeralMessage }` when a quiet notice pause has a completed parent task waiting to resume. */
+export function pendingParentResumeForHook(
+  raw,
+  { env = process.env, home = os.homedir(), connectionsDir = null, scriptPath = SERVE_REQUEST_SCRIPT } = {},
+) {
+  try {
+    const dir = connectionsDir ?? path.join(home, '.devspec', 'remote-control', 'connections')
+    const conversationId = resolveHookConversationId(raw, env)
+    const state = loadState(conversationId, {
+      connectionsDir: dir,
+      legacyPath: path.join(home, '.devspec', 'remote-control.json'),
+    })
+    const connectionId = state?.connection_id
+    if (!connectionId) return null
+    const marker = readTurnMarker(connectionId, dir)
+    if (!marker?.heldParent || marker.otherWake) return null
+    const effectiveTranscriptPath = parseTranscriptPath(raw) || state?.transcript_path || null
+    const effectiveConvId =
+      conversationId || state?.local_id || extractConversationIdFromTranscriptPath(effectiveTranscriptPath) || null
+    const reconciled = reconcileCompletedOwnedWork(connectionId, marker, effectiveTranscriptPath, dir, {
+      conversationId: effectiveConvId,
+    })
+    const latestStep = extractLatestTranscriptStep(effectiveTranscriptPath)
+    return pendingParentResumeHint(connectionId, marker, {
+      dir,
+      reconciled,
+      latestStep,
+      conversationId: effectiveConvId,
+      scriptPath,
+    })
+  } catch {
+    return null
   }
 }
 
@@ -220,13 +1124,53 @@ export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR, now =
   // A notice or check job is not a command: one that arrives during a turn typed at
   // the terminal leaves it a local turn, so that turn's answer keeps its local-turn flags.
   const nonCommandWake = Boolean(wake?.noticeIds || wake?.recordNoticeIds || wake?.checkJobWake)
+  // Check `existing?.heldParent` BEFORE `existing?.held === true`: if Stop held
+  // an already-parked pause open while waiting on a helper subagent and a second
+  // check job or notice wakes the agent, merge into the existing pause instead of
+  // replacing its checkJobIds / noticeIds / settledCheckJobIds (decision a2d9f38f).
+  if (existing?.heldParent && !existing?.otherWake && nonCommandWake) {
+    const merged = mergeTurnWake(existing, wake)
+    const settled = Array.isArray(existing.settledCheckJobIds)
+      ? existing.settledCheckJobIds.map((id) => String(id).toLowerCase())
+      : []
+    const mergedJobs = Array.isArray(merged.checkJobIds)
+      ? merged.checkJobIds.map((id) => String(id).toLowerCase())
+      : []
+    const resetRuled =
+      Boolean(wake?.checkJobWake) &&
+      (mergedJobs.length === 0 || mergedJobs.some((id) => !settled.includes(id)))
+    const replied = Array.isArray(existing.repliedNoticeIds)
+      ? existing.repliedNoticeIds.map((id) => String(id).toLowerCase())
+      : []
+    const mergedNotices = Array.isArray(merged.noticeIds)
+      ? merged.noticeIds.map((id) => String(id).toLowerCase())
+      : []
+    const hasUnrepliedNotice = mergedNotices.some((id) => !replied.includes(id))
+    return writeTurnMarker(
+      connectionId,
+      {
+        held: false,
+        heldParent: existing.heldParent,
+        remoteTurn: true,
+        ...merged,
+        ...(resetRuled ? { checkJobRuled: false, checkJobRuledAt: null } : {}),
+        ...(hasUnrepliedNotice ? { noticeReplyAt: null, acceptedNoticeReplyAt: null } : {}),
+        lastPauseActivityAt: Math.max(
+          typeof existing.lastPauseActivityAt === 'number' ? existing.lastPauseActivityAt : 0,
+          now,
+        ),
+        preserveExplicitReply: true,
+      },
+      dir,
+    )
+  }
   if (existing?.held === true) {
     if (nonCommandWake) {
       return writeTurnMarker(
         connectionId,
         {
           held: false,
-          heldParent: snapshotHeldParent(existing),
+          heldParent: snapshotHeldParent(existing, { connectionId, dir }),
           remoteTurn: true,
           localPromptMirrored: false,
           localTurn: null,
@@ -235,8 +1179,17 @@ export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR, now =
           noticeIds: wake?.noticeIds ?? [],
           recordNoticeIds: wake?.recordNoticeIds ?? [],
           checkJobWake: Boolean(wake?.checkJobWake),
+          checkJobIds: wake?.checkJobIds ?? [],
+          settledCheckJobIds: [],
+          checkJobRuled: false,
+          checkJobRuledAt: null,
+          lastPauseActivityAt: now,
+          pauseStartedAt: now,
+          excludedRanges: normalizeExcludedRanges(existing.excludedRanges),
           tellPerson: false,
           noticeReplyAt: null,
+          acceptedNoticeReplyAt: null,
+          repliedNoticeIds: [],
           personToldAt: null,
           preserveExplicitReply: true,
         },
@@ -248,19 +1201,6 @@ export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR, now =
       {
         held: false,
         heldParent: null,
-        remoteTurn: true,
-        ...mergeTurnWake(existing, wake),
-        preserveExplicitReply: true,
-      },
-      dir,
-    )
-  }
-  if (existing?.heldParent && !existing?.otherWake && nonCommandWake) {
-    return writeTurnMarker(
-      connectionId,
-      {
-        held: false,
-        heldParent: existing.heldParent,
         remoteTurn: true,
         ...mergeTurnWake(existing, wake),
         preserveExplicitReply: true,
@@ -331,9 +1271,13 @@ export function isCurrentTurnRoutine(
 }
 
 /** Note on the turn marker that a write in it carried DevSpec's `tell_person` mark. */
-export function recordTellPerson(connectionId, dir = CONNECTIONS_DIR) {
+export function recordTellPerson(connectionId, dir = CONNECTIONS_DIR, now = Date.now()) {
   if (!connectionId || !readTurnMarker(connectionId, dir)) return false
-  writeTurnMarker(connectionId, { tellPerson: true, preserveExplicitReply: true }, dir)
+  writeTurnMarker(
+    connectionId,
+    { tellPerson: true, tellPersonAt: now, personToldAt: null, preserveExplicitReply: true },
+    dir,
+  )
   return true
 }
 
@@ -353,10 +1297,51 @@ export function isCurrentTurnCheckJobOnly(
   })
 }
 
-/** Note on the turn marker that a reply to its notices went out (for the Stop fallback). */
+/**
+ * Note on the turn marker that the agent initiated a reply to its notices (for
+ * the Stop fallback). Mid-wait pause restoration waits for `recordNoticeReplyAccepted`
+ * in PostToolUse so a server-refused post never clears a pending notice (decision 02f4ce2b).
+ */
 export function recordNoticeReply(connectionId, dir = CONNECTIONS_DIR, now = Date.now()) {
   if (!connectionId || !readTurnMarker(connectionId, dir)) return false
   writeTurnMarker(connectionId, { noticeReplyAt: now, preserveExplicitReply: true }, dir)
+  return true
+}
+
+/**
+ * Record in PostToolUse that DevSpec ACCEPTED a notice reply (`post_session_message`
+ * with `system_notice_ids`), tracking the exact notice ids answered so a refused post
+ * or a later needs-a-person notice in the same pause is never cleared prematurely
+ * (decision 02f4ce2b).
+ */
+export function recordNoticeReplyAccepted(
+  connectionId,
+  dir = CONNECTIONS_DIR,
+  now = Date.now(),
+  { noticeIds = null } = {},
+) {
+  const existing = connectionId ? readTurnMarker(connectionId, dir) : null
+  if (!existing) return false
+  const prevReplied = Array.isArray(existing.repliedNoticeIds)
+    ? existing.repliedNoticeIds.map((id) => String(id).toLowerCase()).filter(Boolean)
+    : []
+  const newlyReplied =
+    Array.isArray(noticeIds) && noticeIds.length > 0
+      ? noticeIds.map((id) => String(id).toLowerCase()).filter(Boolean)
+      : (Array.isArray(existing.noticeIds) ? existing.noticeIds : [])
+          .map((id) => String(id).toLowerCase())
+          .filter(Boolean)
+  const repliedNoticeIds = [...new Set([...prevReplied, ...newlyReplied])]
+  writeTurnMarker(
+    connectionId,
+    {
+      noticeReplyAt: now,
+      acceptedNoticeReplyAt: now,
+      repliedNoticeIds,
+      preserveExplicitReply: true,
+    },
+    dir,
+  )
   return true
 }
 
@@ -504,20 +1489,130 @@ export function readOwnedIds(
   return ids
 }
 
-function stepMatchesOwnedId(stepContent, id) {
+const OWNED_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+function readConnectionLocalId(connectionId, dir = CONNECTIONS_DIR) {
+  if (!connectionId) return null
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(dir, `${connectionId}.json`), 'utf8'))
+    return typeof raw?.local_id === 'string' && raw.local_id.trim() ? raw.local_id.trim() : null
+  } catch {
+    return null
+  }
+}
+
+function extractConversationIdFromTranscriptPath(transcriptPath) {
+  if (typeof transcriptPath !== 'string' || !transcriptPath) return null
+  const m = transcriptPath.replace(/\\/g, '/').match(/\/brain\/([^/]+)\//i)
+  return m?.[1] || null
+}
+
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function hasBoundedIdToken(text, token) {
+  const re = new RegExp(`(?<![A-Za-z0-9_:/-])${escapeRegex(token)}(?![A-Za-z0-9_:/-])`)
+  return re.test(text)
+}
+
+/**
+ * Extract every conversation/namespace scope explicitly named in a completion
+ * notification (log path `/brain/<conv>/...`, qualified `sender=<conv>/<task>`,
+ * `<task-id><conv>/<task></task-id>`, `conversation_id=<conv>`, etc.) so a
+ * short task ID like `task-17` from ANOTHER conversation can never match a
+ * still-running launch in this conversation (decision ce71a72b).
+ */
+function notificationScopeIds(stepContent) {
+  const scopes = new Set()
+  const s = String(stepContent || '')
+  for (const m of s.matchAll(/\/brain\/([A-Za-z0-9_.:-]+)\//gi)) {
+    scopes.add(m[1].toLowerCase())
+  }
+  for (const m of s.matchAll(/\bsender=([A-Za-z0-9_.:-]+)\/[A-Za-z0-9_.:-]+/gi)) {
+    scopes.add(m[1].toLowerCase())
+  }
+  for (const m of s.matchAll(/<task-id>\s*([A-Za-z0-9_.:-]+)\/[A-Za-z0-9_.:-]+\s*<\/task-id>/gi)) {
+    scopes.add(m[1].toLowerCase())
+  }
+  for (const m of s.matchAll(/["']([A-Za-z0-9_.:-]+)\/[A-Za-z0-9_.:-]+["']/gi)) {
+    if (!m[1].startsWith('.') && m[1].toLowerCase() !== 'tasks') {
+      scopes.add(m[1].toLowerCase())
+    }
+  }
+  for (const m of s.matchAll(/\b(?:conversation_id|conversationId|conversation)\s*[=:]\s*["']?([A-Za-z0-9_.:-]+)["']?/gi)) {
+    scopes.add(m[1].toLowerCase())
+  }
+  for (const m of s.matchAll(/<conversation[-_]id>\s*([A-Za-z0-9_.:-]+)\s*<\/conversation[-_]id>/gi)) {
+    scopes.add(m[1].toLowerCase())
+  }
+  for (const m of s.matchAll(/\bsender=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![A-Za-z0-9_:/-])/gi)) {
+    scopes.add(m[1].toLowerCase())
+  }
+  return scopes
+}
+
+function hasConflictingNotificationScope(stepContent, id, conversationId = null) {
+  if (typeof id !== 'string' || !id) return false
+  if (OWNED_UUID_RE.test(id)) return false
+  const scopes = notificationScopeIds(stepContent)
+  if (scopes.size === 0) return false
+  const slashIdx = id.lastIndexOf('/')
+  const expectedScope = slashIdx > 0 ? id.slice(0, slashIdx) : conversationId
+  if (!expectedScope) return false
+  return !scopes.has(expectedScope.toLowerCase())
+}
+
+export function stepMatchesOwnedId(stepContent, id, { conversationId = null } = {}) {
   if (typeof stepContent !== 'string' || typeof id !== 'string' || !id) return false
-  if (stepContent.includes(id)) return true
   const slashIdx = id.lastIndexOf('/')
   if (slashIdx > 0) {
+    if (hasBoundedIdToken(stepContent, id)) return true
+    const prefix = id.slice(0, slashIdx)
     const shortId = id.slice(slashIdx + 1)
-    if (
-      shortId &&
-      (stepContent.includes(`"${shortId}"`) ||
-        stepContent.includes(`/${shortId}.log`) ||
-        stepContent.includes(`/${shortId}`))
-    ) {
-      return true
+    if (!shortId) return false
+    // Exact `<prefix>/.../<shortId>.log` match (e.g. `/brain/<convId>/.system_generated/tasks/task-17.log`).
+    const prefixedLogRe = new RegExp(
+      `/${escapeRegex(prefix)}/[^\\s"'<>]*/${escapeRegex(shortId)}\\.log(?![A-Za-z0-9_:/-])`,
+      'i',
+    )
+    if (prefixedLogRe.test(stepContent)) return true
+    // Reject short-ID fallback whenever the notification explicitly names a
+    // different conversation/scope (decision ce71a72b).
+    const scopes = notificationScopeIds(stepContent)
+    if (scopes.size > 0 && !scopes.has(prefix.toLowerCase())) {
+      return false
     }
+    const qualifiedShortRe = new RegExp(
+      `([A-Za-z0-9_.:-]+)/${escapeRegex(shortId)}(?![A-Za-z0-9_:/-])`,
+      'g',
+    )
+    let sawQualified = false
+    let matchedQualified = false
+    for (const m of stepContent.matchAll(qualifiedShortRe)) {
+      if (m[1].toLowerCase() === 'tasks') continue
+      sawQualified = true
+      if (m[1].toLowerCase() === prefix.toLowerCase()) matchedQualified = true
+    }
+    if (sawQualified) return matchedQualified
+    return stepContent.includes(`"${shortId}"`)
+  }
+  if (OWNED_UUID_RE.test(id)) {
+    return hasBoundedIdToken(stepContent, id)
+  }
+  const scopes = notificationScopeIds(stepContent)
+  if (scopes.size > 0) {
+    if (!conversationId || !scopes.has(conversationId.toLowerCase())) {
+      return false
+    }
+  }
+  if (hasBoundedIdToken(stepContent, id)) return true
+  if (conversationId) {
+    const convLogRe = new RegExp(
+      `/${escapeRegex(conversationId)}/[^\\s"'<>]*/${escapeRegex(id)}\\.log(?![A-Za-z0-9_:/-])`,
+      'i',
+    )
+    if (convLogRe.test(stepContent)) return true
   }
   return false
 }
@@ -533,8 +1628,14 @@ export function reconcileCompletedOwnedWork(
   marker,
   transcriptPath,
   dir = CONNECTIONS_DIR,
+  { conversationId = null } = {},
 ) {
   if (!connectionId || !transcriptPath) return
+  const resolvedConversationId =
+    conversationId ||
+    extractConversationIdFromTranscriptPath(transcriptPath) ||
+    readConnectionLocalId(connectionId, dir) ||
+    null
   let ownedLines = marker ? readOwnedLines(connectionId, marker, dir) : []
   let ownedIds = marker ? readOwnedIds(connectionId, marker, dir) : []
   let reqState = readRequestState(connectionId, { dir })
@@ -566,7 +1667,10 @@ export function reconcileCompletedOwnedWork(
   const endedOwned = new Set(
     ownedLines.filter((e) => typeof e.ended === 'string').map((e) => e.id),
   )
+  const newlyEndedOwned = []
+  const endedOwnedDetails = []
   const newlyNotified = new Set()
+  const matchedSystemMessages = []
   let seenPlannerResponse = false
   let pendingPlannerTools = []
 
@@ -638,11 +1742,7 @@ export function reconcileCompletedOwnedWork(
         )
         const isDaemon =
           runCommandInput?.IsDaemon === true || runCommandInput?.IsDaemon === 'true'
-        const isPlumbing =
-          isDaemon ||
-          cmdLine.includes('devspec-remote-wait.mjs') ||
-          cmdLine.includes('devspec-remote-listen.mjs') ||
-          cmdLine.includes('devspec-remote-poll.mjs')
+        const isPlumbing = isDaemon || isRemotePlumbingBackgroundCommand(cmdLine)
         if (!isPlumbing) {
           const id = bgId
           const label =
@@ -722,22 +1822,41 @@ export function reconcileCompletedOwnedWork(
       continue
     }
     if (step?.type !== 'SYSTEM_MESSAGE' || typeof step.content !== 'string') continue
+    const stepMs = step?.created_at ? Date.parse(step.created_at) : NaN
+    const stepAtMs = Number.isFinite(stepMs) ? stepMs : null
+    let stepMatched = false
     for (const id of ownedIds) {
-      if (!endedOwned.has(id) && stepMatchesOwnedId(step.content, id)) {
-        recordOwnedEnd(connectionId, id, { dir })
+      if (
+        !endedOwned.has(id) &&
+        stepMatchesOwnedId(step.content, id, { conversationId: resolvedConversationId })
+      ) {
+        recordOwnedEnd(connectionId, id, { dir, ...(stepAtMs !== null ? { now: stepAtMs } : {}) })
         endedOwned.add(id)
+        newlyEndedOwned.push(id)
+        endedOwnedDetails.push({ id, atMs: stepAtMs, content: step.content })
+        stepMatched = true
       }
     }
     const keysInStep = notifiedKeys(step.content)
     for (const key of unnotifiedKeys) {
       if (
         !newlyNotified.has(key) &&
-        (keysInStep.includes(key) || stepMatchesOwnedId(step.content, key))
+        !hasConflictingNotificationScope(step.content, key, resolvedConversationId) &&
+        (keysInStep.includes(key) ||
+          stepMatchesOwnedId(step.content, key, { conversationId: resolvedConversationId }))
       ) {
         appendRequestEvent(connectionId, { op: 'notified', key }, { dir })
         newlyNotified.add(key)
+        stepMatched = true
       }
     }
+    if (stepMatched) matchedSystemMessages.push(step.content)
+  }
+  return {
+    endedOwnedIds: newlyEndedOwned,
+    endedOwnedDetails,
+    newlyNotifiedKeys: [...newlyNotified],
+    matchedSystemMessages,
   }
 }
 
@@ -791,11 +1910,7 @@ export function launchedAntigravityBackgroundWork(toolName, toolInput, toolRespo
   if (name === 'run_command' || name === 'default_api:run_command') {
     if (input.IsDaemon === true) return null
     const cmdLine = String(input.CommandLine || input.command || '')
-    if (
-      cmdLine.includes('devspec-remote-wait.mjs') ||
-      cmdLine.includes('devspec-remote-listen.mjs') ||
-      cmdLine.includes('devspec-remote-poll.mjs')
-    ) {
+    if (isRemotePlumbingBackgroundCommand(cmdLine)) {
       return null
     }
     const outText =
@@ -839,11 +1954,7 @@ export function launchedAntigravityBackgroundWork(toolName, toolInput, toolRespo
   // Claude Code / generic Agent or Bash background task support
   if (name === 'Bash' && (input.run_in_background === true || resp.backgroundTaskId)) {
     const cmdLine = String(input.command || input.CommandLine || '')
-    if (
-      cmdLine.includes('devspec-remote-wait.mjs') ||
-      cmdLine.includes('devspec-remote-listen.mjs') ||
-      cmdLine.includes('devspec-remote-poll.mjs')
-    ) {
+    if (isRemotePlumbingBackgroundCommand(cmdLine)) {
       return null
     }
     const id = resp.backgroundTaskId || resp.task_id || resp.id
@@ -1705,10 +2816,20 @@ export function isSessionReplyToolCall(toolName, args = {}) {
   }
   if (name === 'run_command' || name === 'default_api:run_command' || name === 'Bash') {
     const cmdLine = String(effectiveArgs?.CommandLine || effectiveArgs?.command || '')
-    if (cmdLine.includes('post_session_message') && !/phase\s*:\s*['"]trail['"]/.test(cmdLine)) {
-      return true
+    if (isRemotePlumbingShellCommand(cmdLine)) {
+      if (cmdLine.includes('post_session_message') && !/phase\s*:\s*['"]trail['"]/.test(cmdLine)) {
+        return true
+      }
+      if (cmdLine.includes('devspec-question.mjs') && /\brespond\b/.test(cmdLine)) {
+        return true
+      }
     }
-    if (cmdLine.includes('devspec-question.mjs') && /\brespond\b/.test(cmdLine)) {
+    if (
+      /\bnode(?:\.exe)?\b[^\n;]*\s(?:-e|--eval)\b/.test(cmdLine) &&
+      /\bmcpToolsCall\s*\(/.test(cmdLine) &&
+      cmdLine.includes('post_session_message') &&
+      !/phase\s*:\s*['"]trail['"]/.test(cmdLine)
+    ) {
       return true
     }
   }
@@ -1739,20 +2860,7 @@ export function isRemotePlumbingToolCall(toolName, args = {}) {
   }
   if (name === 'run_command' || name === 'default_api:run_command' || name === 'Bash') {
     const cmdLine = String(effectiveArgs?.CommandLine || effectiveArgs?.command || '')
-    if (
-      cmdLine.includes('devspec-remote-wait.mjs') ||
-      cmdLine.includes('devspec-remote-listen.mjs') ||
-      cmdLine.includes('devspec-remote-poll.mjs') ||
-      cmdLine.includes('devspec-remote-connect.mjs') ||
-      cmdLine.includes('devspec-remote-stop.mjs') ||
-      cmdLine.includes('devspec-question.mjs') ||
-      cmdLine.includes('devspec-tell-person.mjs') ||
-      cmdLine.includes('remote-control-state.mjs') ||
-      cmdLine.includes('connection-call.mjs') ||
-      cmdLine.includes('post_session_message') ||
-      cmdLine.includes('heartbeat_connection') ||
-      cmdLine.includes('report_complete')
-    ) {
+    if (isRemotePlumbingShellCommand(cmdLine)) {
       return true
     }
   }
@@ -1964,6 +3072,7 @@ export function extractAntigravityTrailFromTranscript(
   {
     sinceIso = null,
     sinceMs = null,
+    excludedRanges = [],
     stopAtReply = true,
     transcriptPath = null,
     fullTranscriptText = null,
@@ -2018,6 +3127,11 @@ export function extractAntigravityTrailFromTranscript(
       rawStep.type === 'PLANNER_RESPONSE' && fullStepsByIndex.has(rawStep.step_index)
         ? fullStepsByIndex.get(rawStep.step_index)
         : rawStep
+
+    const stepMsForFilter = step.created_at ? Date.parse(step.created_at) : NaN
+    if (isTimestampInExcludedRanges(stepMsForFilter, excludedRanges)) {
+      continue
+    }
 
     if (step.type === 'GENERIC') {
       const extracted = extractRecordIdAndTitleFromToolOutput(step.content)
@@ -2329,6 +3443,7 @@ export async function streamTurnTrailIfChanged(
 
   const trail = extractAntigravityTrailFromTranscript(rawTranscript, {
     sinceMs: marker.startedAt,
+    excludedRanges: marker.excludedRanges ?? [],
     stopAtReply: true,
     transcriptPath: tPath,
   })
@@ -2415,7 +3530,7 @@ export async function streamTurnTrailIfChanged(
  */
 export function extractLatestAssistantReplyFromTranscript(
   transcriptPath,
-  { sinceMs = null, afterLastSystemMessage = false } = {},
+  { sinceMs = null, excludedRanges = [], afterLastSystemMessage = false } = {},
 ) {
   if (!transcriptPath) return null
   let raw = ''
@@ -2463,9 +3578,12 @@ export function extractLatestAssistantReplyFromTranscript(
   for (let i = steps.length - 1; i > lastUserBoundary; i--) {
     const step = steps[i]
     if (!step || step.type !== 'PLANNER_RESPONSE') continue
-    if (typeof sinceMs === 'number' && Number.isFinite(sinceMs) && step.created_at) {
+    if (step.created_at) {
       const stepMs = Date.parse(step.created_at)
-      if (Number.isFinite(stepMs) && stepMs < sinceMs) continue
+      if (Number.isFinite(stepMs)) {
+        if (typeof sinceMs === 'number' && Number.isFinite(sinceMs) && stepMs < sinceMs) continue
+        if (isTimestampInExcludedRanges(stepMs, excludedRanges)) continue
+      }
     }
     if (typeof step.content === 'string' && step.content.trim()) {
       const cleaned = prepareAgentMirrorText(step.content)
@@ -2609,9 +3727,32 @@ export async function handleMirrorTurn(
   // If a `.turn` marker is already live AND the latest transcript step is not a new
   // USER_INPUT (or was already mirrored for this step_index), avoid duplicate
   // local_prompt posts and redundant heartbeats on every tool iteration.
-  const existingMarker = readTurnMarker(connectionId, connectionsDir)
-  reconcileCompletedOwnedWork(connectionId, existingMarker, effectiveTranscriptPath, connectionsDir)
+  const rawExistingMarker = readTurnMarker(connectionId, connectionsDir)
+  const effectiveConvId =
+    conversationId ||
+    state.local_id ||
+    extractConversationIdFromTranscriptPath(effectiveTranscriptPath) ||
+    null
+  const reconciled = reconcileCompletedOwnedWork(
+    connectionId,
+    rawExistingMarker,
+    effectiveTranscriptPath,
+    connectionsDir,
+    { conversationId: effectiveConvId },
+  )
   const latestStep = extractLatestTranscriptStep(effectiveTranscriptPath)
+  const restoreResult =
+    modeArg === 'user_prompt'
+      ? restoreHeldParentIfResumed(connectionId, rawExistingMarker, {
+          dir: connectionsDir,
+          reconciled,
+          latestStep,
+          conversationId: effectiveConvId,
+          requireParentNotificationStep: true,
+        })
+      : { restored: false, marker: rawExistingMarker }
+  const existingMarker = restoreResult.marker
+  const restoredHeldParentNow = Boolean(restoreResult.restored)
   const latestStepMs = latestStep?.created_at ? Date.parse(latestStep.created_at) : NaN
   const latestStepIsBeforeMarker =
     Boolean(
@@ -2669,8 +3810,15 @@ export async function handleMirrorTurn(
       (Boolean(existingMarker?.held) &&
         latestStep?.type === 'SYSTEM_MESSAGE' &&
         !rawStepContent.includes('[DevSpec Remote Wake]')))
+  // When `existingMarker.heldParent` is still parked (meaning `restoreHeldParentIfResumed`
+  // intentionally declined to restore — e.g. a check-job helper subagent finished while
+  // the check pause is still active), keep the pause context intact instead of promoting
+  // `heldParent` into the active turn (decisions a2d9f38f & c1791ffa).
+  const pauseStillParked = Boolean(existingMarker?.heldParent && !existingMarker?.otherWake)
   const bgParentContext = isBgContinuation
-    ? existingMarker?.heldParent || existingMarker || inferredTranscriptContext || {}
+    ? pauseStillParked
+      ? existingMarker
+      : existingMarker?.heldParent || existingMarker || inferredTranscriptContext || {}
     : null
   const isExplicitUserInputStep =
     !isBgContinuation &&
@@ -2722,7 +3870,7 @@ export async function handleMirrorTurn(
     } catch {
       /* non-fatal */
     }
-  } else if (isBgContinuation && connectionId) {
+  } else if (isBgContinuation && connectionId && !restoredHeldParentNow) {
     try {
       const arrival = promptArrival({
         fromAPerson: false,
@@ -2732,6 +3880,11 @@ export async function handleMirrorTurn(
         state: readRequestState(connectionId, { dir: connectionsDir }),
       })
       for (const event of arrival.events) {
+        // When the mid-wait check/notice pause is still parked (e.g. parent work
+        // finished while an unsettled check is waiting on its helper), NEVER make
+        // the parent's request current yet — only record `notified` so the entire
+        // check/notice pause stays separate from the person's command (decision a2d9f38f).
+        if (pauseStillParked && event.op !== 'notified') continue
         appendRequestEvent(connectionId, event, { dir: connectionsDir })
       }
     } catch {
@@ -2897,43 +4050,106 @@ export async function handleMirrorTurn(
         : admittedLocalTurn ||
           (isBgContinuation ? bgParentContext?.localTurn || existingMarker?.localTurn || null : null)
       const currentMarkerForMerge = readTurnMarker(connectionId, connectionsDir)
+      const pauseStartFromStep =
+        Number.isFinite(latestStepMs) && latestStepMs <= Date.now()
+          ? latestStepMs
+          : Date.now()
+      const mergedMidWait = isMidWaitNonCommandWake
+        ? mergeTurnWake(
+            currentMarkerForMerge?.heldParent
+              ? currentMarkerForMerge
+              : currentMarkerForMerge?.held === true
+                ? null
+                : currentMarkerForMerge,
+            wake,
+          )
+        : null
+      const midWaitSettled = Array.isArray(existingMarker?.settledCheckJobIds)
+        ? existingMarker.settledCheckJobIds.map((id) => String(id).toLowerCase())
+        : []
+      const midWaitMergedJobs = Array.isArray(mergedMidWait?.checkJobIds)
+        ? mergedMidWait.checkJobIds.map((id) => String(id).toLowerCase())
+        : []
+      const midWaitKeepRuled =
+        Boolean(existingMarker?.heldParent && existingMarker?.checkJobRuled) &&
+        !(
+          Boolean(wake?.checkJobWake) &&
+          (midWaitMergedJobs.length === 0 ||
+            midWaitMergedJobs.some((id) => !midWaitSettled.includes(id)))
+        )
+      const midWaitReplied = Array.isArray(existingMarker?.repliedNoticeIds)
+        ? existingMarker.repliedNoticeIds.map((id) => String(id).toLowerCase())
+        : []
+      const midWaitMergedNotices = Array.isArray(mergedMidWait?.noticeIds)
+        ? mergedMidWait.noticeIds.map((id) => String(id).toLowerCase())
+        : []
+      const midWaitHasUnrepliedNotice = midWaitMergedNotices.some(
+        (id) => !midWaitReplied.includes(id),
+      )
       const markerExtra = isMidWaitNonCommandWake
         ? {
             held: false,
-            heldParent: snapshotHeldParent(existingMarker),
+            heldParent: snapshotHeldParent(existingMarker, { connectionId, dir: connectionsDir }),
             remoteTurn: true,
             localPromptMirrored: false,
             localTurn: null,
             otherWake: false,
             backgroundContinuation: false,
-            ...mergeTurnWake(
-              currentMarkerForMerge?.held === true ? null : currentMarkerForMerge,
-              wake,
-            ),
+            settledCheckJobIds: midWaitSettled,
+            repliedNoticeIds: midWaitReplied,
+            checkJobRuled: midWaitKeepRuled,
+            checkJobRuledAt: midWaitKeepRuled ? existingMarker?.checkJobRuledAt ?? null : null,
+            ...(midWaitHasUnrepliedNotice
+              ? { noticeReplyAt: null, acceptedNoticeReplyAt: null }
+              : {}),
+            lastPauseActivityAt: Date.now(),
+            pauseStartedAt:
+              typeof existingMarker?.pauseStartedAt === 'number'
+                ? existingMarker.pauseStartedAt
+                : pauseStartFromStep,
+            excludedRanges: normalizeExcludedRanges(existingMarker?.excludedRanges),
+            ...mergedMidWait,
             preserveExplicitReply: true,
           }
-        : {
-            held: false,
-            heldParent: null,
-            remoteTurn: Boolean(isRemoteWakeInput),
-            localPromptMirrored: preservedLocalMirrored,
-            ...(isBgContinuation
-              ? {
-                  backgroundContinuation: true,
-                  ...(bgParentHasCommandOrPrompt
-                    ? { noticeIds: [], recordNoticeIds: [], checkJobWake: false }
-                    : {}),
-                }
-              : {}),
-            ...(preservedLocalTurn ? { localTurn: preservedLocalTurn } : { localTurn: null }),
-            ...mergeTurnWake(
-              isBgContinuation && bgParentHasCommandOrPrompt
-                ? { otherWake: Boolean(bgParentContext?.otherWake) }
-                : currentMarkerForMerge,
-              wake,
-            ),
-            ...(isBgContinuation ? { preserveExplicitReply: true } : {}),
-          }
+        : isBgContinuation && pauseStillParked
+          ? {
+              held: false,
+              heldParent: existingMarker.heldParent,
+              remoteTurn: true,
+              localPromptMirrored: false,
+              localTurn: null,
+              otherWake: false,
+              backgroundContinuation: false,
+              lastPauseActivityAt: Math.max(
+                typeof existingMarker.lastPauseActivityAt === 'number'
+                  ? existingMarker.lastPauseActivityAt
+                  : 0,
+                Date.now(),
+              ),
+              preserveExplicitReply: true,
+            }
+          : {
+              held: false,
+              heldParent: null,
+              remoteTurn: Boolean(isRemoteWakeInput),
+              localPromptMirrored: preservedLocalMirrored,
+              ...(isBgContinuation
+                ? {
+                    backgroundContinuation: true,
+                    ...(bgParentHasCommandOrPrompt
+                      ? { noticeIds: [], recordNoticeIds: [], checkJobWake: false }
+                      : {}),
+                  }
+                : {}),
+              ...(preservedLocalTurn ? { localTurn: preservedLocalTurn } : { localTurn: null }),
+              ...mergeTurnWake(
+                isBgContinuation && bgParentHasCommandOrPrompt
+                  ? { otherWake: Boolean(bgParentContext?.otherWake) }
+                  : currentMarkerForMerge,
+                wake,
+              ),
+              ...(isBgContinuation ? { preserveExplicitReply: true } : {}),
+            }
       if (typeof latestStep?.step_index === 'number') {
         markerExtra.lastStepIndex = latestStep.step_index
       }
@@ -2942,11 +4158,59 @@ export async function handleMirrorTurn(
       // On Stop: check if this turn launched background work (e.g. subagent, async command,
       // or one-shot timer) that has not yet reported back. If so, hold the turn open instead
       // of closing it.
-      const marker = readTurnMarker(connectionId, connectionsDir)
-      reconcileCompletedOwnedWork(connectionId, marker, effectiveTranscriptPath, connectionsDir)
+      let marker = readTurnMarker(connectionId, connectionsDir)
+      const stopReconciled = reconcileCompletedOwnedWork(
+        connectionId,
+        marker,
+        effectiveTranscriptPath,
+        connectionsDir,
+        { conversationId: effectiveConvId },
+      )
       const outstandingIds = marker ? readOwnedIds(connectionId, marker, connectionsDir) : []
+      // Keep all waiting check work in one pause until handled — even if the
+      // parent's last background launch already finished first (`outstandingIds`
+      // is empty) while a batched check ruling still has entries remaining
+      // (decision a2d9f38f).
+      const pauseHasUnsettledCheckJob = Boolean(
+        marker?.heldParent &&
+          marker.checkJobWake &&
+          !marker.checkJobRuled &&
+          (marker.checkJobRemainingEntries === true ||
+            (Array.isArray(marker.checkJobIds) && marker.checkJobIds.length > 1)),
+      )
+      if (pauseHasUnsettledCheckJob) {
+        writeTurnMarker(
+          connectionId,
+          {
+            held: true,
+            preserveExplicitReply: true,
+          },
+          connectionsDir,
+        )
+        return { ok: true, held: true, outstanding: outstandingIds }
+      }
       if (outstandingIds.length > 0) {
         if (marker?.heldParent) {
+          const parent = marker.heldParent
+          const parentOwnedIds = Array.isArray(parent.ownedIds)
+            ? parent.ownedIds.filter((id) => typeof id === 'string' && id)
+            : []
+          const pauseOutstandingIds = outstandingIds.filter((id) => !parentOwnedIds.includes(id))
+          if (pauseOutstandingIds.length > 0) {
+            // A launch started during the mid-wait pause (such as a fresh check-ruling
+            // helper subagent) is still running, OR a batched check job still has
+            // unsettled entries remaining: keep the pause context intact until all
+            // waiting checks are handled (decisions a2d9f38f & c1791ffa).
+            writeTurnMarker(
+              connectionId,
+              {
+                held: true,
+                preserveExplicitReply: true,
+              },
+              connectionsDir,
+            )
+            return { ok: true, held: true, outstanding: outstandingIds }
+          }
           const midWaitNotices = currentTurnReplyNoticeIds(connectionId, {
             dir: connectionsDir,
             connectionState: state,
@@ -2959,9 +4223,7 @@ export async function handleMirrorTurn(
           })
           if (
             (midWaitNotices || midWaitRoutine) &&
-            marker.tellPerson &&
-            !marker.noticeReplyAt &&
-            !marker.personToldAt &&
+            hasPendingTellPersonObligation(marker) &&
             sessionId
           ) {
             const tellText =
@@ -2976,7 +4238,11 @@ export async function handleMirrorTurn(
               })
             }
           }
-          const parent = marker.heldParent
+          const pauseEndMs = Date.now()
+          const nextExcludedRanges =
+            typeof marker.pauseStartedAt === 'number'
+              ? appendExcludedRange(marker.excludedRanges, marker.pauseStartedAt, pauseEndMs)
+              : normalizeExcludedRanges(marker.excludedRanges)
           writeTurnMarker(
             connectionId,
             {
@@ -2990,8 +4256,20 @@ export async function handleMirrorTurn(
               noticeIds: [],
               recordNoticeIds: [],
               checkJobWake: false,
+              checkJobIds: [],
+              settledCheckJobIds: [],
+              checkJobRuled: false,
+              checkJobRemainingEntries: false,
+              checkJobRuledAt: null,
+              lastPauseActivityAt: null,
+              pauseStartedAt: null,
+              resumedFromPauseAt: pauseEndMs,
+              excludedRanges: nextExcludedRanges,
               tellPerson: false,
+              tellPersonAt: null,
               noticeReplyAt: null,
+              acceptedNoticeReplyAt: null,
+              repliedNoticeIds: [],
               personToldAt: null,
               preserveExplicitReply: true,
             },
@@ -3015,6 +4293,11 @@ export async function handleMirrorTurn(
         )
         return { ok: true, held: true, outstanding: outstandingIds }
       }
+
+      // Never blindly pop `heldParent` at Stop when no resumed post-completion
+      // parent work restored it during the turn: if a quiet notice or check pause
+      // reached Stop without resumed parent work, keep the notice/check silent
+      // instead of scraping notice-only text as the command reply (decision 02f4ce2b).
 
       let hadStreamedTrail = false
       try {
@@ -3138,6 +4421,7 @@ export async function handleMirrorTurn(
               fs.readFileSync(effectiveTranscriptPath, 'utf8'),
               {
                 sinceMs: marker?.startedAt ?? null,
+                excludedRanges: marker?.excludedRanges ?? [],
                 stopAtReply: false,
                 transcriptPath: effectiveTranscriptPath,
               },
@@ -3146,11 +4430,28 @@ export async function handleMirrorTurn(
             /* ignore */
           }
         }
+        const replySinceMs =
+          typeof marker?.resumedFromPauseAt === 'number' && Number.isFinite(marker.resumedFromPauseAt)
+            ? Math.max(marker?.startedAt ?? 0, marker.resumedFromPauseAt)
+            : (marker?.startedAt ?? null)
+        const hasPauseExclusion = Boolean(
+          (typeof marker?.resumedFromPauseAt === 'number' && Number.isFinite(marker.resumedFromPauseAt)) ||
+            (Array.isArray(marker?.excludedRanges) && marker.excludedRanges.length > 0),
+        )
+        // When the turn resumed from a check/notice pause, read the fallback
+        // answer strictly through `excludedRanges` and `replySinceMs` from the
+        // transcript — NEVER fall back to an unverified Stop hook
+        // `last_assistant_message`, even when the transcript is unavailable,
+        // because that hook text can be the check/notice's own closing words
+        // (decisions 02f4ce2b & a2d9f38f).
+        const transcriptReply = extractLatestAssistantReplyFromTranscript(effectiveTranscriptPath, {
+          sinceMs: replySinceMs,
+          excludedRanges: marker?.excludedRanges ?? [],
+        })
         const rawStopText =
-          (text ? prepareAgentMirrorText(text) : null) ||
-          extractLatestAssistantReplyFromTranscript(effectiveTranscriptPath, {
-            sinceMs: marker?.startedAt ?? null,
-          }) ||
+          (hasPauseExclusion
+            ? transcriptReply
+            : (text ? prepareAgentMirrorText(text) : null) || transcriptReply) ||
           (hadStreamedTrail && trail.events.length > 0
             ? `Completed ${trail.events.length} step${trail.events.length === 1 ? '' : 's'}.`
             : null)
