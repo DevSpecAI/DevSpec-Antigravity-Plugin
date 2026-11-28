@@ -200,9 +200,25 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
         devspecVerb === 'record_check_rulings' ||
         devspecVerb === 'release_check_job'
       if (existingMarker?.heldParent && !existingMarker?.otherWake) {
-        if (isCheckJobVerb || !effectiveTranscriptPath) {
+        // Only restore from PostToolUse when the pause has an explicit mechanical
+        // completion signal (settled check job, sent notice reply, or delivered
+        // tell_person) AND this non-check tool started after that completion.
+        // Never treat "parent background finished + an ordinary tool call" as the
+        // end of an active notice pause, or the notice's own tools can restore the
+        // parent turn prematurely, clear notice/tellPerson flags, and leak into
+        // the command trail or final answer (decisions 02f4ce2b & a2d9f38f).
+        const pauseCompletedAt = [
+          existingMarker.checkJobWake && existingMarker.checkJobRuled
+            ? existingMarker.checkJobRuledAt
+            : null,
+          existingMarker.noticeReplyAt ?? null,
+          existingMarker.personToldAt ?? null,
+        ].filter((v) => typeof v === 'number' && Number.isFinite(v))
+        const hasExplicitPauseCompletion = pauseCompletedAt.length > 0
+        if (isCheckJobVerb || !effectiveTranscriptPath || !hasExplicitPauseCompletion) {
           recordPauseActivity(connectionId, connectionsDir, now)
         } else {
+          const pauseDoneMs = Math.max(...pauseCompletedAt)
           const reconciled = reconcileCompletedOwnedWork(
             connectionId,
             existingMarker,
@@ -215,15 +231,21 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
                 ? existingMarker.pauseStartedAt
                 : null,
           })
-          const res = restoreHeldParentIfResumed(connectionId, existingMarker, {
-            dir: connectionsDir,
-            reconciled,
-            now,
-            excludeUpToMs: resumedToolStepMs !== null ? resumedToolStepMs - 1 : null,
-          })
-          existingMarker = res.marker
-          if (!res.restored) {
+          const toolRanAfterPauseDone =
+            resumedToolStepMs === null ? now >= pauseDoneMs : resumedToolStepMs >= pauseDoneMs
+          if (!toolRanAfterPauseDone) {
             recordPauseActivity(connectionId, connectionsDir, now)
+          } else {
+            const res = restoreHeldParentIfResumed(connectionId, existingMarker, {
+              dir: connectionsDir,
+              reconciled,
+              now,
+              excludeUpToMs: resumedToolStepMs !== null ? resumedToolStepMs - 1 : null,
+            })
+            existingMarker = res.marker
+            if (!res.restored) {
+              recordPauseActivity(connectionId, connectionsDir, now)
+            }
           }
         }
       }

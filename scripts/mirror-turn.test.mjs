@@ -1715,14 +1715,6 @@ describe('Antigravity native hook payload & transcript handling', () => {
           created_at: new Date(t0 + 4000).toISOString(),
           content: `[Message] sender=${taskId} content=Task id "${taskId}" finished with result:\nAll tests passed`,
         },
-        {
-          step_index: 2,
-          source: 'MODEL',
-          type: 'PLANNER_RESPONSE',
-          created_at: new Date(t0 + 5000).toISOString(),
-          thinking: 'Tests passed; continuing the room task now.',
-          tool_calls: [{ name: 'read_file', args: { Path: '/tmp/app.ts' } }],
-        },
       ]
       fs.writeFileSync(transcriptPath, steps.map((s) => JSON.stringify(s)).join('\n') + '\n')
       fs.writeFileSync(
@@ -1740,7 +1732,8 @@ describe('Antigravity native hook payload & transcript handling', () => {
         }),
       )
 
-      // 4. Mid-turn PreInvocation fires: even though it returns mid_turn_pre_invocation,
+      // 4. Mid-turn PreInvocation fires when Antigravity delivers the parent task's
+      //    completion notification: even though it returns mid_turn_pre_invocation,
       //    it MUST immediately restore heldParent and the active parent request.
       const preRes = await handleMirrorTurn(
         'user_prompt',
@@ -1762,7 +1755,19 @@ describe('Antigravity native hook payload & transcript handling', () => {
       assert.equal(isCurrentTurnRoutine(connId, { dir: connectionsDir }), false)
       assert.equal(requestRefForWrite(readRequestState(connId, { dir: connectionsDir })), reqId)
 
-      // 5. Live trail streaming now succeeds (not suppressed as 'notice_turn')!
+      // 5. The agent rolls straight into resumed parent work after restoration, and
+      //    live trail streaming succeeds (not suppressed as 'notice_turn')!
+      fs.appendFileSync(
+        transcriptPath,
+        JSON.stringify({
+          step_index: 2,
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          created_at: new Date(Date.now() + 1000).toISOString(),
+          thinking: 'Tests passed; continuing the room task now.',
+          tool_calls: [{ name: 'read_file', args: { Path: '/tmp/app.ts' } }],
+        }) + '\n',
+      )
       const trailCalls = []
       const trailRes = await streamTurnTrailIfChanged(
         {
@@ -2392,6 +2397,205 @@ describe('Antigravity native hook payload & transcript handling', () => {
       assert.equal(String(trailPost.arguments.message).includes('batch2-check-file.ts'), false)
     } finally {
       fs.rmSync(tmpHome, { recursive: true, force: true })
+    }
+  })
+
+  it('does not let a notice tool or tell_person write restore the parent turn or leak into command trail/answer (02f4ce2b, a2d9f38f)', async () => {
+    const { appendRequestEvent, setCurrentRequest, UNSTATED } = await import('./requests.mjs')
+    const { runPostToolDispatch } = await import('./post-tool-dispatch.mjs')
+    const {
+      currentTurnReplyNoticeIds,
+      recordOwnedEnd,
+      recordOwnedLaunch,
+      recordTurnWake,
+    } = await import('./mirror-turn.mjs')
+
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-notice-tool-isolation-'))
+    try {
+      const connectionsDir = path.join(tmpHome, '.devspec', 'remote-control', 'connections')
+      const legacyPath = path.join(tmpHome, '.devspec', 'remote-control.json')
+      fs.mkdirSync(connectionsDir, { recursive: true })
+      const connId = '972c8895-0000-4000-8000-000000000071'
+      const sessId = '972c8895-0000-4000-8000-000000000072'
+      const reqId = '972c8895-0000-4000-8000-000000000073'
+      const noticeId = '972c8895-0000-4000-8000-000000000074'
+      const convId = 'conv-notice-tool-isolation'
+      const parentTaskId = `${convId}/task-1`
+      const transcriptPath = path.join(tmpHome, 'transcript.jsonl')
+      const t0 = Date.now() - 20_000
+
+      fs.writeFileSync(
+        path.join(connectionsDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          session_id: sessId,
+          agent_name: 'Antigravity',
+          local_id: convId,
+          transcript_path: transcriptPath,
+          mcp_url: 'https://example.invalid/api/mcp',
+          token: 'test-token',
+          connection_capability: 'dvsc_test',
+        }),
+      )
+      appendRequestEvent(connId, { op: 'open', id: reqId, kind: 'command' }, { dir: connectionsDir })
+      setCurrentRequest(connId, reqId, { dir: connectionsDir })
+      appendRequestEvent(
+        connId,
+        { op: 'launch', key: parentTaskId, kind: 'shell', notifies: true, request: reqId, also: [] },
+        { dir: connectionsDir },
+      )
+      writeTurnMarker(connId, { startedAt: t0, remoteTurn: true, otherWake: true, held: true }, connectionsDir)
+      recordOwnedLaunch(connId, { id: parentTaskId, kind: 'command', label: 'Build' }, { dir: connectionsDir, now: t0 + 500 })
+
+      // A needs_person notice arrives during the wait, and parent task completes while notice is handled.
+      recordTurnWake(
+        connId,
+        {
+          type: 'canonical_system_notices',
+          execute_notice_ids: [noticeId],
+          ingress: { system_notices: [{ notice_id: noticeId, audience: 'needs_person' }] },
+        },
+        connectionsDir,
+        t0 + 2000,
+      )
+      setCurrentRequest(connId, UNSTATED, { dir: connectionsDir })
+      recordOwnedEnd(connId, parentTaskId, { dir: connectionsDir, now: t0 + 3000 })
+
+      fs.writeFileSync(
+        transcriptPath,
+        [
+          {
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            created_at: new Date(t0 + 3500).toISOString(),
+            tool_calls: [{ name: 'update_memory', args: { memory_id: 'm1' } }],
+          },
+          {
+            step_index: 2,
+            type: 'PLANNER_RESPONSE',
+            created_at: new Date(t0 + 4000).toISOString(),
+            content: 'Unresolved conflict still waiting on owner decision.',
+          },
+        ]
+          .map((s) => JSON.stringify(s))
+          .join('\n') + '\n',
+      )
+
+      const toolCalls = []
+      await runPostToolDispatch(
+        JSON.stringify({
+          conversationId: convId,
+          transcriptPath,
+          tool_name: 'call_mcp_tool',
+          tool_input: {
+            ServerName: 'devspec_devspec',
+            ToolName: 'update_memory',
+            Arguments: { memory_id: 'm1' },
+          },
+          tool_response: {
+            content: [{ type: 'text', text: JSON.stringify({ tell_person: { why: 'changed shared record' } }) }],
+          },
+        }),
+        {
+          home: tmpHome,
+          env: {},
+          call: async (req) => {
+            toolCalls.push(req)
+            return { ok: true }
+          },
+        },
+      )
+
+      // MUST stay in notice pause: heldParent preserved, noticeIds preserved, tellPerson preserved, ZERO command trail!
+      const afterTool = readTurnMarker(connId, connectionsDir)
+      assert.ok(afterTool?.heldParent, 'expected heldParent to stay parked during notice handling')
+      assert.equal(afterTool?.tellPerson, true)
+      assert.deepEqual(currentTurnReplyNoticeIds(connId, { dir: connectionsDir }), [noticeId])
+      assert.equal(toolCalls.some((c) => c.name === 'post_session_message'), false)
+
+      // On Stop: must NEVER post the unresolved finding as the command's final answer (complete_turn: true)!
+      const stopCalls = []
+      await handleMirrorTurn('stop', JSON.stringify({ conversationId: convId, transcriptPath }), {
+        env: {},
+        connectionsDir,
+        legacyPath,
+        call: async (req) => {
+          stopCalls.push(req)
+          return { ok: true }
+        },
+      })
+      assert.equal(
+        stopCalls.some((c) => c.name === 'post_session_message' && c.arguments?.complete_turn === true),
+        false,
+      )
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
+    }
+  })
+
+  it('retains unknown attribution when two parked launches finish in the same pause and one is untracked (ce71a72b)', async () => {
+    const {
+      appendRequestEvent,
+      readRequestState,
+      requestRefForWrite,
+      setCurrentRequest,
+      UNSTATED,
+    } = await import('./requests.mjs')
+    const {
+      recordOwnedEnd,
+      recordOwnedLaunch,
+      recordTurnWake,
+      restoreHeldParentIfResumed,
+    } = await import('./mirror-turn.mjs')
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-untracked-mixed-'))
+    try {
+      const connId = '972c8895-0000-4000-8000-000000000081'
+      const reqAlice = '972c8895-0000-4000-8000-000000000082'
+      const noticeId = '972c8895-0000-4000-8000-000000000083'
+      const taskAlice = 'conv-mixed/task-alice'
+      const taskUntracked = 'conv-mixed/task-untracked'
+      const t0 = Date.now() - 10_000
+
+      appendRequestEvent(connId, { op: 'open', id: reqAlice, kind: 'command', requested_by: 'alice' }, { dir: tmpDir })
+      setCurrentRequest(connId, reqAlice, { dir: tmpDir })
+      appendRequestEvent(connId, { op: 'launch', key: taskAlice, kind: 'shell', notifies: true, request: reqAlice, also: [] }, { dir: tmpDir })
+      // taskUntracked intentionally has NO launch record in requests.jsonl!
+
+      writeTurnMarker(connId, { startedAt: t0, remoteTurn: true, otherWake: true, held: true }, tmpDir)
+      recordOwnedLaunch(connId, { id: taskAlice, kind: 'command', label: 'Alice task' }, { dir: tmpDir, now: t0 + 100 })
+      recordOwnedLaunch(connId, { id: taskUntracked, kind: 'command', label: 'Untracked task' }, { dir: tmpDir, now: t0 + 200 })
+
+      recordTurnWake(
+        connId,
+        {
+          type: 'canonical_system_notices',
+          execute_notice_ids: [noticeId],
+          ingress: { system_notices: [{ notice_id: noticeId, audience: 'for_the_record' }] },
+        },
+        tmpDir,
+        t0 + 1000,
+      )
+      setCurrentRequest(connId, UNSTATED, { dir: tmpDir })
+
+      // Both finish in the same pause; notification is for the untracked launch:
+      // MUST retain unknown attribution (null), NEVER credit Alice!
+      recordOwnedEnd(connId, taskAlice, { dir: tmpDir, now: t0 + 1800 })
+      recordOwnedEnd(connId, taskUntracked, { dir: tmpDir, now: t0 + 2000 })
+      const res = restoreHeldParentIfResumed(connId, readTurnMarker(connId, tmpDir), {
+        dir: tmpDir,
+        latestStep: {
+          type: 'SYSTEM_MESSAGE',
+          created_at: new Date(t0 + 2000).toISOString(),
+          content: `[Message] Background command "${taskUntracked}" completed with exit code 0`,
+        },
+        now: t0 + 2500,
+      })
+      assert.equal(res.restored, true)
+      assert.equal(requestRefForWrite(readRequestState(connId, { dir: tmpDir })), null)
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
     }
   })
 })

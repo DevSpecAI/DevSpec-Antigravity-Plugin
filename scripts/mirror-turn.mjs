@@ -405,6 +405,21 @@ export function restoreHeldParentIfResumed(
     return { restored: false, marker }
   }
 
+  // Never clear an active needs_person notice or undelivered tell_person pause
+  // mid-turn before its notice reply / tell-person message has gone out, or
+  // notice work and findings could leak into the command trail / final answer
+  // (decisions 02f4ce2b & a2d9f38f).
+  const hasPendingNeedsPersonNotice =
+    Array.isArray(marker.noticeIds) && marker.noticeIds.length > 0 && !marker.noticeReplyAt
+  if (hasPendingNeedsPersonNotice) {
+    return { restored: false, marker }
+  }
+  const hasPendingTellPerson =
+    Boolean(marker.tellPerson) && !marker.personToldAt && !marker.noticeReplyAt
+  if (hasPendingTellPerson) {
+    return { restored: false, marker }
+  }
+
   // Identify ONLY the parent-owned launch(es) that actually completed and their
   // completion timestamp, PLUS the latest completion timestamp of any pause-owned
   // launch (such as a check-ruling helper subagent) so the exclusion window covers
@@ -554,27 +569,32 @@ export function restoreHeldParentIfResumed(
 
   try {
     const reqState = readRequestState(connectionId, { dir })
-    const endedKeys = [...endedParentIds.filter((id) => id !== '__parent_bg__')]
-    if (notificationText) {
-      for (const key of notifiedKeys(notificationText)) {
-        if (!endedKeys.includes(key)) endedKeys.push(key)
-      }
+    const endedRealIds = endedParentIds.filter((id) => id !== '__parent_bg__')
+    const notifiedEndedKeys = notificationText ? notifiedKeys(notificationText) : []
+    const endedKeys = [...endedRealIds]
+    for (const key of notifiedEndedKeys) {
+      if (!endedKeys.includes(key)) endedKeys.push(key)
     }
     const endedTrackedLaunches = []
     const seenEndedLaunches = new Set()
+    let anyEndedUntracked = false
     for (const key of endedKeys) {
       const launch = reqState.launches.get(key)
-      if (launch && !seenEndedLaunches.has(launch)) {
-        seenEndedLaunches.add(launch)
-        endedTrackedLaunches.push(launch)
+      if (launch) {
+        if (!seenEndedLaunches.has(launch)) {
+          seenEndedLaunches.add(launch)
+          endedTrackedLaunches.push(launch)
+        }
+      } else {
+        anyEndedUntracked = true
       }
     }
 
     if (endedTrackedLaunches.length > 0) {
-      // Authoritative attribution from the completed launch(es) themselves:
-      // if any completed launch is unstated or has no open requester, retain
-      // unknown attribution rather than crediting a different still-running
-      // launch's requester (decision ce71a72b).
+      // Authoritative attribution from ALL completed launches in this pause:
+      // if ANY completed launch is unstated, untracked (missing from launches),
+      // or has no open requester, retain unknown attribution rather than
+      // dropping it and crediting another launch's requester (decision ce71a72b).
       const endedRefs = []
       let anyEndedUnstated = false
       for (const launch of endedTrackedLaunches) {
@@ -593,7 +613,7 @@ export function restoreHeldParentIfResumed(
         }
       }
 
-      if (anyEndedUnstated || endedRefs.length === 0) {
+      if (anyEndedUnstated || anyEndedUntracked || endedRefs.length === 0) {
         setCurrentRequest(connectionId, UNSTATED, { dir })
       } else if (notificationText) {
         const arrival = promptArrival({
@@ -3122,25 +3142,13 @@ export async function handleMirrorTurn(
     connectionsDir,
   )
   const latestStep = extractLatestTranscriptStep(effectiveTranscriptPath)
-  const latestStepMsForPre = latestStep?.created_at ? Date.parse(latestStep.created_at) : NaN
-  const preExcludeUpToMs =
-    modeArg === 'user_prompt' &&
-    rawExistingMarker?.heldParent &&
-    !rawExistingMarker?.checkJobWake &&
-    latestStep?.type === 'PLANNER_RESPONSE' &&
-    Array.isArray(latestStep.tool_calls) &&
-    latestStep.tool_calls.length > 0 &&
-    Number.isFinite(latestStepMsForPre)
-      ? latestStepMsForPre - 1
-      : null
   const existingMarker =
     modeArg === 'user_prompt'
       ? restoreHeldParentIfResumed(connectionId, rawExistingMarker, {
           dir: connectionsDir,
           reconciled,
           latestStep,
-          excludeUpToMs: preExcludeUpToMs,
-          requireParentNotificationStep: Boolean(rawExistingMarker?.checkJobWake),
+          requireParentNotificationStep: true,
         }).marker
       : rawExistingMarker
   const latestStepMs = latestStep?.created_at ? Date.parse(latestStep.created_at) : NaN
