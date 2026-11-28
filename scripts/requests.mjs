@@ -562,9 +562,246 @@ export function rotateRequestLog(
   }
 }
 
+export const BACKGROUND_PLUMBING_SCRIPTS = new Set([
+  'devspec-remote-wait.mjs',
+  'devspec-remote-listen.mjs',
+  'devspec-remote-poll.mjs',
+])
+
+export const TOOL_PLUMBING_SCRIPTS = new Set([
+  ...BACKGROUND_PLUMBING_SCRIPTS,
+  'devspec-remote-connect.mjs',
+  'devspec-remote-stop.mjs',
+  'devspec-question.mjs',
+  'devspec-tell-person.mjs',
+  'remote-control-state.mjs',
+  'connection-call.mjs',
+])
+
+const MCP_PLUMBING_VERBS = new Set([
+  'post_session_message',
+  'heartbeat_connection',
+  'report_complete',
+])
+
+const NODE_VALUE_FLAGS = new Set([
+  '-r',
+  '--require',
+  '--import',
+  '--env-file',
+  '--env-file-if-exists',
+  '-C',
+  '--conditions',
+  '--loader',
+  '--experimental-loader',
+  '--title',
+  '--max-old-space-size',
+  '--inspect',
+  '--inspect-brk',
+])
+
+const NODE_NON_EXEC_FLAGS = new Set([
+  '--test',
+  '-e',
+  '--eval',
+  '-p',
+  '--print',
+  '-c',
+  '--check',
+])
+
+function splitShellCommandSegments(cmdLine) {
+  const s = String(cmdLine || '')
+  const segments = []
+  let current = []
+  let token = ''
+  let inSingle = false
+  let inDouble = false
+  let escaped = false
+
+  const pushToken = () => {
+    if (token.length > 0) {
+      current.push(token)
+      token = ''
+    }
+  }
+  const pushSegment = () => {
+    pushToken()
+    if (current.length > 0) {
+      segments.push(current)
+      current = []
+    }
+  }
+
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]
+    if (escaped) {
+      token += ch
+      escaped = false
+      continue
+    }
+    if (inSingle) {
+      if (ch === "'") inSingle = false
+      else token += ch
+      continue
+    }
+    if (inDouble) {
+      if (ch === '\\' && i + 1 < s.length) {
+        escaped = true
+      } else if (ch === '"') {
+        inDouble = false
+      } else {
+        token += ch
+      }
+      continue
+    }
+    if (ch === '\\' && i + 1 < s.length) {
+      escaped = true
+      continue
+    }
+    if (ch === "'") {
+      inSingle = true
+      continue
+    }
+    if (ch === '"') {
+      inDouble = true
+      continue
+    }
+    if (ch === '#' && token.length === 0) {
+      while (i < s.length && s[i] !== '\n') i++
+      pushSegment()
+      continue
+    }
+    if (ch === '\n' || ch === ';') {
+      pushSegment()
+      continue
+    }
+    if (ch === '&' || ch === '|') {
+      if (s[i + 1] === ch) i++
+      pushSegment()
+      continue
+    }
+    if (/\s/.test(ch)) {
+      pushToken()
+      continue
+    }
+    token += ch
+  }
+  pushSegment()
+  return segments
+}
+
+function scriptBasename(rawToken) {
+  const cleaned = String(rawToken || '').trim().replace(/^['"]+|['"]+$/g, '')
+  if (!cleaned) return ''
+  const normalized = cleaned.replace(/\\/g, '/')
+  const parts = normalized.split('/')
+  return parts[parts.length - 1] || ''
+}
+
+function segmentInvokesPlumbingScript(rawTokens, scriptSet, { allowMcpCallVerbs = false, depth = 0 } = {}) {
+  if (!Array.isArray(rawTokens) || rawTokens.length === 0 || depth > 2) return false
+  let i = 0
+  while (i < rawTokens.length) {
+    const tok = rawTokens[i]
+    if (tok === '(' || tok === '{' || tok === '!') {
+      i++
+      continue
+    }
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok)) {
+      i++
+      continue
+    }
+    const base = scriptBasename(tok)
+    if (base === 'env' || base === 'nohup' || base === 'exec') {
+      i++
+      while (i < rawTokens.length && (rawTokens[i].startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(rawTokens[i]))) {
+        i++
+      }
+      continue
+    }
+    break
+  }
+  if (i >= rawTokens.length) return false
+
+  const cmd = rawTokens[i]
+  const cmdBase = scriptBasename(cmd).toLowerCase()
+
+  // Unwrap single-level `sh -c "..."` / `bash -c "..."` / `zsh -c "..."`.
+  if (cmdBase === 'sh' || cmdBase === 'bash' || cmdBase === 'zsh') {
+    for (let j = i + 1; j < rawTokens.length - 1; j++) {
+      if (rawTokens[j] === '-c' || /^-[a-z]*c[a-z]*$/.test(rawTokens[j])) {
+        return splitShellCommandSegments(rawTokens[j + 1]).some((seg) =>
+          segmentInvokesPlumbingScript(seg, scriptSet, { allowMcpCallVerbs, depth: depth + 1 }),
+        )
+      }
+    }
+    return false
+  }
+
+  // Direct execution of a plumbing script at command position (e.g. `./scripts/devspec-remote-poll.mjs`).
+  if (scriptSet.has(scriptBasename(cmd))) return true
+
+  // Node invocation (`node ... <script>`). Never match `node --test`, `node -e`, `node --check`, etc.
+  if (cmdBase === 'node' || cmdBase === 'node.exe') {
+    let j = i + 1
+    while (j < rawTokens.length) {
+      const arg = rawTokens[j]
+      if (arg === '--') {
+        j++
+        break
+      }
+      if (NODE_NON_EXEC_FLAGS.has(arg) || arg.startsWith('--test-')) return false
+      if (NODE_VALUE_FLAGS.has(arg)) {
+        j += 2
+        continue
+      }
+      if (arg.startsWith('-')) {
+        j++
+        continue
+      }
+      break
+    }
+    if (j >= rawTokens.length) return false
+    const targetBase = scriptBasename(rawTokens[j])
+    if (scriptSet.has(targetBase)) return true
+    if (allowMcpCallVerbs && targetBase === 'mcp-call.mjs') {
+      for (let k = j + 1; k < rawTokens.length; k++) {
+        const arg = rawTokens[k]
+        if (arg.startsWith('-')) continue
+        return MCP_PLUMBING_VERBS.has(arg)
+      }
+    }
+  }
+  return false
+}
+
+/**
+ * True only when `cmdLine` actually invokes one of the plugin's background
+ * remote-control scripts (wait, listen, poll) at command position — never when
+ * those filenames merely appear as arguments in git, test, grep, or commit text
+ * (item 85ced7c4).
+ */
+export function isRemotePlumbingBackgroundCommand(cmdLine) {
+  return splitShellCommandSegments(cmdLine).some((seg) =>
+    segmentInvokesPlumbingScript(seg, BACKGROUND_PLUMBING_SCRIPTS),
+  )
+}
+
+/**
+ * True only when `cmdLine` actually invokes one of the plugin's remote-control
+ * helper scripts (or `mcp-call.mjs` for status/reply plumbing verbs) at command
+ * position (item 85ced7c4).
+ */
+export function isRemotePlumbingShellCommand(cmdLine) {
+  return splitShellCommandSegments(cmdLine).some((seg) =>
+    segmentInvokesPlumbingScript(seg, TOOL_PLUMBING_SCRIPTS, { allowMcpCallVerbs: true }),
+  )
+}
+
 export function isDevSpecListener(toolInput) {
   const cmd = String(toolInput?.command || toolInput?.CommandLine || '')
-  return cmd.includes('devspec-remote-wait.mjs') || cmd.includes('devspec-remote-listen.mjs')
+  return isRemotePlumbingBackgroundCommand(cmd)
 }
 
 /**
