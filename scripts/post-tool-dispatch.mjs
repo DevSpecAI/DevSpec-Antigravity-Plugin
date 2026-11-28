@@ -35,6 +35,7 @@ import {
   readTurnMarker,
   reconcileCompletedOwnedWork,
   recordBackgroundLaunch,
+  recordCheckJobRuled,
   recordOwnedEnd,
   recordTellPerson,
   resolveAntigravityToolResponse,
@@ -136,9 +137,17 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
   // A DevSpec write that changed someone else's record says so on its result
   // (`tell_person`, item a868f41f). Noted on the turn, so Stop's silence for a routine
   // turn gives way and PreToolUse leaves the model's own post to the person unstamped.
+  const devspecVerb = connectionId ? unwrapDevspecToolCall(toolName, toolInput).verb : null
+  if (devspecVerb && (devspecVerb === 'record_check_rulings' || devspecVerb === 'release_check_job')) {
+    try {
+      recordCheckJobRuled(connectionId, connectionsDir)
+    } catch {
+      /* non-fatal */
+    }
+  }
   if (
     connectionId &&
-    unwrapDevspecToolCall(toolName, toolInput).verb &&
+    devspecVerb &&
     resultCarriesTellPerson(toolResponse)
   ) {
     try {
@@ -166,7 +175,11 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
     try {
       let existingMarker = readTurnMarker(connectionId, connectionsDir)
       const effectiveTranscriptPath = parseTranscriptPath(raw) || state?.transcript_path || null
-      if (existingMarker?.heldParent && !existingMarker?.otherWake && effectiveTranscriptPath) {
+      const isCheckJobVerb =
+        devspecVerb === 'claim_check_job' ||
+        devspecVerb === 'record_check_rulings' ||
+        devspecVerb === 'release_check_job'
+      if (existingMarker?.heldParent && !existingMarker?.otherWake && !isCheckJobVerb && effectiveTranscriptPath) {
         const reconciled = reconcileCompletedOwnedWork(
           connectionId,
           existingMarker,
@@ -176,6 +189,7 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
         existingMarker = restoreHeldParentIfResumed(connectionId, existingMarker, {
           dir: connectionsDir,
           reconciled,
+          now,
         }).marker
       }
       const inferred = existingMarker

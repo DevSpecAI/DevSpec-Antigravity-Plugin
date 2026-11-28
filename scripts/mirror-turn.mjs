@@ -208,13 +208,64 @@ function snapshotHeldParent(marker, { connectionId = null, dir = CONNECTIONS_DIR
   }
 }
 
+function normalizeExcludedRanges(ranges) {
+  if (!Array.isArray(ranges)) return []
+  return ranges.filter(
+    (r) =>
+      r &&
+      typeof r.startMs === 'number' &&
+      Number.isFinite(r.startMs) &&
+      typeof r.endMs === 'number' &&
+      Number.isFinite(r.endMs) &&
+      r.endMs >= r.startMs,
+  )
+}
+
+function appendExcludedRange(existing, startMs, endMs) {
+  const ranges = normalizeExcludedRanges(existing)
+  if (typeof startMs === 'number' && Number.isFinite(startMs) && typeof endMs === 'number' && Number.isFinite(endMs)) {
+    ranges.push({ startMs: Math.min(startMs, endMs), endMs })
+  }
+  return ranges
+}
+
+function isTimestampInExcludedRanges(stepMs, excludedRanges) {
+  if (!Number.isFinite(stepMs) || !Array.isArray(excludedRanges) || excludedRanges.length === 0) {
+    return false
+  }
+  return excludedRanges.some(
+    (r) =>
+      typeof r?.startMs === 'number' &&
+      typeof r?.endMs === 'number' &&
+      stepMs >= r.startMs &&
+      stepMs <= r.endMs,
+  )
+}
+
+/**
+ * Mark that a check-job ruling finished during the current mid-wait pause so
+ * subsequent parent-task work can safely restore `heldParent` without mixing
+ * in-flight check ruling steps into the command trail (decisions a2d9f38f & c1791ffa).
+ */
+export function recordCheckJobRuled(connectionId, dir = CONNECTIONS_DIR) {
+  if (!connectionId || !readTurnMarker(connectionId, dir)) return false
+  writeTurnMarker(connectionId, { checkJobRuled: true, preserveExplicitReply: true }, dir)
+  return true
+}
+
 /**
  * Restore a parked parent room task (`marker.heldParent`) and its active request
- * immediately when any of the parent's owned background tasks completes mid-turn
- * (or when Stop runs with no remaining outstanding background work), so a mid-wait
- * DevSpec notice or check job never leaves the resumed room task stuck in silent
- * notice-only mode (item 972c8895). Standalone notices, check jobs, and automations
- * have no `heldParent` and are never touched.
+ * when a parent-owned background task completes mid-turn AND the mid-wait pause
+ * is no longer in flight:
+ * - Never restores while any pause-owned launch (e.g. a check-job helper subagent
+ *   not in `parent.ownedIds`) is still running.
+ * - Never clears an active `checkJobWake` pause until `checkJobRuled` is recorded.
+ * - Records the `[pauseStartedAt, resumedAt]` window in `excludedRanges` and sets
+ *   `resumedFromPauseAt` so neither trail extraction nor Stop fallback can leak
+ *   notice/check activity or assistant text into the person's command (decisions
+ *   02f4ce2b, a2d9f38f, c1791ffa).
+ * - Restores request attribution strictly from the launch(es) that actually ended,
+ *   never picking an unrelated still-open launch (decision ce71a72b).
  */
 export function restoreHeldParentIfResumed(
   connectionId,
@@ -223,7 +274,7 @@ export function restoreHeldParentIfResumed(
     dir = CONNECTIONS_DIR,
     reconciled = null,
     latestStep = null,
-    forceWhenNoOutstanding = false,
+    now = Date.now(),
   } = {},
 ) {
   if (!connectionId || !marker?.heldParent || marker.otherWake) {
@@ -232,46 +283,99 @@ export function restoreHeldParentIfResumed(
   const parent = marker.heldParent
   const parentOwnedIds = Array.isArray(parent.ownedIds)
     ? parent.ownedIds.filter((id) => typeof id === 'string' && id)
-    : null
+    : []
 
-  let matchedParentCompletion = Boolean(forceWhenNoOutstanding)
+  // Never restore while any launch created during the mid-wait pause (such as a
+  // check-job helper subagent) is still running.
+  const allOutstanding = readOwnedIds(connectionId, marker, dir)
+  if (allOutstanding.some((id) => !parentOwnedIds.includes(id))) {
+    return { restored: false, marker }
+  }
+
+  // Never clear an in-flight check-job pause until its ruling completed.
+  if (marker.checkJobWake && !marker.checkJobRuled) {
+    return { restored: false, marker }
+  }
+
+  // Identify ONLY the parent-owned launch(es) that actually completed and their
+  // completion timestamp, so attribution and pause exclusion stay exact.
+  const endedParentIds = []
+  let completedAtMs = null
   let notificationText = ''
 
-  if (!matchedParentCompletion && Array.isArray(reconciled?.endedOwnedIds) && reconciled.endedOwnedIds.length > 0) {
-    matchedParentCompletion =
-      !parentOwnedIds || parentOwnedIds.length === 0
-        ? true
-        : reconciled.endedOwnedIds.some((id) => parentOwnedIds.includes(id))
-  }
-  if (!matchedParentCompletion && parentOwnedIds && parentOwnedIds.length > 0) {
-    const ownedLines = readOwnedLines(connectionId, marker, dir)
-    if (ownedLines.some((entry) => typeof entry.ended === 'string' && parentOwnedIds.includes(entry.id))) {
-      matchedParentCompletion = true
+  const noteEnded = (id, atMs = null, text = '') => {
+    if (typeof id === 'string' && id && !endedParentIds.includes(id)) {
+      endedParentIds.push(id)
+    }
+    if (typeof atMs === 'number' && Number.isFinite(atMs)) {
+      completedAtMs = completedAtMs === null ? atMs : Math.max(completedAtMs, atMs)
+    }
+    if (text && !notificationText) {
+      notificationText = text
     }
   }
+
+  if (Array.isArray(reconciled?.endedOwnedDetails)) {
+    for (const detail of reconciled.endedOwnedDetails) {
+      if (parentOwnedIds.length === 0 || parentOwnedIds.includes(detail.id)) {
+        noteEnded(detail.id, detail.atMs ?? null, detail.content || '')
+      }
+    }
+  } else if (Array.isArray(reconciled?.endedOwnedIds)) {
+    for (const id of reconciled.endedOwnedIds) {
+      if (parentOwnedIds.length === 0 || parentOwnedIds.includes(id)) {
+        noteEnded(id, null, '')
+      }
+    }
+  }
+
+  if (parentOwnedIds.length > 0) {
+    const ownedLines = readOwnedLines(connectionId, marker, dir)
+    for (const entry of ownedLines) {
+      if (typeof entry.ended === 'string' && parentOwnedIds.includes(entry.id)) {
+        const endedMs = Date.parse(entry.ended)
+        noteEnded(entry.id, Number.isFinite(endedMs) ? endedMs : null, '')
+      }
+    }
+  }
+
   if (
-    !matchedParentCompletion &&
     latestStep?.type === 'SYSTEM_MESSAGE' &&
     typeof latestStep.content === 'string' &&
     !latestStep.content.includes('[DevSpec Remote Wake]') &&
     isBackgroundTaskNotification(latestStep.content)
   ) {
-    matchedParentCompletion =
-      !parentOwnedIds || parentOwnedIds.length === 0
-        ? true
-        : parentOwnedIds.some((id) => stepMatchesOwnedId(latestStep.content, id))
-    if (matchedParentCompletion) notificationText = latestStep.content
+    const stepMs = latestStep.created_at ? Date.parse(latestStep.created_at) : NaN
+    const matchedIds = parentOwnedIds.filter((id) => stepMatchesOwnedId(latestStep.content, id))
+    if (matchedIds.length > 0) {
+      for (const id of matchedIds) {
+        noteEnded(id, Number.isFinite(stepMs) ? stepMs : null, latestStep.content)
+      }
+    } else if (parentOwnedIds.length === 0) {
+      noteEnded('__parent_bg__', Number.isFinite(stepMs) ? stepMs : null, latestStep.content)
+    }
   }
-  if (!matchedParentCompletion) {
+
+  if (endedParentIds.length === 0) {
     return { restored: false, marker }
   }
+
   if (!notificationText && Array.isArray(reconciled?.matchedSystemMessages) && reconciled.matchedSystemMessages.length > 0) {
-    const matchingMsg =
-      parentOwnedIds && parentOwnedIds.length > 0
-        ? reconciled.matchedSystemMessages.find((msg) => parentOwnedIds.some((id) => stepMatchesOwnedId(msg, id)))
-        : reconciled.matchedSystemMessages[reconciled.matchedSystemMessages.length - 1]
-    notificationText = matchingMsg || reconciled.matchedSystemMessages[reconciled.matchedSystemMessages.length - 1] || ''
+    const matchingMsg = reconciled.matchedSystemMessages.find((msg) =>
+      endedParentIds.some((id) => id !== '__parent_bg__' && stepMatchesOwnedId(msg, id)),
+    )
+    if (matchingMsg) notificationText = matchingMsg
   }
+
+  const pauseStartMs = typeof marker.pauseStartedAt === 'number' && Number.isFinite(marker.pauseStartedAt)
+    ? marker.pauseStartedAt
+    : null
+  const resumedAtMs =
+    typeof completedAtMs === 'number' && Number.isFinite(completedAtMs) ? completedAtMs : now
+  const nextExcludedRanges =
+    pauseStartMs !== null
+      ? appendExcludedRange(marker.excludedRanges, pauseStartMs, resumedAtMs)
+      : normalizeExcludedRanges(marker.excludedRanges)
 
   const restoredMarker = writeTurnMarker(
     connectionId,
@@ -286,6 +390,10 @@ export function restoreHeldParentIfResumed(
       noticeIds: [],
       recordNoticeIds: [],
       checkJobWake: false,
+      checkJobRuled: false,
+      pauseStartedAt: null,
+      resumedFromPauseAt: resumedAtMs,
+      excludedRanges: nextExcludedRanges,
       tellPerson: false,
       noticeReplyAt: null,
       personToldAt: null,
@@ -313,23 +421,43 @@ export function restoreHeldParentIfResumed(
         restoredRequest = true
       }
     }
-    if (!restoredRequest && parentOwnedIds && parentOwnedIds.length > 0) {
-      for (const id of parentOwnedIds) {
+    if (!restoredRequest) {
+      // Resolve strictly from the launch(es) that actually ended — never pick
+      // another still-open launch in `parentOwnedIds` (decision ce71a72b).
+      const endedRefs = []
+      for (const id of endedParentIds) {
+        if (id === '__parent_bg__') continue
         const launch = reqState.launches.get(id)
-        if (launch && (reqState.open.has(launch.request) || launch.request === 'none')) {
-          setCurrentRequest(connectionId, launch.request, { dir })
-          for (const extra of launch.also ?? []) {
-            if (reqState.open.has(extra) && extra !== launch.request) {
-              appendRequestEvent(connectionId, { op: 'joined', id: extra }, { dir })
-            }
+        if (!launch) continue
+        for (const candidate of [launch.request, ...(launch.also ?? [])]) {
+          if ((reqState.open.has(candidate) || candidate === 'none') && !endedRefs.includes(candidate)) {
+            endedRefs.push(candidate)
           }
-          restoredRequest = true
-          break
         }
+      }
+      if (endedRefs.length > 0) {
+        setCurrentRequest(connectionId, endedRefs.at(-1), { dir })
+        for (const extra of endedRefs.slice(0, -1)) {
+          appendRequestEvent(connectionId, { op: 'joined', id: extra }, { dir })
+        }
+        restoredRequest = true
       }
     }
     if (!restoredRequest && parent.requestRef && (reqState.open.has(parent.requestRef) || parent.requestRef === 'none')) {
-      setCurrentRequest(connectionId, parent.requestRef, { dir })
+      // Only fall back to parent.requestRef when the parked launches do not span
+      // multiple distinct requesters, avoiding misattribution when completion had
+      // no matching launch entry.
+      const distinctParkedRefs = new Set()
+      for (const id of parentOwnedIds) {
+        const launch = reqState.launches.get(id)
+        if (!launch) continue
+        for (const candidate of [launch.request, ...(launch.also ?? [])]) {
+          if (reqState.open.has(candidate) || candidate === 'none') distinctParkedRefs.add(candidate)
+        }
+      }
+      if (distinctParkedRefs.size <= 1) {
+        setCurrentRequest(connectionId, parent.requestRef, { dir })
+      }
     }
   } catch {
     /* non-fatal */
@@ -379,6 +507,9 @@ export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR, now =
           noticeIds: wake?.noticeIds ?? [],
           recordNoticeIds: wake?.recordNoticeIds ?? [],
           checkJobWake: Boolean(wake?.checkJobWake),
+          checkJobRuled: false,
+          pauseStartedAt: now,
+          excludedRanges: normalizeExcludedRanges(existing.excludedRanges),
           tellPerson: false,
           noticeReplyAt: null,
           personToldAt: null,
@@ -711,6 +842,7 @@ export function reconcileCompletedOwnedWork(
     ownedLines.filter((e) => typeof e.ended === 'string').map((e) => e.id),
   )
   const newlyEndedOwned = []
+  const endedOwnedDetails = []
   const newlyNotified = new Set()
   const matchedSystemMessages = []
   let seenPlannerResponse = false
@@ -864,12 +996,15 @@ export function reconcileCompletedOwnedWork(
       continue
     }
     if (step?.type !== 'SYSTEM_MESSAGE' || typeof step.content !== 'string') continue
+    const stepMs = step?.created_at ? Date.parse(step.created_at) : NaN
+    const stepAtMs = Number.isFinite(stepMs) ? stepMs : null
     let stepMatched = false
     for (const id of ownedIds) {
       if (!endedOwned.has(id) && stepMatchesOwnedId(step.content, id)) {
-        recordOwnedEnd(connectionId, id, { dir })
+        recordOwnedEnd(connectionId, id, { dir, ...(stepAtMs !== null ? { now: stepAtMs } : {}) })
         endedOwned.add(id)
         newlyEndedOwned.push(id)
+        endedOwnedDetails.push({ id, atMs: stepAtMs, content: step.content })
         stepMatched = true
       }
     }
@@ -888,6 +1023,7 @@ export function reconcileCompletedOwnedWork(
   }
   return {
     endedOwnedIds: newlyEndedOwned,
+    endedOwnedDetails,
     newlyNotifiedKeys: [...newlyNotified],
     matchedSystemMessages,
   }
@@ -1849,11 +1985,20 @@ export function isSessionReplyToolCall(toolName, args = {}) {
   }
   if (name === 'run_command' || name === 'default_api:run_command' || name === 'Bash') {
     const cmdLine = String(effectiveArgs?.CommandLine || effectiveArgs?.command || '')
-    if (!isRemotePlumbingShellCommand(cmdLine)) return false
-    if (cmdLine.includes('post_session_message') && !/phase\s*:\s*['"]trail['"]/.test(cmdLine)) {
-      return true
+    if (isRemotePlumbingShellCommand(cmdLine)) {
+      if (cmdLine.includes('post_session_message') && !/phase\s*:\s*['"]trail['"]/.test(cmdLine)) {
+        return true
+      }
+      if (cmdLine.includes('devspec-question.mjs') && /\brespond\b/.test(cmdLine)) {
+        return true
+      }
     }
-    if (cmdLine.includes('devspec-question.mjs') && /\brespond\b/.test(cmdLine)) {
+    if (
+      /\bnode(?:\.exe)?\b[^\n;]*\s(?:-e|--eval)\b/.test(cmdLine) &&
+      /\bmcpToolsCall\s*\(/.test(cmdLine) &&
+      cmdLine.includes('post_session_message') &&
+      !/phase\s*:\s*['"]trail['"]/.test(cmdLine)
+    ) {
       return true
     }
   }
@@ -2096,6 +2241,7 @@ export function extractAntigravityTrailFromTranscript(
   {
     sinceIso = null,
     sinceMs = null,
+    excludedRanges = [],
     stopAtReply = true,
     transcriptPath = null,
     fullTranscriptText = null,
@@ -2150,6 +2296,11 @@ export function extractAntigravityTrailFromTranscript(
       rawStep.type === 'PLANNER_RESPONSE' && fullStepsByIndex.has(rawStep.step_index)
         ? fullStepsByIndex.get(rawStep.step_index)
         : rawStep
+
+    const stepMsForFilter = step.created_at ? Date.parse(step.created_at) : NaN
+    if (isTimestampInExcludedRanges(stepMsForFilter, excludedRanges)) {
+      continue
+    }
 
     if (step.type === 'GENERIC') {
       const extracted = extractRecordIdAndTitleFromToolOutput(step.content)
@@ -2461,6 +2612,7 @@ export async function streamTurnTrailIfChanged(
 
   const trail = extractAntigravityTrailFromTranscript(rawTranscript, {
     sinceMs: marker.startedAt,
+    excludedRanges: marker.excludedRanges ?? [],
     stopAtReply: true,
     transcriptPath: tPath,
   })
@@ -2547,7 +2699,7 @@ export async function streamTurnTrailIfChanged(
  */
 export function extractLatestAssistantReplyFromTranscript(
   transcriptPath,
-  { sinceMs = null, afterLastSystemMessage = false } = {},
+  { sinceMs = null, excludedRanges = [], afterLastSystemMessage = false } = {},
 ) {
   if (!transcriptPath) return null
   let raw = ''
@@ -2595,9 +2747,12 @@ export function extractLatestAssistantReplyFromTranscript(
   for (let i = steps.length - 1; i > lastUserBoundary; i--) {
     const step = steps[i]
     if (!step || step.type !== 'PLANNER_RESPONSE') continue
-    if (typeof sinceMs === 'number' && Number.isFinite(sinceMs) && step.created_at) {
+    if (step.created_at) {
       const stepMs = Date.parse(step.created_at)
-      if (Number.isFinite(stepMs) && stepMs < sinceMs) continue
+      if (Number.isFinite(stepMs)) {
+        if (typeof sinceMs === 'number' && Number.isFinite(sinceMs) && stepMs < sinceMs) continue
+        if (isTimestampInExcludedRanges(stepMs, excludedRanges)) continue
+      }
     }
     if (typeof step.content === 'string' && step.content.trim()) {
       const cleaned = prepareAgentMirrorText(step.content)
@@ -2749,11 +2904,14 @@ export async function handleMirrorTurn(
     connectionsDir,
   )
   const latestStep = extractLatestTranscriptStep(effectiveTranscriptPath)
-  const existingMarker = restoreHeldParentIfResumed(connectionId, rawExistingMarker, {
-    dir: connectionsDir,
-    reconciled,
-    latestStep,
-  }).marker
+  const existingMarker =
+    modeArg === 'user_prompt'
+      ? restoreHeldParentIfResumed(connectionId, rawExistingMarker, {
+          dir: connectionsDir,
+          reconciled,
+          latestStep,
+        }).marker
+      : rawExistingMarker
   const latestStepMs = latestStep?.created_at ? Date.parse(latestStep.created_at) : NaN
   const latestStepIsBeforeMarker =
     Boolean(
@@ -3039,6 +3197,10 @@ export async function handleMirrorTurn(
         : admittedLocalTurn ||
           (isBgContinuation ? bgParentContext?.localTurn || existingMarker?.localTurn || null : null)
       const currentMarkerForMerge = readTurnMarker(connectionId, connectionsDir)
+      const pauseStartFromStep =
+        Number.isFinite(latestStepMs) && latestStepMs <= Date.now()
+          ? latestStepMs
+          : Date.now()
       const markerExtra = isMidWaitNonCommandWake
         ? {
             held: false,
@@ -3048,6 +3210,12 @@ export async function handleMirrorTurn(
             localTurn: null,
             otherWake: false,
             backgroundContinuation: false,
+            checkJobRuled: false,
+            pauseStartedAt:
+              typeof existingMarker?.pauseStartedAt === 'number'
+                ? existingMarker.pauseStartedAt
+                : pauseStartFromStep,
+            excludedRanges: normalizeExcludedRanges(existingMarker?.excludedRanges),
             ...mergeTurnWake(
               currentMarkerForMerge?.held === true ? null : currentMarkerForMerge,
               wake,
@@ -3094,6 +3262,26 @@ export async function handleMirrorTurn(
       const outstandingIds = marker ? readOwnedIds(connectionId, marker, connectionsDir) : []
       if (outstandingIds.length > 0) {
         if (marker?.heldParent) {
+          const parent = marker.heldParent
+          const parentOwnedIds = Array.isArray(parent.ownedIds)
+            ? parent.ownedIds.filter((id) => typeof id === 'string' && id)
+            : []
+          const pauseOutstandingIds = outstandingIds.filter((id) => !parentOwnedIds.includes(id))
+          if (pauseOutstandingIds.length > 0) {
+            // A launch started during the mid-wait pause (such as a fresh check-ruling
+            // helper subagent) is still running: keep the pause context intact until it
+            // finishes rather than dropping checkJobWake/notice context prematurely
+            // (decisions a2d9f38f & c1791ffa).
+            writeTurnMarker(
+              connectionId,
+              {
+                held: true,
+                preserveExplicitReply: true,
+              },
+              connectionsDir,
+            )
+            return { ok: true, held: true, outstanding: outstandingIds }
+          }
           const midWaitNotices = currentTurnReplyNoticeIds(connectionId, {
             dir: connectionsDir,
             connectionState: state,
@@ -3123,7 +3311,11 @@ export async function handleMirrorTurn(
               })
             }
           }
-          const parent = marker.heldParent
+          const pauseEndMs = Date.now()
+          const nextExcludedRanges =
+            typeof marker.pauseStartedAt === 'number'
+              ? appendExcludedRange(marker.excludedRanges, marker.pauseStartedAt, pauseEndMs)
+              : normalizeExcludedRanges(marker.excludedRanges)
           writeTurnMarker(
             connectionId,
             {
@@ -3137,6 +3329,10 @@ export async function handleMirrorTurn(
               noticeIds: [],
               recordNoticeIds: [],
               checkJobWake: false,
+              checkJobRuled: false,
+              pauseStartedAt: null,
+              resumedFromPauseAt: pauseEndMs,
+              excludedRanges: nextExcludedRanges,
               tellPerson: false,
               noticeReplyAt: null,
               personToldAt: null,
@@ -3163,17 +3359,10 @@ export async function handleMirrorTurn(
         return { ok: true, held: true, outstanding: outstandingIds }
       }
 
-      // If a mid-wait notice parked the parent room task and all owned background work
-      // finished before Stop without an intervening restore, restore the parent now so
-      // Stop does not suppress fallback reply handling because of the earlier notice
-      // (item 972c8895).
-      if (marker?.heldParent && !marker?.otherWake) {
-        marker = restoreHeldParentIfResumed(connectionId, marker, {
-          dir: connectionsDir,
-          reconciled: stopReconciled,
-          forceWhenNoOutstanding: true,
-        }).marker
-      }
+      // Never blindly pop `heldParent` at Stop when no resumed post-completion
+      // parent work restored it during the turn: if a quiet notice or check pause
+      // reached Stop without resumed parent work, keep the notice/check silent
+      // instead of scraping notice-only text as the command reply (decision 02f4ce2b).
 
       let hadStreamedTrail = false
       try {
@@ -3297,6 +3486,7 @@ export async function handleMirrorTurn(
               fs.readFileSync(effectiveTranscriptPath, 'utf8'),
               {
                 sinceMs: marker?.startedAt ?? null,
+                excludedRanges: marker?.excludedRanges ?? [],
                 stopAtReply: false,
                 transcriptPath: effectiveTranscriptPath,
               },
@@ -3305,10 +3495,15 @@ export async function handleMirrorTurn(
             /* ignore */
           }
         }
+        const replySinceMs =
+          typeof marker?.resumedFromPauseAt === 'number' && Number.isFinite(marker.resumedFromPauseAt)
+            ? Math.max(marker?.startedAt ?? 0, marker.resumedFromPauseAt)
+            : (marker?.startedAt ?? null)
         const rawStopText =
           (text ? prepareAgentMirrorText(text) : null) ||
           extractLatestAssistantReplyFromTranscript(effectiveTranscriptPath, {
-            sinceMs: marker?.startedAt ?? null,
+            sinceMs: replySinceMs,
+            excludedRanges: marker?.excludedRanges ?? [],
           }) ||
           (hadStreamedTrail && trail.events.length > 0
             ? `Completed ${trail.events.length} step${trail.events.length === 1 ? '' : 's'}.`
