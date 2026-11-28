@@ -21,7 +21,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { resolveOwnConnectionId } from './launch-guard.mjs'
-import { handleMirrorTurn, resolveHookConversationId } from './mirror-turn.mjs'
+import { handleMirrorTurn, pendingParentResumeForHook, resolveHookConversationId } from './mirror-turn.mjs'
 import { invocationNotice } from './room-unread.mjs'
 import { handBackText, takeHandBack } from './tell-person.mjs'
 import { turnRecallSteps } from './turn-recall.mjs'
@@ -59,6 +59,7 @@ export async function runPreInvocation(raw = '', options = {}) {
   }
   const notice = invocationNotice({ input, env, home })
   const handBack = tellPersonHandBackStep(raw, { env, home, connectionsDir: options.connectionsDir ?? null })
+  const resumeHint = pendingParentResumeForHook(raw, { env, home, connectionsDir: options.connectionsDir ?? null })
   let recalled = null
   try {
     recalled = await recall(raw, { env, home, ...recallOptions })
@@ -66,14 +67,15 @@ export async function runPreInvocation(raw = '', options = {}) {
     recalled = null
   }
   const recallSteps = Array.isArray(recalled?.injectSteps) ? recalled.injectSteps : []
-  if (recallSteps.length === 0 && !handBack) return notice
-  // The room notice first, then what was handed back, then the recalled cards: all land
+  if (recallSteps.length === 0 && !handBack && !resumeHint) return notice
+  // The room notice first, then what was handed back, then any parent-resume hint, then the recalled cards: all land
   // after the turn's own step.
   return {
     ...(notice ?? {}),
     injectSteps: [
       ...(Array.isArray(notice?.injectSteps) ? notice.injectSteps : []),
       ...(handBack ? [handBack] : []),
+      ...(resumeHint ? [resumeHint] : []),
       ...recallSteps,
     ],
   }

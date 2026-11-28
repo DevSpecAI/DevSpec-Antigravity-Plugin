@@ -1733,19 +1733,80 @@ describe('Antigravity native hook payload & transcript handling', () => {
       )
 
       // 4. Mid-turn PreInvocation fires when Antigravity delivers the parent task's
-      //    completion notification: even though it returns mid_turn_pre_invocation,
-      //    it MUST immediately restore heldParent and the active parent request.
-      const preRes = await handleMirrorTurn(
-        'user_prompt',
+      //    completion notification while the for_the_record notice pause is still active:
+      //    it MUST NOT prematurely end the quiet notice pause (02f4ce2b, a2d9f38f), and
+      //    PreInvocation injects the exact `devspec-serve-request.mjs resume` hint.
+      const { runPreInvocation } = await import('./pre-invocation.mjs')
+      const { resumeParentMain } = await import('./devspec-serve-request.mjs')
+      const preOut = await runPreInvocation(
         JSON.stringify({ conversationId: convId, transcriptPath }),
         {
           env: {},
+          home: tmpHome,
           connectionsDir,
           legacyPath,
           call: async () => ({ ok: true }),
+          recall: async () => null,
         },
       )
-      assert.equal(preRes.skipped, 'mid_turn_pre_invocation')
+      assert.ok(
+        preOut?.injectSteps?.some((s) => String(s.ephemeralMessage || '').includes('resume --connection-id')),
+        'expected PreInvocation to inject the explicit resume command when parent finished during quiet notice',
+      )
+
+      // Still parked while the agent finishes investigating the quiet notice!
+      const stillParked = readTurnMarker(connId, connectionsDir)
+      assert.ok(stillParked.heldParent)
+      assert.equal(stillParked.otherWake, false)
+      assert.deepEqual(stillParked.recordNoticeIds, [noticeId])
+      assert.equal(requestRefForWrite(readRequestState(connId, { dir: connectionsDir })), null)
+
+      // 4b. A quiet notice investigation step running after task-415 finished MUST NOT
+      //     stream into the room's command trail while the notice pause is open (02f4ce2b).
+      const noticeStepAt = Date.now()
+      fs.appendFileSync(
+        transcriptPath,
+        JSON.stringify({
+          step_index: 2,
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          created_at: new Date(noticeStepAt).toISOString(),
+          thinking: 'Investigating the quiet deploy notice first.',
+          tool_calls: [{ name: 'read_file', args: { Path: '/tmp/quiet-deploy-log.txt' } }],
+        }) + '\n',
+      )
+      const quietTrailCalls = []
+      const quietTrailRes = await streamTurnTrailIfChanged(
+        {
+          connection_id: connId,
+          session_id: sessId,
+          agent_name: 'Antigravity',
+          transcript_path: transcriptPath,
+          mcp_url: 'https://example.invalid/api/mcp',
+          token: 'test-token',
+        },
+        {
+          connectionsDir,
+          call: async (req) => {
+            quietTrailCalls.push(req)
+            return { ok: true }
+          },
+        },
+      )
+      assert.equal(quietTrailRes.streamed, false)
+      assert.equal(quietTrailRes.reason, 'notice_turn')
+      assert.equal(quietTrailCalls.length, 0)
+
+      // 4c. Once done with the quiet notice, the agent runs `devspec-serve-request.mjs resume`:
+      //     immediately restores heldParent + reqId and excludes the entire pause window!
+      const resumeAt = noticeStepAt + 500
+      const resumeRes = resumeParentMain(['resume', '--connection-id', connId], {
+        dir: connectionsDir,
+        now: resumeAt,
+      })
+      assert.equal(resumeRes.ok, true)
+      assert.equal(resumeRes.resumed, true)
+      assert.equal(resumeRes.request_ref, reqId)
 
       const restored = readTurnMarker(connId, connectionsDir)
       assert.equal(restored.heldParent, null)
@@ -1756,14 +1817,15 @@ describe('Antigravity native hook payload & transcript handling', () => {
       assert.equal(requestRefForWrite(readRequestState(connId, { dir: connectionsDir })), reqId)
 
       // 5. The agent rolls straight into resumed parent work after restoration, and
-      //    live trail streaming succeeds (not suppressed as 'notice_turn')!
+      //    live trail streaming succeeds (not suppressed as 'notice_turn') while
+      //    excluding the earlier quiet notice investigation step!
       fs.appendFileSync(
         transcriptPath,
         JSON.stringify({
-          step_index: 2,
+          step_index: 3,
           source: 'MODEL',
           type: 'PLANNER_RESPONSE',
-          created_at: new Date(Date.now() + 1000).toISOString(),
+          created_at: new Date(resumeAt + 1000).toISOString(),
           thinking: 'Tests passed; continuing the room task now.',
           tool_calls: [{ name: 'read_file', args: { Path: '/tmp/app.ts' } }],
         }) + '\n',
@@ -1787,7 +1849,10 @@ describe('Antigravity native hook payload & transcript handling', () => {
         },
       )
       assert.equal(trailRes.skipped, undefined)
-      assert.equal(trailCalls.some((c) => c.name === 'post_session_message' && c.arguments.phase === 'trail'), true)
+      const trailCall = trailCalls.find((c) => c.name === 'post_session_message' && c.arguments.phase === 'trail')
+      assert.ok(trailCall)
+      assert.ok(String(trailCall.arguments.work_trail).includes('app.ts'))
+      assert.equal(String(trailCall.arguments.work_trail).includes('quiet-deploy-log.txt'), false)
 
       // 6. When the resumed room task finishes without calling post_session_message,
       //    Stop posts the fallback reply instead of suppressing it as a notice turn.
@@ -2177,9 +2242,13 @@ describe('Antigravity native hook payload & transcript handling', () => {
       setCurrentRequest(connId, UNSTATED, { dir: tmpDir })
 
       // Only Bob's task ends (recorded in owned log, with no matching notification text):
-      // MUST restore Bob's request, NEVER Alice's still-open launch!
+      // MUST restore Bob's request on explicit resume, NEVER Alice's still-open launch!
       recordOwnedEnd(connId, taskBob, { dir: tmpDir, now: t0 + 2000 })
-      const res = restoreHeldParentIfResumed(connId, readTurnMarker(connId, tmpDir), { dir: tmpDir, now: t0 + 2500 })
+      const res = restoreHeldParentIfResumed(connId, readTurnMarker(connId, tmpDir), {
+        dir: tmpDir,
+        now: t0 + 2500,
+        allowQuietNoticeResume: true,
+      })
       assert.equal(res.restored, true)
       assert.equal(requestRefForWrite(readRequestState(connId, { dir: tmpDir })), reqBob)
     } finally {
@@ -2235,7 +2304,11 @@ describe('Antigravity native hook payload & transcript handling', () => {
       // Only the unstated launch finishes while Alice's launch is still running:
       // MUST retain unknown attribution (null), NEVER credit Alice!
       recordOwnedEnd(connId, taskUnstated, { dir: tmpDir, now: t0 + 2000 })
-      const res = restoreHeldParentIfResumed(connId, readTurnMarker(connId, tmpDir), { dir: tmpDir, now: t0 + 2500 })
+      const res = restoreHeldParentIfResumed(connId, readTurnMarker(connId, tmpDir), {
+        dir: tmpDir,
+        now: t0 + 2500,
+        allowQuietNoticeResume: true,
+      })
       assert.equal(res.restored, true)
       assert.equal(requestRefForWrite(readRequestState(connId, { dir: tmpDir })), null)
     } finally {
@@ -2591,6 +2664,7 @@ describe('Antigravity native hook payload & transcript handling', () => {
           content: `[Message] Background command "${taskUntracked}" completed with exit code 0`,
         },
         now: t0 + 2500,
+        allowQuietNoticeResume: true,
       })
       assert.equal(res.restored, true)
       assert.equal(requestRefForWrite(readRequestState(connId, { dir: tmpDir })), null)
@@ -2843,6 +2917,7 @@ describe('Antigravity native hook payload & transcript handling', () => {
           content: `[Message] sender=${taskBob} content=Task id "${taskBob}" finished with result:\nDone`,
         },
         now: t0 + 2500,
+        allowQuietNoticeResume: true,
       })
       assert.equal(res.restored, true)
       const state = readRequestState(connId, { dir: tmpDir })
@@ -3090,6 +3165,7 @@ describe('Antigravity native hook payload & transcript handling', () => {
           content: `[Message] Background command "task-415" completed. Output saved to /tmp/brain/${convUuid}/.system_generated/tasks/task-415.log`,
         },
         now: t0 + 2500,
+        allowQuietNoticeResume: true,
       })
       assert.equal(res.restored, true)
       assert.equal(requestRefForWrite(readRequestState(connId, { dir: tmpDir })), reqId)
@@ -3230,11 +3306,264 @@ describe('Antigravity native hook payload & transcript handling', () => {
       const res = restoreHeldParentIfResumed(connId, readTurnMarker(connId, tmpDir), {
         dir: tmpDir,
         now: t0 + 2500,
+        allowQuietNoticeResume: true,
       })
       assert.equal(res.restored, true)
       assert.equal(requestRefForWrite(readRequestState(connId, { dir: tmpDir })), null)
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps a shared check + for_the_record pause separate when parent completes after the check settles, and refuses resume before the check settles (02f4ce2b, a2d9f38f)', async () => {
+    const { appendRequestEvent, readRequestState, requestRefForWrite, setCurrentRequest, UNSTATED } =
+      await import('./requests.mjs')
+    const { runPostToolDispatch } = await import('./post-tool-dispatch.mjs')
+    const { runPreInvocation } = await import('./pre-invocation.mjs')
+    const { resumeParentMain } = await import('./devspec-serve-request.mjs')
+    const { recordOwnedLaunch, recordTurnWake } = await import('./mirror-turn.mjs')
+
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-shared-check-record-'))
+    try {
+      const connectionsDir = path.join(tmpHome, '.devspec', 'remote-control', 'connections')
+      fs.mkdirSync(connectionsDir, { recursive: true })
+      const connId = '972c8895-0000-4000-8000-000000000171'
+      const sessId = '972c8895-0000-4000-8000-000000000172'
+      const reqId = '972c8895-0000-4000-8000-000000000173'
+      const jobId = '972c8895-0000-4000-8000-000000000174'
+      const noticeId = '972c8895-0000-4000-8000-000000000175'
+      const convId = 'conv-shared-batch'
+      const taskId = `${convId}/task-1`
+      const transcriptPath = path.join(tmpHome, 'transcript.jsonl')
+      const t0 = Date.now() - 20_000
+
+      fs.writeFileSync(
+        path.join(connectionsDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          session_id: sessId,
+          agent_name: 'Antigravity',
+          local_id: convId,
+          transcript_path: transcriptPath,
+          mcp_url: 'https://example.invalid/api/mcp',
+          token: 'test-token',
+          connection_capability: 'dvsc_test',
+        }),
+      )
+      appendRequestEvent(connId, { op: 'open', id: reqId, kind: 'command' }, { dir: connectionsDir })
+      setCurrentRequest(connId, reqId, { dir: connectionsDir })
+      appendRequestEvent(
+        connId,
+        { op: 'launch', key: taskId, kind: 'shell', notifies: true, request: reqId, also: [] },
+        { dir: connectionsDir },
+      )
+      writeTurnMarker(connId, { startedAt: t0, remoteTurn: true, otherWake: true, held: true }, connectionsDir)
+      recordOwnedLaunch(connId, { id: taskId, kind: 'command', label: 'Build' }, { dir: connectionsDir, now: t0 + 200 })
+
+      // Shared check job + for_the_record notice batch arrives while waiting.
+      recordTurnWake(connId, { type: 'check_job', check_job_id: jobId }, connectionsDir, t0 + 1000)
+      recordTurnWake(
+        connId,
+        {
+          type: 'canonical_system_notices',
+          execute_notice_ids: [noticeId],
+          ingress: { system_notices: [{ notice_id: noticeId, audience: 'for_the_record' }] },
+        },
+        connectionsDir,
+        t0 + 1100,
+      )
+      setCurrentRequest(connId, UNSTATED, { dir: connectionsDir })
+
+      // Parent finishes while check job is still unruled: explicit resume MUST be refused.
+      fs.writeFileSync(
+        transcriptPath,
+        JSON.stringify({
+          step_index: 1,
+          source: 'SYSTEM',
+          type: 'SYSTEM_MESSAGE',
+          created_at: new Date(t0 + 2000).toISOString(),
+          content: `[Message] sender=${taskId} content=Task id "${taskId}" finished with result:\nOK`,
+        }) + '\n',
+      )
+      const prematureResume = resumeParentMain(['resume', '--connection-id', connId], {
+        dir: connectionsDir,
+        now: t0 + 2200,
+      })
+      assert.equal(prematureResume.ok, false)
+
+      // Check job settles, THEN PreInvocation fires on the parent completion:
+      // remaining for_the_record notice MUST keep the batch parked (never credit command!).
+      const calls = []
+      await runPostToolDispatch(
+        JSON.stringify({
+          conversationId: convId,
+          transcriptPath,
+          tool_name: 'call_mcp_tool',
+          tool_input: {
+            ServerName: 'devspec_devspec',
+            ToolName: 'record_check_rulings',
+            Arguments: { check_job_id: jobId, rulings: [] },
+          },
+          tool_response: {
+            content: [{ type: 'text', text: JSON.stringify({ settled: true, remaining: 0 }) }],
+          },
+        }),
+        { home: tmpHome, env: {}, call: async (r) => { calls.push(r); return { ok: true } } },
+      )
+      const preOut = await runPreInvocation(
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        {
+          env: {},
+          home: tmpHome,
+          connectionsDir,
+          call: async () => ({ ok: true }),
+          recall: async () => null,
+        },
+      )
+      assert.ok(readTurnMarker(connId, connectionsDir).heldParent)
+      assert.equal(requestRefForWrite(readRequestState(connId, { dir: connectionsDir })), null)
+      assert.ok(preOut?.injectSteps?.some((s) => String(s.ephemeralMessage || '').includes('resume --connection-id')))
+
+      // Remaining notice investigation tool runs: MUST NOT stream into the room trail!
+      const noticeWorkAt = Date.now()
+      fs.appendFileSync(
+        transcriptPath,
+        JSON.stringify({
+          step_index: 2,
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          created_at: new Date(noticeWorkAt).toISOString(),
+          tool_calls: [{ name: 'read_file', args: { Path: '/tmp/remaining-notice.log' } }],
+        }) + '\n',
+      )
+      await runPostToolDispatch(
+        JSON.stringify({
+          conversationId: convId,
+          transcriptPath,
+          tool_name: 'read_file',
+          tool_input: { Path: '/tmp/remaining-notice.log' },
+        }),
+        { home: tmpHome, env: {}, call: async (r) => { calls.push(r); return { ok: true } } },
+      )
+      assert.equal(calls.length, 0)
+      assert.ok(readTurnMarker(connId, connectionsDir).heldParent)
+
+      // Once the agent finishes the remaining notice and runs `resume`, parent + reqId restore cleanly!
+      const resumed = resumeParentMain(['resume', '--connection-id', connId], {
+        dir: connectionsDir,
+        now: noticeWorkAt + 500,
+      })
+      assert.equal(resumed.ok, true)
+      assert.equal(resumed.request_ref, reqId)
+      assert.equal(readTurnMarker(connId, connectionsDir).heldParent, null)
+      assert.equal(requestRefForWrite(readRequestState(connId, { dir: connectionsDir })), reqId)
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
+    }
+  })
+
+  it('restores the known parent request in PreToolUse before the very first resumed write when parent completed before the check settled (ce71a72b)', async () => {
+    const { appendRequestEvent, readRequestState, requestRefForWrite, setCurrentRequest, UNSTATED } =
+      await import('./requests.mjs')
+    const { prepareDevspecToolInput } = await import('./devspec-tool-input.mjs')
+    const { runPostToolDispatch } = await import('./post-tool-dispatch.mjs')
+    const { writeLocalBond } = await import('./remote-control-state.mjs')
+    const { recordOwnedEnd, recordOwnedLaunch, recordTurnWake } = await import('./mirror-turn.mjs')
+
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-first-write-attr-'))
+    try {
+      const rcDir = path.join(tmpHome, '.devspec', 'remote-control')
+      const connectionsDir = path.join(rcDir, 'connections')
+      fs.mkdirSync(connectionsDir, { recursive: true })
+      const connId = '972c8895-0000-4000-8000-000000000181'
+      const projId = '972c8895-0000-4000-8000-000000000182'
+      const sessId = '972c8895-0000-4000-8000-000000000183'
+      const reqId = '972c8895-0000-4000-8000-000000000184'
+      const jobId = '972c8895-0000-4000-8000-000000000185'
+      const convId = 'conv-first-write'
+      const taskId = `${convId}/task-1`
+      const transcriptPath = path.join(tmpHome, 'transcript.jsonl')
+      const t0 = Date.now() - 20_000
+
+      writeLocalBond(convId, { connection_id: connId }, rcDir)
+      fs.writeFileSync(
+        path.join(connectionsDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          project_id: projId,
+          session_id: sessId,
+          agent_name: 'Antigravity',
+          local_id: convId,
+          transcript_path: transcriptPath,
+          mcp_url: 'https://example.invalid/api/mcp',
+          token: 'test-token',
+          connection_capability: 'dvsc_test',
+        }),
+      )
+      fs.writeFileSync(transcriptPath, '')
+      appendRequestEvent(connId, { op: 'open', id: reqId, kind: 'command' }, { dir: connectionsDir })
+      setCurrentRequest(connId, reqId, { dir: connectionsDir })
+      appendRequestEvent(
+        connId,
+        { op: 'launch', key: taskId, kind: 'shell', notifies: true, request: reqId, also: [] },
+        { dir: connectionsDir },
+      )
+      writeTurnMarker(connId, { startedAt: t0, remoteTurn: true, otherWake: true, held: true }, connectionsDir)
+      recordOwnedLaunch(connId, { id: taskId, kind: 'command', label: 'Build' }, { dir: connectionsDir, now: t0 + 200 })
+
+      // Check job arrives -> parks heldParent and clears current request.
+      recordTurnWake(connId, { type: 'check_job', check_job_id: jobId }, connectionsDir, t0 + 1000)
+      setCurrentRequest(connId, UNSTATED, { dir: connectionsDir })
+
+      // Parent background job completes BEFORE the check job settles!
+      recordOwnedEnd(connId, taskId, { dir: connectionsDir, now: t0 + 2000 })
+
+      // Check job settles via PostToolUse.
+      await runPostToolDispatch(
+        JSON.stringify({
+          conversationId: convId,
+          transcriptPath,
+          tool_name: 'call_mcp_tool',
+          tool_input: {
+            ServerName: 'devspec_devspec',
+            ToolName: 'record_check_rulings',
+            Arguments: { check_job_id: jobId, rulings: [] },
+          },
+          tool_response: {
+            content: [{ type: 'text', text: JSON.stringify({ settled: true, remaining: 0 }) }],
+          },
+        }),
+        { home: tmpHome, env: {}, call: async () => ({ ok: true }) },
+      )
+      // Still parked until resumed work actually begins (so Stop stays quiet if agent stops now).
+      assert.ok(readTurnMarker(connId, connectionsDir).heldParent)
+
+      // Agent immediately makes its VERY FIRST resumed DevSpec write:
+      // PreToolUse MUST restore heldParent + reqId BEFORE stamping request_ref!
+      const preOut = prepareDevspecToolInput(
+        {
+          conversationId: convId,
+          transcriptPath,
+          tool_name: 'call_mcp_tool',
+          tool_input: {
+            ServerName: 'devspec_devspec',
+            ToolName: 'update_task',
+            Arguments: {
+              task_id: '972c8895-0000-4000-8000-000000000189',
+              status: 'in_progress',
+            },
+          },
+        },
+        { home: tmpHome, env: {}, now: Date.now() + 1000 },
+      )
+      const stamped = preOut?.hookSpecificOutput?.updatedInput?.Arguments
+      assert.equal(stamped?.request_ref, reqId, 'first resumed write must carry the known parent request_ref')
+      assert.equal(readTurnMarker(connId, connectionsDir).heldParent, null)
+      assert.equal(requestRefForWrite(readRequestState(connId, { dir: connectionsDir })), reqId)
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
     }
   })
 })

@@ -573,6 +573,7 @@ export const TOOL_PLUMBING_SCRIPTS = new Set([
   'devspec-remote-connect.mjs',
   'devspec-remote-stop.mjs',
   'devspec-question.mjs',
+  'devspec-serve-request.mjs',
   'devspec-tell-person.mjs',
   'remote-control-state.mjs',
   'connection-call.mjs',

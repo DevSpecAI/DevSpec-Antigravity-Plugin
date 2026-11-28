@@ -32,10 +32,13 @@ import { launchGuard, resolveOwnConnectionId } from './launch-guard.mjs'
 import {
   currentTurnStampNoticeIds,
   extractAntigravityTrailFromTranscript,
+  isRemotePlumbingToolCall,
   parseTranscriptPath,
   readTurnMarker,
+  reconcileCompletedOwnedWork,
   recordNoticeReply,
   resolveHookConversationId,
+  restoreHeldParentIfResumed,
   writeExplicitReplyMarker,
 } from './mirror-turn.mjs'
 import { normalizeNoticeIds, postCanTakeTurnNotices } from './notice-reply.mjs'
@@ -155,14 +158,62 @@ function readProjectPin(cwd) {
   }
 }
 
-export function prepareDevspecToolInput(input, { env = process.env, home = os.homedir() } = {}) {
-  if (!input || typeof input !== 'object') return {}
-
-  // 1. Background launch guard during multi-requester turns
-  const guard = launchGuard(input, { home, env })
-  if (guard?.decision === 'deny' || guard?.hookSpecificOutput?.permissionDecision === 'deny') {
-    return guard
+function maybeRestoreSettledPauseBeforeTool(
+  input,
+  rawToolName,
+  rawToolInput,
+  verb,
+  toolInput,
+  { env, home, now },
+) {
+  if (isRemotePlumbingToolCall(rawToolName, rawToolInput)) return
+  if (
+    verb === 'claim_check_job' ||
+    verb === 'record_check_rulings' ||
+    verb === 'release_check_job'
+  ) {
+    return
   }
+  if (verb === 'post_session_message' && toolInput?.system_notice_ids !== undefined) {
+    return
+  }
+  const conversationId = resolveHookConversationId(input, env)
+  const connectionId = resolveOwnConnectionId(conversationId, { home })
+  if (!connectionId) return
+  const connDir = path.join(home, '.devspec', 'remote-control', 'connections')
+  const marker = readTurnMarker(connectionId, connDir)
+  if (!marker?.heldParent || marker.otherWake) return
+  const hasForTheRecordNotice =
+    Array.isArray(marker.recordNoticeIds) && marker.recordNoticeIds.length > 0
+  if (hasForTheRecordNotice) return
+  const pauseCompletedAt = [
+    marker.checkJobWake && marker.checkJobRuled ? marker.checkJobRuledAt : null,
+    marker.acceptedNoticeReplyAt ?? null,
+    marker.personToldAt ?? null,
+  ].filter((v) => typeof v === 'number' && Number.isFinite(v))
+  if (pauseCompletedAt.length === 0) return
+
+  const connState = readStateFile(connectionId, connDir)
+  const transcriptPath =
+    parseTranscriptPath(JSON.stringify(input)) ||
+    connState?.transcript_path ||
+    inferAntigravityTranscriptPath(conversationId || connState?.local_id) ||
+    null
+  const reconciled = transcriptPath
+    ? reconcileCompletedOwnedWork(connectionId, marker, transcriptPath, connDir)
+    : null
+  const pauseDoneMs = Math.max(...pauseCompletedAt)
+  if (now < pauseDoneMs) return
+  restoreHeldParentIfResumed(connectionId, marker, {
+    dir: connDir,
+    reconciled,
+    now,
+    excludeUpToMs: pauseDoneMs,
+  })
+}
+
+export function prepareDevspecToolInput(input, { env = process.env, home = os.homedir(), now = Date.now() } = {}) {
+  if (!input || typeof input !== 'object') return {}
 
   const rawToolName = input.tool_name ?? input.toolName ?? input.toolCall?.name ?? ''
   const rawToolInput = input.tool_input ?? input.toolInput ?? input.toolCall?.args
@@ -173,6 +224,27 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
     argumentsWasString,
     argumentsKey,
   } = unwrapDevspecToolCall(rawToolName, rawToolInput)
+
+  // 0. If a mid-wait check-job or answered-notice pause already settled after a
+  //    parked parent launch completed, restore the parent context and active
+  //    request BEFORE launchGuard and stampRequest so the very first resumed
+  //    DevSpec write or background launch carries the known request (ce71a72b).
+  try {
+    maybeRestoreSettledPauseBeforeTool(input, rawToolName, rawToolInput, verb, toolInput, {
+      env,
+      home,
+      now,
+    })
+  } catch {
+    /* non-fatal */
+  }
+
+  // 1. Background launch guard during multi-requester turns
+  const guard = launchGuard(input, { home, env })
+  if (guard?.decision === 'deny' || guard?.hookSpecificOutput?.permissionDecision === 'deny') {
+    return guard
+  }
+
   if (!verb || !toolInput || typeof toolInput !== 'object' || Array.isArray(toolInput)) {
     return {}
   }

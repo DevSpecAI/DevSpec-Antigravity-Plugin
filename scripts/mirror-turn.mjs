@@ -49,6 +49,7 @@ import {
   requestRefForWrite,
   requestsWithWorkPending,
   rotateRequestLog,
+  SERVE_REQUEST_SCRIPT,
   setCurrentRequest,
   UNSTATED,
 } from './requests.mjs'
@@ -374,6 +375,7 @@ export function restoreHeldParentIfResumed(
     now = Date.now(),
     excludeUpToMs = null,
     requireParentNotificationStep = false,
+    allowQuietNoticeResume = false,
   } = {},
 ) {
   if (!connectionId || !marker?.heldParent || marker.otherWake) {
@@ -396,10 +398,23 @@ export function restoreHeldParentIfResumed(
     return { restored: false, marker }
   }
 
+  // Never clear an active for-the-record notice pause automatically just because a
+  // parent background task finished asynchronously (decisions 02f4ce2b & a2d9f38f):
+  // the agent may still be investigating/handling the quiet notice (alone or after
+  // a check job in the same pause settled). Only restore a quiet-notice pause
+  // mid-turn when the agent explicitly hands back control after finishing the
+  // notice (`allowQuietNoticeResume: true`, via `devspec-serve-request.mjs resume`).
+  const hasForTheRecordNotice =
+    Array.isArray(marker.recordNoticeIds) && marker.recordNoticeIds.length > 0
+  if (hasForTheRecordNotice && !allowQuietNoticeResume) {
+    return { restored: false, marker }
+  }
+
   // Never clear an active needs_person notice or undelivered tell_person pause
   // mid-turn before EVERY needs_person notice in the pause has had an ACCEPTED
-  // notice reply from the server (or tell-person delivered), so a refused post
-  // never clears a notice that still needs attention (decisions 02f4ce2b & a2d9f38f).
+  // notice reply from the server (or the agent explicitly hands back after
+  // settling a self-fixable notice quietly via `devspec-serve-request.mjs resume`),
+  // so a refused post never clears a notice that still needs attention (02f4ce2b).
   const repliedNoticeSet = new Set(
     (Array.isArray(marker.repliedNoticeIds) ? marker.repliedNoticeIds : [])
       .map((id) => String(id).toLowerCase())
@@ -412,7 +427,7 @@ export function restoreHeldParentIfResumed(
     Array.isArray(marker.noticeIds) &&
     marker.noticeIds.length > 0 &&
     (pendingNeedsPersonIds.length > 0 || !marker.acceptedNoticeReplyAt)
-  if (hasPendingNeedsPersonNotice) {
+  if (hasPendingNeedsPersonNotice && !allowQuietNoticeResume) {
     return { restored: false, marker }
   }
   const hasPendingTellPerson =
@@ -682,6 +697,120 @@ export function restoreHeldParentIfResumed(
   }
 
   return { restored: true, marker: restoredMarker }
+}
+
+/**
+ * When a parent background launch has already completed during a quiet notice pause
+ * (for-the-record notice or self-fixable needs_person notice with no reply needed)
+ * and all check jobs / pause helpers / tell_person obligations are clear, return an
+ * ephemeral PreInvocation hint telling the agent the exact command to hand back
+ * to its parked room task once it finishes handling the notice (decisions 02f4ce2b,
+ * a2d9f38f; item 972c8895).
+ */
+export function pendingParentResumeHint(
+  connectionId,
+  marker,
+  {
+    dir = CONNECTIONS_DIR,
+    reconciled = null,
+    latestStep = null,
+    scriptPath = SERVE_REQUEST_SCRIPT,
+  } = {},
+) {
+  if (!connectionId || !marker?.heldParent || marker.otherWake) return null
+  const parent = marker.heldParent
+  const parentOwnedIds = Array.isArray(parent.ownedIds)
+    ? parent.ownedIds.filter((id) => typeof id === 'string' && id)
+    : []
+  const allOutstanding = readOwnedIds(connectionId, marker, dir)
+  if (allOutstanding.some((id) => !parentOwnedIds.includes(id))) return null
+  if (marker.checkJobWake && !marker.checkJobRuled) return null
+  const hasPendingTellPerson =
+    Boolean(marker.tellPerson) && !marker.personToldAt && !marker.acceptedNoticeReplyAt
+  if (hasPendingTellPerson) return null
+
+  const hasForTheRecordNotice =
+    Array.isArray(marker.recordNoticeIds) && marker.recordNoticeIds.length > 0
+  const repliedNoticeSet = new Set(
+    (Array.isArray(marker.repliedNoticeIds) ? marker.repliedNoticeIds : [])
+      .map((id) => String(id).toLowerCase())
+      .filter(Boolean),
+  )
+  const pendingNeedsPersonIds = (Array.isArray(marker.noticeIds) ? marker.noticeIds : [])
+    .map((id) => String(id).toLowerCase())
+    .filter((id) => id && !repliedNoticeSet.has(id))
+  const hasPendingNeedsPersonNotice =
+    Array.isArray(marker.noticeIds) &&
+    marker.noticeIds.length > 0 &&
+    (pendingNeedsPersonIds.length > 0 || !marker.acceptedNoticeReplyAt)
+  if (!hasForTheRecordNotice && !hasPendingNeedsPersonNotice) return null
+
+  let hasEndedParent = false
+  if (Array.isArray(reconciled?.endedOwnedDetails)) {
+    hasEndedParent = reconciled.endedOwnedDetails.some(
+      (d) => parentOwnedIds.length === 0 || parentOwnedIds.includes(d.id),
+    )
+  } else if (Array.isArray(reconciled?.endedOwnedIds)) {
+    hasEndedParent = reconciled.endedOwnedIds.some(
+      (id) => parentOwnedIds.length === 0 || parentOwnedIds.includes(id),
+    )
+  }
+  if (!hasEndedParent) {
+    const ownedLines = readOwnedLines(connectionId, marker, dir)
+    hasEndedParent = ownedLines.some(
+      (entry) =>
+        typeof entry.ended === 'string' &&
+        parentOwnedIds.length > 0 &&
+        parentOwnedIds.includes(entry.id),
+    )
+  }
+  if (
+    !hasEndedParent &&
+    latestStep?.type === 'SYSTEM_MESSAGE' &&
+    typeof latestStep.content === 'string' &&
+    !latestStep.content.includes('[DevSpec Remote Wake]') &&
+    isBackgroundTaskNotification(latestStep.content)
+  ) {
+    hasEndedParent =
+      parentOwnedIds.length === 0 ||
+      parentOwnedIds.some((id) => stepMatchesOwnedId(latestStep.content, id))
+  }
+  if (!hasEndedParent) return null
+
+  return {
+    ephemeralMessage: [
+      'Your parked room task has background work that finished while this DevSpec notice pause is open.',
+      'Finish handling the notice first — all notice work stays out of the room while the pause is active.',
+      'When you are done with the notice and ready to resume the parked room task mid-turn, run:',
+      `  node ${JSON.stringify(scriptPath)} resume --connection-id ${connectionId}`,
+      '(Or end your turn if nothing more is needed.)',
+    ].join('\n'),
+  }
+}
+
+/** PreInvocation helper: returns `{ ephemeralMessage }` when a quiet notice pause has a completed parent task waiting to resume. */
+export function pendingParentResumeForHook(
+  raw,
+  { env = process.env, home = os.homedir(), connectionsDir = null, scriptPath = SERVE_REQUEST_SCRIPT } = {},
+) {
+  try {
+    const dir = connectionsDir ?? path.join(home, '.devspec', 'remote-control', 'connections')
+    const conversationId = resolveHookConversationId(raw, env)
+    const state = loadState(conversationId, {
+      connectionsDir: dir,
+      legacyPath: path.join(home, '.devspec', 'remote-control.json'),
+    })
+    const connectionId = state?.connection_id
+    if (!connectionId) return null
+    const marker = readTurnMarker(connectionId, dir)
+    if (!marker?.heldParent || marker.otherWake) return null
+    const effectiveTranscriptPath = parseTranscriptPath(raw) || state?.transcript_path || null
+    const reconciled = reconcileCompletedOwnedWork(connectionId, marker, effectiveTranscriptPath, dir)
+    const latestStep = extractLatestTranscriptStep(effectiveTranscriptPath)
+    return pendingParentResumeHint(connectionId, marker, { dir, reconciled, latestStep, scriptPath })
+  } catch {
+    return null
+  }
 }
 
 /**
