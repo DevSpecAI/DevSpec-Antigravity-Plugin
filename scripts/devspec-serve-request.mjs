@@ -54,8 +54,11 @@ export function resumeParentMain(
     return { ok: false, error: 'No parked parent room task is waiting to resume.' }
   }
   const connState = readStateFile(connectionId, dir)
+  const effectiveConvId = connState?.local_id || null
   const transcriptPath = connState?.transcript_path || null
-  const reconciled = reconcileCompletedOwnedWork(connectionId, marker, transcriptPath, dir)
+  const reconciled = reconcileCompletedOwnedWork(connectionId, marker, transcriptPath, dir, {
+    conversationId: effectiveConvId,
+  })
   const parentOwnedIds = Array.isArray(marker.heldParent.ownedIds)
     ? marker.heldParent.ownedIds.filter((id) => typeof id === 'string' && id)
     : []
@@ -81,6 +84,7 @@ export function resumeParentMain(
   const res = restoreHeldParentIfResumed(connectionId, marker, {
     dir,
     reconciled,
+    conversationId: effectiveConvId,
     now,
     allowQuietNoticeResume: true,
   })

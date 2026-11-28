@@ -394,6 +394,7 @@ export function restoreHeldParentIfResumed(
     dir = CONNECTIONS_DIR,
     reconciled = null,
     latestStep = null,
+    conversationId = null,
     now = Date.now(),
     excludeUpToMs = null,
     requireParentNotificationStep = false,
@@ -403,6 +404,8 @@ export function restoreHeldParentIfResumed(
   if (!connectionId || !marker?.heldParent || marker.otherWake) {
     return { restored: false, marker }
   }
+  const resolvedConversationId =
+    conversationId || readConnectionLocalId(connectionId, dir) || null
   const parent = marker.heldParent
   const parentOwnedIds = Array.isArray(parent.ownedIds)
     ? parent.ownedIds.filter((id) => typeof id === 'string' && id)
@@ -520,7 +523,9 @@ export function restoreHeldParentIfResumed(
     isBackgroundTaskNotification(latestStep.content)
   ) {
     const stepMs = latestStep.created_at ? Date.parse(latestStep.created_at) : NaN
-    const matchedIds = parentOwnedIds.filter((id) => stepMatchesOwnedId(latestStep.content, id))
+    const matchedIds = parentOwnedIds.filter((id) =>
+      stepMatchesOwnedId(latestStep.content, id, { conversationId: resolvedConversationId }),
+    )
     if (matchedIds.length > 0) {
       latestStepIsParentCompletion = true
       for (const id of matchedIds) {
@@ -542,7 +547,11 @@ export function restoreHeldParentIfResumed(
 
   if (!notificationText && Array.isArray(reconciled?.matchedSystemMessages) && reconciled.matchedSystemMessages.length > 0) {
     const matchingMsg = reconciled.matchedSystemMessages.find((msg) =>
-      endedParentIds.some((id) => id !== '__parent_bg__' && stepMatchesOwnedId(msg, id)),
+      endedParentIds.some(
+        (id) =>
+          id !== '__parent_bg__' &&
+          stepMatchesOwnedId(msg, id, { conversationId: resolvedConversationId }),
+      ),
     )
     if (matchingMsg) notificationText = matchingMsg
   }
@@ -741,10 +750,13 @@ export function pendingParentResumeHint(
     dir = CONNECTIONS_DIR,
     reconciled = null,
     latestStep = null,
+    conversationId = null,
     scriptPath = SERVE_REQUEST_SCRIPT,
   } = {},
 ) {
   if (!connectionId || !marker?.heldParent || marker.otherWake) return null
+  const resolvedConversationId =
+    conversationId || readConnectionLocalId(connectionId, dir) || null
   const parent = marker.heldParent
   const parentOwnedIds = Array.isArray(parent.ownedIds)
     ? parent.ownedIds.filter((id) => typeof id === 'string' && id)
@@ -798,7 +810,9 @@ export function pendingParentResumeHint(
   ) {
     hasEndedParent =
       parentOwnedIds.length === 0 ||
-      parentOwnedIds.some((id) => stepMatchesOwnedId(latestStep.content, id))
+      parentOwnedIds.some((id) =>
+        stepMatchesOwnedId(latestStep.content, id, { conversationId: resolvedConversationId }),
+      )
   }
   if (!hasEndedParent) return null
 
@@ -830,9 +844,19 @@ export function pendingParentResumeForHook(
     const marker = readTurnMarker(connectionId, dir)
     if (!marker?.heldParent || marker.otherWake) return null
     const effectiveTranscriptPath = parseTranscriptPath(raw) || state?.transcript_path || null
-    const reconciled = reconcileCompletedOwnedWork(connectionId, marker, effectiveTranscriptPath, dir)
+    const effectiveConvId =
+      conversationId || state?.local_id || extractConversationIdFromTranscriptPath(effectiveTranscriptPath) || null
+    const reconciled = reconcileCompletedOwnedWork(connectionId, marker, effectiveTranscriptPath, dir, {
+      conversationId: effectiveConvId,
+    })
     const latestStep = extractLatestTranscriptStep(effectiveTranscriptPath)
-    return pendingParentResumeHint(connectionId, marker, { dir, reconciled, latestStep, scriptPath })
+    return pendingParentResumeHint(connectionId, marker, {
+      dir,
+      reconciled,
+      latestStep,
+      conversationId: effectiveConvId,
+      scriptPath,
+    })
   } catch {
     return null
   }
@@ -1229,29 +1253,130 @@ export function readOwnedIds(
   return ids
 }
 
+const OWNED_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+function readConnectionLocalId(connectionId, dir = CONNECTIONS_DIR) {
+  if (!connectionId) return null
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(dir, `${connectionId}.json`), 'utf8'))
+    return typeof raw?.local_id === 'string' && raw.local_id.trim() ? raw.local_id.trim() : null
+  } catch {
+    return null
+  }
+}
+
+function extractConversationIdFromTranscriptPath(transcriptPath) {
+  if (typeof transcriptPath !== 'string' || !transcriptPath) return null
+  const m = transcriptPath.replace(/\\/g, '/').match(/\/brain\/([^/]+)\//i)
+  return m?.[1] || null
+}
+
 function escapeRegex(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 function hasBoundedIdToken(text, token) {
-  const re = new RegExp(`(?<![A-Za-z0-9_:-])${escapeRegex(token)}(?![A-Za-z0-9_:-])`)
+  const re = new RegExp(`(?<![A-Za-z0-9_:/-])${escapeRegex(token)}(?![A-Za-z0-9_:/-])`)
   return re.test(text)
 }
 
-function stepMatchesOwnedId(stepContent, id) {
+/**
+ * Extract every conversation/namespace scope explicitly named in a completion
+ * notification (log path `/brain/<conv>/...`, qualified `sender=<conv>/<task>`,
+ * `<task-id><conv>/<task></task-id>`, `conversation_id=<conv>`, etc.) so a
+ * short task ID like `task-17` from ANOTHER conversation can never match a
+ * still-running launch in this conversation (decision ce71a72b).
+ */
+function notificationScopeIds(stepContent) {
+  const scopes = new Set()
+  const s = String(stepContent || '')
+  for (const m of s.matchAll(/\/brain\/([A-Za-z0-9_.:-]+)\//gi)) {
+    scopes.add(m[1].toLowerCase())
+  }
+  for (const m of s.matchAll(/\bsender=([A-Za-z0-9_.:-]+)\/[A-Za-z0-9_.:-]+/gi)) {
+    scopes.add(m[1].toLowerCase())
+  }
+  for (const m of s.matchAll(/<task-id>\s*([A-Za-z0-9_.:-]+)\/[A-Za-z0-9_.:-]+\s*<\/task-id>/gi)) {
+    scopes.add(m[1].toLowerCase())
+  }
+  for (const m of s.matchAll(/["']([A-Za-z0-9_.:-]+)\/[A-Za-z0-9_.:-]+["']/gi)) {
+    if (!m[1].startsWith('.') && m[1].toLowerCase() !== 'tasks') {
+      scopes.add(m[1].toLowerCase())
+    }
+  }
+  for (const m of s.matchAll(/\b(?:conversation_id|conversationId|conversation)\s*[=:]\s*["']?([A-Za-z0-9_.:-]+)["']?/gi)) {
+    scopes.add(m[1].toLowerCase())
+  }
+  for (const m of s.matchAll(/<conversation[-_]id>\s*([A-Za-z0-9_.:-]+)\s*<\/conversation[-_]id>/gi)) {
+    scopes.add(m[1].toLowerCase())
+  }
+  for (const m of s.matchAll(/\bsender=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![A-Za-z0-9_:/-])/gi)) {
+    scopes.add(m[1].toLowerCase())
+  }
+  return scopes
+}
+
+function hasConflictingNotificationScope(stepContent, id, conversationId = null) {
+  if (typeof id !== 'string' || !id) return false
+  if (OWNED_UUID_RE.test(id)) return false
+  const scopes = notificationScopeIds(stepContent)
+  if (scopes.size === 0) return false
+  const slashIdx = id.lastIndexOf('/')
+  const expectedScope = slashIdx > 0 ? id.slice(0, slashIdx) : conversationId
+  if (!expectedScope) return false
+  return !scopes.has(expectedScope.toLowerCase())
+}
+
+export function stepMatchesOwnedId(stepContent, id, { conversationId = null } = {}) {
   if (typeof stepContent !== 'string' || typeof id !== 'string' || !id) return false
-  if (hasBoundedIdToken(stepContent, id)) return true
   const slashIdx = id.lastIndexOf('/')
   if (slashIdx > 0) {
+    if (hasBoundedIdToken(stepContent, id)) return true
+    const prefix = id.slice(0, slashIdx)
     const shortId = id.slice(slashIdx + 1)
-    if (
-      shortId &&
-      (stepContent.includes(`"${shortId}"`) ||
-        stepContent.includes(`/${shortId}.log`) ||
-        new RegExp(`/${escapeRegex(shortId)}(?![A-Za-z0-9_:-])`).test(stepContent))
-    ) {
-      return true
+    if (!shortId) return false
+    // Exact `<prefix>/.../<shortId>.log` match (e.g. `/brain/<convId>/.system_generated/tasks/task-17.log`).
+    const prefixedLogRe = new RegExp(
+      `/${escapeRegex(prefix)}/[^\\s"'<>]*/${escapeRegex(shortId)}\\.log(?![A-Za-z0-9_:/-])`,
+      'i',
+    )
+    if (prefixedLogRe.test(stepContent)) return true
+    // Reject short-ID fallback whenever the notification explicitly names a
+    // different conversation/scope (decision ce71a72b).
+    const scopes = notificationScopeIds(stepContent)
+    if (scopes.size > 0 && !scopes.has(prefix.toLowerCase())) {
+      return false
     }
+    const qualifiedShortRe = new RegExp(
+      `([A-Za-z0-9_.:-]+)/${escapeRegex(shortId)}(?![A-Za-z0-9_:/-])`,
+      'g',
+    )
+    let sawQualified = false
+    let matchedQualified = false
+    for (const m of stepContent.matchAll(qualifiedShortRe)) {
+      if (m[1].toLowerCase() === 'tasks') continue
+      sawQualified = true
+      if (m[1].toLowerCase() === prefix.toLowerCase()) matchedQualified = true
+    }
+    if (sawQualified) return matchedQualified
+    return stepContent.includes(`"${shortId}"`)
+  }
+  if (OWNED_UUID_RE.test(id)) {
+    return hasBoundedIdToken(stepContent, id)
+  }
+  const scopes = notificationScopeIds(stepContent)
+  if (scopes.size > 0) {
+    if (!conversationId || !scopes.has(conversationId.toLowerCase())) {
+      return false
+    }
+  }
+  if (hasBoundedIdToken(stepContent, id)) return true
+  if (conversationId) {
+    const convLogRe = new RegExp(
+      `/${escapeRegex(conversationId)}/[^\\s"'<>]*/${escapeRegex(id)}\\.log(?![A-Za-z0-9_:/-])`,
+      'i',
+    )
+    if (convLogRe.test(stepContent)) return true
   }
   return false
 }
@@ -1267,8 +1392,14 @@ export function reconcileCompletedOwnedWork(
   marker,
   transcriptPath,
   dir = CONNECTIONS_DIR,
+  { conversationId = null } = {},
 ) {
   if (!connectionId || !transcriptPath) return
+  const resolvedConversationId =
+    conversationId ||
+    extractConversationIdFromTranscriptPath(transcriptPath) ||
+    readConnectionLocalId(connectionId, dir) ||
+    null
   let ownedLines = marker ? readOwnedLines(connectionId, marker, dir) : []
   let ownedIds = marker ? readOwnedIds(connectionId, marker, dir) : []
   let reqState = readRequestState(connectionId, { dir })
@@ -1459,7 +1590,10 @@ export function reconcileCompletedOwnedWork(
     const stepAtMs = Number.isFinite(stepMs) ? stepMs : null
     let stepMatched = false
     for (const id of ownedIds) {
-      if (!endedOwned.has(id) && stepMatchesOwnedId(step.content, id)) {
+      if (
+        !endedOwned.has(id) &&
+        stepMatchesOwnedId(step.content, id, { conversationId: resolvedConversationId })
+      ) {
         recordOwnedEnd(connectionId, id, { dir, ...(stepAtMs !== null ? { now: stepAtMs } : {}) })
         endedOwned.add(id)
         newlyEndedOwned.push(id)
@@ -1471,7 +1605,9 @@ export function reconcileCompletedOwnedWork(
     for (const key of unnotifiedKeys) {
       if (
         !newlyNotified.has(key) &&
-        (keysInStep.includes(key) || stepMatchesOwnedId(step.content, key))
+        !hasConflictingNotificationScope(step.content, key, resolvedConversationId) &&
+        (keysInStep.includes(key) ||
+          stepMatchesOwnedId(step.content, key, { conversationId: resolvedConversationId }))
       ) {
         appendRequestEvent(connectionId, { op: 'notified', key }, { dir })
         newlyNotified.add(key)
@@ -3356,11 +3492,17 @@ export async function handleMirrorTurn(
   // USER_INPUT (or was already mirrored for this step_index), avoid duplicate
   // local_prompt posts and redundant heartbeats on every tool iteration.
   const rawExistingMarker = readTurnMarker(connectionId, connectionsDir)
+  const effectiveConvId =
+    conversationId ||
+    state.local_id ||
+    extractConversationIdFromTranscriptPath(effectiveTranscriptPath) ||
+    null
   const reconciled = reconcileCompletedOwnedWork(
     connectionId,
     rawExistingMarker,
     effectiveTranscriptPath,
     connectionsDir,
+    { conversationId: effectiveConvId },
   )
   const latestStep = extractLatestTranscriptStep(effectiveTranscriptPath)
   const restoreResult =
@@ -3369,6 +3511,7 @@ export async function handleMirrorTurn(
           dir: connectionsDir,
           reconciled,
           latestStep,
+          conversationId: effectiveConvId,
           requireParentNotificationStep: true,
         })
       : { restored: false, marker: rawExistingMarker }
@@ -4031,20 +4174,18 @@ export async function handleMirrorTurn(
           (typeof marker?.resumedFromPauseAt === 'number' && Number.isFinite(marker.resumedFromPauseAt)) ||
             (Array.isArray(marker?.excludedRanges) && marker.excludedRanges.length > 0),
         )
-        const hasTranscriptForExclusion = Boolean(
-          hasPauseExclusion && effectiveTranscriptPath && fs.existsSync(effectiveTranscriptPath),
-        )
-        // When the turn resumed from a check/notice pause and the transcript is
-        // available, read the fallback answer strictly through `excludedRanges`
-        // and `replySinceMs` so a Stop hook's `last_assistant_message` carried
-        // over from the check pause can NEVER bypass pause exclusion and post
-        // routine check text to the room (decisions 02f4ce2b & a2d9f38f).
+        // When the turn resumed from a check/notice pause, read the fallback
+        // answer strictly through `excludedRanges` and `replySinceMs` from the
+        // transcript — NEVER fall back to an unverified Stop hook
+        // `last_assistant_message`, even when the transcript is unavailable,
+        // because that hook text can be the check/notice's own closing words
+        // (decisions 02f4ce2b & a2d9f38f).
         const transcriptReply = extractLatestAssistantReplyFromTranscript(effectiveTranscriptPath, {
           sinceMs: replySinceMs,
           excludedRanges: marker?.excludedRanges ?? [],
         })
         const rawStopText =
-          (hasTranscriptForExclusion
+          (hasPauseExclusion
             ? transcriptReply
             : (text ? prepareAgentMirrorText(text) : null) || transcriptReply) ||
           (hadStreamedTrail && trail.events.length > 0

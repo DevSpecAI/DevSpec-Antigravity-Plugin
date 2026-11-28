@@ -4126,5 +4126,283 @@ describe('Antigravity native hook payload & transcript handling', () => {
       fs.rmSync(tmpHome, { recursive: true, force: true })
     }
   })
+
+  it('never posts hook last_assistant_message on Stop after a quiet-notice resume when the transcript is unavailable (02f4ce2b)', async () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-stop-no-transcript-notice-'))
+    const connectionsDir = path.join(tmpHome, '.devspec', 'remote-control', 'connections')
+    const legacyPath = path.join(tmpHome, '.devspec', 'remote-control.json')
+    fs.mkdirSync(connectionsDir, { recursive: true })
+    const {
+      handleMirrorTurn,
+      recordOwnedEnd,
+      recordOwnedLaunch,
+      recordTurnWake,
+      writeTurnMarker,
+    } = await import('./mirror-turn.mjs')
+    const { resumeParentMain } = await import('./devspec-serve-request.mjs')
+    const { appendRequestEvent, setCurrentRequest, UNSTATED } = await import('./requests.mjs')
+    const { writeLocalBond } = await import('./remote-control-state.mjs')
+
+    try {
+      const connId = '11111111-1111-4111-8111-111111111961'
+      const sessId = '22222222-2222-4222-8222-222222222961'
+      const convId = '33333333-3333-4333-8333-333333333961'
+      const reqId = '44444444-4444-4444-8444-444444444961'
+      const noticeId = '55555555-5555-4555-8555-555555555961'
+      const taskId = `${convId}/task-17`
+      const missingTranscript = path.join(tmpHome, 'does-not-exist-transcript.jsonl')
+      const t0 = Date.now() - 10_000
+
+      writeLocalBond(convId, connId, { dir: connectionsDir })
+      fs.writeFileSync(
+        path.join(connectionsDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          session_id: sessId,
+          agent_name: 'Antigravity',
+          local_id: convId,
+          transcript_path: missingTranscript,
+          mcp_url: 'https://example.invalid/api/mcp',
+          token: 'test-token',
+          connection_capability: 'dvsc_test',
+        }),
+      )
+
+      appendRequestEvent(connId, { op: 'open', id: reqId, kind: 'command', requested_by: 'u-alice' }, { dir: connectionsDir })
+      appendRequestEvent(connId, { op: 'current', ref: reqId }, { dir: connectionsDir })
+      appendRequestEvent(connId, { op: 'launch', key: taskId, kind: 'shell', notifies: true, request: reqId, also: [] }, { dir: connectionsDir })
+
+      writeTurnMarker(connId, { startedAt: t0, remoteTurn: true, otherWake: true, held: true }, connectionsDir)
+      recordOwnedLaunch(connId, { id: taskId, kind: 'command', label: 'Build' }, { dir: connectionsDir, now: t0 + 100 })
+      recordTurnWake(
+        connId,
+        {
+          type: 'canonical_system_notices',
+          execute_notice_ids: [noticeId],
+          ingress: {
+            system_notices: [{ notice_id: noticeId, audience: 'for_the_record', topic: 'deploy_failed' }],
+          },
+        },
+        connectionsDir,
+        t0 + 1000,
+      )
+      setCurrentRequest(connId, UNSTATED, { dir: connectionsDir })
+      recordOwnedEnd(connId, taskId, { dir: connectionsDir, now: t0 + 1500 })
+
+      // Agent finishes quiet notice and explicitly resumes parent, with no transcript file on disk.
+      const resumed = resumeParentMain(['--connection-id', connId], { dir: connectionsDir, now: t0 + 2000 })
+      assert.equal(resumed.ok, true)
+
+      const calls = []
+      await handleMirrorTurn(
+        'stop',
+        JSON.stringify({
+          conversationId: convId,
+          transcriptPath: missingTranscript,
+          last_assistant_message: 'Quiet notice handled — no reply needed.',
+        }),
+        {
+          env: {},
+          connectionsDir,
+          legacyPath,
+          call: async (req) => {
+            calls.push(req)
+            return { ok: true }
+          },
+        },
+      )
+
+      const posts = calls.filter((c) => c.name === 'post_session_message')
+      assert.equal(posts.length, 0, 'Stop must never post unverified hook last_assistant_message after a notice pause when transcript is unavailable')
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
+    }
+  })
+
+  it('never posts check last_assistant_message on Stop after PreToolUse resume when the transcript is unavailable (a2d9f38f)', async () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-stop-no-transcript-check-'))
+    const connectionsDir = path.join(tmpHome, '.devspec', 'remote-control', 'connections')
+    const legacyPath = path.join(tmpHome, '.devspec', 'remote-control.json')
+    fs.mkdirSync(connectionsDir, { recursive: true })
+    const {
+      handleMirrorTurn,
+      recordCheckJobRuled,
+      recordOwnedEnd,
+      recordOwnedLaunch,
+      recordTurnWake,
+      writeTurnMarker,
+    } = await import('./mirror-turn.mjs')
+    const { prepareDevspecToolInput } = await import('./devspec-tool-input.mjs')
+    const { appendRequestEvent, setCurrentRequest, UNSTATED } = await import('./requests.mjs')
+    const { writeLocalBond } = await import('./remote-control-state.mjs')
+
+    try {
+      const connId = '11111111-1111-4111-8111-111111111962'
+      const sessId = '22222222-2222-4222-8222-222222222962'
+      const convId = '33333333-3333-4333-8333-333333333962'
+      const reqId = '44444444-4444-4444-8444-444444444962'
+      const jobId = '55555555-5555-4555-8555-555555555962'
+      const taskId = `${convId}/task-17`
+      const missingTranscript = path.join(tmpHome, 'missing-check-transcript.jsonl')
+      const t0 = Date.now() - 10_000
+
+      writeLocalBond(convId, connId, { dir: connectionsDir })
+      fs.writeFileSync(
+        path.join(connectionsDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          session_id: sessId,
+          agent_name: 'Antigravity',
+          local_id: convId,
+          transcript_path: missingTranscript,
+          mcp_url: 'https://example.invalid/api/mcp',
+          token: 'test-token',
+          connection_capability: 'dvsc_test',
+        }),
+      )
+
+      appendRequestEvent(connId, { op: 'open', id: reqId, kind: 'command', requested_by: 'u-alice' }, { dir: connectionsDir })
+      appendRequestEvent(connId, { op: 'current', ref: reqId }, { dir: connectionsDir })
+      appendRequestEvent(connId, { op: 'launch', key: taskId, kind: 'shell', notifies: true, request: reqId, also: [] }, { dir: connectionsDir })
+
+      writeTurnMarker(connId, { startedAt: t0, remoteTurn: true, otherWake: true, held: true }, connectionsDir)
+      recordOwnedLaunch(connId, { id: taskId, kind: 'command', label: 'Build' }, { dir: connectionsDir, now: t0 + 100 })
+      recordTurnWake(connId, { type: 'check_job', check_job_id: jobId }, connectionsDir, t0 + 1000)
+      setCurrentRequest(connId, UNSTATED, { dir: connectionsDir })
+      recordOwnedEnd(connId, taskId, { dir: connectionsDir, now: t0 + 1400 })
+      recordCheckJobRuled(connId, connectionsDir, { jobId, now: t0 + 1600 })
+
+      // Settled check pause resumes on PreToolUse with no transcript available on disk.
+      prepareDevspecToolInput(
+        {
+          conversationId: convId,
+          transcriptPath: missingTranscript,
+          tool_name: 'read_file',
+          tool_input: { Path: '/tmp/foo.txt' },
+        },
+        { env: {}, home: tmpHome, now: t0 + 2000 },
+      )
+
+      const calls = []
+      await handleMirrorTurn(
+        'stop',
+        JSON.stringify({
+          conversationId: convId,
+          transcriptPath: missingTranscript,
+          last_assistant_message: 'Ruled check job cleanly — no conflict.',
+        }),
+        {
+          env: {},
+          connectionsDir,
+          legacyPath,
+          call: async (req) => {
+            calls.push(req)
+            return { ok: true }
+          },
+        },
+      )
+
+      const posts = calls.filter((c) => c.name === 'post_session_message')
+      assert.equal(posts.length, 0, 'Stop must never post check closing words as completing the parent command when transcript is unavailable')
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects another conversation completion of task-17 so it never marks this conversation parent task-17 finished or restores its request (ce71a72b)', async () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-cross-conv-task-id-'))
+    const connectionsDir = path.join(tmpHome, '.devspec', 'remote-control', 'connections')
+    fs.mkdirSync(connectionsDir, { recursive: true })
+    const {
+      readOwnedIds,
+      readTurnMarker,
+      reconcileCompletedOwnedWork,
+      recordCheckJobRuled,
+      recordOwnedLaunch,
+      recordTurnWake,
+      restoreHeldParentIfResumed,
+      stepMatchesOwnedId,
+      writeTurnMarker,
+    } = await import('./mirror-turn.mjs')
+    const { appendRequestEvent, readRequestState, setCurrentRequest, UNSTATED } = await import('./requests.mjs')
+
+    try {
+      const connId = '11111111-1111-4111-8111-111111111963'
+      const convA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+      const convB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+      const reqAlice = '44444444-4444-4444-8444-444444444963'
+      const jobId = '55555555-5555-4555-8555-555555555963'
+      const taskA = `${convA}/task-17`
+      const transcriptDir = path.join(tmpHome, 'brain', convA, '.system_generated', 'logs')
+      fs.mkdirSync(transcriptDir, { recursive: true })
+      const transcriptPath = path.join(transcriptDir, 'transcript.jsonl')
+      const t0 = Date.now() - 10_000
+
+      // Direct matcher checks across formats naming another conversation.
+      const otherLogNotif = `[Message] Background command "task-17" completed. Output saved to /brain/${convB}/.system_generated/tasks/task-17.log`
+      const otherSenderNotif = `[Message] sender=${convB}/task-17 content=Task id "task-17" finished`
+      const otherConvFieldNotif = `[Message] conversation_id=${convB} content=Background command "task-17" completed.`
+      const ownLogNotif = `[Message] Background command "task-17" completed. Output saved to /brain/${convA}/.system_generated/tasks/task-17.log`
+      assert.equal(stepMatchesOwnedId(otherLogNotif, taskA, { conversationId: convA }), false)
+      assert.equal(stepMatchesOwnedId(otherSenderNotif, taskA, { conversationId: convA }), false)
+      assert.equal(stepMatchesOwnedId(otherConvFieldNotif, taskA, { conversationId: convA }), false)
+      assert.equal(stepMatchesOwnedId(otherLogNotif, 'task-17', { conversationId: convA }), false)
+      assert.equal(stepMatchesOwnedId(otherSenderNotif, 'task-17', { conversationId: convA }), false)
+      assert.equal(stepMatchesOwnedId(ownLogNotif, taskA, { conversationId: convA }), true)
+      assert.equal(stepMatchesOwnedId(ownLogNotif, 'task-17', { conversationId: convA }), true)
+
+      fs.writeFileSync(
+        path.join(connectionsDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          local_id: convA,
+          transcript_path: transcriptPath,
+        }),
+      )
+
+      appendRequestEvent(connId, { op: 'open', id: reqAlice, kind: 'command', requested_by: 'u-alice' }, { dir: connectionsDir })
+      appendRequestEvent(connId, { op: 'current', ref: reqAlice }, { dir: connectionsDir })
+      appendRequestEvent(connId, { op: 'launch', key: taskA, kind: 'shell', notifies: true, request: reqAlice, also: [] }, { dir: connectionsDir })
+
+      writeTurnMarker(connId, { startedAt: t0, remoteTurn: true, otherWake: true, held: true }, connectionsDir)
+      recordOwnedLaunch(connId, { id: taskA, kind: 'command', label: 'Alice task-17' }, { dir: connectionsDir, now: t0 + 100 })
+      recordTurnWake(connId, { type: 'check_job', check_job_id: jobId }, connectionsDir, t0 + 1000)
+      setCurrentRequest(connId, UNSTATED, { dir: connectionsDir })
+      recordCheckJobRuled(connId, connectionsDir, { jobId, now: t0 + 1500 })
+
+      // Another conversation (convB) finishes its own task-17!
+      const foreignStep = {
+        step_index: 1,
+        source: 'SYSTEM',
+        type: 'SYSTEM_MESSAGE',
+        created_at: new Date(t0 + 2000).toISOString(),
+        content: otherLogNotif,
+      }
+      fs.writeFileSync(transcriptPath, `${JSON.stringify(foreignStep)}\n`)
+
+      const marker = readTurnMarker(connId, connectionsDir)
+      const reconciled = reconcileCompletedOwnedWork(connId, marker, transcriptPath, connectionsDir, {
+        conversationId: convA,
+      })
+      assert.deepEqual(reconciled.endedOwnedIds, [], 'foreign conversation task-17 must not mark convA task-17 ended')
+      assert.deepEqual(readOwnedIds(connId, marker, connectionsDir), [taskA], 'convA task-17 must remain running')
+
+      const res = restoreHeldParentIfResumed(connId, marker, {
+        dir: connectionsDir,
+        reconciled,
+        latestStep: foreignStep,
+        conversationId: convA,
+        now: t0 + 2100,
+      })
+      assert.equal(res.restored, false, 'foreign conversation task-17 must never restore convA parked parent')
+      const state = readRequestState(connId, { dir: connectionsDir })
+      assert.equal(state.current, null, 'unrelated parent request must remain unstated when foreign task-17 completes')
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
+    }
+  })
 })
 

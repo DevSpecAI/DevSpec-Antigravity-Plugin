@@ -272,11 +272,13 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
           recordPauseActivity(connectionId, connectionsDir, now)
         } else {
           const pauseDoneMs = Math.max(...pauseCompletedAt)
+          const effectiveConvId = conversationId || state?.local_id || null
           const reconciled = reconcileCompletedOwnedWork(
             connectionId,
             existingMarker,
             effectiveTranscriptPath,
             connectionsDir,
+            { conversationId: effectiveConvId },
           )
           const resumedToolStepMs = findLatestToolCallStepMs(effectiveTranscriptPath, toolName, {
             afterMs:
@@ -292,6 +294,7 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
             const res = restoreHeldParentIfResumed(connectionId, existingMarker, {
               dir: connectionsDir,
               reconciled,
+              conversationId: effectiveConvId,
               now,
               excludeUpToMs: resumedToolStepMs !== null ? resumedToolStepMs - 1 : null,
             })

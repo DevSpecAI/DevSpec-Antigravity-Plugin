@@ -197,13 +197,16 @@ function maybeRestoreSettledPauseBeforeTool(
   if (pauseCompletedAt.length === 0) return
 
   const connState = readStateFile(connectionId, connDir)
+  const effectiveConvId = conversationId || connState?.local_id || null
   const transcriptPath =
     parseTranscriptPath(JSON.stringify(input)) ||
     connState?.transcript_path ||
-    inferAntigravityTranscriptPath(conversationId || connState?.local_id) ||
+    inferAntigravityTranscriptPath(effectiveConvId) ||
     null
   const reconciled = transcriptPath
-    ? reconcileCompletedOwnedWork(connectionId, marker, transcriptPath, connDir)
+    ? reconcileCompletedOwnedWork(connectionId, marker, transcriptPath, connDir, {
+        conversationId: effectiveConvId,
+      })
     : null
   const pauseDoneMs = Math.max(...pauseCompletedAt)
   if (now < pauseDoneMs) return
@@ -222,6 +225,7 @@ function maybeRestoreSettledPauseBeforeTool(
   restoreHeldParentIfResumed(connectionId, marker, {
     dir: connDir,
     reconciled,
+    conversationId: effectiveConvId,
     now,
     excludeUpToMs,
   })
