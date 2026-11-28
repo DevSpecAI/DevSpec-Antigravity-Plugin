@@ -32,6 +32,7 @@ import { launchGuard, resolveOwnConnectionId } from './launch-guard.mjs'
 import {
   currentTurnStampNoticeIds,
   extractAntigravityTrailFromTranscript,
+  findLatestToolCallStepMs,
   hasPendingTellPersonObligation,
   isRemotePlumbingToolCall,
   parseTranscriptPath,
@@ -206,11 +207,23 @@ function maybeRestoreSettledPauseBeforeTool(
     : null
   const pauseDoneMs = Math.max(...pauseCompletedAt)
   if (now < pauseDoneMs) return
+  const resumedToolStepMs = transcriptPath
+    ? findLatestToolCallStepMs(transcriptPath, rawToolName, { afterMs: pauseDoneMs + 1 })
+    : null
+  // Extend the pause exclusion window up to the start of the resumed tool call
+  // (resumedToolStepMs - 1, or now - 1 when the step is not yet in the transcript),
+  // never cutting it short at pauseDoneMs, so terminal-only check summary text
+  // written between check settlement and the resumed tool call is excluded from
+  // Stop fallback (decisions 02f4ce2b & a2d9f38f).
+  const excludeUpToMs =
+    resumedToolStepMs !== null
+      ? Math.max(pauseDoneMs, resumedToolStepMs - 1)
+      : Math.max(pauseDoneMs, now - 1)
   restoreHeldParentIfResumed(connectionId, marker, {
     dir: connDir,
     reconciled,
     now,
-    excludeUpToMs: pauseDoneMs,
+    excludeUpToMs,
   })
 }
 

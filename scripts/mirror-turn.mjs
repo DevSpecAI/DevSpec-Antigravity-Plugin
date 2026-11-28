@@ -1229,9 +1229,18 @@ export function readOwnedIds(
   return ids
 }
 
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function hasBoundedIdToken(text, token) {
+  const re = new RegExp(`(?<![A-Za-z0-9_:-])${escapeRegex(token)}(?![A-Za-z0-9_:-])`)
+  return re.test(text)
+}
+
 function stepMatchesOwnedId(stepContent, id) {
   if (typeof stepContent !== 'string' || typeof id !== 'string' || !id) return false
-  if (stepContent.includes(id)) return true
+  if (hasBoundedIdToken(stepContent, id)) return true
   const slashIdx = id.lastIndexOf('/')
   if (slashIdx > 0) {
     const shortId = id.slice(slashIdx + 1)
@@ -1239,7 +1248,7 @@ function stepMatchesOwnedId(stepContent, id) {
       shortId &&
       (stepContent.includes(`"${shortId}"`) ||
         stepContent.includes(`/${shortId}.log`) ||
-        stepContent.includes(`/${shortId}`))
+        new RegExp(`/${escapeRegex(shortId)}(?![A-Za-z0-9_:-])`).test(stepContent))
     ) {
       return true
     }
