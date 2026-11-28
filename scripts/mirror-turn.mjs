@@ -189,14 +189,6 @@ function snapshotHeldParent(marker, { connectionId = null, dir = CONNECTIONS_DIR
   if (!marker) return null
   if (marker.heldParent && typeof marker.heldParent === 'object') return marker.heldParent
   const ownedIds = connectionId ? readOwnedIds(connectionId, marker, dir) : []
-  let requestRef = null
-  if (connectionId) {
-    try {
-      requestRef = requestRefForWrite(readRequestState(connectionId, { dir }))
-    } catch {
-      requestRef = null
-    }
-  }
   return {
     remoteTurn: Boolean(marker.remoteTurn),
     localPromptMirrored: Boolean(marker.localPromptMirrored),
@@ -204,7 +196,6 @@ function snapshotHeldParent(marker, { connectionId = null, dir = CONNECTIONS_DIR
     otherWake: Boolean(marker.otherWake),
     backgroundContinuation: Boolean(marker.backgroundContinuation),
     ...(ownedIds.length > 0 ? { ownedIds } : {}),
-    ...(requestRef ? { requestRef } : {}),
   }
 }
 
@@ -406,9 +397,9 @@ export function restoreHeldParentIfResumed(
   }
 
   // Never clear an active needs_person notice or undelivered tell_person pause
-  // mid-turn before EVERY needs_person notice in the pause has been replied to
-  // (or tell-person delivered), or notice work and findings could leak into the
-  // command trail / final answer (decisions 02f4ce2b & a2d9f38f).
+  // mid-turn before EVERY needs_person notice in the pause has had an ACCEPTED
+  // notice reply from the server (or tell-person delivered), so a refused post
+  // never clears a notice that still needs attention (decisions 02f4ce2b & a2d9f38f).
   const repliedNoticeSet = new Set(
     (Array.isArray(marker.repliedNoticeIds) ? marker.repliedNoticeIds : [])
       .map((id) => String(id).toLowerCase())
@@ -420,12 +411,12 @@ export function restoreHeldParentIfResumed(
   const hasPendingNeedsPersonNotice =
     Array.isArray(marker.noticeIds) &&
     marker.noticeIds.length > 0 &&
-    (pendingNeedsPersonIds.length > 0 || !marker.noticeReplyAt)
+    (pendingNeedsPersonIds.length > 0 || !marker.acceptedNoticeReplyAt)
   if (hasPendingNeedsPersonNotice) {
     return { restored: false, marker }
   }
   const hasPendingTellPerson =
-    Boolean(marker.tellPerson) && !marker.personToldAt && !marker.noticeReplyAt
+    Boolean(marker.tellPerson) && !marker.personToldAt && !marker.acceptedNoticeReplyAt
   if (hasPendingTellPerson) {
     return { restored: false, marker }
   }
@@ -571,6 +562,7 @@ export function restoreHeldParentIfResumed(
       excludedRanges: nextExcludedRanges,
       tellPerson: false,
       noticeReplyAt: null,
+      acceptedNoticeReplyAt: null,
       repliedNoticeIds: [],
       personToldAt: null,
       preserveExplicitReply: true,
@@ -679,23 +671,10 @@ export function restoreHeldParentIfResumed(
         }
       }
       if (!restoredFromNotification) {
-        // Only fall back to parent.requestRef when NO other still-running parked
-        // launch exists and NO parked launch had a tracked launch entry, so a
-        // completed untagged launch never borrows another launch's requester.
-        const allParkedEnded =
-          parentOwnedIds.length === 0 ||
-          parentOwnedIds.every((id) => endedParentIds.includes(id))
-        const anyParkedHasLaunch = parentOwnedIds.some((id) => reqState.launches.has(id))
-        if (
-          allParkedEnded &&
-          !anyParkedHasLaunch &&
-          parent.requestRef &&
-          (reqState.open.has(parent.requestRef) || parent.requestRef === 'none')
-        ) {
-          setCurrentRequest(connectionId, parent.requestRef, { dir })
-        } else {
-          setCurrentRequest(connectionId, UNSTATED, { dir })
-        }
+        // Never infer requester attribution from whichever request was current
+        // when the pause began: an untracked launch without a request record
+        // must leave attribution unknown (decision ce71a72b).
+        setCurrentRequest(connectionId, UNSTATED, { dir })
       }
     }
   } catch {
@@ -761,7 +740,7 @@ export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR, now =
         remoteTurn: true,
         ...merged,
         ...(resetRuled ? { checkJobRuled: false, checkJobRuledAt: null } : {}),
-        ...(hasUnrepliedNotice ? { noticeReplyAt: null } : {}),
+        ...(hasUnrepliedNotice ? { noticeReplyAt: null, acceptedNoticeReplyAt: null } : {}),
         lastPauseActivityAt: Math.max(
           typeof existing.lastPauseActivityAt === 'number' ? existing.lastPauseActivityAt : 0,
           now,
@@ -795,6 +774,7 @@ export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR, now =
           excludedRanges: normalizeExcludedRanges(existing.excludedRanges),
           tellPerson: false,
           noticeReplyAt: null,
+          acceptedNoticeReplyAt: null,
           repliedNoticeIds: [],
           personToldAt: null,
           preserveExplicitReply: true,
@@ -900,12 +880,23 @@ export function isCurrentTurnCheckJobOnly(
 }
 
 /**
- * Note on the turn marker that a reply to its notices went out (for the Stop fallback
- * and mid-wait pause completion tracking). Tracks the exact notice ids answered so a
- * later needs-a-person notice arriving in the same pause is never treated as already
- * answered (decision 02f4ce2b).
+ * Note on the turn marker that the agent initiated a reply to its notices (for
+ * the Stop fallback). Mid-wait pause restoration waits for `recordNoticeReplyAccepted`
+ * in PostToolUse so a server-refused post never clears a pending notice (decision 02f4ce2b).
  */
-export function recordNoticeReply(
+export function recordNoticeReply(connectionId, dir = CONNECTIONS_DIR, now = Date.now()) {
+  if (!connectionId || !readTurnMarker(connectionId, dir)) return false
+  writeTurnMarker(connectionId, { noticeReplyAt: now, preserveExplicitReply: true }, dir)
+  return true
+}
+
+/**
+ * Record in PostToolUse that DevSpec ACCEPTED a notice reply (`post_session_message`
+ * with `system_notice_ids`), tracking the exact notice ids answered so a refused post
+ * or a later needs-a-person notice in the same pause is never cleared prematurely
+ * (decision 02f4ce2b).
+ */
+export function recordNoticeReplyAccepted(
   connectionId,
   dir = CONNECTIONS_DIR,
   now = Date.now(),
@@ -916,15 +907,21 @@ export function recordNoticeReply(
   const prevReplied = Array.isArray(existing.repliedNoticeIds)
     ? existing.repliedNoticeIds.map((id) => String(id).toLowerCase()).filter(Boolean)
     : []
-  const newlyReplied = Array.isArray(noticeIds) && noticeIds.length > 0
-    ? noticeIds.map((id) => String(id).toLowerCase()).filter(Boolean)
-    : (Array.isArray(existing.noticeIds) ? existing.noticeIds : [])
-        .map((id) => String(id).toLowerCase())
-        .filter(Boolean)
+  const newlyReplied =
+    Array.isArray(noticeIds) && noticeIds.length > 0
+      ? noticeIds.map((id) => String(id).toLowerCase()).filter(Boolean)
+      : (Array.isArray(existing.noticeIds) ? existing.noticeIds : [])
+          .map((id) => String(id).toLowerCase())
+          .filter(Boolean)
   const repliedNoticeIds = [...new Set([...prevReplied, ...newlyReplied])]
   writeTurnMarker(
     connectionId,
-    { noticeReplyAt: now, repliedNoticeIds, preserveExplicitReply: true },
+    {
+      noticeReplyAt: now,
+      acceptedNoticeReplyAt: now,
+      repliedNoticeIds,
+      preserveExplicitReply: true,
+    },
     dir,
   )
   return true
@@ -3554,7 +3551,9 @@ export async function handleMirrorTurn(
             repliedNoticeIds: midWaitReplied,
             checkJobRuled: midWaitKeepRuled,
             checkJobRuledAt: midWaitKeepRuled ? existingMarker?.checkJobRuledAt ?? null : null,
-            ...(midWaitHasUnrepliedNotice ? { noticeReplyAt: null } : {}),
+            ...(midWaitHasUnrepliedNotice
+              ? { noticeReplyAt: null, acceptedNoticeReplyAt: null }
+              : {}),
             lastPauseActivityAt: Date.now(),
             pauseStartedAt:
               typeof existingMarker?.pauseStartedAt === 'number'

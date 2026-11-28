@@ -2857,33 +2857,52 @@ describe('Antigravity native hook payload & transcript handling', () => {
     }
   })
 
-  it('does not treat a reply to notice 1 as covering a later needs_person notice 2 in the same pause (02f4ce2b)', async () => {
+  it('does not treat a refused reply or a reply to notice 1 as covering an unanswered needs_person notice in the same pause (02f4ce2b)', async () => {
     const { appendRequestEvent, setCurrentRequest, UNSTATED } = await import('./requests.mjs')
+    const { runPostToolDispatch } = await import('./post-tool-dispatch.mjs')
     const {
       currentTurnReplyNoticeIds,
       recordNoticeReply,
+      recordNoticeReplyAccepted,
       recordOwnedEnd,
       recordOwnedLaunch,
       recordTurnWake,
       restoreHeldParentIfResumed,
     } = await import('./mirror-turn.mjs')
 
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-second-notice-'))
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-second-notice-'))
     try {
+      const tmpDir = path.join(tmpHome, '.devspec', 'remote-control', 'connections')
+      fs.mkdirSync(tmpDir, { recursive: true })
       const connId = '972c8895-0000-4000-8000-000000000121'
+      const sessId = '972c8895-0000-4000-8000-000000000120'
       const reqId = '972c8895-0000-4000-8000-000000000122'
       const notice1 = '972c8895-0000-4000-8000-000000000123'
       const notice2 = '972c8895-0000-4000-8000-000000000124'
-      const taskId = 'conv-second-notice/task-1'
+      const convId = 'conv-second-notice'
+      const taskId = `${convId}/task-1`
       const t0 = Date.now() - 10_000
 
+      fs.writeFileSync(
+        path.join(tmpDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          session_id: sessId,
+          agent_name: 'Antigravity',
+          local_id: convId,
+          mcp_url: 'https://example.invalid/api/mcp',
+          token: 'test-token',
+          connection_capability: 'dvsc_test',
+        }),
+      )
       appendRequestEvent(connId, { op: 'open', id: reqId, kind: 'command' }, { dir: tmpDir })
       setCurrentRequest(connId, reqId, { dir: tmpDir })
       appendRequestEvent(connId, { op: 'launch', key: taskId, kind: 'shell', notifies: true, request: reqId, also: [] }, { dir: tmpDir })
       writeTurnMarker(connId, { startedAt: t0, remoteTurn: true, otherWake: true, held: true }, tmpDir)
       recordOwnedLaunch(connId, { id: taskId, kind: 'command', label: 'Build' }, { dir: tmpDir, now: t0 + 100 })
 
-      // Notice 1 arrives and is replied to.
+      // Notice 1 arrives; parent ends; PreToolUse marks noticeReplyAt, then server REFUSES the post!
       recordTurnWake(
         connId,
         {
@@ -2895,9 +2914,41 @@ describe('Antigravity native hook payload & transcript handling', () => {
         t0 + 1000,
       )
       setCurrentRequest(connId, UNSTATED, { dir: tmpDir })
-      recordNoticeReply(connId, tmpDir, t0 + 1500, { noticeIds: [notice1] })
+      recordOwnedEnd(connId, taskId, { dir: tmpDir, now: t0 + 1200 })
+      recordNoticeReply(connId, tmpDir, t0 + 1300)
+      await runPostToolDispatch(
+        JSON.stringify({
+          conversationId: convId,
+          tool_name: 'call_mcp_tool',
+          tool_input: {
+            ServerName: 'devspec_devspec',
+            ToolName: 'post_session_message',
+            Arguments: { message: 'Notice 1 reply', system_notice_ids: [notice1] },
+          },
+          tool_response: { isError: true, error: 'Refused by server' },
+        }),
+        { home: tmpHome, env: {}, call: async () => ({ ok: true }) },
+      )
+      const afterRefused = restoreHeldParentIfResumed(connId, readTurnMarker(connId, tmpDir), {
+        dir: tmpDir,
+        now: t0 + 1400,
+      })
+      assert.equal(afterRefused.restored, false)
 
-      // Notice 2 arrives in the same pause; parent task ends — MUST NOT restore until notice 2 is answered!
+      // Now server ACCEPTS notice 1's reply via PostToolUse, then notice 2 arrives in the same pause:
+      await runPostToolDispatch(
+        JSON.stringify({
+          conversationId: convId,
+          tool_name: 'call_mcp_tool',
+          tool_input: {
+            ServerName: 'devspec_devspec',
+            ToolName: 'post_session_message',
+            Arguments: { message: 'Notice 1 reply', system_notice_ids: [notice1] },
+          },
+          tool_response: { content: [{ type: 'text', text: JSON.stringify({ ok: true, id: 'msg-1' }) }] },
+        }),
+        { home: tmpHome, env: {}, call: async () => ({ ok: true }) },
+      )
       recordTurnWake(
         connId,
         {
@@ -2908,7 +2959,6 @@ describe('Antigravity native hook payload & transcript handling', () => {
         tmpDir,
         t0 + 2000,
       )
-      recordOwnedEnd(connId, taskId, { dir: tmpDir, now: t0 + 2500 })
 
       const beforeSecondReply = restoreHeldParentIfResumed(connId, readTurnMarker(connId, tmpDir), {
         dir: tmpDir,
@@ -2917,15 +2967,15 @@ describe('Antigravity native hook payload & transcript handling', () => {
       assert.equal(beforeSecondReply.restored, false)
       assert.deepEqual(currentTurnReplyNoticeIds(connId, { dir: tmpDir }), [notice1, notice2])
 
-      // Once notice 2 is also replied to, restoration succeeds!
-      recordNoticeReply(connId, tmpDir, t0 + 3500, { noticeIds: [notice2] })
+      // Once notice 2 is also accepted, restoration succeeds!
+      recordNoticeReplyAccepted(connId, tmpDir, t0 + 3500, { noticeIds: [notice2] })
       const afterSecondReply = restoreHeldParentIfResumed(connId, readTurnMarker(connId, tmpDir), {
         dir: tmpDir,
         now: t0 + 4000,
       })
       assert.equal(afterSecondReply.restored, true)
     } finally {
-      fs.rmSync(tmpDir, { recursive: true, force: true })
+      fs.rmSync(tmpHome, { recursive: true, force: true })
     }
   })
 
@@ -3043,6 +3093,146 @@ describe('Antigravity native hook payload & transcript handling', () => {
       })
       assert.equal(res.restored, true)
       assert.equal(requestRefForWrite(readRequestState(connId, { dir: tmpDir })), reqId)
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('excludes pause steps from explicit post_session_message work_trail attached by PreToolUse (02f4ce2b, a2d9f38f)', async () => {
+    const { prepareDevspecToolInput } = await import('./devspec-tool-input.mjs')
+    const { writeLocalBond } = await import('./remote-control-state.mjs')
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-explicit-trail-exclude-'))
+    try {
+      const rcDir = path.join(tmpHome, '.devspec', 'remote-control')
+      const connDir = path.join(rcDir, 'connections')
+      fs.mkdirSync(connDir, { recursive: true })
+      const connId = '972c8895-0000-4000-8000-000000000151'
+      const sessId = '972c8895-0000-4000-8000-000000000152'
+      const convId = 'conv-explicit-trail'
+      const transcriptPath = path.join(tmpHome, 'transcript.jsonl')
+      const t0 = Date.now() - 20_000
+
+      writeLocalBond(convId, { connection_id: connId }, rcDir)
+      fs.writeFileSync(
+        path.join(connDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          session_id: sessId,
+          agent_name: 'Antigravity',
+          local_id: convId,
+          transcript_path: transcriptPath,
+          mcp_url: 'https://example.invalid/api/mcp',
+          token: 'test-token',
+        }),
+      )
+      writeTurnMarker(
+        connId,
+        {
+          startedAt: t0,
+          remoteTurn: true,
+          otherWake: true,
+          excludedRanges: [{ startMs: t0 + 2000, endMs: t0 + 5000 }],
+        },
+        connDir,
+      )
+      fs.writeFileSync(
+        transcriptPath,
+        [
+          {
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            created_at: new Date(t0 + 1000).toISOString(),
+            tool_calls: [{ name: 'read_file', args: { Path: '/tmp/command-before.ts' } }],
+          },
+          {
+            step_index: 2,
+            type: 'PLANNER_RESPONSE',
+            created_at: new Date(t0 + 3000).toISOString(),
+            tool_calls: [{ name: 'read_file', args: { Path: '/tmp/quiet-check-helper.ts' } }],
+          },
+          {
+            step_index: 3,
+            type: 'PLANNER_RESPONSE',
+            created_at: new Date(t0 + 6000).toISOString(),
+            tool_calls: [{ name: 'edit_file', args: { Path: '/tmp/command-after.ts' } }],
+          },
+        ]
+          .map((s) => JSON.stringify(s))
+          .join('\n') + '\n',
+      )
+
+      const out = prepareDevspecToolInput(
+        {
+          conversationId: convId,
+          transcriptPath,
+          tool_name: 'call_mcp_tool',
+          tool_input: {
+            ServerName: 'devspec_devspec',
+            ToolName: 'post_session_message',
+            Arguments: { message: 'All done!', complete_turn: true },
+          },
+        },
+        { home: tmpHome, env: {} },
+      )
+      const args = out?.hookSpecificOutput?.updatedInput?.Arguments
+      assert.ok(args?.work_trail, 'expected explicit reply to attach work_trail')
+      assert.ok(String(args.work_trail).includes('command-before.ts'))
+      assert.ok(String(args.work_trail).includes('command-after.ts'))
+      assert.equal(String(args.work_trail).includes('quiet-check-helper.ts'), false)
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
+    }
+  })
+
+  it('leaves attribution unknown when the only parked launch completes without a request record (ce71a72b)', async () => {
+    const {
+      appendRequestEvent,
+      readRequestState,
+      requestRefForWrite,
+      setCurrentRequest,
+      UNSTATED,
+    } = await import('./requests.mjs')
+    const {
+      recordOwnedEnd,
+      recordOwnedLaunch,
+      recordTurnWake,
+      restoreHeldParentIfResumed,
+    } = await import('./mirror-turn.mjs')
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-single-untracked-'))
+    try {
+      const connId = '972c8895-0000-4000-8000-000000000161'
+      const reqId = '972c8895-0000-4000-8000-000000000162'
+      const noticeId = '972c8895-0000-4000-8000-000000000163'
+      const untrackedTask = 'conv-single/task-untracked'
+      const t0 = Date.now() - 10_000
+
+      // reqId was open/current when pause began, but untrackedTask has NO launch record!
+      appendRequestEvent(connId, { op: 'open', id: reqId, kind: 'command' }, { dir: tmpDir })
+      setCurrentRequest(connId, reqId, { dir: tmpDir })
+      writeTurnMarker(connId, { startedAt: t0, remoteTurn: true, otherWake: true, held: true }, tmpDir)
+      recordOwnedLaunch(connId, { id: untrackedTask, kind: 'command', label: 'Untracked' }, { dir: tmpDir, now: t0 + 100 })
+
+      recordTurnWake(
+        connId,
+        {
+          type: 'canonical_system_notices',
+          execute_notice_ids: [noticeId],
+          ingress: { system_notices: [{ notice_id: noticeId, audience: 'for_the_record' }] },
+        },
+        tmpDir,
+        t0 + 1000,
+      )
+      setCurrentRequest(connId, UNSTATED, { dir: tmpDir })
+      recordOwnedEnd(connId, untrackedTask, { dir: tmpDir, now: t0 + 2000 })
+
+      const res = restoreHeldParentIfResumed(connId, readTurnMarker(connId, tmpDir), {
+        dir: tmpDir,
+        now: t0 + 2500,
+      })
+      assert.equal(res.restored, true)
+      assert.equal(requestRefForWrite(readRequestState(connId, { dir: tmpDir })), null)
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true })
     }

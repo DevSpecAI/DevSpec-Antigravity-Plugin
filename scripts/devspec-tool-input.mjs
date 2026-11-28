@@ -301,9 +301,7 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
   if (verb === 'post_session_message' && noticeReply) {
     const targetConnId = next.connection_id || connectionId
     if (targetConnId) {
-      recordNoticeReply(targetConnId, connDir, Date.now(), {
-        noticeIds: Array.isArray(next.system_notice_ids) ? next.system_notice_ids : null,
-      })
+      recordNoticeReply(targetConnId, connDir)
       const telemetry = readConnectionTelemetry(targetConnId, { home })
       if (telemetry) {
         if (!next.agent_stats) next = { ...next, agent_stats: telemetry }
@@ -385,6 +383,7 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
             fs.readFileSync(tPath, 'utf8'),
             {
               sinceMs: turnMarker?.startedAt ?? null,
+              excludedRanges: turnMarker?.excludedRanges ?? [],
               stopAtReply: true,
               transcriptPath: tPath,
             },

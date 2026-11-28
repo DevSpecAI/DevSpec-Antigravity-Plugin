@@ -37,6 +37,7 @@ import {
   reconcileCompletedOwnedWork,
   recordBackgroundLaunch,
   recordCheckJobRuled,
+  recordNoticeReplyAccepted,
   recordOwnedEnd,
   recordPauseActivity,
   recordTellPerson,
@@ -57,7 +58,12 @@ import {
   setCurrentRequest,
   UNSTATED,
 } from './requests.mjs'
-import { isCheckJobRulingSettled, resultCarriesTellPerson } from './notice-reply.mjs'
+import {
+  isCheckJobRulingSettled,
+  isNoticeReplyAccepted,
+  normalizeNoticeIds,
+  resultCarriesTellPerson,
+} from './notice-reply.mjs'
 import { postToolNotice } from './room-unread.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
@@ -142,6 +148,28 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
   const unwrappedDevspec = connectionId ? unwrapDevspecToolCall(toolName, toolInput) : { verb: null, args: {} }
   const devspecVerb = unwrappedDevspec.verb
   const effectiveTranscriptPathForCheck = parseTranscriptPath(raw) || state?.transcript_path || null
+  if (connectionId && devspecVerb === 'post_session_message' && noticeReply) {
+    try {
+      const replyResponse =
+        toolResponse ??
+        resolveAntigravityToolResponse(payload, {
+          transcriptPath: effectiveTranscriptPathForCheck,
+          conversationId: conversationId || state?.local_id || null,
+        })
+      if (isNoticeReplyAccepted(replyResponse)) {
+        const rawIds =
+          unwrappedDevspec.args?.system_notice_ids ?? toolInput?.system_notice_ids ?? null
+        const normalized = normalizeNoticeIds(rawIds)
+        recordNoticeReplyAccepted(connectionId, connectionsDir, now, {
+          noticeIds: Array.isArray(normalized) ? normalized : null,
+        })
+      } else {
+        recordPauseActivity(connectionId, connectionsDir, now)
+      }
+    } catch {
+      /* non-fatal */
+    }
+  }
   if (devspecVerb && (devspecVerb === 'record_check_rulings' || devspecVerb === 'release_check_job')) {
     try {
       const checkResponse =
@@ -212,7 +240,7 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
           existingMarker.checkJobWake && existingMarker.checkJobRuled
             ? existingMarker.checkJobRuledAt
             : null,
-          existingMarker.noticeReplyAt ?? null,
+          existingMarker.acceptedNoticeReplyAt ?? null,
           existingMarker.personToldAt ?? null,
         ].filter((v) => typeof v === 'number' && Number.isFinite(v))
         const hasExplicitPauseCompletion = !hasForTheRecordNotice && pauseCompletedAt.length > 0
