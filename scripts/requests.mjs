@@ -699,77 +699,91 @@ function scriptBasename(rawToken) {
   return parts[parts.length - 1] || ''
 }
 
-function segmentInvokesPlumbingScript(rawTokens, scriptSet, { allowMcpCallVerbs = false, depth = 0 } = {}) {
-  if (!Array.isArray(rawTokens) || rawTokens.length === 0 || depth > 2) return false
-  let i = 0
-  while (i < rawTokens.length) {
-    const tok = rawTokens[i]
-    if (tok === '(' || tok === '{' || tok === '!') {
-      i++
-      continue
-    }
-    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok)) {
-      i++
-      continue
-    }
-    const base = scriptBasename(tok)
-    if (base === 'env' || base === 'nohup' || base === 'exec') {
-      i++
-      while (i < rawTokens.length && (rawTokens[i].startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(rawTokens[i]))) {
+function segmentInvokesPlumbingScript(rawTokens, scriptSet, { allowMcpCallVerbs = false } = {}) {
+  const queue = [{ tokens: rawTokens, sourceLength: Infinity }]
+  while (queue.length > 0) {
+    const { tokens, sourceLength } = queue.shift()
+    if (!Array.isArray(tokens) || tokens.length === 0) continue
+    let i = 0
+    while (i < tokens.length) {
+      const tok = tokens[i]
+      if (tok === '(' || tok === '{' || tok === '!') {
         i++
-      }
-      continue
-    }
-    break
-  }
-  if (i >= rawTokens.length) return false
-
-  const cmd = rawTokens[i]
-  const cmdBase = scriptBasename(cmd).toLowerCase()
-
-  // Unwrap single-level `sh -c "..."` / `bash -c "..."` / `zsh -c "..."`.
-  if (cmdBase === 'sh' || cmdBase === 'bash' || cmdBase === 'zsh') {
-    for (let j = i + 1; j < rawTokens.length - 1; j++) {
-      if (rawTokens[j] === '-c' || /^-[a-z]*c[a-z]*$/.test(rawTokens[j])) {
-        return splitShellCommandSegments(rawTokens[j + 1]).some((seg) =>
-          segmentInvokesPlumbingScript(seg, scriptSet, { allowMcpCallVerbs, depth: depth + 1 }),
-        )
-      }
-    }
-    return false
-  }
-
-  // Direct execution of a plumbing script at command position (e.g. `./scripts/devspec-remote-poll.mjs`).
-  if (scriptSet.has(scriptBasename(cmd))) return true
-
-  // Node invocation (`node ... <script>`). Never match `node --test`, `node -e`, `node --check`, etc.
-  if (cmdBase === 'node' || cmdBase === 'node.exe') {
-    let j = i + 1
-    while (j < rawTokens.length) {
-      const arg = rawTokens[j]
-      if (arg === '--') {
-        j++
-        break
-      }
-      if (NODE_NON_EXEC_FLAGS.has(arg) || arg.startsWith('--test-')) return false
-      if (NODE_VALUE_FLAGS.has(arg)) {
-        j += 2
         continue
       }
-      if (arg.startsWith('-')) {
-        j++
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok)) {
+        i++
+        continue
+      }
+      const base = scriptBasename(tok)
+      if (base === 'env' || base === 'nohup' || base === 'exec') {
+        i++
+        while (i < tokens.length && (tokens[i].startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i]))) {
+          i++
+        }
         continue
       }
       break
     }
-    if (j >= rawTokens.length) return false
-    const targetBase = scriptBasename(rawTokens[j])
-    if (scriptSet.has(targetBase)) return true
-    if (allowMcpCallVerbs && targetBase === 'mcp-call.mjs') {
-      for (let k = j + 1; k < rawTokens.length; k++) {
-        const arg = rawTokens[k]
-        if (arg.startsWith('-')) continue
-        return MCP_PLUMBING_VERBS.has(arg)
+    if (i >= tokens.length) continue
+
+    const cmd = tokens[i]
+    const cmdBase = scriptBasename(cmd).toLowerCase()
+
+    // Unwrap nested `sh -c "..."` / `bash -c "..."` / `zsh -c "..."` wrappers.
+    // Every unwrapped command string is strictly shorter than its enclosing
+    // wrapper, guaranteeing termination without an arbitrary nesting cap.
+    if (cmdBase === 'sh' || cmdBase === 'bash' || cmdBase === 'zsh') {
+      for (let j = i + 1; j < tokens.length - 1; j++) {
+        if (tokens[j] === '-c' || /^-[a-z]*c[a-z]*$/.test(tokens[j])) {
+          const inner = String(tokens[j + 1] || '')
+          if (inner.length < sourceLength) {
+            for (const seg of splitShellCommandSegments(inner)) {
+              queue.push({ tokens: seg, sourceLength: inner.length })
+            }
+          }
+          break
+        }
+      }
+      continue
+    }
+
+    // Direct execution of a plumbing script at command position (e.g. `./scripts/devspec-remote-poll.mjs`).
+    if (scriptSet.has(scriptBasename(cmd))) return true
+
+    // Node invocation (`node ... <script>`). Never match `node --test`, `node -e`, `node --check`, etc.
+    if (cmdBase === 'node' || cmdBase === 'node.exe') {
+      let j = i + 1
+      while (j < tokens.length) {
+        const arg = tokens[j]
+        if (arg === '--') {
+          j++
+          break
+        }
+        if (NODE_NON_EXEC_FLAGS.has(arg) || arg.startsWith('--test-')) {
+          j = tokens.length
+          break
+        }
+        if (NODE_VALUE_FLAGS.has(arg)) {
+          j += 2
+          continue
+        }
+        if (arg.startsWith('-')) {
+          j++
+          continue
+        }
+        break
+      }
+      if (j >= tokens.length) continue
+      const targetBase = scriptBasename(tokens[j])
+      if (scriptSet.has(targetBase)) return true
+      if (allowMcpCallVerbs && targetBase === 'mcp-call.mjs') {
+        for (let k = j + 1; k < tokens.length; k++) {
+          const arg = tokens[k]
+          if (arg.startsWith('-')) continue
+          if (MCP_PLUMBING_VERBS.has(arg)) return true
+          break
+        }
       }
     }
   }
