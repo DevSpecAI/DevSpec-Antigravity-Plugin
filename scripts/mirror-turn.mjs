@@ -39,11 +39,14 @@ import {
   appendRequestEvent,
   closeRequest,
   extractBackgroundCommandTaskId,
+  isRemotePlumbingBackgroundCommand,
+  isRemotePlumbingShellCommand,
   notifiedKeys,
   openRequest,
   promptArrival,
   readRequestState,
   requestForLaunch,
+  requestRefForWrite,
   requestsWithWorkPending,
   rotateRequestLog,
   setCurrentRequest,
@@ -182,16 +185,157 @@ export function writeTurnMarker(connectionId, extra = {}, dir = CONNECTIONS_DIR)
   return payload
 }
 
-function snapshotHeldParent(marker) {
+function snapshotHeldParent(marker, { connectionId = null, dir = CONNECTIONS_DIR } = {}) {
   if (!marker) return null
   if (marker.heldParent && typeof marker.heldParent === 'object') return marker.heldParent
+  const ownedIds = connectionId ? readOwnedIds(connectionId, marker, dir) : []
+  let requestRef = null
+  if (connectionId) {
+    try {
+      requestRef = requestRefForWrite(readRequestState(connectionId, { dir }))
+    } catch {
+      requestRef = null
+    }
+  }
   return {
     remoteTurn: Boolean(marker.remoteTurn),
     localPromptMirrored: Boolean(marker.localPromptMirrored),
     localTurn: marker.localTurn || null,
     otherWake: Boolean(marker.otherWake),
     backgroundContinuation: Boolean(marker.backgroundContinuation),
+    ...(ownedIds.length > 0 ? { ownedIds } : {}),
+    ...(requestRef ? { requestRef } : {}),
   }
+}
+
+/**
+ * Restore a parked parent room task (`marker.heldParent`) and its active request
+ * immediately when any of the parent's owned background tasks completes mid-turn
+ * (or when Stop runs with no remaining outstanding background work), so a mid-wait
+ * DevSpec notice or check job never leaves the resumed room task stuck in silent
+ * notice-only mode (item 972c8895). Standalone notices, check jobs, and automations
+ * have no `heldParent` and are never touched.
+ */
+export function restoreHeldParentIfResumed(
+  connectionId,
+  marker,
+  {
+    dir = CONNECTIONS_DIR,
+    reconciled = null,
+    latestStep = null,
+    forceWhenNoOutstanding = false,
+  } = {},
+) {
+  if (!connectionId || !marker?.heldParent || marker.otherWake) {
+    return { restored: false, marker }
+  }
+  const parent = marker.heldParent
+  const parentOwnedIds = Array.isArray(parent.ownedIds)
+    ? parent.ownedIds.filter((id) => typeof id === 'string' && id)
+    : null
+
+  let matchedParentCompletion = Boolean(forceWhenNoOutstanding)
+  let notificationText = ''
+
+  if (!matchedParentCompletion && Array.isArray(reconciled?.endedOwnedIds) && reconciled.endedOwnedIds.length > 0) {
+    matchedParentCompletion =
+      !parentOwnedIds || parentOwnedIds.length === 0
+        ? true
+        : reconciled.endedOwnedIds.some((id) => parentOwnedIds.includes(id))
+  }
+  if (!matchedParentCompletion && parentOwnedIds && parentOwnedIds.length > 0) {
+    const ownedLines = readOwnedLines(connectionId, marker, dir)
+    if (ownedLines.some((entry) => typeof entry.ended === 'string' && parentOwnedIds.includes(entry.id))) {
+      matchedParentCompletion = true
+    }
+  }
+  if (
+    !matchedParentCompletion &&
+    latestStep?.type === 'SYSTEM_MESSAGE' &&
+    typeof latestStep.content === 'string' &&
+    !latestStep.content.includes('[DevSpec Remote Wake]') &&
+    isBackgroundTaskNotification(latestStep.content)
+  ) {
+    matchedParentCompletion =
+      !parentOwnedIds || parentOwnedIds.length === 0
+        ? true
+        : parentOwnedIds.some((id) => stepMatchesOwnedId(latestStep.content, id))
+    if (matchedParentCompletion) notificationText = latestStep.content
+  }
+  if (!matchedParentCompletion) {
+    return { restored: false, marker }
+  }
+  if (!notificationText && Array.isArray(reconciled?.matchedSystemMessages) && reconciled.matchedSystemMessages.length > 0) {
+    const matchingMsg =
+      parentOwnedIds && parentOwnedIds.length > 0
+        ? reconciled.matchedSystemMessages.find((msg) => parentOwnedIds.some((id) => stepMatchesOwnedId(msg, id)))
+        : reconciled.matchedSystemMessages[reconciled.matchedSystemMessages.length - 1]
+    notificationText = matchingMsg || reconciled.matchedSystemMessages[reconciled.matchedSystemMessages.length - 1] || ''
+  }
+
+  const restoredMarker = writeTurnMarker(
+    connectionId,
+    {
+      held: false,
+      heldParent: null,
+      remoteTurn: Boolean(parent.remoteTurn),
+      localPromptMirrored: Boolean(parent.localPromptMirrored),
+      localTurn: parent.localTurn || null,
+      otherWake: Boolean(parent.otherWake),
+      backgroundContinuation: true,
+      noticeIds: [],
+      recordNoticeIds: [],
+      checkJobWake: false,
+      tellPerson: false,
+      noticeReplyAt: null,
+      personToldAt: null,
+      preserveExplicitReply: true,
+    },
+    dir,
+  )
+
+  try {
+    const reqState = readRequestState(connectionId, { dir })
+    let restoredRequest = false
+    if (notificationText) {
+      const arrival = promptArrival({
+        fromAPerson: false,
+        origin: 'task-notification',
+        text: notificationText,
+        midTurn: false,
+        state: reqState,
+      })
+      const hasCurrent = arrival.events.some((ev) => ev.op === 'current' && ev.ref !== null)
+      if (hasCurrent) {
+        for (const event of arrival.events) {
+          appendRequestEvent(connectionId, event, { dir })
+        }
+        restoredRequest = true
+      }
+    }
+    if (!restoredRequest && parentOwnedIds && parentOwnedIds.length > 0) {
+      for (const id of parentOwnedIds) {
+        const launch = reqState.launches.get(id)
+        if (launch && (reqState.open.has(launch.request) || launch.request === 'none')) {
+          setCurrentRequest(connectionId, launch.request, { dir })
+          for (const extra of launch.also ?? []) {
+            if (reqState.open.has(extra) && extra !== launch.request) {
+              appendRequestEvent(connectionId, { op: 'joined', id: extra }, { dir })
+            }
+          }
+          restoredRequest = true
+          break
+        }
+      }
+    }
+    if (!restoredRequest && parent.requestRef && (reqState.open.has(parent.requestRef) || parent.requestRef === 'none')) {
+      setCurrentRequest(connectionId, parent.requestRef, { dir })
+    }
+  } catch {
+    /* non-fatal */
+  }
+
+  return { restored: true, marker: restoredMarker }
 }
 
 /**
@@ -226,7 +370,7 @@ export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR, now =
         connectionId,
         {
           held: false,
-          heldParent: snapshotHeldParent(existing),
+          heldParent: snapshotHeldParent(existing, { connectionId, dir }),
           remoteTurn: true,
           localPromptMirrored: false,
           localTurn: null,
@@ -566,7 +710,9 @@ export function reconcileCompletedOwnedWork(
   const endedOwned = new Set(
     ownedLines.filter((e) => typeof e.ended === 'string').map((e) => e.id),
   )
+  const newlyEndedOwned = []
   const newlyNotified = new Set()
+  const matchedSystemMessages = []
   let seenPlannerResponse = false
   let pendingPlannerTools = []
 
@@ -638,11 +784,7 @@ export function reconcileCompletedOwnedWork(
         )
         const isDaemon =
           runCommandInput?.IsDaemon === true || runCommandInput?.IsDaemon === 'true'
-        const isPlumbing =
-          isDaemon ||
-          cmdLine.includes('devspec-remote-wait.mjs') ||
-          cmdLine.includes('devspec-remote-listen.mjs') ||
-          cmdLine.includes('devspec-remote-poll.mjs')
+        const isPlumbing = isDaemon || isRemotePlumbingBackgroundCommand(cmdLine)
         if (!isPlumbing) {
           const id = bgId
           const label =
@@ -722,10 +864,13 @@ export function reconcileCompletedOwnedWork(
       continue
     }
     if (step?.type !== 'SYSTEM_MESSAGE' || typeof step.content !== 'string') continue
+    let stepMatched = false
     for (const id of ownedIds) {
       if (!endedOwned.has(id) && stepMatchesOwnedId(step.content, id)) {
         recordOwnedEnd(connectionId, id, { dir })
         endedOwned.add(id)
+        newlyEndedOwned.push(id)
+        stepMatched = true
       }
     }
     const keysInStep = notifiedKeys(step.content)
@@ -736,8 +881,15 @@ export function reconcileCompletedOwnedWork(
       ) {
         appendRequestEvent(connectionId, { op: 'notified', key }, { dir })
         newlyNotified.add(key)
+        stepMatched = true
       }
     }
+    if (stepMatched) matchedSystemMessages.push(step.content)
+  }
+  return {
+    endedOwnedIds: newlyEndedOwned,
+    newlyNotifiedKeys: [...newlyNotified],
+    matchedSystemMessages,
   }
 }
 
@@ -791,11 +943,7 @@ export function launchedAntigravityBackgroundWork(toolName, toolInput, toolRespo
   if (name === 'run_command' || name === 'default_api:run_command') {
     if (input.IsDaemon === true) return null
     const cmdLine = String(input.CommandLine || input.command || '')
-    if (
-      cmdLine.includes('devspec-remote-wait.mjs') ||
-      cmdLine.includes('devspec-remote-listen.mjs') ||
-      cmdLine.includes('devspec-remote-poll.mjs')
-    ) {
+    if (isRemotePlumbingBackgroundCommand(cmdLine)) {
       return null
     }
     const outText =
@@ -839,11 +987,7 @@ export function launchedAntigravityBackgroundWork(toolName, toolInput, toolRespo
   // Claude Code / generic Agent or Bash background task support
   if (name === 'Bash' && (input.run_in_background === true || resp.backgroundTaskId)) {
     const cmdLine = String(input.command || input.CommandLine || '')
-    if (
-      cmdLine.includes('devspec-remote-wait.mjs') ||
-      cmdLine.includes('devspec-remote-listen.mjs') ||
-      cmdLine.includes('devspec-remote-poll.mjs')
-    ) {
+    if (isRemotePlumbingBackgroundCommand(cmdLine)) {
       return null
     }
     const id = resp.backgroundTaskId || resp.task_id || resp.id
@@ -1705,6 +1849,7 @@ export function isSessionReplyToolCall(toolName, args = {}) {
   }
   if (name === 'run_command' || name === 'default_api:run_command' || name === 'Bash') {
     const cmdLine = String(effectiveArgs?.CommandLine || effectiveArgs?.command || '')
+    if (!isRemotePlumbingShellCommand(cmdLine)) return false
     if (cmdLine.includes('post_session_message') && !/phase\s*:\s*['"]trail['"]/.test(cmdLine)) {
       return true
     }
@@ -1739,20 +1884,7 @@ export function isRemotePlumbingToolCall(toolName, args = {}) {
   }
   if (name === 'run_command' || name === 'default_api:run_command' || name === 'Bash') {
     const cmdLine = String(effectiveArgs?.CommandLine || effectiveArgs?.command || '')
-    if (
-      cmdLine.includes('devspec-remote-wait.mjs') ||
-      cmdLine.includes('devspec-remote-listen.mjs') ||
-      cmdLine.includes('devspec-remote-poll.mjs') ||
-      cmdLine.includes('devspec-remote-connect.mjs') ||
-      cmdLine.includes('devspec-remote-stop.mjs') ||
-      cmdLine.includes('devspec-question.mjs') ||
-      cmdLine.includes('devspec-tell-person.mjs') ||
-      cmdLine.includes('remote-control-state.mjs') ||
-      cmdLine.includes('connection-call.mjs') ||
-      cmdLine.includes('post_session_message') ||
-      cmdLine.includes('heartbeat_connection') ||
-      cmdLine.includes('report_complete')
-    ) {
+    if (isRemotePlumbingShellCommand(cmdLine)) {
       return true
     }
   }
@@ -2609,9 +2741,19 @@ export async function handleMirrorTurn(
   // If a `.turn` marker is already live AND the latest transcript step is not a new
   // USER_INPUT (or was already mirrored for this step_index), avoid duplicate
   // local_prompt posts and redundant heartbeats on every tool iteration.
-  const existingMarker = readTurnMarker(connectionId, connectionsDir)
-  reconcileCompletedOwnedWork(connectionId, existingMarker, effectiveTranscriptPath, connectionsDir)
+  const rawExistingMarker = readTurnMarker(connectionId, connectionsDir)
+  const reconciled = reconcileCompletedOwnedWork(
+    connectionId,
+    rawExistingMarker,
+    effectiveTranscriptPath,
+    connectionsDir,
+  )
   const latestStep = extractLatestTranscriptStep(effectiveTranscriptPath)
+  const existingMarker = restoreHeldParentIfResumed(connectionId, rawExistingMarker, {
+    dir: connectionsDir,
+    reconciled,
+    latestStep,
+  }).marker
   const latestStepMs = latestStep?.created_at ? Date.parse(latestStep.created_at) : NaN
   const latestStepIsBeforeMarker =
     Boolean(
@@ -2900,7 +3042,7 @@ export async function handleMirrorTurn(
       const markerExtra = isMidWaitNonCommandWake
         ? {
             held: false,
-            heldParent: snapshotHeldParent(existingMarker),
+            heldParent: snapshotHeldParent(existingMarker, { connectionId, dir: connectionsDir }),
             remoteTurn: true,
             localPromptMirrored: false,
             localTurn: null,
@@ -2942,8 +3084,13 @@ export async function handleMirrorTurn(
       // On Stop: check if this turn launched background work (e.g. subagent, async command,
       // or one-shot timer) that has not yet reported back. If so, hold the turn open instead
       // of closing it.
-      const marker = readTurnMarker(connectionId, connectionsDir)
-      reconcileCompletedOwnedWork(connectionId, marker, effectiveTranscriptPath, connectionsDir)
+      let marker = readTurnMarker(connectionId, connectionsDir)
+      const stopReconciled = reconcileCompletedOwnedWork(
+        connectionId,
+        marker,
+        effectiveTranscriptPath,
+        connectionsDir,
+      )
       const outstandingIds = marker ? readOwnedIds(connectionId, marker, connectionsDir) : []
       if (outstandingIds.length > 0) {
         if (marker?.heldParent) {
@@ -3014,6 +3161,18 @@ export async function handleMirrorTurn(
           connectionsDir,
         )
         return { ok: true, held: true, outstanding: outstandingIds }
+      }
+
+      // If a mid-wait notice parked the parent room task and all owned background work
+      // finished before Stop without an intervening restore, restore the parent now so
+      // Stop does not suppress fallback reply handling because of the earlier notice
+      // (item 972c8895).
+      if (marker?.heldParent && !marker?.otherWake) {
+        marker = restoreHeldParentIfResumed(connectionId, marker, {
+          dir: connectionsDir,
+          reconciled: stopReconciled,
+          forceWhenNoOutstanding: true,
+        }).marker
       }
 
       let hadStreamedTrail = false

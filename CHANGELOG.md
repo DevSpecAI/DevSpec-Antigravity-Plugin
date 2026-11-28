@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.29.10
+
+- **A background notification arriving while your agent is waiting on a command no longer silences the rest of your task.** If your agent was working on a room request, paused to wait on a background command or subagent, and a quiet DevSpec notification woke it in the meantime, finishing that background command mid-turn used to leave the rest of the task stuck in silent notice mode with no live progress updates. The plugin now restores your room task and active request as soon as the waiting work finishes, while keeping standalone notifications, check rulings, and automations quiet as before.
+- **Ordinary background commands that mention plugin script names stay tracked as active work.** Running tests, git commands, or commits whose arguments happen to mention the plugin's remote-control filenames used to be mistaken for internal connection plumbing, causing your agent to show as idle while it was still working. The plugin now excludes only commands that actually run its own remote-control scripts.
+- Update the plugin and start a new `agy` session to pick this up.
+
 ## 0.29.9
 
 - **A message sent to an agent that has just joined or resumed a busy room is picked up within seconds.** While the agent was still loading earlier room history, a new message's nudge could be thrown away by the next page of history, and the agent then slept for up to 45 seconds before noticing it. The plugin now keeps a nudge until a check that actually read the room's latest messages has succeeded. A reply that only carried a question answer, a page of older history, or a reply that could not be applied no longer counts.

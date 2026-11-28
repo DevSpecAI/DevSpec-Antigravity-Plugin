@@ -33,11 +33,13 @@ import {
   parseTranscriptPath,
   readOwnedLines,
   readTurnMarker,
+  reconcileCompletedOwnedWork,
   recordBackgroundLaunch,
   recordOwnedEnd,
   recordTellPerson,
   resolveAntigravityToolResponse,
   resolveHookConversationId,
+  restoreHeldParentIfResumed,
   streamTurnTrailIfChanged,
   syncStateTranscriptPath,
   writeTurnMarker,
@@ -162,8 +164,20 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
     }
   } else if (connectionId && !isRemotePlumbingToolCall(toolName, toolInput)) {
     try {
-      const existingMarker = readTurnMarker(connectionId, connectionsDir)
+      let existingMarker = readTurnMarker(connectionId, connectionsDir)
       const effectiveTranscriptPath = parseTranscriptPath(raw) || state?.transcript_path || null
+      if (existingMarker?.heldParent && !existingMarker?.otherWake && effectiveTranscriptPath) {
+        const reconciled = reconcileCompletedOwnedWork(
+          connectionId,
+          existingMarker,
+          effectiveTranscriptPath,
+          connectionsDir,
+        )
+        existingMarker = restoreHeldParentIfResumed(connectionId, existingMarker, {
+          dir: connectionsDir,
+          reconciled,
+        }).marker
+      }
       const inferred = existingMarker
         ? null
         : inferTurnContextFromTranscript(effectiveTranscriptPath)

@@ -1548,5 +1548,308 @@ describe('Antigravity native hook payload & transcript handling', () => {
       fs.rmSync(tmpHome, { recursive: true, force: true })
     }
   })
+
+  it('matches remote-control plumbing strictly by actual invocation, tracking git/test/commit mentions as owned background work (85ced7c4)', async () => {
+    const {
+      isDevSpecListener,
+      isRemotePlumbingBackgroundCommand,
+      isRemotePlumbingShellCommand,
+      launchForRequest,
+    } = await import('./requests.mjs')
+    const {
+      isRemotePlumbingToolCall,
+      launchedAntigravityBackgroundWork,
+    } = await import('./mirror-turn.mjs')
+
+    // Actual invocations of plugin plumbing scripts remain excluded.
+    const directPlumbing = [
+      'node "/home/user/.gemini/config/plugins/devspec/scripts/devspec-remote-wait.mjs" --pending',
+      'export PATH="/tmp/bin:$PATH" # devspec-git-observer v1\nnode "$HOME/.gemini/config/plugins/devspec/scripts/devspec-remote-listen.mjs" --connection-id abc',
+      'nohup node /opt/devspec/scripts/devspec-remote-poll.mjs --connection-id abc',
+      './scripts/devspec-remote-wait.mjs --from-end',
+      'bash -c "node /opt/devspec/scripts/devspec-remote-poll.mjs"',
+    ]
+    for (const cmd of directPlumbing) {
+      assert.equal(isRemotePlumbingBackgroundCommand(cmd), true, `expected plumbing: ${cmd}`)
+      assert.equal(isDevSpecListener({ CommandLine: cmd }), true, `expected listener: ${cmd}`)
+      assert.equal(isRemotePlumbingToolCall('run_command', { CommandLine: cmd }), true)
+      assert.equal(
+        launchedAntigravityBackgroundWork(
+          'run_command',
+          { CommandLine: cmd },
+          { output: 'Tool is running as a background task with task id: conv-1/task-99' },
+        ),
+        null,
+      )
+      assert.equal(
+        launchForRequest(
+          'run_command',
+          { CommandLine: cmd },
+          { output: 'Tool is running as a background task with task id: conv-1/task-99' },
+        ),
+        null,
+      )
+    }
+
+    // Ordinary shell commands merely mentioning those filenames are NOT plumbing and ARE tracked.
+    const ordinaryMentions = [
+      'git add hooks/scripts/devspec-remote-poll.mjs hooks/scripts/devspec-remote-wait.mjs && git commit -m "Fix devspec-remote-wait.mjs"',
+      'node --test hooks/scripts/devspec-remote-poll.test.mjs scripts/devspec-remote-wait.mjs',
+      'node --check scripts/devspec-remote-listen.mjs',
+      'node -e "console.log(\'devspec-remote-wait.mjs\')"',
+      'grep -n devspec-remote-wait.mjs scripts/mirror-turn.mjs',
+      'git commit -m "Update heartbeat_connection and post_session_message"',
+    ]
+    for (const cmd of ordinaryMentions) {
+      assert.equal(isRemotePlumbingBackgroundCommand(cmd), false, `should not be plumbing: ${cmd}`)
+      assert.equal(isRemotePlumbingShellCommand(cmd), false, `should not be shell plumbing: ${cmd}`)
+      assert.equal(isDevSpecListener({ CommandLine: cmd }), false, `should not be listener: ${cmd}`)
+      assert.equal(isRemotePlumbingToolCall('run_command', { CommandLine: cmd }), false)
+      const bg = launchedAntigravityBackgroundWork(
+        'run_command',
+        { CommandLine: cmd, toolSummary: 'Commit changes' },
+        { output: 'Tool is running as a background task with task id: conv-1/task-521' },
+      )
+      assert.deepEqual(bg, { id: 'conv-1/task-521', kind: 'command', label: 'Commit changes' })
+      const reqLaunch = launchForRequest(
+        'run_command',
+        { CommandLine: cmd },
+        { output: 'Tool is running as a background task with task id: conv-1/task-521' },
+      )
+      assert.deepEqual(reqLaunch, { key: 'conv-1/task-521', alias: null, kind: 'shell', notifies: true })
+    }
+
+    // Direct plugin helper invocations like connect/mcp-call remain filtered in isRemotePlumbingToolCall.
+    assert.equal(
+      isRemotePlumbingShellCommand('PLUGIN_DIR="$HOME/.gemini/config/plugins/devspec"; node "$PLUGIN_DIR/scripts/devspec-remote-connect.mjs" --owner-pid "$PPID"'),
+      true,
+    )
+    assert.equal(
+      isRemotePlumbingShellCommand('node /opt/devspec/scripts/mcp-call.mjs heartbeat_connection "{}"'),
+      true,
+    )
+  })
+
+  it('restores parked room task, active request, trail streaming, and Stop fallback when held background work completes mid-turn after a for_the_record notice (972c8895)', async () => {
+    const {
+      appendRequestEvent,
+      readRequestState,
+      requestRefForWrite,
+      setCurrentRequest,
+      UNSTATED,
+    } = await import('./requests.mjs')
+    const {
+      currentTurnNoticeIds,
+      isCurrentTurnRoutine,
+      recordOwnedLaunch,
+      recordTurnWake,
+      streamTurnTrailIfChanged,
+    } = await import('./mirror-turn.mjs')
+
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-972c8895-'))
+    try {
+      const connectionsDir = path.join(tmpHome, 'connections')
+      const legacyPath = path.join(tmpHome, 'legacy.json')
+      fs.mkdirSync(connectionsDir, { recursive: true })
+      const connId = '972c8895-0000-4000-8000-000000000001'
+      const sessId = '972c8895-0000-4000-8000-000000000002'
+      const reqId = '972c8895-0000-4000-8000-000000000003'
+      const noticeId = '972c8895-0000-4000-8000-000000000004'
+      const convId = 'conv-972c8895'
+      const taskId = `${convId}/task-415`
+      const transcriptPath = path.join(tmpHome, 'transcript.jsonl')
+      const t0 = Date.now() - 10_000
+
+      // 1. Room task opened a request, launched background task-415, and paused (held: true).
+      appendRequestEvent(connId, { op: 'open', id: reqId, kind: 'command' }, { dir: connectionsDir })
+      setCurrentRequest(connId, reqId, { dir: connectionsDir })
+      appendRequestEvent(
+        connId,
+        { op: 'launch', key: taskId, kind: 'shell', notifies: true, request: reqId, also: [] },
+        { dir: connectionsDir },
+      )
+      writeTurnMarker(
+        connId,
+        { startedAt: t0, remoteTurn: true, otherWake: true, held: true },
+        connectionsDir,
+      )
+      recordOwnedLaunch(connId, { id: taskId, kind: 'command', label: 'Run tests' }, { dir: connectionsDir })
+
+      // 2. A quiet for_the_record notice wakes the agent while held: true, parking heldParent and clearing current request.
+      recordTurnWake(
+        connId,
+        {
+          type: 'canonical_system_notices',
+          execute_notice_ids: [noticeId],
+          ingress: {
+            system_notices: [{ notice_id: noticeId, audience: 'for_the_record', topic: 'deploy_failed' }],
+          },
+        },
+        connectionsDir,
+      )
+      setCurrentRequest(connId, UNSTATED, { dir: connectionsDir })
+
+      const parked = readTurnMarker(connId, connectionsDir)
+      assert.equal(parked.held, false)
+      assert.equal(parked.otherWake, false)
+      assert.ok(parked.heldParent)
+      assert.deepEqual(parked.recordNoticeIds, [noticeId])
+      assert.deepEqual(currentTurnNoticeIds(connId, { dir: connectionsDir }), [noticeId])
+      assert.equal(requestRefForWrite(readRequestState(connId, { dir: connectionsDir })), null)
+
+      // 3. Mid-turn (no Stop in between), task-415 finishes and transcript gets its SYSTEM_MESSAGE + a real model step.
+      const steps = [
+        {
+          step_index: 1,
+          source: 'SYSTEM',
+          type: 'SYSTEM_MESSAGE',
+          created_at: new Date(t0 + 4000).toISOString(),
+          content: `[Message] sender=${taskId} content=Task id "${taskId}" finished with result:\nAll tests passed`,
+        },
+        {
+          step_index: 2,
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          created_at: new Date(t0 + 5000).toISOString(),
+          thinking: 'Tests passed; continuing the room task now.',
+          tool_calls: [{ name: 'read_file', args: { Path: '/tmp/app.ts' } }],
+        },
+      ]
+      fs.writeFileSync(transcriptPath, steps.map((s) => JSON.stringify(s)).join('\n') + '\n')
+      fs.writeFileSync(
+        path.join(connectionsDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          session_id: sessId,
+          agent_name: 'Antigravity',
+          local_id: convId,
+          transcript_path: transcriptPath,
+          mcp_url: 'https://example.invalid/api/mcp',
+          token: 'test-token',
+          connection_capability: 'dvsc_test',
+        }),
+      )
+
+      // 4. Mid-turn PreInvocation fires: even though it returns mid_turn_pre_invocation,
+      //    it MUST immediately restore heldParent and the active parent request.
+      const preRes = await handleMirrorTurn(
+        'user_prompt',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        {
+          env: {},
+          connectionsDir,
+          legacyPath,
+          call: async () => ({ ok: true }),
+        },
+      )
+      assert.equal(preRes.skipped, 'mid_turn_pre_invocation')
+
+      const restored = readTurnMarker(connId, connectionsDir)
+      assert.equal(restored.heldParent, null)
+      assert.equal(restored.otherWake, true)
+      assert.deepEqual(restored.recordNoticeIds, [])
+      assert.equal(currentTurnNoticeIds(connId, { dir: connectionsDir }), null)
+      assert.equal(isCurrentTurnRoutine(connId, { dir: connectionsDir }), false)
+      assert.equal(requestRefForWrite(readRequestState(connId, { dir: connectionsDir })), reqId)
+
+      // 5. Live trail streaming now succeeds (not suppressed as 'notice_turn')!
+      const trailCalls = []
+      const trailRes = await streamTurnTrailIfChanged(
+        {
+          connection_id: connId,
+          session_id: sessId,
+          agent_name: 'Antigravity',
+          transcript_path: transcriptPath,
+          mcp_url: 'https://example.invalid/api/mcp',
+          token: 'test-token',
+        },
+        {
+          connectionsDir,
+          call: async (req) => {
+            trailCalls.push(req)
+            return { ok: true }
+          },
+        },
+      )
+      assert.equal(trailRes.skipped, undefined)
+      assert.equal(trailCalls.some((c) => c.name === 'post_session_message' && c.arguments.phase === 'trail'), true)
+
+      // 6. When the resumed room task finishes without calling post_session_message,
+      //    Stop posts the fallback reply instead of suppressing it as a notice turn.
+      steps.push({
+        step_index: 3,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        created_at: new Date(Date.now() + 1000).toISOString(),
+        content: 'All tests passed and the room task is finished.',
+      })
+      fs.writeFileSync(transcriptPath, steps.map((s) => JSON.stringify(s)).join('\n') + '\n')
+      const stopCalls = []
+      await handleMirrorTurn(
+        'stop',
+        JSON.stringify({ conversationId: convId, transcriptPath }),
+        {
+          env: {},
+          connectionsDir,
+          legacyPath,
+          call: async (req) => {
+            stopCalls.push(req)
+            return { ok: true }
+          },
+        },
+      )
+      assert.equal(
+        stopCalls.some(
+          (c) =>
+            c.name === 'post_session_message' &&
+            c.arguments.complete_turn === true &&
+            String(c.arguments.message).includes('All tests passed and the room task is finished.'),
+        ),
+        true,
+      )
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps standalone for_the_record notices and check-job turns silent with no heldParent (972c8895)', async () => {
+    const {
+      currentTurnNoticeIds,
+      isCurrentTurnRoutine,
+      recordTurnWake,
+      restoreHeldParentIfResumed,
+    } = await import('./mirror-turn.mjs')
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-standalone-'))
+    try {
+      const connA = '972c8895-0000-4000-8000-000000000010'
+      const noticeId = '972c8895-0000-4000-8000-000000000011'
+      recordTurnWake(
+        connA,
+        {
+          type: 'canonical_system_notices',
+          execute_notice_ids: [noticeId],
+          ingress: {
+            system_notices: [{ notice_id: noticeId, audience: 'for_the_record' }],
+          },
+        },
+        tmpDir,
+      )
+      const markerA = readTurnMarker(connA, tmpDir)
+      const resA = restoreHeldParentIfResumed(connA, markerA, { dir: tmpDir, forceWhenNoOutstanding: true })
+      assert.equal(resA.restored, false)
+      assert.deepEqual(currentTurnNoticeIds(connA, { dir: tmpDir }), [noticeId])
+      assert.equal(isCurrentTurnRoutine(connA, { dir: tmpDir }), true)
+
+      const connB = '972c8895-0000-4000-8000-000000000012'
+      recordTurnWake(connB, { type: 'check_job', check_job_id: '972c8895-0000-4000-8000-000000000013' }, tmpDir)
+      const markerB = readTurnMarker(connB, tmpDir)
+      const resB = restoreHeldParentIfResumed(connB, markerB, { dir: tmpDir, forceWhenNoOutstanding: true })
+      assert.equal(resB.restored, false)
+      assert.equal(isCurrentTurnRoutine(connB, { dir: tmpDir }), true)
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
 })
 
