@@ -36,6 +36,7 @@ import {
   readTurnMarker,
   reconcileCompletedOwnedWork,
   recordBackgroundLaunch,
+  recordCheckJobRemainingEntries,
   recordCheckJobRuled,
   recordNoticeReplyAccepted,
   recordOwnedEnd,
@@ -197,6 +198,8 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
           toolInput?.job_id ||
           null
         recordCheckJobRuled(devspecTargetConnId, connectionsDir, { jobId, now })
+      } else if (devspecVerb === 'record_check_rulings') {
+        recordCheckJobRemainingEntries(devspecTargetConnId, connectionsDir, { now })
       } else {
         recordPauseActivity(devspecTargetConnId, connectionsDir, now)
       }
@@ -247,63 +250,13 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
     try {
       let existingMarker = readTurnMarker(connectionId, connectionsDir)
       const effectiveTranscriptPath = effectiveTranscriptPathForCheck
-      const isCheckJobVerb =
-        devspecVerb === 'claim_check_job' ||
-        devspecVerb === 'record_check_rulings' ||
-        devspecVerb === 'release_check_job'
       if (existingMarker?.heldParent && !existingMarker?.otherWake) {
-        // Only restore from PostToolUse when the pause has an explicit mechanical
-        // completion signal (settled check job, sent notice reply, or delivered
-        // tell_person), has NO for-the-record notice in the same pause (whose
-        // handling has no mechanical end-of-notice signal and must never leak into
-        // the room's progress trail), AND this non-check tool started after that
-        // completion (decisions 02f4ce2b & a2d9f38f).
-        const hasForTheRecordNotice =
-          Array.isArray(existingMarker.recordNoticeIds) && existingMarker.recordNoticeIds.length > 0
-        const pauseCompletedAt = [
-          existingMarker.checkJobWake && existingMarker.checkJobRuled
-            ? existingMarker.checkJobRuledAt
-            : null,
-          existingMarker.acceptedNoticeReplyAt ?? null,
-          existingMarker.personToldAt ?? null,
-        ].filter((v) => typeof v === 'number' && Number.isFinite(v))
-        const hasExplicitPauseCompletion = !hasForTheRecordNotice && pauseCompletedAt.length > 0
-        if (isCheckJobVerb || !effectiveTranscriptPath || !hasExplicitPauseCompletion) {
-          recordPauseActivity(connectionId, connectionsDir, now)
-        } else {
-          const pauseDoneMs = Math.max(...pauseCompletedAt)
-          const effectiveConvId = conversationId || state?.local_id || null
-          const reconciled = reconcileCompletedOwnedWork(
-            connectionId,
-            existingMarker,
-            effectiveTranscriptPath,
-            connectionsDir,
-            { conversationId: effectiveConvId },
-          )
-          const resumedToolStepMs = findLatestToolCallStepMs(effectiveTranscriptPath, toolName, {
-            afterMs:
-              typeof existingMarker.pauseStartedAt === 'number'
-                ? existingMarker.pauseStartedAt
-                : null,
-          })
-          const toolRanAfterPauseDone =
-            resumedToolStepMs === null ? now >= pauseDoneMs : resumedToolStepMs >= pauseDoneMs
-          if (!toolRanAfterPauseDone) {
-            recordPauseActivity(connectionId, connectionsDir, now)
-          } else {
-            const res = restoreHeldParentIfResumed(connectionId, existingMarker, {
-              dir: connectionsDir,
-              reconciled,
-              conversationId: effectiveConvId,
-              now,
-              excludeUpToMs: resumedToolStepMs !== null ? resumedToolStepMs - 1 : null,
-            })
-            existingMarker = res.marker
-            if (!res.restored) {
-              recordPauseActivity(connectionId, connectionsDir, now)
-            }
-          }
-        }
+        // Keep pause activity in the exclusion window while heldParent is parked.
+        // Never infer from an arbitrary tool call in PostToolUse that the agent has
+        // switched from check/notice follow-up back to the parked parent task: the
+        // agent restores parent context cleanly via PreInvocation (when the parent's
+        // completion step arrives) or `devspec-serve-request.mjs resume` (ce71a72b).
+        recordPauseActivity(connectionId, connectionsDir, now)
       }
       const inferred = existingMarker
         ? null

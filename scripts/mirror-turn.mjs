@@ -292,6 +292,7 @@ export function recordCheckJobRuled(
     {
       settledCheckJobIds: settledJobs,
       checkJobRuled: allSettled,
+      checkJobRemainingEntries: false,
       ...(allSettled ? { checkJobRuledAt: now } : {}),
       lastPauseActivityAt: nextPauseAt,
       preserveExplicitReply: true,
@@ -299,6 +300,35 @@ export function recordCheckJobRuled(
     dir,
   )
   return allSettled
+}
+
+/**
+ * Record that a batched `record_check_rulings` call still has entries remaining
+ * (`settled: false` / `remaining > 0`) so Stop while the parent task is still
+ * waiting will NEVER clear the parked check state prematurely (decision a2d9f38f).
+ */
+export function recordCheckJobRemainingEntries(
+  connectionId,
+  dir = CONNECTIONS_DIR,
+  { now = Date.now() } = {},
+) {
+  const existing = connectionId ? readTurnMarker(connectionId, dir) : null
+  if (!existing) return false
+  const prevPauseAt =
+    typeof existing.lastPauseActivityAt === 'number' && Number.isFinite(existing.lastPauseActivityAt)
+      ? existing.lastPauseActivityAt
+      : 0
+  writeTurnMarker(
+    connectionId,
+    {
+      checkJobRuled: false,
+      checkJobRemainingEntries: true,
+      lastPauseActivityAt: Math.max(prevPauseAt, now),
+      preserveExplicitReply: true,
+    },
+    dir,
+  )
+  return true
 }
 
 /**
@@ -437,9 +467,8 @@ export function restoreHeldParentIfResumed(
 
   // Never clear an active needs_person notice or undelivered tell_person pause
   // mid-turn before EVERY needs_person notice in the pause has had an ACCEPTED
-  // notice reply from the server (or the agent explicitly hands back after
-  // settling a self-fixable notice quietly via `devspec-serve-request.mjs resume`),
-  // so a refused post never clears a notice that still needs attention (02f4ce2b).
+  // notice reply from the server. Even explicit `devspec-serve-request.mjs resume`
+  // must NOT bypass an unanswered needs_person notice (decision 02f4ce2b).
   const repliedNoticeSet = new Set(
     (Array.isArray(marker.repliedNoticeIds) ? marker.repliedNoticeIds : [])
       .map((id) => String(id).toLowerCase())
@@ -452,7 +481,7 @@ export function restoreHeldParentIfResumed(
     Array.isArray(marker.noticeIds) &&
     marker.noticeIds.length > 0 &&
     (pendingNeedsPersonIds.length > 0 || !marker.acceptedNoticeReplyAt)
-  if (hasPendingNeedsPersonNotice && !allowQuietNoticeResume) {
+  if (hasPendingNeedsPersonNotice) {
     return { restored: false, marker }
   }
   if (hasPendingTellPersonObligation(marker)) {
@@ -599,6 +628,7 @@ export function restoreHeldParentIfResumed(
       checkJobIds: [],
       settledCheckJobIds: [],
       checkJobRuled: false,
+      checkJobRemainingEntries: false,
       checkJobRuledAt: null,
       lastPauseActivityAt: null,
       pauseStartedAt: null,
@@ -766,8 +796,6 @@ export function pendingParentResumeHint(
   if (marker.checkJobWake && !marker.checkJobRuled) return null
   if (hasPendingTellPersonObligation(marker)) return null
 
-  const hasForTheRecordNotice =
-    Array.isArray(marker.recordNoticeIds) && marker.recordNoticeIds.length > 0
   const repliedNoticeSet = new Set(
     (Array.isArray(marker.repliedNoticeIds) ? marker.repliedNoticeIds : [])
       .map((id) => String(id).toLowerCase())
@@ -780,7 +808,7 @@ export function pendingParentResumeHint(
     Array.isArray(marker.noticeIds) &&
     marker.noticeIds.length > 0 &&
     (pendingNeedsPersonIds.length > 0 || !marker.acceptedNoticeReplyAt)
-  if (!hasForTheRecordNotice && !hasPendingNeedsPersonNotice) return null
+  if (hasPendingNeedsPersonNotice) return null
 
   let hasEndedParent = false
   if (Array.isArray(reconciled?.endedOwnedDetails)) {
@@ -3937,11 +3965,17 @@ export async function handleMirrorTurn(
             ? parent.ownedIds.filter((id) => typeof id === 'string' && id)
             : []
           const pauseOutstandingIds = outstandingIds.filter((id) => !parentOwnedIds.includes(id))
-          if (pauseOutstandingIds.length > 0) {
+          const pauseHasUnsettledCheckJob = Boolean(
+            marker.checkJobWake &&
+              !marker.checkJobRuled &&
+              (marker.checkJobRemainingEntries === true ||
+                (Array.isArray(marker.checkJobIds) && marker.checkJobIds.length > 1)),
+          )
+          if (pauseOutstandingIds.length > 0 || pauseHasUnsettledCheckJob) {
             // A launch started during the mid-wait pause (such as a fresh check-ruling
-            // helper subagent) is still running: keep the pause context intact until it
-            // finishes rather than dropping checkJobWake/notice context prematurely
-            // (decisions a2d9f38f & c1791ffa).
+            // helper subagent) is still running, OR a batched check job still has
+            // unsettled entries remaining: keep the pause context intact until all
+            // waiting checks are handled (decisions a2d9f38f & c1791ffa).
             writeTurnMarker(
               connectionId,
               {
@@ -3997,7 +4031,12 @@ export async function handleMirrorTurn(
               noticeIds: [],
               recordNoticeIds: [],
               checkJobWake: false,
+              checkJobIds: [],
+              settledCheckJobIds: [],
               checkJobRuled: false,
+              checkJobRemainingEntries: false,
+              checkJobRuledAt: null,
+              lastPauseActivityAt: null,
               pauseStartedAt: null,
               resumedFromPauseAt: pauseEndMs,
               excludedRanges: nextExcludedRanges,

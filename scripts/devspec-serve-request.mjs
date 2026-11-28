@@ -75,6 +75,24 @@ export function resumeParentMain(
       error: 'A waiting DevSpec check job in this pause has not been ruled yet; settle it before resuming the parent task.',
     }
   }
+  const repliedNoticeSet = new Set(
+    (Array.isArray(marker.repliedNoticeIds) ? marker.repliedNoticeIds : [])
+      .map((id) => String(id).toLowerCase())
+      .filter(Boolean),
+  )
+  const pendingNeedsPersonIds = (Array.isArray(marker.noticeIds) ? marker.noticeIds : [])
+    .map((id) => String(id).toLowerCase())
+    .filter((id) => id && !repliedNoticeSet.has(id))
+  if (
+    Array.isArray(marker.noticeIds) &&
+    marker.noticeIds.length > 0 &&
+    (pendingNeedsPersonIds.length > 0 || !marker.acceptedNoticeReplyAt)
+  ) {
+    return {
+      ok: false,
+      error: 'This pause carries an unanswered notice that needs a person; reply to it with post_session_message (including system_notice_ids) before resuming, or end your turn quietly if settled.',
+    }
+  }
   if (hasPendingTellPersonObligation(marker)) {
     return {
       ok: false,

@@ -160,77 +160,6 @@ function readProjectPin(cwd) {
   }
 }
 
-function maybeRestoreSettledPauseBeforeTool(
-  input,
-  rawToolName,
-  rawToolInput,
-  verb,
-  toolInput,
-  { env, home, now },
-) {
-  if (isRemotePlumbingToolCall(rawToolName, rawToolInput)) return
-  if (
-    verb === 'claim_check_job' ||
-    verb === 'record_check_rulings' ||
-    verb === 'release_check_job'
-  ) {
-    return
-  }
-  if (verb === 'post_session_message' && toolInput?.system_notice_ids !== undefined) {
-    return
-  }
-  const conversationId = resolveHookConversationId(input, env)
-  const connectionId = resolveOwnConnectionId(conversationId, { home })
-  if (!connectionId) return
-  const connDir = path.join(home, '.devspec', 'remote-control', 'connections')
-  const marker = readTurnMarker(connectionId, connDir)
-  if (!marker?.heldParent || marker.otherWake) return
-  const hasForTheRecordNotice =
-    Array.isArray(marker.recordNoticeIds) && marker.recordNoticeIds.length > 0
-  if (hasForTheRecordNotice) return
-  if (hasPendingTellPersonObligation(marker)) return
-  const pauseCompletedAt = [
-    marker.checkJobWake && marker.checkJobRuled ? marker.checkJobRuledAt : null,
-    marker.acceptedNoticeReplyAt ?? null,
-    marker.personToldAt ?? null,
-  ].filter((v) => typeof v === 'number' && Number.isFinite(v))
-  if (pauseCompletedAt.length === 0) return
-
-  const connState = readStateFile(connectionId, connDir)
-  const effectiveConvId = conversationId || connState?.local_id || null
-  const transcriptPath =
-    parseTranscriptPath(JSON.stringify(input)) ||
-    connState?.transcript_path ||
-    inferAntigravityTranscriptPath(effectiveConvId) ||
-    null
-  const reconciled = transcriptPath
-    ? reconcileCompletedOwnedWork(connectionId, marker, transcriptPath, connDir, {
-        conversationId: effectiveConvId,
-      })
-    : null
-  const pauseDoneMs = Math.max(...pauseCompletedAt)
-  if (now < pauseDoneMs) return
-  const resumedToolStepMs = transcriptPath
-    ? findLatestToolCallStepMs(transcriptPath, rawToolName, { afterMs: pauseDoneMs + 1 })
-    : null
-  // Extend the pause exclusion window up to the start of the resumed tool call
-  // (resumedToolStepMs - 1, or now - 1 when the step is not yet in the transcript),
-  // never cutting it short at pauseDoneMs, so terminal-only check summary text
-  // written between check settlement and the resumed tool call is excluded from
-  // Stop fallback (decisions 02f4ce2b & a2d9f38f).
-  const excludeUpToMs =
-    resumedToolStepMs !== null
-      ? Math.max(pauseDoneMs, resumedToolStepMs - 1)
-      : Math.max(pauseDoneMs, now - 1)
-  restoreHeldParentIfResumed(connectionId, marker, {
-    dir: connDir,
-    reconciled,
-    conversationId: effectiveConvId,
-    now,
-    excludeUpToMs,
-  })
-}
-
 export function prepareDevspecToolInput(input, { env = process.env, home = os.homedir(), now = Date.now() } = {}) {
   if (!input || typeof input !== 'object') return {}
 
@@ -243,20 +172,6 @@ export function prepareDevspecToolInput(input, { env = process.env, home = os.ho
     argumentsWasString,
     argumentsKey,
   } = unwrapDevspecToolCall(rawToolName, rawToolInput)
-
-  // 0. If a mid-wait check-job or answered-notice pause already settled after a
-  //    parked parent launch completed, restore the parent context and active
-  //    request BEFORE launchGuard and stampRequest so the very first resumed
-  //    DevSpec write or background launch carries the known request (ce71a72b).
-  try {
-    maybeRestoreSettledPauseBeforeTool(input, rawToolName, rawToolInput, verb, toolInput, {
-      env,
-      home,
-      now,
-    })
-  } catch {
-    /* non-fatal */
-  }
 
   // 1. Background launch guard during multi-requester turns
   const guard = launchGuard(input, { home, env })
