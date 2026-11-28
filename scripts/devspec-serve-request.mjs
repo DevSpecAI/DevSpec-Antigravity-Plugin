@@ -8,7 +8,7 @@
  * Usage:
  *   node "./scripts/devspec-serve-request.mjs" [serve] --connection-id <uuid> \
  *     (--message-id <uuid> | --request-id <uuid> | --terminal | --none | --unstated)
- *   node "./scripts/devspec-serve-request.mjs" resume --connection-id <uuid>
+ *   node "./scripts/devspec-serve-request.mjs" resume --connection-id <uuid> [--settled-quietly]
  */
 
 import os from 'node:os'
@@ -46,6 +46,7 @@ export function resumeParentMain(
   const args = argv[0] === 'resume' ? argv.slice(1) : argv
   const at = args.indexOf('--connection-id')
   const connectionId = at >= 0 && typeof args[at + 1] === 'string' ? args[at + 1] : null
+  const settledQuietly = args.includes('--settled-quietly')
   if (!UUID.test(connectionId ?? '')) {
     return { ok: false, error: 'resume needs --connection-id <your connection id>' }
   }
@@ -75,6 +76,21 @@ export function resumeParentMain(
       error: 'A waiting DevSpec check job in this pause has not been ruled yet; settle it before resuming the parent task.',
     }
   }
+  const noticeReplyUnaccepted = Boolean(
+    typeof marker.noticeReplyAt === 'number' &&
+      Number.isFinite(marker.noticeReplyAt) &&
+      !(
+        typeof marker.acceptedNoticeReplyAt === 'number' &&
+        Number.isFinite(marker.acceptedNoticeReplyAt) &&
+        marker.acceptedNoticeReplyAt >= marker.noticeReplyAt
+      ),
+  )
+  if (noticeReplyUnaccepted) {
+    return {
+      ok: false,
+      error: 'A notice reply in this pause has not been accepted by DevSpec yet; resolve the refusal before resuming the parent task.',
+    }
+  }
   const repliedNoticeSet = new Set(
     (Array.isArray(marker.repliedNoticeIds) ? marker.repliedNoticeIds : [])
       .map((id) => String(id).toLowerCase())
@@ -86,11 +102,12 @@ export function resumeParentMain(
   if (
     Array.isArray(marker.noticeIds) &&
     marker.noticeIds.length > 0 &&
-    (pendingNeedsPersonIds.length > 0 || !marker.acceptedNoticeReplyAt)
+    (pendingNeedsPersonIds.length > 0 || !marker.acceptedNoticeReplyAt) &&
+    !settledQuietly
   ) {
     return {
       ok: false,
-      error: 'This pause carries an unanswered notice that needs a person; reply to it with post_session_message (including system_notice_ids) before resuming, or end your turn quietly if settled.',
+      error: 'This pause carries a notice originally labelled as needing a person. If a choice, hold, rejection, or block still needs them, post a notice reply (post_session_message with system_notice_ids) first; if you already settled it quietly and no reply is needed, re-run resume with --settled-quietly.',
     }
   }
   if (hasPendingTellPersonObligation(marker)) {
@@ -105,6 +122,7 @@ export function resumeParentMain(
     conversationId: effectiveConvId,
     now,
     allowQuietNoticeResume: true,
+    settledQuietly,
   })
   if (!res.restored) {
     return {

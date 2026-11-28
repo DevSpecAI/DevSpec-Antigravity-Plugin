@@ -41,6 +41,7 @@ import {
   extractBackgroundCommandTaskId,
   isRemotePlumbingBackgroundCommand,
   isRemotePlumbingShellCommand,
+  NO_REQUEST,
   notifiedKeys,
   openRequest,
   promptArrival,
@@ -429,6 +430,7 @@ export function restoreHeldParentIfResumed(
     excludeUpToMs = null,
     requireParentNotificationStep = false,
     allowQuietNoticeResume = false,
+    settledQuietly = false,
   } = {},
 ) {
   if (!connectionId || !marker?.heldParent || marker.otherWake) {
@@ -466,9 +468,24 @@ export function restoreHeldParentIfResumed(
   }
 
   // Never clear an active needs_person notice or undelivered tell_person pause
-  // mid-turn before EVERY needs_person notice in the pause has had an ACCEPTED
-  // notice reply from the server. Even explicit `devspec-serve-request.mjs resume`
-  // must NOT bypass an unanswered needs_person notice (decision 02f4ce2b).
+  // automatically, and never clear a pause after a notice reply was attempted
+  // and refused by the server (decision 02f4ce2b). When the agent settled a
+  // needs_person notice quietly in place with nobody still needing to decide,
+  // explicit `devspec-serve-request.mjs resume --settled-quietly` confirms that
+  // settlement and restores the parent task without forcing a room reply
+  // (decisions 02f4ce2b & a2d9f38f).
+  const noticeReplyUnaccepted = Boolean(
+    typeof marker.noticeReplyAt === 'number' &&
+      Number.isFinite(marker.noticeReplyAt) &&
+      !(
+        typeof marker.acceptedNoticeReplyAt === 'number' &&
+        Number.isFinite(marker.acceptedNoticeReplyAt) &&
+        marker.acceptedNoticeReplyAt >= marker.noticeReplyAt
+      ),
+  )
+  if (noticeReplyUnaccepted) {
+    return { restored: false, marker }
+  }
   const repliedNoticeSet = new Set(
     (Array.isArray(marker.repliedNoticeIds) ? marker.repliedNoticeIds : [])
       .map((id) => String(id).toLowerCase())
@@ -481,7 +498,7 @@ export function restoreHeldParentIfResumed(
     Array.isArray(marker.noticeIds) &&
     marker.noticeIds.length > 0 &&
     (pendingNeedsPersonIds.length > 0 || !marker.acceptedNoticeReplyAt)
-  if (hasPendingNeedsPersonNotice) {
+  if (hasPendingNeedsPersonNotice && !(allowQuietNoticeResume && settledQuietly)) {
     return { restored: false, marker }
   }
   if (hasPendingTellPersonObligation(marker)) {
@@ -838,6 +855,29 @@ export function parkedParentWriteAmbiguity(
   }
   if (candidateReqs.length === 0) return null
 
+  // Decision ce71a72b: "When DevSpec can't tell who asked, a change is never
+  // refused for it, and nothing is held just for that... when one turn carries
+  // two people's requests, the agent says which." Only deny when 2+ distinct
+  // known (non-unknown) attributions are in play (e.g. two different people's
+  // requests, or room + terminal). When there is at most one possible human
+  // requester alongside an unstated notice/check pause, let the write proceed
+  // with unknown requester attribution without mutating `reqState`.
+  const knownAttributions = new Set()
+  const addKnownAttribution = (ref) => {
+    if (ref === NO_REQUEST) {
+      knownAttributions.add('nobody')
+    } else if (ref && ref !== UNSTATED && reqState.open.has(ref)) {
+      const info = reqState.open.get(ref)
+      knownAttributions.add(
+        `${info.requested_by ?? 'unknown'}:${info.kind === 'typed_prompt' ? 'terminal' : 'room'}`,
+      )
+    }
+  }
+  for (const ref of candidateReqs) addKnownAttribution(ref)
+  addKnownAttribution(reqState.current)
+  for (const ref of reqState.joined) addKnownAttribution(ref)
+  if (knownAttributions.size < 2) return null
+
   // Join the completed parent request(s) onto the request state so `serve --unstated`
   // or `serve --message-id <id>` is valid when the agent disambiguates.
   for (const ref of candidateReqs) {
@@ -849,6 +889,15 @@ export function parkedParentWriteAmbiguity(
   const allOutstanding = readOwnedIds(connectionId, marker, dir)
   const pauseHelperRunning = allOutstanding.some((id) => !parentOwnedIds.includes(id))
   const unsettledCheck = Boolean(marker.checkJobWake && !marker.checkJobRuled)
+  const noticeReplyUnaccepted = Boolean(
+    typeof marker.noticeReplyAt === 'number' &&
+      Number.isFinite(marker.noticeReplyAt) &&
+      !(
+        typeof marker.acceptedNoticeReplyAt === 'number' &&
+        Number.isFinite(marker.acceptedNoticeReplyAt) &&
+        marker.acceptedNoticeReplyAt >= marker.noticeReplyAt
+      ),
+  )
   const repliedNoticeSet = new Set(
     (Array.isArray(marker.repliedNoticeIds) ? marker.repliedNoticeIds : [])
       .map((id) => String(id).toLowerCase())
@@ -862,18 +911,27 @@ export function parkedParentWriteAmbiguity(
   const canResumeNow =
     !pauseHelperRunning &&
     !unsettledCheck &&
-    !pendingNeedsPerson &&
+    !noticeReplyUnaccepted &&
     !hasPendingTellPersonObligation(marker)
 
   const lines = [
-    'A parked room task has completed background work with a known requester while this DevSpec notice/check pause is still active.',
-    'DevSpec cannot tell whether this call is resuming the parked room task or still following up on the pause.',
+    'A parked room task has completed background work carrying multiple distinct requests while this DevSpec notice/check pause is still active.',
+    'Say which request this call serves before retrying.',
   ]
   if (canResumeNow) {
-    lines.push(
-      'If you are resuming the parked room task (which restores its requester and live progress), run:',
-      `  node ${JSON.stringify(scriptPath)} resume --connection-id ${connectionId}`,
-    )
+    if (pendingNeedsPerson) {
+      lines.push(
+        'If you already settled the notice quietly and are resuming the parked room task, run:',
+        `  node ${JSON.stringify(scriptPath)} resume --connection-id ${connectionId} --settled-quietly`,
+        'If the notice still needs a person, reply with post_session_message (including system_notice_ids) first, then run:',
+        `  node ${JSON.stringify(scriptPath)} resume --connection-id ${connectionId}`,
+      )
+    } else {
+      lines.push(
+        'If you are resuming the parked room task (which restores its requester and live progress), run:',
+        `  node ${JSON.stringify(scriptPath)} resume --connection-id ${connectionId}`,
+      )
+    }
   } else {
     lines.push(
       'Finish settling the active check job / notice first before resuming the parked room task.',
@@ -922,6 +980,17 @@ export function pendingParentResumeHint(
   if (marker.checkJobWake && !marker.checkJobRuled) return null
   if (hasPendingTellPersonObligation(marker)) return null
 
+  const noticeReplyUnaccepted = Boolean(
+    typeof marker.noticeReplyAt === 'number' &&
+      Number.isFinite(marker.noticeReplyAt) &&
+      !(
+        typeof marker.acceptedNoticeReplyAt === 'number' &&
+        Number.isFinite(marker.acceptedNoticeReplyAt) &&
+        marker.acceptedNoticeReplyAt >= marker.noticeReplyAt
+      ),
+  )
+  if (noticeReplyUnaccepted) return null
+
   const repliedNoticeSet = new Set(
     (Array.isArray(marker.repliedNoticeIds) ? marker.repliedNoticeIds : [])
       .map((id) => String(id).toLowerCase())
@@ -934,7 +1003,6 @@ export function pendingParentResumeHint(
     Array.isArray(marker.noticeIds) &&
     marker.noticeIds.length > 0 &&
     (pendingNeedsPersonIds.length > 0 || !marker.acceptedNoticeReplyAt)
-  if (hasPendingNeedsPersonNotice) return null
 
   let hasEndedParent = false
   if (Array.isArray(reconciled?.endedOwnedDetails)) {
@@ -969,6 +1037,20 @@ export function pendingParentResumeHint(
       )
   }
   if (!hasEndedParent) return null
+
+  if (hasPendingNeedsPersonNotice) {
+    return {
+      ephemeralMessage: [
+        'Your parked room task has background work that finished while this DevSpec notice pause is open.',
+        'Finish handling the notice first — all notice work stays out of the room while the pause is active.',
+        'If an unresolved choice, hold, rejection, or block still needs the person, post a notice reply (post_session_message with system_notice_ids) and then run:',
+        `  node ${JSON.stringify(scriptPath)} resume --connection-id ${connectionId}`,
+        'If you already settled the notice quietly and no room reply is needed, resume mid-turn with:',
+        `  node ${JSON.stringify(scriptPath)} resume --connection-id ${connectionId} --settled-quietly`,
+        '(Or end your turn quietly if nothing more is needed.)',
+      ].join('\n'),
+    }
+  }
 
   return {
     ephemeralMessage: [
