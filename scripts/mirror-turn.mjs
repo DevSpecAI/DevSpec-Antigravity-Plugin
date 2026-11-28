@@ -3363,15 +3363,17 @@ export async function handleMirrorTurn(
     connectionsDir,
   )
   const latestStep = extractLatestTranscriptStep(effectiveTranscriptPath)
-  const existingMarker =
+  const restoreResult =
     modeArg === 'user_prompt'
       ? restoreHeldParentIfResumed(connectionId, rawExistingMarker, {
           dir: connectionsDir,
           reconciled,
           latestStep,
           requireParentNotificationStep: true,
-        }).marker
-      : rawExistingMarker
+        })
+      : { restored: false, marker: rawExistingMarker }
+  const existingMarker = restoreResult.marker
+  const restoredHeldParentNow = Boolean(restoreResult.restored)
   const latestStepMs = latestStep?.created_at ? Date.parse(latestStep.created_at) : NaN
   const latestStepIsBeforeMarker =
     Boolean(
@@ -3489,7 +3491,7 @@ export async function handleMirrorTurn(
     } catch {
       /* non-fatal */
     }
-  } else if (isBgContinuation && connectionId) {
+  } else if (isBgContinuation && connectionId && !restoredHeldParentNow) {
     try {
       const arrival = promptArrival({
         fromAPerson: false,
@@ -4025,12 +4027,26 @@ export async function handleMirrorTurn(
           typeof marker?.resumedFromPauseAt === 'number' && Number.isFinite(marker.resumedFromPauseAt)
             ? Math.max(marker?.startedAt ?? 0, marker.resumedFromPauseAt)
             : (marker?.startedAt ?? null)
+        const hasPauseExclusion = Boolean(
+          (typeof marker?.resumedFromPauseAt === 'number' && Number.isFinite(marker.resumedFromPauseAt)) ||
+            (Array.isArray(marker?.excludedRanges) && marker.excludedRanges.length > 0),
+        )
+        const hasTranscriptForExclusion = Boolean(
+          hasPauseExclusion && effectiveTranscriptPath && fs.existsSync(effectiveTranscriptPath),
+        )
+        // When the turn resumed from a check/notice pause and the transcript is
+        // available, read the fallback answer strictly through `excludedRanges`
+        // and `replySinceMs` so a Stop hook's `last_assistant_message` carried
+        // over from the check pause can NEVER bypass pause exclusion and post
+        // routine check text to the room (decisions 02f4ce2b & a2d9f38f).
+        const transcriptReply = extractLatestAssistantReplyFromTranscript(effectiveTranscriptPath, {
+          sinceMs: replySinceMs,
+          excludedRanges: marker?.excludedRanges ?? [],
+        })
         const rawStopText =
-          (text ? prepareAgentMirrorText(text) : null) ||
-          extractLatestAssistantReplyFromTranscript(effectiveTranscriptPath, {
-            sinceMs: replySinceMs,
-            excludedRanges: marker?.excludedRanges ?? [],
-          }) ||
+          (hasTranscriptForExclusion
+            ? transcriptReply
+            : (text ? prepareAgentMirrorText(text) : null) || transcriptReply) ||
           (hadStreamedTrail && trail.events.length > 0
             ? `Completed ${trail.events.length} step${trail.events.length === 1 ? '' : 's'}.`
             : null)

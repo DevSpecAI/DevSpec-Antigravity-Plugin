@@ -3891,12 +3891,17 @@ describe('Antigravity native hook payload & transcript handling', () => {
       assert.equal(restored.heldParent, null)
       assert.ok(restored.resumedFromPauseAt >= checkTextAt)
 
-      // Stop fires with no new answer text after the resumed tool call:
-      // MUST NOT post the check-only text "Ruled check job as no conflict." to the room!
+      // Stop fires with no new answer text after the resumed tool call — EVEN WHEN
+      // the Stop hook payload itself supplies the earlier check summary as `last_assistant_message`!
+      // MUST NOT let `last_assistant_message` bypass transcript pause exclusion!
       const stopCalls = []
       await handleMirrorTurn(
         'stop',
-        JSON.stringify({ conversationId: convId, transcriptPath }),
+        JSON.stringify({
+          conversationId: convId,
+          transcriptPath,
+          last_assistant_message: 'Ruled check job as no conflict.',
+        }),
         {
           env: {},
           connectionsDir,
@@ -3908,7 +3913,7 @@ describe('Antigravity native hook payload & transcript handling', () => {
         },
       )
       const roomPosts = stopCalls.filter((c) => c.name === 'post_session_message')
-      assert.equal(roomPosts.length, 0, 'Stop must not post routine check-only text written before resumed tool call')
+      assert.equal(roomPosts.length, 0, 'Stop must not post routine check-only text supplied in last_assistant_message')
     } finally {
       fs.rmSync(tmpHome, { recursive: true, force: true })
     }
@@ -4027,6 +4032,96 @@ describe('Antigravity native hook payload & transcript handling', () => {
       )
       assert.equal(preOut.decision, 'allow')
       assert.equal(preOut?.hookSpecificOutput?.updatedInput?.Arguments?.request_ref, reqBob)
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves multi-requester turnAmbiguity when a prompt-bearing PreInvocation resumes after two different people launches completed in the pause (ce71a72b)', async () => {
+    const {
+      appendRequestEvent,
+      readRequestState,
+      setCurrentRequest,
+      turnAmbiguity,
+      UNSTATED,
+    } = await import('./requests.mjs')
+    const { recordCheckJobRuled, recordOwnedEnd, recordOwnedLaunch, recordTurnWake } =
+      await import('./mirror-turn.mjs')
+
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-prompt-resume-ambiguity-'))
+    try {
+      const connectionsDir = path.join(tmpHome, 'connections')
+      const legacyPath = path.join(tmpHome, 'legacy.json')
+      fs.mkdirSync(connectionsDir, { recursive: true })
+      const connId = '972c8895-0000-4000-8000-000000000241'
+      const sessId = '972c8895-0000-4000-8000-000000000242'
+      const reqAlice = '972c8895-0000-4000-8000-000000000243'
+      const reqBob = '972c8895-0000-4000-8000-000000000244'
+      const jobId = '972c8895-0000-4000-8000-000000000245'
+      const convId = 'conv-prompt-ambiguity'
+      const taskAlice = `${convId}/task-alice`
+      const taskBob = `${convId}/task-bob`
+      const transcriptPath = path.join(tmpHome, 'transcript.jsonl')
+      const t0 = Date.now() - 10_000
+
+      appendRequestEvent(connId, { op: 'open', id: reqAlice, kind: 'command', requested_by: 'alice' }, { dir: connectionsDir })
+      appendRequestEvent(connId, { op: 'open', id: reqBob, kind: 'command', requested_by: 'bob' }, { dir: connectionsDir })
+      setCurrentRequest(connId, reqAlice, { dir: connectionsDir })
+      appendRequestEvent(connId, { op: 'launch', key: taskAlice, kind: 'shell', notifies: true, request: reqAlice, also: [] }, { dir: connectionsDir })
+      appendRequestEvent(connId, { op: 'launch', key: taskBob, kind: 'shell', notifies: true, request: reqBob, also: [] }, { dir: connectionsDir })
+
+      writeTurnMarker(connId, { startedAt: t0, remoteTurn: true, otherWake: true, held: true }, connectionsDir)
+      recordOwnedLaunch(connId, { id: taskAlice, kind: 'command', label: 'Alice task' }, { dir: connectionsDir, now: t0 + 100 })
+      recordOwnedLaunch(connId, { id: taskBob, kind: 'command', label: 'Bob task' }, { dir: connectionsDir, now: t0 + 200 })
+
+      recordTurnWake(connId, { type: 'check_job', check_job_id: jobId }, connectionsDir, t0 + 1000)
+      setCurrentRequest(connId, UNSTATED, { dir: connectionsDir })
+      recordCheckJobRuled(connId, connectionsDir, { jobId, now: t0 + 1500 })
+
+      // Both Alice's and Bob's launches finish; latest notification names ONLY Bob's launch,
+      // AND the hook payload also includes an explicit `prompt` field with Bob's notification!
+      recordOwnedEnd(connId, taskAlice, { dir: connectionsDir, now: t0 + 1800 })
+      const bobNotif = `[Message] sender=${taskBob} content=Task id "${taskBob}" finished with result:\nDone`
+      fs.writeFileSync(
+        transcriptPath,
+        JSON.stringify({
+          step_index: 1,
+          source: 'SYSTEM',
+          type: 'SYSTEM_MESSAGE',
+          created_at: new Date(t0 + 2000).toISOString(),
+          content: bobNotif,
+        }) + '\n',
+      )
+      fs.writeFileSync(
+        path.join(connectionsDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          session_id: sessId,
+          agent_name: 'Antigravity',
+          local_id: convId,
+          transcript_path: transcriptPath,
+          mcp_url: 'https://example.invalid/api/mcp',
+          token: 'test-token',
+          connection_capability: 'dvsc_test',
+        }),
+      )
+
+      await handleMirrorTurn(
+        'user_prompt',
+        JSON.stringify({ conversationId: convId, transcriptPath, prompt: bobNotif }),
+        { env: {}, connectionsDir, legacyPath, call: async () => ({ ok: true }) },
+      )
+
+      const state = readRequestState(connId, { dir: connectionsDir })
+      assert.deepEqual(
+        new Set([state.current, ...state.joined]),
+        new Set([reqAlice, reqBob]),
+        'prompt-bearing resume must preserve BOTH Alice and Bob requests',
+      )
+      const ambiguity = turnAmbiguity(state)
+      assert.ok(Array.isArray(ambiguity) && ambiguity.length === 2)
+      assert.deepEqual(new Set(ambiguity.map((e) => e.id)), new Set([reqAlice, reqBob]))
     } finally {
       fs.rmSync(tmpHome, { recursive: true, force: true })
     }
