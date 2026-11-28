@@ -32,6 +32,7 @@ import { launchGuard, resolveOwnConnectionId } from './launch-guard.mjs'
 import {
   currentTurnStampNoticeIds,
   extractAntigravityTrailFromTranscript,
+  hasPendingTellPersonObligation,
   isRemotePlumbingToolCall,
   parseTranscriptPath,
   readTurnMarker,
@@ -186,6 +187,7 @@ function maybeRestoreSettledPauseBeforeTool(
   const hasForTheRecordNotice =
     Array.isArray(marker.recordNoticeIds) && marker.recordNoticeIds.length > 0
   if (hasForTheRecordNotice) return
+  if (hasPendingTellPersonObligation(marker)) return
   const pauseCompletedAt = [
     marker.checkJobWake && marker.checkJobRuled ? marker.checkJobRuledAt : null,
     marker.acceptedNoticeReplyAt ?? null,

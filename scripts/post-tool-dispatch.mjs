@@ -145,8 +145,19 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
   // A DevSpec write that changed someone else's record says so on its result
   // (`tell_person`, item a868f41f). Noted on the turn, so Stop's silence for a routine
   // turn gives way and PreToolUse leaves the model's own post to the person unstamped.
-  const unwrappedDevspec = connectionId ? unwrapDevspecToolCall(toolName, toolInput) : { verb: null, args: {} }
+  // Always unwrap DevSpec calls even when the caller is a helper subagent running
+  // in its own unbonded conversation that explicitly names the parent's connection_id
+  // (decision a2d9f38f).
+  const unwrappedDevspec = unwrapDevspecToolCall(toolName, toolInput)
   const devspecVerb = unwrappedDevspec.verb
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+  const explicitTargetConnId =
+    typeof unwrappedDevspec.args?.connection_id === 'string' && UUID_RE.test(unwrappedDevspec.args.connection_id)
+      ? unwrappedDevspec.args.connection_id
+      : typeof toolInput?.connection_id === 'string' && UUID_RE.test(toolInput.connection_id)
+        ? toolInput.connection_id
+        : null
+  const devspecTargetConnId = connectionId || explicitTargetConnId
   const effectiveTranscriptPathForCheck = parseTranscriptPath(raw) || state?.transcript_path || null
   if (connectionId && devspecVerb === 'post_session_message' && noticeReply) {
     try {
@@ -170,7 +181,7 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
       /* non-fatal */
     }
   }
-  if (devspecVerb && (devspecVerb === 'record_check_rulings' || devspecVerb === 'release_check_job')) {
+  if (devspecTargetConnId && devspecVerb && (devspecVerb === 'record_check_rulings' || devspecVerb === 'release_check_job')) {
     try {
       const checkResponse =
         toolResponse ??
@@ -185,21 +196,21 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
           toolInput?.check_job_id ||
           toolInput?.job_id ||
           null
-        recordCheckJobRuled(connectionId, connectionsDir, { jobId, now })
+        recordCheckJobRuled(devspecTargetConnId, connectionsDir, { jobId, now })
       } else {
-        recordPauseActivity(connectionId, connectionsDir, now)
+        recordPauseActivity(devspecTargetConnId, connectionsDir, now)
       }
     } catch {
       /* non-fatal */
     }
   }
   if (
-    connectionId &&
+    devspecTargetConnId &&
     devspecVerb &&
     resultCarriesTellPerson(toolResponse)
   ) {
     try {
-      recordTellPerson(connectionId, connectionsDir)
+      recordTellPerson(devspecTargetConnId, connectionsDir, now)
     } catch {
       /* non-fatal */
     }
@@ -210,9 +221,22 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
       fs.writeFileSync(p, JSON.stringify({ at: now }), { mode: 0o600 })
       const existingMarker = readTurnMarker(connectionId, connectionsDir)
       if (existingMarker) {
+        const replyAccepted =
+          existingMarker.tellPerson &&
+          isNoticeReplyAccepted(
+            toolResponse ??
+              resolveAntigravityToolResponse(payload, {
+                transcriptPath: effectiveTranscriptPathForCheck,
+                conversationId: conversationId || state?.local_id || null,
+              }),
+          )
         writeTurnMarker(
           connectionId,
-          { lastReplyAt: now, preserveExplicitReply: true },
+          {
+            lastReplyAt: now,
+            ...(replyAccepted ? { personToldAt: now } : {}),
+            preserveExplicitReply: true,
+          },
           connectionsDir,
         )
       }

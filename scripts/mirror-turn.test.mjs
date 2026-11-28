@@ -3566,5 +3566,217 @@ describe('Antigravity native hook payload & transcript handling', () => {
       fs.rmSync(tmpHome, { recursive: true, force: true })
     }
   })
+
+  it('does not let an earlier accepted notice reply satisfy a later tell_person obligation (02f4ce2b)', async () => {
+    const { appendRequestEvent, setCurrentRequest, UNSTATED } = await import('./requests.mjs')
+    const { resumeParentMain } = await import('./devspec-serve-request.mjs')
+    const {
+      recordNoticeReplyAccepted,
+      recordOwnedEnd,
+      recordOwnedLaunch,
+      recordPersonTold,
+      recordTellPerson,
+      recordTurnWake,
+      restoreHeldParentIfResumed,
+    } = await import('./mirror-turn.mjs')
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-tell-after-reply-'))
+    try {
+      const connId = '972c8895-0000-4000-8000-000000000191'
+      const reqId = '972c8895-0000-4000-8000-000000000192'
+      const noticeId = '972c8895-0000-4000-8000-000000000193'
+      const taskId = 'conv-tell/task-1'
+      const t0 = Date.now() - 10_000
+
+      appendRequestEvent(connId, { op: 'open', id: reqId, kind: 'command' }, { dir: tmpDir })
+      setCurrentRequest(connId, reqId, { dir: tmpDir })
+      appendRequestEvent(
+        connId,
+        { op: 'launch', key: taskId, kind: 'shell', notifies: true, request: reqId, also: [] },
+        { dir: tmpDir },
+      )
+      writeTurnMarker(connId, { startedAt: t0, remoteTurn: true, otherWake: true, held: true }, tmpDir)
+      recordOwnedLaunch(connId, { id: taskId, kind: 'command', label: 'Build' }, { dir: tmpDir, now: t0 + 100 })
+
+      // Notice 1 arrives -> accepted notice reply at t0 + 1500.
+      recordTurnWake(
+        connId,
+        {
+          type: 'canonical_system_notices',
+          execute_notice_ids: [noticeId],
+          ingress: { system_notices: [{ notice_id: noticeId, audience: 'needs_person' }] },
+        },
+        tmpDir,
+        t0 + 1000,
+      )
+      setCurrentRequest(connId, UNSTATED, { dir: tmpDir })
+      recordNoticeReplyAccepted(connId, tmpDir, t0 + 1500, { noticeIds: [noticeId] })
+
+      // Later (t0 + 2000), a separate write carries tell_person, AND parent finishes!
+      recordTellPerson(connId, tmpDir, t0 + 2000)
+      recordOwnedEnd(connId, taskId, { dir: tmpDir, now: t0 + 2200 })
+
+      // Neither automatic restore nor explicit resume may clear the later tell_person obligation!
+      const autoRes = restoreHeldParentIfResumed(connId, readTurnMarker(connId, tmpDir), {
+        dir: tmpDir,
+        now: t0 + 2500,
+      })
+      assert.equal(autoRes.restored, false)
+      const explicitRefused = resumeParentMain(['resume', '--connection-id', connId], {
+        dir: tmpDir,
+        now: t0 + 2500,
+      })
+      assert.equal(explicitRefused.ok, false)
+
+      // Once the person is actually told AFTER tellPersonAt, restore succeeds cleanly!
+      recordPersonTold(connId, tmpDir, t0 + 3000)
+      const afterTold = restoreHeldParentIfResumed(connId, readTurnMarker(connId, tmpDir), {
+        dir: tmpDir,
+        now: t0 + 3200,
+      })
+      assert.equal(afterTold.restored, true)
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('settles a parent check-job pause when a helper subagent calls record_check_rulings from its own conversation with explicit connection_id (a2d9f38f)', async () => {
+    const { appendRequestEvent, readRequestState, requestRefForWrite, setCurrentRequest, UNSTATED } =
+      await import('./requests.mjs')
+    const { runPostToolDispatch } = await import('./post-tool-dispatch.mjs')
+    const { recordOwnedEnd, recordOwnedLaunch, recordTurnWake, restoreHeldParentIfResumed } =
+      await import('./mirror-turn.mjs')
+
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-helper-conv-ruling-'))
+    try {
+      const connectionsDir = path.join(tmpHome, '.devspec', 'remote-control', 'connections')
+      fs.mkdirSync(connectionsDir, { recursive: true })
+      const connId = '972c8895-0000-4000-8000-000000000201'
+      const reqId = '972c8895-0000-4000-8000-000000000202'
+      const jobId = '972c8895-0000-4000-8000-000000000203'
+      const parentConvId = 'conv-parent-ruling'
+      const helperConvId = 'conv-helper-unbonded'
+      const taskId = `${parentConvId}/task-1`
+      const t0 = Date.now() - 10_000
+
+      fs.writeFileSync(
+        path.join(connectionsDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          local_id: parentConvId,
+          agent_name: 'Antigravity',
+        }),
+      )
+      appendRequestEvent(connId, { op: 'open', id: reqId, kind: 'command' }, { dir: connectionsDir })
+      setCurrentRequest(connId, reqId, { dir: connectionsDir })
+      appendRequestEvent(
+        connId,
+        { op: 'launch', key: taskId, kind: 'shell', notifies: true, request: reqId, also: [] },
+        { dir: connectionsDir },
+      )
+      writeTurnMarker(connId, { startedAt: t0, remoteTurn: true, otherWake: true, held: true }, connectionsDir)
+      recordOwnedLaunch(connId, { id: taskId, kind: 'command', label: 'Build' }, { dir: connectionsDir, now: t0 + 100 })
+      recordTurnWake(connId, { type: 'check_job', check_job_id: jobId }, connectionsDir, t0 + 1000)
+      setCurrentRequest(connId, UNSTATED, { dir: connectionsDir })
+
+      // Helper subagent runs in its OWN unbonded conversation and calls record_check_rulings
+      // passing the parent's explicit connection_id.
+      await runPostToolDispatch(
+        JSON.stringify({
+          conversationId: helperConvId,
+          tool_name: 'call_mcp_tool',
+          tool_input: {
+            ServerName: 'devspec_devspec',
+            ToolName: 'record_check_rulings',
+            Arguments: { connection_id: connId, check_job_id: jobId, rulings: [] },
+          },
+          tool_response: {
+            content: [{ type: 'text', text: JSON.stringify({ settled: true, remaining: 0 }) }],
+          },
+        }),
+        { home: tmpHome, env: {}, call: async () => ({ ok: true }) },
+      )
+
+      const settledMarker = readTurnMarker(connId, connectionsDir)
+      assert.equal(settledMarker.checkJobRuled, true)
+
+      // Parent task finishes -> parent resumes cleanly without staying parked!
+      recordOwnedEnd(connId, taskId, { dir: connectionsDir, now: t0 + 2000 })
+      const res = restoreHeldParentIfResumed(connId, settledMarker, {
+        dir: connectionsDir,
+        now: t0 + 2500,
+      })
+      assert.equal(res.restored, true)
+      assert.equal(requestRefForWrite(readRequestState(connId, { dir: connectionsDir })), reqId)
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
+    }
+  })
+
+  it('leaves primary requester unknown instead of crediting co-carried requester alone when primary request closed (ce71a72b)', async () => {
+    const {
+      appendRequestEvent,
+      readRequestState,
+      requestRefForWrite,
+      setCurrentRequest,
+      turnAmbiguity,
+      UNSTATED,
+    } = await import('./requests.mjs')
+    const { recordOwnedEnd, recordOwnedLaunch, recordTurnWake, restoreHeldParentIfResumed } =
+      await import('./mirror-turn.mjs')
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-closed-primary-also-'))
+    try {
+      const connId = '972c8895-0000-4000-8000-000000000211'
+      const reqAlice = '972c8895-0000-4000-8000-000000000212'
+      const reqBob = '972c8895-0000-4000-8000-000000000213'
+      const noticeId = '972c8895-0000-4000-8000-000000000214'
+      const taskId = 'conv-closed-primary/task-1'
+      const t0 = Date.now() - 10_000
+
+      appendRequestEvent(connId, { op: 'open', id: reqAlice, kind: 'command', requested_by: 'alice' }, { dir: tmpDir })
+      appendRequestEvent(connId, { op: 'open', id: reqBob, kind: 'command', requested_by: 'bob' }, { dir: tmpDir })
+      setCurrentRequest(connId, reqAlice, { dir: tmpDir })
+      appendRequestEvent(
+        connId,
+        { op: 'launch', key: taskId, kind: 'shell', notifies: true, request: reqAlice, also: [reqBob] },
+        { dir: tmpDir },
+      )
+      // Primary request (Alice) closes while co-carried request (Bob) stays open!
+      appendRequestEvent(connId, { op: 'close', id: reqAlice }, { dir: tmpDir })
+
+      writeTurnMarker(connId, { startedAt: t0, remoteTurn: true, otherWake: true, held: true }, tmpDir)
+      recordOwnedLaunch(connId, { id: taskId, kind: 'command', label: 'Build' }, { dir: tmpDir, now: t0 + 100 })
+      recordTurnWake(
+        connId,
+        {
+          type: 'canonical_system_notices',
+          execute_notice_ids: [noticeId],
+          ingress: { system_notices: [{ notice_id: noticeId, audience: 'for_the_record' }] },
+        },
+        tmpDir,
+        t0 + 1000,
+      )
+      setCurrentRequest(connId, UNSTATED, { dir: tmpDir })
+      recordOwnedEnd(connId, taskId, { dir: tmpDir, now: t0 + 2000 })
+
+      const res = restoreHeldParentIfResumed(connId, readTurnMarker(connId, tmpDir), {
+        dir: tmpDir,
+        now: t0 + 2500,
+        allowQuietNoticeResume: true,
+      })
+      assert.equal(res.restored, true)
+      const state = readRequestState(connId, { dir: tmpDir })
+      // Primary is unknown (null) — NEVER silently credit Bob alone — and Bob stays joined for ambiguity!
+      assert.equal(requestRefForWrite(state), null)
+      assert.equal(state.joined.has(reqBob), true)
+      const ambiguity = turnAmbiguity(state)
+      assert.ok(Array.isArray(ambiguity) && ambiguity.length === 2)
+      assert.deepEqual(new Set(ambiguity.map((e) => e.id)), new Set([UNSTATED, reqBob]))
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
 })
 

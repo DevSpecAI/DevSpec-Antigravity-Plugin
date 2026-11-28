@@ -365,6 +365,28 @@ export function findLatestToolCallStepMs(transcriptPath, toolName, { afterMs = n
  *   retaining unknown attribution whenever an ended launch is unstated or cannot be
  *   tied to the parent request while another launch is parked (decision ce71a72b).
  */
+/**
+ * True when the pause carries a `tell_person` obligation that has NOT yet been
+ * satisfied by actually telling the person AFTER it was recorded. An earlier
+ * accepted notice reply to a separate notice never satisfies a later
+ * `tell_person` obligation (decision 02f4ce2b).
+ */
+export function hasPendingTellPersonObligation(marker) {
+  if (!marker?.tellPerson) return false
+  const tellAt =
+    typeof marker.tellPersonAt === 'number' && Number.isFinite(marker.tellPersonAt)
+      ? marker.tellPersonAt
+      : null
+  const toldAt =
+    typeof marker.personToldAt === 'number' && Number.isFinite(marker.personToldAt)
+      ? marker.personToldAt
+      : null
+  if (toldAt !== null && (tellAt === null || toldAt >= tellAt)) {
+    return false
+  }
+  return true
+}
+
 export function restoreHeldParentIfResumed(
   connectionId,
   marker,
@@ -430,9 +452,7 @@ export function restoreHeldParentIfResumed(
   if (hasPendingNeedsPersonNotice && !allowQuietNoticeResume) {
     return { restored: false, marker }
   }
-  const hasPendingTellPerson =
-    Boolean(marker.tellPerson) && !marker.personToldAt && !marker.acceptedNoticeReplyAt
-  if (hasPendingTellPerson) {
+  if (hasPendingTellPersonObligation(marker)) {
     return { restored: false, marker }
   }
 
@@ -576,6 +596,7 @@ export function restoreHeldParentIfResumed(
       resumedFromPauseAt: resumedAtMs,
       excludedRanges: nextExcludedRanges,
       tellPerson: false,
+      tellPersonAt: null,
       noticeReplyAt: null,
       acceptedNoticeReplyAt: null,
       repliedNoticeIds: [],
@@ -628,43 +649,49 @@ export function restoreHeldParentIfResumed(
     }
 
     if (endedTrackedLaunches.length > 0) {
-      // Authoritative attribution from ALL completed launches in this pause:
-      // if ANY completed launch is unstated, untracked (missing from launches),
-      // or has no open requester, retain unknown attribution rather than
-      // dropping it and crediting another launch's requester (decision ce71a72b).
-      const endedRefs = []
-      let anyEndedUnstated = false
+      // Match normal wake resolution (`carriedBy` + `promptArrival` in requests.mjs):
+      // each finished launch's primary requester is `launch.request` ONLY if it is
+      // still open (or `'none'`), else `UNSTATED`; any still-open co-carried
+      // `launch.also` requests join alongside it rather than silently replacing a
+      // closed or unstated primary requester (decision ce71a72b).
+      const endedPrimaries = []
+      const endedJoined = []
+      let anyEndedUnknown = anyEndedUntracked
       for (const launch of endedTrackedLaunches) {
-        const launchRefs = []
-        for (const candidate of [launch.request, ...(launch.also ?? [])]) {
-          if (reqState.open.has(candidate) || candidate === 'none') {
-            if (!launchRefs.includes(candidate)) launchRefs.push(candidate)
-          }
+        const primary =
+          reqState.open.has(launch.request) || launch.request === 'none'
+            ? launch.request
+            : UNSTATED
+        if (primary === UNSTATED) {
+          anyEndedUnknown = true
+        } else if (!endedPrimaries.includes(primary)) {
+          endedPrimaries.push(primary)
         }
-        if (launch.request === UNSTATED || launchRefs.length === 0) {
-          anyEndedUnstated = true
-        } else {
-          for (const ref of launchRefs) {
-            if (!endedRefs.includes(ref)) endedRefs.push(ref)
+        for (const extra of launch.also ?? []) {
+          if (reqState.open.has(extra) && extra !== launch.request && !endedJoined.includes(extra)) {
+            endedJoined.push(extra)
           }
         }
       }
 
-      if (anyEndedUnstated || anyEndedUntracked || endedRefs.length === 0) {
-        setCurrentRequest(connectionId, UNSTATED, { dir })
-      } else {
-        // Record any notified keys from notificationText, then ALWAYS restore the
-        // full set of ended requesters (including `joined` when two launches for
-        // different people finished in the same pause, even if `notificationText`
-        // only names one of them — decision ce71a72b).
-        if (notificationText) {
-          for (const key of notifiedKeys(notificationText)) {
-            appendRequestEvent(connectionId, { op: 'notified', key }, { dir })
-          }
+      if (notificationText) {
+        for (const key of notifiedKeys(notificationText)) {
+          appendRequestEvent(connectionId, { op: 'notified', key }, { dir })
         }
-        setCurrentRequest(connectionId, endedRefs.at(-1), { dir })
-        for (const extra of endedRefs.slice(0, -1)) {
+      }
+
+      if (anyEndedUnknown || endedPrimaries.length === 0) {
+        setCurrentRequest(connectionId, UNSTATED, { dir })
+        for (const extra of [...endedPrimaries, ...endedJoined]) {
           appendRequestEvent(connectionId, { op: 'joined', id: extra }, { dir })
+        }
+      } else {
+        const currentRef = endedPrimaries.at(-1)
+        setCurrentRequest(connectionId, currentRef, { dir })
+        for (const extra of [...endedPrimaries.slice(0, -1), ...endedJoined]) {
+          if (extra !== currentRef) {
+            appendRequestEvent(connectionId, { op: 'joined', id: extra }, { dir })
+          }
         }
       }
     } else {
@@ -725,9 +752,7 @@ export function pendingParentResumeHint(
   const allOutstanding = readOwnedIds(connectionId, marker, dir)
   if (allOutstanding.some((id) => !parentOwnedIds.includes(id))) return null
   if (marker.checkJobWake && !marker.checkJobRuled) return null
-  const hasPendingTellPerson =
-    Boolean(marker.tellPerson) && !marker.personToldAt && !marker.acceptedNoticeReplyAt
-  if (hasPendingTellPerson) return null
+  if (hasPendingTellPersonObligation(marker)) return null
 
   const hasForTheRecordNotice =
     Array.isArray(marker.recordNoticeIds) && marker.recordNoticeIds.length > 0
@@ -986,9 +1011,13 @@ export function isCurrentTurnRoutine(
 }
 
 /** Note on the turn marker that a write in it carried DevSpec's `tell_person` mark. */
-export function recordTellPerson(connectionId, dir = CONNECTIONS_DIR) {
+export function recordTellPerson(connectionId, dir = CONNECTIONS_DIR, now = Date.now()) {
   if (!connectionId || !readTurnMarker(connectionId, dir)) return false
-  writeTurnMarker(connectionId, { tellPerson: true, preserveExplicitReply: true }, dir)
+  writeTurnMarker(
+    connectionId,
+    { tellPerson: true, tellPersonAt: now, personToldAt: null, preserveExplicitReply: true },
+    dir,
+  )
   return true
 }
 
@@ -3781,9 +3810,7 @@ export async function handleMirrorTurn(
           })
           if (
             (midWaitNotices || midWaitRoutine) &&
-            marker.tellPerson &&
-            !marker.noticeReplyAt &&
-            !marker.personToldAt &&
+            hasPendingTellPersonObligation(marker) &&
             sessionId
           ) {
             const tellText =
@@ -3821,7 +3848,10 @@ export async function handleMirrorTurn(
               resumedFromPauseAt: pauseEndMs,
               excludedRanges: nextExcludedRanges,
               tellPerson: false,
+              tellPersonAt: null,
               noticeReplyAt: null,
+              acceptedNoticeReplyAt: null,
+              repliedNoticeIds: [],
               personToldAt: null,
               preserveExplicitReply: true,
             },

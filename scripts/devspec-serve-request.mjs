@@ -14,6 +14,7 @@
 import os from 'node:os'
 import path from 'node:path'
 import {
+  hasPendingTellPersonObligation,
   readOwnedIds,
   readTurnMarker,
   reconcileCompletedOwnedWork,
@@ -71,7 +72,7 @@ export function resumeParentMain(
       error: 'A waiting DevSpec check job in this pause has not been ruled yet; settle it before resuming the parent task.',
     }
   }
-  if (marker.tellPerson && !marker.personToldAt && !marker.acceptedNoticeReplyAt) {
+  if (hasPendingTellPersonObligation(marker)) {
     return {
       ok: false,
       error: 'This pause carries a pending tell_person obligation; tell the person before resuming the parent task.',
