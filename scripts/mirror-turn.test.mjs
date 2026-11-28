@@ -1926,14 +1926,22 @@ describe('Antigravity native hook payload & transcript handling', () => {
       assert.equal(isCurrentTurnCheckJobOnly(connId, { dir: connectionsDir }), true)
 
       // Now check ruling finishes (`recordCheckJobRuled`), and parent task resumes.
-      recordCheckJobRuled(connId, connectionsDir)
+      recordCheckJobRuled(connId, connectionsDir, {
+        jobId: '972c8895-0000-4000-8000-000000000024',
+        now: t0 + 4900,
+      })
       const afterRuling = restoreHeldParentIfResumed(connId, readTurnMarker(connId, connectionsDir), {
         dir: connectionsDir,
         now: t0 + 5000,
       })
       assert.equal(afterRuling.restored, true)
 
-      // Transcript has: pre-pause command step, check-pause steps (helper launch + notice text), and post-resume command step.
+      // Transcript has:
+      // - pre-pause command step (t0 + 1000)
+      // - check-pause helper launch (t0 + 2500)
+      // - check-only tool step AFTER parent finished (t0 + 4200, while helper still running!)
+      // - routine check-only response AFTER parent & helper finished, before pause ended (t0 + 4700!)
+      // - post-resume command step (t0 + 6000)
       const steps = [
         {
           step_index: 1,
@@ -1955,11 +1963,17 @@ describe('Antigravity native hook payload & transcript handling', () => {
         {
           step_index: 3,
           type: 'PLANNER_RESPONSE',
-          created_at: new Date(t0 + 3500).toISOString(),
-          content: 'Check job ruled cleanly (internal note only).',
+          created_at: new Date(t0 + 4200).toISOString(),
+          tool_calls: [{ name: 'read_file', args: { Path: '/tmp/check-only-between-completion-and-pause-end.ts' } }],
         },
         {
           step_index: 4,
+          type: 'PLANNER_RESPONSE',
+          created_at: new Date(t0 + 4700).toISOString(),
+          content: 'Check job ruled cleanly (internal note only).',
+        },
+        {
+          step_index: 5,
           type: 'PLANNER_RESPONSE',
           created_at: new Date(t0 + 6000).toISOString(),
           tool_calls: [{ name: 'read_file', args: { Path: '/tmp/after-resume.ts' } }],
@@ -2005,6 +2019,7 @@ describe('Antigravity native hook payload & transcript handling', () => {
       assert.ok(trailMsg.includes('after-resume.ts'))
       assert.equal(trailMsg.includes('Check Reviewer'), false)
       assert.equal(trailMsg.includes('invoke_subagent'), false)
+      assert.equal(trailMsg.includes('check-only-between-completion-and-pause-end.ts'), false)
 
       // Stop without any post-resume assistant reply must NOT scrape the check-pause note from t0 + 3500!
       const stopCalls = []
@@ -2164,6 +2179,219 @@ describe('Antigravity native hook payload & transcript handling', () => {
       assert.equal(requestRefForWrite(readRequestState(connId, { dir: tmpDir })), reqBob)
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('retains unknown attribution when a completed launch was unstated even if another parked launch has a known requester (ce71a72b)', async () => {
+    const {
+      appendRequestEvent,
+      readRequestState,
+      requestRefForWrite,
+      setCurrentRequest,
+      UNSTATED,
+    } = await import('./requests.mjs')
+    const {
+      recordOwnedEnd,
+      recordOwnedLaunch,
+      recordTurnWake,
+      restoreHeldParentIfResumed,
+    } = await import('./mirror-turn.mjs')
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-unstated-launch-'))
+    try {
+      const connId = '972c8895-0000-4000-8000-000000000051'
+      const reqAlice = '972c8895-0000-4000-8000-000000000052'
+      const noticeId = '972c8895-0000-4000-8000-000000000053'
+      const taskAlice = 'conv-unstated/task-alice'
+      const taskUnstated = 'conv-unstated/task-unknown'
+      const t0 = Date.now() - 10_000
+
+      appendRequestEvent(connId, { op: 'open', id: reqAlice, kind: 'command', requested_by: 'alice' }, { dir: tmpDir })
+      setCurrentRequest(connId, reqAlice, { dir: tmpDir })
+      appendRequestEvent(connId, { op: 'launch', key: taskAlice, kind: 'shell', notifies: true, request: reqAlice, also: [] }, { dir: tmpDir })
+      appendRequestEvent(connId, { op: 'launch', key: taskUnstated, kind: 'shell', notifies: true, request: UNSTATED, also: [] }, { dir: tmpDir })
+
+      writeTurnMarker(connId, { startedAt: t0, remoteTurn: true, otherWake: true, held: true }, tmpDir)
+      recordOwnedLaunch(connId, { id: taskAlice, kind: 'command', label: 'Alice task' }, { dir: tmpDir, now: t0 + 100 })
+      recordOwnedLaunch(connId, { id: taskUnstated, kind: 'command', label: 'Unstated task' }, { dir: tmpDir, now: t0 + 200 })
+
+      recordTurnWake(
+        connId,
+        {
+          type: 'canonical_system_notices',
+          execute_notice_ids: [noticeId],
+          ingress: { system_notices: [{ notice_id: noticeId, audience: 'for_the_record' }] },
+        },
+        tmpDir,
+        t0 + 1000,
+      )
+      setCurrentRequest(connId, UNSTATED, { dir: tmpDir })
+
+      // Only the unstated launch finishes while Alice's launch is still running:
+      // MUST retain unknown attribution (null), NEVER credit Alice!
+      recordOwnedEnd(connId, taskUnstated, { dir: tmpDir, now: t0 + 2000 })
+      const res = restoreHeldParentIfResumed(connId, readTurnMarker(connId, tmpDir), { dir: tmpDir, now: t0 + 2500 })
+      assert.equal(res.restored, true)
+      assert.equal(requestRefForWrite(readRequestState(connId, { dir: tmpDir })), null)
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('does not mark a check-job pause ruled on an intermediate record_check_rulings batch with remaining entries (a2d9f38f)', async () => {
+    const { appendRequestEvent, setCurrentRequest, UNSTATED } = await import('./requests.mjs')
+    const { runPostToolDispatch } = await import('./post-tool-dispatch.mjs')
+    const {
+      isCurrentTurnCheckJobOnly,
+      recordOwnedEnd,
+      recordOwnedLaunch,
+      recordTurnWake,
+    } = await import('./mirror-turn.mjs')
+
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-mid-batch-'))
+    try {
+      const connectionsDir = path.join(tmpHome, '.devspec', 'remote-control', 'connections')
+      fs.mkdirSync(connectionsDir, { recursive: true })
+      const connId = '972c8895-0000-4000-8000-000000000061'
+      const sessId = '972c8895-0000-4000-8000-000000000062'
+      const reqId = '972c8895-0000-4000-8000-000000000063'
+      const jobId = '972c8895-0000-4000-8000-000000000064'
+      const convId = 'conv-mid-batch'
+      const parentTaskId = `${convId}/task-1`
+      const transcriptPath = path.join(tmpHome, 'transcript.jsonl')
+      const t0 = Date.now() - 20_000
+
+      fs.writeFileSync(
+        path.join(connectionsDir, `${connId}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: connId,
+          session_id: sessId,
+          agent_name: 'Antigravity',
+          local_id: convId,
+          transcript_path: transcriptPath,
+          mcp_url: 'https://example.invalid/api/mcp',
+          token: 'test-token',
+          connection_capability: 'dvsc_test',
+        }),
+      )
+      appendRequestEvent(connId, { op: 'open', id: reqId, kind: 'command' }, { dir: connectionsDir })
+      setCurrentRequest(connId, reqId, { dir: connectionsDir })
+      appendRequestEvent(
+        connId,
+        { op: 'launch', key: parentTaskId, kind: 'shell', notifies: true, request: reqId, also: [] },
+        { dir: connectionsDir },
+      )
+      writeTurnMarker(connId, { startedAt: t0, remoteTurn: true, otherWake: true, held: true }, connectionsDir)
+      recordOwnedLaunch(connId, { id: parentTaskId, kind: 'command', label: 'Build' }, { dir: connectionsDir, now: t0 + 500 })
+      recordTurnWake(connId, { type: 'check_job', check_job_id: jobId }, connectionsDir, t0 + 2000)
+      setCurrentRequest(connId, UNSTATED, { dir: connectionsDir })
+      recordOwnedEnd(connId, parentTaskId, { dir: connectionsDir, now: t0 + 3000 })
+
+      fs.writeFileSync(
+        transcriptPath,
+        JSON.stringify({
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          created_at: new Date(t0 + 1000).toISOString(),
+          tool_calls: [{ name: 'read_file', args: { Path: '/tmp/parent-before.ts' } }],
+        }) + '\n',
+      )
+
+      const calls = []
+      const fakeCall = async (req) => {
+        calls.push(req)
+        return { ok: true }
+      }
+
+      // 1. Intermediate batch (settled: false, remaining: 5) MUST NOT mark checkJobRuled!
+      await runPostToolDispatch(
+        JSON.stringify({
+          conversationId: convId,
+          transcriptPath,
+          tool_name: 'call_mcp_tool',
+          tool_input: {
+            ServerName: 'devspec_devspec',
+            ToolName: 'record_check_rulings',
+            Arguments: { check_job_id: jobId, rulings: [] },
+          },
+          tool_response: {
+            content: [{ type: 'text', text: JSON.stringify({ settled: false, remaining: 5 }) }],
+          },
+        }),
+        { home: tmpHome, env: {}, call: fakeCall },
+      )
+      assert.equal(readTurnMarker(connId, connectionsDir)?.checkJobRuled, false)
+      assert.equal(isCurrentTurnCheckJobOnly(connId, { dir: connectionsDir }), true)
+
+      // 2. Subsequent check-only read_file before batch 2 MUST stay in check-job pause (no restore, no trail)!
+      fs.appendFileSync(
+        transcriptPath,
+        JSON.stringify({
+          step_index: 2,
+          type: 'PLANNER_RESPONSE',
+          created_at: new Date(Date.now() - 50).toISOString(),
+          tool_calls: [{ name: 'read_file', args: { Path: '/tmp/batch2-check-file.ts' } }],
+        }) + '\n',
+      )
+      await runPostToolDispatch(
+        JSON.stringify({
+          conversationId: convId,
+          transcriptPath,
+          tool_name: 'read_file',
+          tool_input: { Path: '/tmp/batch2-check-file.ts' },
+        }),
+        { home: tmpHome, env: {}, call: fakeCall },
+      )
+      assert.equal(isCurrentTurnCheckJobOnly(connId, { dir: connectionsDir }), true)
+      assert.equal(calls.some((c) => c.name === 'post_session_message'), false)
+
+      // 3. Final batch (settled: true, remaining: 0) marks checkJobRuled = true,
+      //    and the next resumed parent tool restores heldParent while excluding batch2-check-file.ts!
+      await runPostToolDispatch(
+        JSON.stringify({
+          conversationId: convId,
+          transcriptPath,
+          tool_name: 'call_mcp_tool',
+          tool_input: {
+            ServerName: 'devspec_devspec',
+            ToolName: 'record_check_rulings',
+            Arguments: { check_job_id: jobId, rulings: [] },
+          },
+          tool_response: {
+            content: [{ type: 'text', text: JSON.stringify({ settled: true, remaining: 0 }) }],
+          },
+        }),
+        { home: tmpHome, env: {}, call: fakeCall },
+      )
+      assert.equal(readTurnMarker(connId, connectionsDir)?.checkJobRuled, true)
+
+      const resumedStepMs = Date.now() + 50
+      fs.appendFileSync(
+        transcriptPath,
+        JSON.stringify({
+          step_index: 3,
+          type: 'PLANNER_RESPONSE',
+          created_at: new Date(resumedStepMs).toISOString(),
+          tool_calls: [{ name: 'edit_file', args: { Path: '/tmp/resumed-parent.ts' } }],
+        }) + '\n',
+      )
+      await runPostToolDispatch(
+        JSON.stringify({
+          conversationId: convId,
+          transcriptPath,
+          tool_name: 'edit_file',
+          tool_input: { Path: '/tmp/resumed-parent.ts' },
+        }),
+        { home: tmpHome, env: {}, call: fakeCall },
+      )
+      assert.equal(readTurnMarker(connId, connectionsDir)?.heldParent, null)
+      const trailPost = calls.find((c) => c.name === 'post_session_message')
+      assert.ok(trailPost, 'expected resumed parent trail to stream')
+      assert.ok(String(trailPost.arguments.message).includes('resumed-parent.ts'))
+      assert.equal(String(trailPost.arguments.message).includes('batch2-check-file.ts'), false)
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
     }
   })
 })

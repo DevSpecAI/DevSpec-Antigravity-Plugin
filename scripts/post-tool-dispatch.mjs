@@ -25,6 +25,7 @@ import { resolveOwnConnectionId } from './launch-guard.mjs'
 import {
   currentTurnStampNoticeIds,
   explicitReplyMarkerPath,
+  findLatestToolCallStepMs,
   inferTurnContextFromTranscript,
   isNoticeReplyToolCall,
   isRemotePlumbingToolCall,
@@ -37,6 +38,7 @@ import {
   recordBackgroundLaunch,
   recordCheckJobRuled,
   recordOwnedEnd,
+  recordPauseActivity,
   recordTellPerson,
   resolveAntigravityToolResponse,
   resolveHookConversationId,
@@ -55,7 +57,7 @@ import {
   setCurrentRequest,
   UNSTATED,
 } from './requests.mjs'
-import { resultCarriesTellPerson } from './notice-reply.mjs'
+import { isCheckJobRulingSettled, resultCarriesTellPerson } from './notice-reply.mjs'
 import { postToolNotice } from './room-unread.mjs'
 import { isEntryPoint } from './entry-point.mjs'
 
@@ -137,10 +139,28 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
   // A DevSpec write that changed someone else's record says so on its result
   // (`tell_person`, item a868f41f). Noted on the turn, so Stop's silence for a routine
   // turn gives way and PreToolUse leaves the model's own post to the person unstamped.
-  const devspecVerb = connectionId ? unwrapDevspecToolCall(toolName, toolInput).verb : null
+  const unwrappedDevspec = connectionId ? unwrapDevspecToolCall(toolName, toolInput) : { verb: null, args: {} }
+  const devspecVerb = unwrappedDevspec.verb
+  const effectiveTranscriptPathForCheck = parseTranscriptPath(raw) || state?.transcript_path || null
   if (devspecVerb && (devspecVerb === 'record_check_rulings' || devspecVerb === 'release_check_job')) {
     try {
-      recordCheckJobRuled(connectionId, connectionsDir)
+      const checkResponse =
+        toolResponse ??
+        resolveAntigravityToolResponse(payload, {
+          transcriptPath: effectiveTranscriptPathForCheck,
+          conversationId: conversationId || state?.local_id || null,
+        })
+      if (isCheckJobRulingSettled(devspecVerb, checkResponse)) {
+        const jobId =
+          unwrappedDevspec.args?.check_job_id ||
+          unwrappedDevspec.args?.job_id ||
+          toolInput?.check_job_id ||
+          toolInput?.job_id ||
+          null
+        recordCheckJobRuled(connectionId, connectionsDir, { jobId, now })
+      } else {
+        recordPauseActivity(connectionId, connectionsDir, now)
+      }
     } catch {
       /* non-fatal */
     }
@@ -174,23 +194,38 @@ export async function runPostToolDispatch(raw = '', { env = process.env, home = 
   } else if (connectionId && !isRemotePlumbingToolCall(toolName, toolInput)) {
     try {
       let existingMarker = readTurnMarker(connectionId, connectionsDir)
-      const effectiveTranscriptPath = parseTranscriptPath(raw) || state?.transcript_path || null
+      const effectiveTranscriptPath = effectiveTranscriptPathForCheck
       const isCheckJobVerb =
         devspecVerb === 'claim_check_job' ||
         devspecVerb === 'record_check_rulings' ||
         devspecVerb === 'release_check_job'
-      if (existingMarker?.heldParent && !existingMarker?.otherWake && !isCheckJobVerb && effectiveTranscriptPath) {
-        const reconciled = reconcileCompletedOwnedWork(
-          connectionId,
-          existingMarker,
-          effectiveTranscriptPath,
-          connectionsDir,
-        )
-        existingMarker = restoreHeldParentIfResumed(connectionId, existingMarker, {
-          dir: connectionsDir,
-          reconciled,
-          now,
-        }).marker
+      if (existingMarker?.heldParent && !existingMarker?.otherWake) {
+        if (isCheckJobVerb || !effectiveTranscriptPath) {
+          recordPauseActivity(connectionId, connectionsDir, now)
+        } else {
+          const reconciled = reconcileCompletedOwnedWork(
+            connectionId,
+            existingMarker,
+            effectiveTranscriptPath,
+            connectionsDir,
+          )
+          const resumedToolStepMs = findLatestToolCallStepMs(effectiveTranscriptPath, toolName, {
+            afterMs:
+              typeof existingMarker.pauseStartedAt === 'number'
+                ? existingMarker.pauseStartedAt
+                : null,
+          })
+          const res = restoreHeldParentIfResumed(connectionId, existingMarker, {
+            dir: connectionsDir,
+            reconciled,
+            now,
+            excludeUpToMs: resumedToolStepMs !== null ? resumedToolStepMs - 1 : null,
+          })
+          existingMarker = res.marker
+          if (!res.restored) {
+            recordPauseActivity(connectionId, connectionsDir, now)
+          }
+        }
       }
       const inferred = existingMarker
         ? null

@@ -243,14 +243,117 @@ function isTimestampInExcludedRanges(stepMs, excludedRanges) {
 }
 
 /**
- * Mark that a check-job ruling finished during the current mid-wait pause so
- * subsequent parent-task work can safely restore `heldParent` without mixing
- * in-flight check ruling steps into the command trail (decisions a2d9f38f & c1791ffa).
+ * Record that pause-phase activity happened at `now` while `heldParent` is parked so
+ * the pause exclusion window covers the full pause interval (never ending early at
+ * the parent background task's completion timestamp; decisions 02f4ce2b, a2d9f38f, c1791ffa).
  */
-export function recordCheckJobRuled(connectionId, dir = CONNECTIONS_DIR) {
-  if (!connectionId || !readTurnMarker(connectionId, dir)) return false
-  writeTurnMarker(connectionId, { checkJobRuled: true, preserveExplicitReply: true }, dir)
+export function recordPauseActivity(connectionId, dir = CONNECTIONS_DIR, now = Date.now()) {
+  const existing = connectionId ? readTurnMarker(connectionId, dir) : null
+  if (!existing?.heldParent || existing.otherWake) return false
+  const prev =
+    typeof existing.lastPauseActivityAt === 'number' && Number.isFinite(existing.lastPauseActivityAt)
+      ? existing.lastPauseActivityAt
+      : 0
+  writeTurnMarker(
+    connectionId,
+    { lastPauseActivityAt: Math.max(prev, now), preserveExplicitReply: true },
+    dir,
+  )
   return true
+}
+
+/**
+ * Mark that a check-job ruling settled (all entries ruled or handed back) during the
+ * current mid-wait pause so subsequent parent-task work can safely restore `heldParent`
+ * without mixing in-flight check ruling steps into the command trail (decisions
+ * a2d9f38f & c1791ffa). When multiple check jobs are batched in one pause, `checkJobRuled`
+ * only becomes true once every tracked job has settled.
+ */
+export function recordCheckJobRuled(
+  connectionId,
+  dir = CONNECTIONS_DIR,
+  { jobId = null, now = Date.now() } = {},
+) {
+  const existing = connectionId ? readTurnMarker(connectionId, dir) : null
+  if (!existing) return false
+  const prevPauseAt =
+    typeof existing.lastPauseActivityAt === 'number' && Number.isFinite(existing.lastPauseActivityAt)
+      ? existing.lastPauseActivityAt
+      : 0
+  const nextPauseAt = Math.max(prevPauseAt, now)
+  const trackedJobs = Array.isArray(existing.checkJobIds)
+    ? existing.checkJobIds.map((id) => String(id).toLowerCase()).filter(Boolean)
+    : []
+  const settledJobs = Array.isArray(existing.settledCheckJobIds)
+    ? [...new Set(existing.settledCheckJobIds.map((id) => String(id).toLowerCase()).filter(Boolean))]
+    : []
+  const normalizedJobId = typeof jobId === 'string' && jobId.trim() ? jobId.trim().toLowerCase() : null
+  if (normalizedJobId && !settledJobs.includes(normalizedJobId)) {
+    settledJobs.push(normalizedJobId)
+  }
+  const allSettled =
+    trackedJobs.length === 0 ||
+    !normalizedJobId ||
+    trackedJobs.every((id) => settledJobs.includes(id))
+  writeTurnMarker(
+    connectionId,
+    {
+      settledCheckJobIds: settledJobs,
+      checkJobRuled: allSettled,
+      ...(allSettled ? { checkJobRuledAt: now } : {}),
+      lastPauseActivityAt: nextPauseAt,
+      preserveExplicitReply: true,
+    },
+    dir,
+  )
+  return allSettled
+}
+
+/**
+ * Find the `created_at` timestamp (ms) of the latest `PLANNER_RESPONSE` step in
+ * `transcriptPath` that invoked `toolName` after `afterMs`, so `PostToolUse` can bound
+ * the pause exclusion window strictly before the resumed parent tool step itself.
+ */
+export function findLatestToolCallStepMs(transcriptPath, toolName, { afterMs = null } = {}) {
+  if (!transcriptPath || !toolName) return null
+  const bareTarget = String(toolName).replace(/^default_api:/, '')
+  let raw = ''
+  try {
+    const stat = fs.statSync(transcriptPath)
+    if (!stat.isFile() || stat.size === 0) return null
+    const readSize = Math.min(stat.size, 262_144)
+    const fd = fs.openSync(transcriptPath, 'r')
+    try {
+      const buf = Buffer.alloc(readSize)
+      fs.readSync(fd, buf, 0, readSize, stat.size - readSize)
+      raw = buf.toString('utf8')
+    } finally {
+      fs.closeSync(fd)
+    }
+  } catch {
+    return null
+  }
+  const lines = raw.split(/\r?\n/)
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const trimmed = lines[i].trim()
+    if (!trimmed) continue
+    let step
+    try {
+      step = JSON.parse(trimmed)
+    } catch {
+      continue
+    }
+    if (step?.type !== 'PLANNER_RESPONSE' || !Array.isArray(step.tool_calls)) continue
+    const matches = step.tool_calls.some(
+      (tc) => String(tc?.name || '').replace(/^default_api:/, '') === bareTarget,
+    )
+    if (!matches) continue
+    const stepMs = step.created_at ? Date.parse(step.created_at) : NaN
+    if (!Number.isFinite(stepMs)) return null
+    if (typeof afterMs === 'number' && Number.isFinite(afterMs) && stepMs < afterMs) return null
+    return stepMs
+  }
+  return null
 }
 
 /**
@@ -259,13 +362,16 @@ export function recordCheckJobRuled(connectionId, dir = CONNECTIONS_DIR) {
  * is no longer in flight:
  * - Never restores while any pause-owned launch (e.g. a check-job helper subagent
  *   not in `parent.ownedIds`) is still running.
- * - Never clears an active `checkJobWake` pause until `checkJobRuled` is recorded.
- * - Records the `[pauseStartedAt, resumedAt]` window in `excludedRanges` and sets
- *   `resumedFromPauseAt` so neither trail extraction nor Stop fallback can leak
- *   notice/check activity or assistant text into the person's command (decisions
- *   02f4ce2b, a2d9f38f, c1791ffa).
+ * - Never clears an active `checkJobWake` pause until every tracked check job is
+ *   settled (`checkJobRuled`).
+ * - Ends the `[pauseStartedAt, resumedAt]` exclusion window at the full pause end
+ *   (covering helper completions, check rulings, and pause tool activity — never
+ *   cutting it short at an earlier parent-launch completion timestamp) so neither
+ *   trail extraction nor Stop fallback can leak check/notice steps or routine
+ *   check-only responses into the person's command (decisions 02f4ce2b, a2d9f38f, c1791ffa).
  * - Restores request attribution strictly from the launch(es) that actually ended,
- *   never picking an unrelated still-open launch (decision ce71a72b).
+ *   retaining unknown attribution whenever an ended launch is unstated or cannot be
+ *   tied to the parent request while another launch is parked (decision ce71a72b).
  */
 export function restoreHeldParentIfResumed(
   connectionId,
@@ -275,6 +381,8 @@ export function restoreHeldParentIfResumed(
     reconciled = null,
     latestStep = null,
     now = Date.now(),
+    excludeUpToMs = null,
+    requireParentNotificationStep = false,
   } = {},
 ) {
   if (!connectionId || !marker?.heldParent || marker.otherWake) {
@@ -292,16 +400,20 @@ export function restoreHeldParentIfResumed(
     return { restored: false, marker }
   }
 
-  // Never clear an in-flight check-job pause until its ruling completed.
+  // Never clear an in-flight check-job pause until its ruling settled.
   if (marker.checkJobWake && !marker.checkJobRuled) {
     return { restored: false, marker }
   }
 
   // Identify ONLY the parent-owned launch(es) that actually completed and their
-  // completion timestamp, so attribution and pause exclusion stay exact.
+  // completion timestamp, PLUS the latest completion timestamp of any pause-owned
+  // launch (such as a check-ruling helper subagent) so the exclusion window covers
+  // the entire pause interval.
   const endedParentIds = []
   let completedAtMs = null
+  let endedPauseLaunchAtMs = null
   let notificationText = ''
+  let latestStepIsParentCompletion = false
 
   const noteEnded = (id, atMs = null, text = '') => {
     if (typeof id === 'string' && id && !endedParentIds.includes(id)) {
@@ -315,10 +427,19 @@ export function restoreHeldParentIfResumed(
     }
   }
 
+  const notePauseEnded = (atMs) => {
+    if (typeof atMs === 'number' && Number.isFinite(atMs)) {
+      endedPauseLaunchAtMs =
+        endedPauseLaunchAtMs === null ? atMs : Math.max(endedPauseLaunchAtMs, atMs)
+    }
+  }
+
   if (Array.isArray(reconciled?.endedOwnedDetails)) {
     for (const detail of reconciled.endedOwnedDetails) {
       if (parentOwnedIds.length === 0 || parentOwnedIds.includes(detail.id)) {
         noteEnded(detail.id, detail.atMs ?? null, detail.content || '')
+      } else {
+        notePauseEnded(detail.atMs ?? null)
       }
     }
   } else if (Array.isArray(reconciled?.endedOwnedIds)) {
@@ -329,13 +450,15 @@ export function restoreHeldParentIfResumed(
     }
   }
 
-  if (parentOwnedIds.length > 0) {
-    const ownedLines = readOwnedLines(connectionId, marker, dir)
-    for (const entry of ownedLines) {
-      if (typeof entry.ended === 'string' && parentOwnedIds.includes(entry.id)) {
-        const endedMs = Date.parse(entry.ended)
-        noteEnded(entry.id, Number.isFinite(endedMs) ? endedMs : null, '')
-      }
+  const ownedLines = readOwnedLines(connectionId, marker, dir)
+  for (const entry of ownedLines) {
+    if (typeof entry.ended !== 'string') continue
+    const endedMs = Date.parse(entry.ended)
+    const validEndedMs = Number.isFinite(endedMs) ? endedMs : null
+    if (parentOwnedIds.length > 0 && parentOwnedIds.includes(entry.id)) {
+      noteEnded(entry.id, validEndedMs, '')
+    } else if (parentOwnedIds.length > 0 && !parentOwnedIds.includes(entry.id)) {
+      notePauseEnded(validEndedMs)
     }
   }
 
@@ -348,12 +471,18 @@ export function restoreHeldParentIfResumed(
     const stepMs = latestStep.created_at ? Date.parse(latestStep.created_at) : NaN
     const matchedIds = parentOwnedIds.filter((id) => stepMatchesOwnedId(latestStep.content, id))
     if (matchedIds.length > 0) {
+      latestStepIsParentCompletion = true
       for (const id of matchedIds) {
         noteEnded(id, Number.isFinite(stepMs) ? stepMs : null, latestStep.content)
       }
     } else if (parentOwnedIds.length === 0) {
+      latestStepIsParentCompletion = true
       noteEnded('__parent_bg__', Number.isFinite(stepMs) ? stepMs : null, latestStep.content)
     }
+  }
+
+  if (requireParentNotificationStep && !latestStepIsParentCompletion) {
+    return { restored: false, marker }
   }
 
   if (endedParentIds.length === 0) {
@@ -370,8 +499,25 @@ export function restoreHeldParentIfResumed(
   const pauseStartMs = typeof marker.pauseStartedAt === 'number' && Number.isFinite(marker.pauseStartedAt)
     ? marker.pauseStartedAt
     : null
+  const pauseFloorCandidates = [
+    completedAtMs,
+    endedPauseLaunchAtMs,
+    typeof marker.checkJobRuledAt === 'number' && Number.isFinite(marker.checkJobRuledAt)
+      ? marker.checkJobRuledAt
+      : null,
+    typeof marker.lastPauseActivityAt === 'number' && Number.isFinite(marker.lastPauseActivityAt)
+      ? marker.lastPauseActivityAt
+      : null,
+  ].filter((v) => typeof v === 'number' && Number.isFinite(v))
+  const pauseFloorMs = pauseFloorCandidates.length > 0 ? Math.max(...pauseFloorCandidates) : null
   const resumedAtMs =
-    typeof completedAtMs === 'number' && Number.isFinite(completedAtMs) ? completedAtMs : now
+    typeof excludeUpToMs === 'number' && Number.isFinite(excludeUpToMs)
+      ? pauseFloorMs !== null
+        ? Math.max(pauseFloorMs, excludeUpToMs)
+        : excludeUpToMs
+      : pauseFloorMs !== null
+        ? Math.max(now, pauseFloorMs)
+        : now
   const nextExcludedRanges =
     pauseStartMs !== null
       ? appendExcludedRange(marker.excludedRanges, pauseStartMs, resumedAtMs)
@@ -390,7 +536,11 @@ export function restoreHeldParentIfResumed(
       noticeIds: [],
       recordNoticeIds: [],
       checkJobWake: false,
+      checkJobIds: [],
+      settledCheckJobIds: [],
       checkJobRuled: false,
+      checkJobRuledAt: null,
+      lastPauseActivityAt: null,
       pauseStartedAt: null,
       resumedFromPauseAt: resumedAtMs,
       excludedRanges: nextExcludedRanges,
@@ -404,59 +554,108 @@ export function restoreHeldParentIfResumed(
 
   try {
     const reqState = readRequestState(connectionId, { dir })
-    let restoredRequest = false
+    const endedKeys = [...endedParentIds.filter((id) => id !== '__parent_bg__')]
     if (notificationText) {
-      const arrival = promptArrival({
-        fromAPerson: false,
-        origin: 'task-notification',
-        text: notificationText,
-        midTurn: false,
-        state: reqState,
-      })
-      const hasCurrent = arrival.events.some((ev) => ev.op === 'current' && ev.ref !== null)
-      if (hasCurrent) {
-        for (const event of arrival.events) {
-          appendRequestEvent(connectionId, event, { dir })
-        }
-        restoredRequest = true
+      for (const key of notifiedKeys(notificationText)) {
+        if (!endedKeys.includes(key)) endedKeys.push(key)
       }
     }
-    if (!restoredRequest) {
-      // Resolve strictly from the launch(es) that actually ended — never pick
-      // another still-open launch in `parentOwnedIds` (decision ce71a72b).
+    const endedTrackedLaunches = []
+    const seenEndedLaunches = new Set()
+    for (const key of endedKeys) {
+      const launch = reqState.launches.get(key)
+      if (launch && !seenEndedLaunches.has(launch)) {
+        seenEndedLaunches.add(launch)
+        endedTrackedLaunches.push(launch)
+      }
+    }
+
+    if (endedTrackedLaunches.length > 0) {
+      // Authoritative attribution from the completed launch(es) themselves:
+      // if any completed launch is unstated or has no open requester, retain
+      // unknown attribution rather than crediting a different still-running
+      // launch's requester (decision ce71a72b).
       const endedRefs = []
-      for (const id of endedParentIds) {
-        if (id === '__parent_bg__') continue
-        const launch = reqState.launches.get(id)
-        if (!launch) continue
+      let anyEndedUnstated = false
+      for (const launch of endedTrackedLaunches) {
+        const launchRefs = []
         for (const candidate of [launch.request, ...(launch.also ?? [])]) {
-          if ((reqState.open.has(candidate) || candidate === 'none') && !endedRefs.includes(candidate)) {
-            endedRefs.push(candidate)
+          if (reqState.open.has(candidate) || candidate === 'none') {
+            if (!launchRefs.includes(candidate)) launchRefs.push(candidate)
+          }
+        }
+        if (launch.request === UNSTATED || launchRefs.length === 0) {
+          anyEndedUnstated = true
+        } else {
+          for (const ref of launchRefs) {
+            if (!endedRefs.includes(ref)) endedRefs.push(ref)
           }
         }
       }
-      if (endedRefs.length > 0) {
+
+      if (anyEndedUnstated || endedRefs.length === 0) {
+        setCurrentRequest(connectionId, UNSTATED, { dir })
+      } else if (notificationText) {
+        const arrival = promptArrival({
+          fromAPerson: false,
+          origin: 'task-notification',
+          text: notificationText,
+          midTurn: false,
+          state: reqState,
+        })
+        const hasCurrent = arrival.events.some((ev) => ev.op === 'current' && ev.ref !== null)
+        if (hasCurrent) {
+          for (const event of arrival.events) {
+            appendRequestEvent(connectionId, event, { dir })
+          }
+        } else {
+          setCurrentRequest(connectionId, endedRefs.at(-1), { dir })
+          for (const extra of endedRefs.slice(0, -1)) {
+            appendRequestEvent(connectionId, { op: 'joined', id: extra }, { dir })
+          }
+        }
+      } else {
         setCurrentRequest(connectionId, endedRefs.at(-1), { dir })
         for (const extra of endedRefs.slice(0, -1)) {
           appendRequestEvent(connectionId, { op: 'joined', id: extra }, { dir })
         }
-        restoredRequest = true
       }
-    }
-    if (!restoredRequest && parent.requestRef && (reqState.open.has(parent.requestRef) || parent.requestRef === 'none')) {
-      // Only fall back to parent.requestRef when the parked launches do not span
-      // multiple distinct requesters, avoiding misattribution when completion had
-      // no matching launch entry.
-      const distinctParkedRefs = new Set()
-      for (const id of parentOwnedIds) {
-        const launch = reqState.launches.get(id)
-        if (!launch) continue
-        for (const candidate of [launch.request, ...(launch.also ?? [])]) {
-          if (reqState.open.has(candidate) || candidate === 'none') distinctParkedRefs.add(candidate)
+    } else {
+      let restoredFromNotification = false
+      if (notificationText) {
+        const arrival = promptArrival({
+          fromAPerson: false,
+          origin: 'task-notification',
+          text: notificationText,
+          midTurn: false,
+          state: reqState,
+        })
+        const hasCurrent = arrival.events.some((ev) => ev.op === 'current' && ev.ref !== null)
+        if (hasCurrent) {
+          for (const event of arrival.events) {
+            appendRequestEvent(connectionId, event, { dir })
+          }
+          restoredFromNotification = true
         }
       }
-      if (distinctParkedRefs.size <= 1) {
-        setCurrentRequest(connectionId, parent.requestRef, { dir })
+      if (!restoredFromNotification) {
+        // Only fall back to parent.requestRef when NO other still-running parked
+        // launch exists and NO parked launch had a tracked launch entry, so a
+        // completed untagged launch never borrows another launch's requester.
+        const allParkedEnded =
+          parentOwnedIds.length === 0 ||
+          parentOwnedIds.every((id) => endedParentIds.includes(id))
+        const anyParkedHasLaunch = parentOwnedIds.some((id) => reqState.launches.has(id))
+        if (
+          allParkedEnded &&
+          !anyParkedHasLaunch &&
+          parent.requestRef &&
+          (reqState.open.has(parent.requestRef) || parent.requestRef === 'none')
+        ) {
+          setCurrentRequest(connectionId, parent.requestRef, { dir })
+        } else {
+          setCurrentRequest(connectionId, UNSTATED, { dir })
+        }
       }
     }
   } catch {
@@ -507,7 +706,11 @@ export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR, now =
           noticeIds: wake?.noticeIds ?? [],
           recordNoticeIds: wake?.recordNoticeIds ?? [],
           checkJobWake: Boolean(wake?.checkJobWake),
+          checkJobIds: wake?.checkJobIds ?? [],
+          settledCheckJobIds: [],
           checkJobRuled: false,
+          checkJobRuledAt: null,
+          lastPauseActivityAt: now,
           pauseStartedAt: now,
           excludedRanges: normalizeExcludedRanges(existing.excludedRanges),
           tellPerson: false,
@@ -531,13 +734,28 @@ export function recordTurnWake(connectionId, entry, dir = CONNECTIONS_DIR, now =
     )
   }
   if (existing?.heldParent && !existing?.otherWake && nonCommandWake) {
+    const merged = mergeTurnWake(existing, wake)
+    const settled = Array.isArray(existing.settledCheckJobIds)
+      ? existing.settledCheckJobIds.map((id) => String(id).toLowerCase())
+      : []
+    const mergedJobs = Array.isArray(merged.checkJobIds)
+      ? merged.checkJobIds.map((id) => String(id).toLowerCase())
+      : []
+    const resetRuled =
+      Boolean(wake?.checkJobWake) &&
+      (mergedJobs.length === 0 || mergedJobs.some((id) => !settled.includes(id)))
     return writeTurnMarker(
       connectionId,
       {
         held: false,
         heldParent: existing.heldParent,
         remoteTurn: true,
-        ...mergeTurnWake(existing, wake),
+        ...merged,
+        ...(resetRuled ? { checkJobRuled: false, checkJobRuledAt: null } : {}),
+        lastPauseActivityAt: Math.max(
+          typeof existing.lastPauseActivityAt === 'number' ? existing.lastPauseActivityAt : 0,
+          now,
+        ),
         preserveExplicitReply: true,
       },
       dir,
@@ -2904,12 +3122,25 @@ export async function handleMirrorTurn(
     connectionsDir,
   )
   const latestStep = extractLatestTranscriptStep(effectiveTranscriptPath)
+  const latestStepMsForPre = latestStep?.created_at ? Date.parse(latestStep.created_at) : NaN
+  const preExcludeUpToMs =
+    modeArg === 'user_prompt' &&
+    rawExistingMarker?.heldParent &&
+    !rawExistingMarker?.checkJobWake &&
+    latestStep?.type === 'PLANNER_RESPONSE' &&
+    Array.isArray(latestStep.tool_calls) &&
+    latestStep.tool_calls.length > 0 &&
+    Number.isFinite(latestStepMsForPre)
+      ? latestStepMsForPre - 1
+      : null
   const existingMarker =
     modeArg === 'user_prompt'
       ? restoreHeldParentIfResumed(connectionId, rawExistingMarker, {
           dir: connectionsDir,
           reconciled,
           latestStep,
+          excludeUpToMs: preExcludeUpToMs,
+          requireParentNotificationStep: Boolean(rawExistingMarker?.checkJobWake),
         }).marker
       : rawExistingMarker
   const latestStepMs = latestStep?.created_at ? Date.parse(latestStep.created_at) : NaN
@@ -2969,8 +3200,15 @@ export async function handleMirrorTurn(
       (Boolean(existingMarker?.held) &&
         latestStep?.type === 'SYSTEM_MESSAGE' &&
         !rawStepContent.includes('[DevSpec Remote Wake]')))
+  // When `existingMarker.heldParent` is still parked (meaning `restoreHeldParentIfResumed`
+  // intentionally declined to restore — e.g. a check-job helper subagent finished while
+  // the check pause is still active), keep the pause context intact instead of promoting
+  // `heldParent` into the active turn (decisions a2d9f38f & c1791ffa).
+  const pauseStillParked = Boolean(existingMarker?.heldParent && !existingMarker?.otherWake)
   const bgParentContext = isBgContinuation
-    ? existingMarker?.heldParent || existingMarker || inferredTranscriptContext || {}
+    ? pauseStillParked
+      ? existingMarker
+      : existingMarker?.heldParent || existingMarker || inferredTranscriptContext || {}
     : null
   const isExplicitUserInputStep =
     !isBgContinuation &&
@@ -3210,7 +3448,12 @@ export async function handleMirrorTurn(
             localTurn: null,
             otherWake: false,
             backgroundContinuation: false,
+            settledCheckJobIds: Array.isArray(existingMarker?.settledCheckJobIds)
+              ? existingMarker.settledCheckJobIds
+              : [],
             checkJobRuled: false,
+            checkJobRuledAt: null,
+            lastPauseActivityAt: Date.now(),
             pauseStartedAt:
               typeof existingMarker?.pauseStartedAt === 'number'
                 ? existingMarker.pauseStartedAt
@@ -3222,28 +3465,45 @@ export async function handleMirrorTurn(
             ),
             preserveExplicitReply: true,
           }
-        : {
-            held: false,
-            heldParent: null,
-            remoteTurn: Boolean(isRemoteWakeInput),
-            localPromptMirrored: preservedLocalMirrored,
-            ...(isBgContinuation
-              ? {
-                  backgroundContinuation: true,
-                  ...(bgParentHasCommandOrPrompt
-                    ? { noticeIds: [], recordNoticeIds: [], checkJobWake: false }
-                    : {}),
-                }
-              : {}),
-            ...(preservedLocalTurn ? { localTurn: preservedLocalTurn } : { localTurn: null }),
-            ...mergeTurnWake(
-              isBgContinuation && bgParentHasCommandOrPrompt
-                ? { otherWake: Boolean(bgParentContext?.otherWake) }
-                : currentMarkerForMerge,
-              wake,
-            ),
-            ...(isBgContinuation ? { preserveExplicitReply: true } : {}),
-          }
+        : isBgContinuation && pauseStillParked
+          ? {
+              held: false,
+              heldParent: existingMarker.heldParent,
+              remoteTurn: true,
+              localPromptMirrored: false,
+              localTurn: null,
+              otherWake: false,
+              backgroundContinuation: false,
+              lastPauseActivityAt: Math.max(
+                typeof existingMarker.lastPauseActivityAt === 'number'
+                  ? existingMarker.lastPauseActivityAt
+                  : 0,
+                Date.now(),
+              ),
+              preserveExplicitReply: true,
+            }
+          : {
+              held: false,
+              heldParent: null,
+              remoteTurn: Boolean(isRemoteWakeInput),
+              localPromptMirrored: preservedLocalMirrored,
+              ...(isBgContinuation
+                ? {
+                    backgroundContinuation: true,
+                    ...(bgParentHasCommandOrPrompt
+                      ? { noticeIds: [], recordNoticeIds: [], checkJobWake: false }
+                      : {}),
+                  }
+                : {}),
+              ...(preservedLocalTurn ? { localTurn: preservedLocalTurn } : { localTurn: null }),
+              ...mergeTurnWake(
+                isBgContinuation && bgParentHasCommandOrPrompt
+                  ? { otherWake: Boolean(bgParentContext?.otherWake) }
+                  : currentMarkerForMerge,
+                wake,
+              ),
+              ...(isBgContinuation ? { preserveExplicitReply: true } : {}),
+            }
       if (typeof latestStep?.step_index === 'number') {
         markerExtra.lastStepIndex = latestStep.step_index
       }
